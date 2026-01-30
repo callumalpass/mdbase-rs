@@ -1,1 +1,369 @@
-//! Type matching engine (§6).
+//! Match rule evaluation engine (§6).
+
+use crate::types::schema::MatchRules;
+
+/// Check if a file matches the given match rules.
+/// `rel_path` is the file path relative to the collection root (forward slashes).
+/// `frontmatter` is the parsed frontmatter JSON object.
+pub fn matches_rules(
+    rules: &MatchRules,
+    rel_path: &str,
+    frontmatter: &serde_json::Value,
+) -> bool {
+    // All conditions in a match rule are AND'd together
+    if let Some(ref path_glob) = rules.path_glob {
+        if !matches_path_glob(rel_path, path_glob) {
+            return false;
+        }
+    }
+
+    if let Some(ref fields_present) = rules.fields_present {
+        if !check_fields_present(frontmatter, fields_present) {
+            return false;
+        }
+    }
+
+    if let Some(ref where_clause) = rules.where_clause {
+        if !evaluate_where(frontmatter, where_clause) {
+            return false;
+        }
+    }
+
+    // At least one condition must be specified
+    rules.path_glob.is_some() || rules.fields_present.is_some() || rules.where_clause.is_some()
+}
+
+/// Check if a relative path matches a glob pattern.
+/// Supports: * (single level), ** (any depth), ? (single char)
+fn matches_path_glob(rel_path: &str, pattern: &str) -> bool {
+    // Normalize separators
+    let path = rel_path.replace('\\', "/");
+    let pattern = pattern.replace('\\', "/");
+
+    glob_match(&path, &pattern)
+}
+
+/// Recursive glob matcher.
+fn glob_match(path: &str, pattern: &str) -> bool {
+    let path_parts: Vec<&str> = path.split('/').collect();
+    let pattern_parts: Vec<&str> = pattern.split('/').collect();
+
+    glob_match_parts(&path_parts, &pattern_parts)
+}
+
+fn glob_match_parts(path_parts: &[&str], pattern_parts: &[&str]) -> bool {
+    if pattern_parts.is_empty() {
+        return path_parts.is_empty();
+    }
+
+    if path_parts.is_empty() {
+        // Remaining pattern parts must all be ** to match empty
+        return pattern_parts.iter().all(|p| *p == "**");
+    }
+
+    let pat = pattern_parts[0];
+
+    if pat == "**" {
+        // ** matches zero or more path segments
+        // Try matching 0 segments (skip **)
+        if glob_match_parts(path_parts, &pattern_parts[1..]) {
+            return true;
+        }
+        // Try matching 1+ segments (consume one path part, keep **)
+        if glob_match_parts(&path_parts[1..], pattern_parts) {
+            return true;
+        }
+        return false;
+    }
+
+    // Match current segment
+    if segment_matches(path_parts[0], pat) {
+        return glob_match_parts(&path_parts[1..], &pattern_parts[1..]);
+    }
+
+    false
+}
+
+/// Check if a single path segment matches a glob pattern segment.
+/// Supports * (any chars) and ? (single char).
+fn segment_matches(segment: &str, pattern: &str) -> bool {
+    segment_match_chars(segment.as_bytes(), pattern.as_bytes())
+}
+
+fn segment_match_chars(seg: &[u8], pat: &[u8]) -> bool {
+    if pat.is_empty() {
+        return seg.is_empty();
+    }
+    if seg.is_empty() {
+        // Remaining pattern must all be * to match empty
+        return pat.iter().all(|&c| c == b'*');
+    }
+
+    match pat[0] {
+        b'*' => {
+            // * matches zero or more characters in this segment
+            // Try zero chars
+            if segment_match_chars(seg, &pat[1..]) {
+                return true;
+            }
+            // Try one+ chars
+            segment_match_chars(&seg[1..], pat)
+        }
+        b'?' => {
+            // ? matches exactly one character
+            segment_match_chars(&seg[1..], &pat[1..])
+        }
+        c => {
+            if seg[0] == c {
+                segment_match_chars(&seg[1..], &pat[1..])
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Check that all listed fields are present and non-null in frontmatter.
+fn check_fields_present(frontmatter: &serde_json::Value, fields: &[String]) -> bool {
+    let obj = match frontmatter.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+
+    for field in fields {
+        match obj.get(field) {
+            None => return false,
+            Some(v) if v.is_null() => return false,
+            _ => {} // present and non-null
+        }
+    }
+    true
+}
+
+/// Evaluate a where clause against frontmatter.
+/// The where clause is a JSON object where keys are field names
+/// and values are either literal values (exact match) or operator objects.
+fn evaluate_where(frontmatter: &serde_json::Value, where_clause: &serde_json::Value) -> bool {
+    let conditions = match where_clause.as_object() {
+        Some(obj) => obj,
+        None => return false,
+    };
+
+    let fm_obj = match frontmatter.as_object() {
+        Some(obj) => obj,
+        None => return false,
+    };
+
+    for (field, condition) in conditions {
+        let field_value = fm_obj.get(field);
+
+        if let Some(cond_obj) = condition.as_object() {
+            // Operator-based condition
+            if !evaluate_field_condition(field_value, cond_obj) {
+                return false;
+            }
+        } else {
+            // Literal value - exact equality
+            match field_value {
+                Some(actual) => {
+                    if !values_equal(actual, condition) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+    }
+
+    true
+}
+
+/// Evaluate a single field condition with operators.
+fn evaluate_field_condition(
+    field_value: Option<&serde_json::Value>,
+    operators: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    for (op, expected) in operators {
+        match op.as_str() {
+            "eq" => {
+                match field_value {
+                    Some(actual) => if !values_equal(actual, expected) { return false; }
+                    None => return false,
+                }
+            }
+            "neq" => {
+                match field_value {
+                    Some(actual) => if values_equal(actual, expected) { return false; }
+                    None => {} // missing != anything is true
+                }
+            }
+            "gt" => {
+                match field_value {
+                    Some(actual) => {
+                        if compare_values(actual, expected).map_or(true, |ord| ord != std::cmp::Ordering::Greater) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            "gte" => {
+                match field_value {
+                    Some(actual) => {
+                        if compare_values(actual, expected).map_or(true, |ord| ord == std::cmp::Ordering::Less) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            "lt" => {
+                match field_value {
+                    Some(actual) => {
+                        if compare_values(actual, expected).map_or(true, |ord| ord != std::cmp::Ordering::Less) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            "lte" => {
+                match field_value {
+                    Some(actual) => {
+                        if compare_values(actual, expected).map_or(true, |ord| ord == std::cmp::Ordering::Greater) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            "exists" => {
+                let should_exist = expected.as_bool().unwrap_or(true);
+                let does_exist = field_value.map_or(false, |v| !v.is_null());
+                if should_exist != does_exist {
+                    return false;
+                }
+            }
+            "contains" => {
+                match field_value {
+                    Some(serde_json::Value::Array(arr)) => {
+                        if !arr.iter().any(|item| values_equal(item, expected)) {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            "containsAll" => {
+                match field_value {
+                    Some(serde_json::Value::Array(arr)) => {
+                        if let Some(expected_arr) = expected.as_array() {
+                            for exp in expected_arr {
+                                if !arr.iter().any(|item| values_equal(item, exp)) {
+                                    return false;
+                                }
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            "containsAny" => {
+                match field_value {
+                    Some(serde_json::Value::Array(arr)) => {
+                        if let Some(expected_arr) = expected.as_array() {
+                            if !expected_arr.iter().any(|exp| arr.iter().any(|item| values_equal(item, exp))) {
+                                return false;
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            "startsWith" => {
+                match field_value {
+                    Some(serde_json::Value::String(s)) => {
+                        if let Some(prefix) = expected.as_str() {
+                            if !s.starts_with(prefix) { return false; }
+                        } else {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            "endsWith" => {
+                match field_value {
+                    Some(serde_json::Value::String(s)) => {
+                        if let Some(suffix) = expected.as_str() {
+                            if !s.ends_with(suffix) { return false; }
+                        } else {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            "matches" => {
+                match field_value {
+                    Some(serde_json::Value::String(s)) => {
+                        if let Some(pattern) = expected.as_str() {
+                            match fancy_regex::Regex::new(pattern) {
+                                Ok(re) => {
+                                    if !re.is_match(s).unwrap_or(false) { return false; }
+                                }
+                                Err(_) => return false,
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            _ => {} // Unknown operator - ignore
+        }
+    }
+    true
+}
+
+/// Compare two JSON values for equality (with type coercion).
+fn values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    if a == b {
+        return true;
+    }
+    // Try numeric comparison
+    if let (Some(an), Some(bn)) = (to_f64(a), to_f64(b)) {
+        return (an - bn).abs() < f64::EPSILON;
+    }
+    // Try string comparison
+    if let (Some(as_str), Some(bs_str)) = (a.as_str(), b.as_str()) {
+        return as_str == bs_str;
+    }
+    false
+}
+
+/// Compare two JSON values, returning ordering if comparable.
+fn compare_values(a: &serde_json::Value, b: &serde_json::Value) -> Option<std::cmp::Ordering> {
+    // Try numeric comparison
+    if let (Some(an), Some(bn)) = (to_f64(a), to_f64(b)) {
+        return an.partial_cmp(&bn);
+    }
+    // Try string comparison
+    if let (Some(as_str), Some(bs_str)) = (a.as_str(), b.as_str()) {
+        return Some(as_str.cmp(bs_str));
+    }
+    None
+}
+
+fn to_f64(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
