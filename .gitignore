@@ -1,0 +1,9 @@
+target/
+
+PROMPT.md
+AGENTS.md
+PROGRESS.md
+loop.sh
+
+# Test artifacts
+.mdbase-test-*/

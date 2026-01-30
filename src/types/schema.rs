@@ -1,0 +1,1 @@
+//! Type definition schema types.

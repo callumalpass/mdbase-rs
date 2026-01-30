@@ -1,0 +1,1 @@
+//! File → cache indexing.
