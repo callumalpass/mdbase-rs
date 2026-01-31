@@ -74,6 +74,7 @@ struct TestCase {
     input: serde_yaml::Value,
     #[serde(default)]
     expect: TestExpectation,
+    verify_after: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -107,7 +108,6 @@ struct TestExpectation {
     results_count: Option<usize>,
     batch_result: Option<serde_yaml::Value>,
     broken_links: Option<Vec<serde_yaml::Value>>,
-    verify_after: Option<Vec<serde_yaml::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +127,8 @@ struct ExpectedError {
 struct WarningExpectation {
     contains: Option<String>,
     code: Option<String>,
+    path: Option<String>,
+    message_contains: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +250,7 @@ fn materialize_merged_setup(group: &TestSetup, test: &TestSetup) -> TempDir {
         }
     }
 
-    // Files: merge (group first, test overrides)
+    // Files: merge (group first, test overrides same-named files)
     let mut all_files: HashMap<String, serde_yaml::Value> = HashMap::new();
     if let Some(files) = &group.files {
         for (k, v) in files {
@@ -434,7 +436,7 @@ fn conformance_tests() {
                     Ok(result) => match check_expectation(&result, &test_case.expect) {
                         Ok(()) => {
                             // Run verify_after checks if present
-                            let verify_ok = run_verify_after(root, &test_case.expect, &test_case.name, &filename);
+                            let verify_ok = run_verify_after(root, &test_case.verify_after, &test_case.name, &filename);
                             match verify_ok {
                                 Ok(()) => {
                                     passed += 1;
@@ -462,7 +464,7 @@ fn conformance_tests() {
                             if let Some(expected_code) = &expected_error.code {
                                 if err.contains(expected_code) {
                                     // Run verify_after for error cases too
-                                    let verify_ok = run_verify_after(root, &test_case.expect, &test_case.name, &filename);
+                                    let verify_ok = run_verify_after(root, &test_case.verify_after, &test_case.name, &filename);
                                     match verify_ok {
                                         Ok(()) => {
                                             passed += 1;
@@ -554,7 +556,8 @@ fn execute_operation(
             Ok(result)
         }
         "read" | "create" | "update" | "delete" | "rename" | "validate"
-        | "load_types" | "get_types" | "get_type" | "create_type" => {
+        | "load_types" | "get_types" | "get_type" | "create_type"
+        | "cache_rebuild" | "cache_clear" => {
             let collection_result = mdbase::Collection::open(collection_root);
             let collection = match collection_result {
                 Ok(c) => c,
@@ -583,6 +586,8 @@ fn execute_operation(
                 "delete" => collection.delete(&input_json),
                 "rename" => collection.rename(&input_json),
                 "validate" => collection.validate_op(&input_json),
+                "cache_rebuild" => collection.cache_rebuild(),
+                "cache_clear" => collection.cache_clear(),
                 "load_types" | "get_types" => {
                     // If a path is provided, determine types for that specific file
                     if let Some(path) = input_json.get("path").and_then(|v| v.as_str()) {
@@ -964,13 +969,20 @@ fn execute_operation(
 
 fn run_verify_after(
     root: &Path,
-    expect: &TestExpectation,
+    verify_after: &Option<serde_yaml::Value>,
     _test_name: &str,
     _filename: &str,
 ) -> Result<(), String> {
-    let verify_steps = match &expect.verify_after {
-        Some(steps) => steps,
+    let verify_val = match verify_after {
+        Some(v) => v,
         None => return Ok(()),
+    };
+
+    // verify_after can be a single object or a list of steps
+    let verify_steps: Vec<serde_yaml::Value> = match verify_val {
+        serde_yaml::Value::Sequence(seq) => seq.clone(),
+        obj @ serde_yaml::Value::Mapping(_) => vec![obj.clone()],
+        _ => return Ok(()),
     };
 
     for (i, step) in verify_steps.iter().enumerate() {
@@ -1065,22 +1077,52 @@ fn check_expectation(
             .ok_or_else(|| "expected 'warnings' array in result".to_string())?;
         for exp in expected_warnings {
             let found = actual_warnings.iter().any(|w| {
+                // Check "path" against warning path field
+                if let Some(exp_path) = &exp.path {
+                    if let Some(actual_path) = w.get("path").and_then(|p| p.as_str()) {
+                        if actual_path != exp_path.as_str() {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                // Check "message_contains" against warning message field
+                if let Some(needle) = &exp.message_contains {
+                    if let Some(msg) = w.get("message").and_then(|m| m.as_str()) {
+                        if !msg.to_lowercase().contains(&needle.to_lowercase()) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
                 // Check "contains" against string warnings or warning message fields
                 if let Some(needle) = &exp.contains {
                     if let Some(s) = w.as_str() {
-                        return s.contains(needle.as_str());
-                    }
-                    if let Some(msg) = w.get("message").and_then(|m| m.as_str()) {
-                        return msg.contains(needle.as_str());
+                        if !s.contains(needle.as_str()) {
+                            return false;
+                        }
+                    } else if let Some(msg) = w.get("message").and_then(|m| m.as_str()) {
+                        if !msg.contains(needle.as_str()) {
+                            return false;
+                        }
+                    } else {
+                        return false;
                     }
                 }
                 // Check "code" against warning code fields
                 if let Some(code) = &exp.code {
                     if let Some(actual_code) = w.get("code").and_then(|c| c.as_str()) {
-                        return actual_code == code.as_str();
+                        if actual_code != code.as_str() {
+                            return false;
+                        }
+                    } else {
+                        return false;
                     }
                 }
-                false
+                // If we passed all checks and at least one field was checked, it's a match
+                exp.path.is_some() || exp.message_contains.is_some() || exp.contains.is_some() || exp.code.is_some()
             });
             if !found {
                 return Err(format!(

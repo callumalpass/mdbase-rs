@@ -1874,9 +1874,42 @@ fn date_to_epoch_ms(s: &str) -> Option<i64> {
 
 /// Strip inline code spans from body text before extracting links/tags/embeds.
 /// Handles both single backtick `code` and multi-backtick ``code`` spans.
-fn strip_inline_code(body: &str) -> String {
-    let mut result = String::with_capacity(body.len());
-    let chars: Vec<char> = body.chars().collect();
+fn strip_code_blocks_and_inline_code(body: &str) -> String {
+    // First pass: strip fenced code blocks (``` or ~~~)
+    let mut lines_out = Vec::new();
+    let mut in_fence = false;
+    let mut fence_marker = "";
+    let mut fence_backtick_count = 0;
+
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if !in_fence {
+            // Check for opening fence
+            let (is_fence, marker, count) = detect_fence_open(trimmed);
+            if is_fence {
+                in_fence = true;
+                fence_marker = marker;
+                fence_backtick_count = count;
+                // Skip the fence line itself
+                continue;
+            }
+            lines_out.push(line);
+        } else {
+            // Check for closing fence (must use same marker and at least as many chars)
+            if is_fence_close(trimmed, fence_marker, fence_backtick_count) {
+                in_fence = false;
+                // Skip the closing fence line
+                continue;
+            }
+            // Skip content inside the fenced code block
+        }
+    }
+
+    let after_fences = lines_out.join("\n");
+
+    // Second pass: strip inline code spans
+    let mut result = String::with_capacity(after_fences.len());
+    let chars: Vec<char> = after_fences.chars().collect();
     let len = chars.len();
     let mut i = 0;
 
@@ -1893,7 +1926,6 @@ fn strip_inline_code(body: &str) -> String {
             let search_start = i;
             while i <= len - backtick_count {
                 if chars[i] == '`' {
-                    let close_start = i;
                     let mut close_count = 0;
                     while i < len && chars[i] == '`' {
                         close_count += 1;
@@ -1924,11 +1956,37 @@ fn strip_inline_code(body: &str) -> String {
     result
 }
 
+fn detect_fence_open(trimmed: &str) -> (bool, &'static str, usize) {
+    if trimmed.starts_with("```") {
+        let count = trimmed.chars().take_while(|&c| c == '`').count();
+        // Opening fence: at least 3 backticks, rest is info string (no closing backticks)
+        (true, "`", count)
+    } else if trimmed.starts_with("~~~") {
+        let count = trimmed.chars().take_while(|&c| c == '~').count();
+        (true, "~", count)
+    } else {
+        (false, "", 0)
+    }
+}
+
+fn is_fence_close(trimmed: &str, marker: &str, min_count: usize) -> bool {
+    let fence_char = if marker == "`" { '`' } else { '~' };
+    if !trimmed.starts_with(fence_char) {
+        return false;
+    }
+    let count = trimmed.chars().take_while(|&c| c == fence_char).count();
+    if count < min_count {
+        return false;
+    }
+    // Closing fence: only fence chars and optional whitespace
+    trimmed[count * fence_char.len_utf8()..].trim().is_empty()
+}
+
 /// Extract inline tags from markdown body.
 /// Tags match #[A-Za-z0-9_/-]+ and must be preceded by whitespace or start of line.
 /// Tags inside inline code spans are excluded.
 pub fn extract_tags_from_body(body: &str) -> Vec<String> {
-    let clean = strip_inline_code(body);
+    let clean = strip_code_blocks_and_inline_code(body);
     let mut tags = Vec::new();
 
     for line in clean.lines() {
@@ -1979,7 +2037,7 @@ pub fn extract_tags_from_body(body: &str) -> Vec<String> {
 /// Returns a list of link target strings.
 /// Links inside inline code spans are excluded.
 pub fn extract_links_from_body(body: &str) -> Vec<String> {
-    let clean = strip_inline_code(body);
+    let clean = strip_code_blocks_and_inline_code(body);
     let mut links = Vec::new();
 
     let chars: Vec<char> = clean.chars().collect();
@@ -2053,7 +2111,7 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
 /// Extract embeds from markdown body (![[target]]).
 /// Embeds inside inline code spans are excluded.
 pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
-    let clean = strip_inline_code(body);
+    let clean = strip_code_blocks_and_inline_code(body);
     let mut embeds = Vec::new();
 
     let chars: Vec<char> = clean.chars().collect();

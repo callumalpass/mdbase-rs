@@ -315,6 +315,7 @@ fn parse_settings(
     };
 
     // id_field
+    let id_field_explicit = matches!(get_setting(settings_map, "id_field"), Some(serde_yaml::Value::String(_)));
     let id_field = match get_setting(settings_map, "id_field") {
         Some(serde_yaml::Value::String(s)) => s.clone(),
         Some(serde_yaml::Value::Null) | None => "id".to_string(),
@@ -419,6 +420,7 @@ fn parse_settings(
         "default_validation": default_validation,
         "default_strict": default_strict,
         "id_field": id_field,
+        "id_field_explicit": id_field_explicit,
         "write_nulls": write_nulls,
         "write_empty_lists": write_empty_lists,
         "rename_update_refs": rename_update_refs,
