@@ -68,6 +68,7 @@ struct TestCase {
     #[allow(dead_code)]
     spec_ref: Option<String>,
     setup: Option<TestSetup>,
+    simulate: Option<serde_yaml::Value>,
     operation: String,
     #[serde(default)]
     input: serde_yaml::Value,
@@ -87,6 +88,7 @@ struct TestExpectation {
     results: Option<Vec<serde_yaml::Value>>,
     count: Option<usize>,
     paths: Option<Vec<String>>,
+    meta: Option<serde_yaml::Value>,
     frontmatter: Option<serde_yaml::Value>,
     body: Option<String>,
     body_contains: Option<String>,
@@ -98,6 +100,14 @@ struct TestExpectation {
     from: Option<String>,
     to: Option<String>,
     validation: Option<serde_yaml::Value>,
+    summaries: Option<serde_yaml::Value>,
+    groups: Option<Vec<serde_yaml::Value>>,
+    link: Option<serde_yaml::Value>,
+    resolved_path: Option<serde_yaml::Value>,
+    results_count: Option<usize>,
+    batch_result: Option<serde_yaml::Value>,
+    broken_links: Option<Vec<serde_yaml::Value>>,
+    verify_after: Option<Vec<serde_yaml::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,11 +395,58 @@ fn conformance_tests() {
                     }
                 };
 
-                match execute_operation(root, &test_case.operation, &test_case.input) {
+                // Apply simulate actions before the operation
+                if let Some(sim) = &test_case.simulate {
+                    if let Some(mapping) = sim.as_mapping() {
+                        for (key, val) in mapping {
+                            let action = key.as_str().unwrap_or("");
+                            match action {
+                                "external_modify" | "external_create" => {
+                                    if let Some(path_str) = val.as_mapping()
+                                        .and_then(|m| m.get(serde_yaml::Value::String("path".to_string())))
+                                        .and_then(|v| v.as_str()) {
+                                        if let Some(content) = val.as_mapping()
+                                            .and_then(|m| m.get(serde_yaml::Value::String("content".to_string())))
+                                            .and_then(|v| v.as_str()) {
+                                            let full_path = root.join(path_str);
+                                            if let Some(parent) = full_path.parent() {
+                                                let _ = fs::create_dir_all(parent);
+                                            }
+                                            let _ = fs::write(&full_path, content);
+                                        }
+                                    }
+                                }
+                                "external_delete" => {
+                                    if let Some(path_str) = val.as_mapping()
+                                        .and_then(|m| m.get(serde_yaml::Value::String("path".to_string())))
+                                        .and_then(|v| v.as_str()) {
+                                        let full_path = root.join(path_str);
+                                        let _ = fs::remove_file(&full_path);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                match execute_operation(root, &test_case.operation, &test_case.input, test_case.simulate.as_ref()) {
                     Ok(result) => match check_expectation(&result, &test_case.expect) {
                         Ok(()) => {
-                            passed += 1;
-                            println!("    ✓ {}", test_case.name);
+                            // Run verify_after checks if present
+                            let verify_ok = run_verify_after(root, &test_case.expect, &test_case.name, &filename);
+                            match verify_ok {
+                                Ok(()) => {
+                                    passed += 1;
+                                    println!("    ✓ {}", test_case.name);
+                                }
+                                Err(msg) => {
+                                    failed += 1;
+                                    let err = format!("[{}] {}: verify_after: {}", filename, test_case.name, msg);
+                                    println!("    ✗ {}: verify_after: {}", test_case.name, msg);
+                                    errors.push(err);
+                                }
+                            }
                         }
                         Err(msg) => {
                             failed += 1;
@@ -404,11 +461,23 @@ fn conformance_tests() {
                         if let Some(expected_error) = &test_case.expect.error {
                             if let Some(expected_code) = &expected_error.code {
                                 if err.contains(expected_code) {
-                                    passed += 1;
-                                    println!(
-                                        "    ✓ {} (expected error)",
-                                        test_case.name
-                                    );
+                                    // Run verify_after for error cases too
+                                    let verify_ok = run_verify_after(root, &test_case.expect, &test_case.name, &filename);
+                                    match verify_ok {
+                                        Ok(()) => {
+                                            passed += 1;
+                                            println!(
+                                                "    ✓ {} (expected error)",
+                                                test_case.name
+                                            );
+                                        }
+                                        Err(msg) => {
+                                            failed += 1;
+                                            let err = format!("[{}] {}: verify_after: {}", filename, test_case.name, msg);
+                                            println!("    ✗ {}: verify_after: {}", test_case.name, msg);
+                                            errors.push(err);
+                                        }
+                                    }
                                     continue;
                                 }
                             }
@@ -448,11 +517,42 @@ fn execute_operation(
     collection_root: &Path,
     operation: &str,
     input: &serde_yaml::Value,
+    simulate: Option<&serde_yaml::Value>,
 ) -> Result<serde_json::Value, String> {
     let input_json = yaml_to_json(input);
 
     match operation {
         "load_config" => Ok(mdbase::config::load_config(collection_root)),
+        "query" => {
+            let collection = mdbase::Collection::open(collection_root)
+                .map_err(|e| {
+                    if let Some(err) = e.get("error") {
+                        let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+                        format!("{}: {}", code, msg)
+                    } else {
+                        format!("Failed to open collection: {}", e)
+                    }
+                })?;
+            Ok(collection.query(&input_json))
+        }
+        "parse_link" => {
+            let collection = mdbase::Collection::open(collection_root)
+                .map_err(|e| format!("Failed to open collection: {:?}", e))?;
+            Ok(collection.parse_link(&input_json))
+        }
+        "resolve_link" => {
+            let collection = mdbase::Collection::open(collection_root)
+                .map_err(|e| format!("Failed to open collection: {:?}", e))?;
+            let result = collection.resolve_link(&input_json);
+            // Check if result contains issues (for path_traversal etc.)
+            if let Some(error) = result.get("error") {
+                let code = error.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                return Err(format!("{}: {}", code, msg));
+            }
+            Ok(result)
+        }
         "read" | "create" | "update" | "delete" | "rename" | "validate"
         | "load_types" | "get_types" | "get_type" | "create_type" => {
             let collection_result = mdbase::Collection::open(collection_root);
@@ -730,14 +830,17 @@ fn execute_operation(
             let parsed = match mdbase::expressions::parser::Parser::parse(expression) {
                 Ok(expr) => expr,
                 Err(e) => {
+                    let code = if e.contains("expression_depth_exceeded") { "expression_depth_exceeded" } else { "invalid_expression" };
                     return Ok(serde_json::json!({
-                        "error": { "code": "invalid_expression", "message": e }
+                        "error": { "code": code, "message": e }
                     }));
                 }
             };
 
             // Build evaluation context
-            let ctx = if let Some(path_val) = input_json.get("path").and_then(|v| v.as_str()) {
+            let ctx = if let Some(path_val) = input_json.get("path")
+                .or_else(|| input_json.get("context_path"))
+                .and_then(|v| v.as_str()) {
                 // Read the file to get frontmatter context
                 let collection = mdbase::Collection::open(collection_root)
                     .map_err(|e| format!("Failed to open collection: {}", e))?;
@@ -746,14 +849,45 @@ fn execute_operation(
                     .get("frontmatter")
                     .cloned()
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                let raw_frontmatter = read_result
+                    .get("raw_frontmatter")
+                    .cloned();
                 let body = read_result
                     .get("body")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let file_size = read_result.pointer("/file/size").and_then(|v| v.as_u64());
+                let file_mtime = read_result.pointer("/file/mtime").and_then(|v| v.as_str()).map(String::from);
+                // Build all_files for asFile() traversal
+                let all_files = collection.build_all_files_data();
+                let backlinks_index = collection.build_backlinks_index(&all_files);
+                let all_files_arc = std::sync::Arc::new(all_files);
+                let backlinks_arc = std::sync::Arc::new(backlinks_index);
                 mdbase::expressions::evaluator::EvalContext {
                     frontmatter,
+                    raw_frontmatter,
                     file_path: Some(path_val.to_string()),
                     body,
+                    file_size,
+                    file_mtime: file_mtime.clone(),
+                    file_ctime: None,
+                    this_context: None,
+                    all_files: Some(all_files_arc),
+                    traversal_depth: std::cell::Cell::new(0),
+                    backlinks_index: Some(backlinks_arc),
+                }
+            } else if let Some(context_val) = input_json.get("context") {
+                // Inline frontmatter context provided
+                mdbase::expressions::evaluator::EvalContext {
+                    frontmatter: context_val.clone(),
+                    raw_frontmatter: None,
+                    file_path: None,
+                    body: None,
+                    file_size: None, file_mtime: None, file_ctime: None,
+                    this_context: None,
+                    all_files: None,
+                    traversal_depth: std::cell::Cell::new(0),
+                    backlinks_index: None,
                 }
             } else {
                 // No file context - evaluate in empty context
@@ -768,11 +902,110 @@ fn execute_operation(
                 })),
             }
         }
+        "batch_update" | "batch_delete" => {
+            let collection = mdbase::Collection::open(collection_root)
+                .map_err(|e| {
+                    if let Some(err) = e.get("error") {
+                        let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+                        format!("{}: {}", code, msg)
+                    } else {
+                        format!("Failed to open collection: {}", e)
+                    }
+                })?;
+
+            // Extract simulate parameters from both top-level simulate and input.simulate
+            let sim_io_error: Option<String> = simulate
+                .and_then(|s| s.as_mapping())
+                .and_then(|m| m.get(&serde_yaml::Value::String("io_error_on".to_string())))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| {
+                    input_json.get("simulate")
+                        .and_then(|s| s.get("io_error_on"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                });
+            let skip_dependents: bool = simulate
+                .and_then(|s| s.as_mapping())
+                .and_then(|m| m.get(&serde_yaml::Value::String("skip_dependents".to_string())))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || input_json.get("simulate")
+                    .and_then(|s| s.get("skip_dependents"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+            let result = if operation == "batch_update" {
+                collection.batch_update(&input_json, sim_io_error.as_deref(), skip_dependents)
+            } else {
+                collection.batch_delete(&input_json, sim_io_error.as_deref())
+            };
+
+            // If result contains an error, return it as Err for the test runner
+            if let Some(error) = result.get("error") {
+                let code = error.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                return Err(format!("{}: {}", code, msg));
+            }
+
+            Ok(result)
+        }
         _ => Err(format!(
             "Operation '{}' not yet implemented",
             operation
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// verify_after: run follow-up operations after the primary operation
+// ---------------------------------------------------------------------------
+
+fn run_verify_after(
+    root: &Path,
+    expect: &TestExpectation,
+    _test_name: &str,
+    _filename: &str,
+) -> Result<(), String> {
+    let verify_steps = match &expect.verify_after {
+        Some(steps) => steps,
+        None => return Ok(()),
+    };
+
+    for (i, step) in verify_steps.iter().enumerate() {
+        let step_json = yaml_to_json(step);
+        let op = step_json.get("operation").and_then(|v| v.as_str()).unwrap_or("");
+        let input = step_json.get("input").cloned().unwrap_or(serde_json::json!({}));
+        let expect_val = step_json.get("expect").cloned().unwrap_or(serde_json::json!({}));
+
+        // Deserialize expected into TestExpectation
+        let expect_yaml_str = serde_json::to_string(&expect_val).unwrap_or_default();
+        let step_expect: TestExpectation = serde_yaml::from_str(&expect_yaml_str).unwrap_or_default();
+
+        // Convert input back to yaml for execute_operation
+        let input_yaml_str = serde_json::to_string(&input).unwrap_or_default();
+        let input_yaml: serde_yaml::Value = serde_yaml::from_str(&input_yaml_str).unwrap_or_default();
+
+        match execute_operation(root, op, &input_yaml, None) {
+            Ok(result) => {
+                check_expectation(&result, &step_expect)
+                    .map_err(|msg| format!("verify_after[{}] ({}): {}", i, op, msg))?;
+            }
+            Err(err) => {
+                // If the verify step expects an error, check it matches
+                if let Some(expected_error) = &step_expect.error {
+                    if let Some(expected_code) = &expected_error.code {
+                        if err.contains(expected_code) {
+                            continue;
+                        }
+                    }
+                }
+                return Err(format!("verify_after[{}] ({}): {}", i, op, err));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,6 +1259,233 @@ fn check_expectation(
                 "expected to='{}', got {:?}",
                 expected_to, actual_to
             ));
+        }
+    }
+
+    // Check result (single result, partial match)
+    if let Some(expected_result) = &expected.result {
+        let expected_json = yaml_to_json(expected_result);
+        // For evaluate operations, check .result field
+        if let Some(actual_result) = actual.get("result") {
+            check_partial_match(actual_result, &expected_json, "result")?;
+        } else {
+            // Check against whole result
+            check_partial_match(actual, &expected_json, "result")?;
+        }
+    }
+
+    // Check results (array of result items)
+    if let Some(expected_results) = &expected.results {
+        let actual_results = actual.get("results")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| format!("expected 'results' array in result, got {:?}", actual.get("results")))?;
+
+        let expected_json: Vec<serde_json::Value> = expected_results.iter()
+            .map(yaml_to_json)
+            .collect();
+
+        if actual_results.len() != expected_json.len() {
+            return Err(format!(
+                "expected {} results, got {} (paths: {:?})",
+                expected_json.len(),
+                actual_results.len(),
+                actual_results.iter().filter_map(|r| r.get("path").and_then(|v| v.as_str())).collect::<Vec<_>>()
+            ));
+        }
+
+        for (i, (actual_item, expected_item)) in actual_results.iter().zip(expected_json.iter()).enumerate() {
+            // Handle body_contains in expected result items
+            if let Some(body_contains) = expected_item.get("body_contains").and_then(|v| v.as_str()) {
+                let actual_body = actual_item.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                if !actual_body.contains(body_contains) {
+                    return Err(format!(
+                        "results[{}]: expected body containing '{}', got '{}'",
+                        i, body_contains, actual_body
+                    ));
+                }
+                // Check remaining fields (excluding body_contains)
+                if let serde_json::Value::Object(expected_map) = expected_item {
+                    for (key, val) in expected_map {
+                        if key == "body_contains" { continue; }
+                        let actual_val = actual_item.get(key).ok_or_else(|| {
+                            format!("results[{}].{}: expected field missing from result", i, key)
+                        })?;
+                        check_partial_match(actual_val, val, &format!("results[{}].{}", i, key))?;
+                    }
+                }
+            } else {
+                check_partial_match(actual_item, expected_item, &format!("results[{}]", i))?;
+            }
+        }
+    }
+
+    // Check meta (partial match)
+    if let Some(expected_meta) = &expected.meta {
+        let actual_meta = actual.get("meta")
+            .ok_or_else(|| "expected 'meta' in result".to_string())?;
+        let expected_json = yaml_to_json(expected_meta);
+        check_partial_match(actual_meta, &expected_json, "meta")?;
+    }
+
+    // Check summaries (partial match)
+    if let Some(expected_summaries) = &expected.summaries {
+        let actual_summaries = actual.get("summaries")
+            .ok_or_else(|| "expected 'summaries' in result".to_string())?;
+        let expected_json = yaml_to_json(expected_summaries);
+        check_partial_match(actual_summaries, &expected_json, "summaries")?;
+    }
+
+    // Check batch_result (partial match)
+    if let Some(expected_batch) = &expected.batch_result {
+        let actual_batch = actual.get("batch_result")
+            .ok_or_else(|| format!("expected 'batch_result' in result, got {:?}", actual))?;
+        let expected_json = yaml_to_json(expected_batch);
+        check_partial_match(actual_batch, &expected_json, "batch_result")?;
+    }
+
+    // Check broken_links
+    if let Some(expected_broken) = &expected.broken_links {
+        let actual_broken = actual.get("broken_links")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "expected 'broken_links' array in result".to_string())?;
+        let expected_json: Vec<serde_json::Value> = expected_broken.iter()
+            .map(yaml_to_json)
+            .collect();
+        for (i, exp) in expected_json.iter().enumerate() {
+            let found = actual_broken.iter().any(|a| {
+                check_partial_match(a, exp, "broken_link").is_ok()
+            });
+            if !found {
+                return Err(format!(
+                    "broken_links[{}]: expected {:?} not found in {:?}",
+                    i, exp, actual_broken
+                ));
+            }
+        }
+    }
+
+    // Check groups
+    if let Some(expected_groups) = &expected.groups {
+        let actual_groups = actual.get("groups")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "expected 'groups' array in result".to_string())?;
+
+        // Match each expected group against actual groups by key in order
+        // Expected groups are checked positionally (by index in the sorted order)
+        for (i, expected_group) in expected_groups.iter().enumerate() {
+            let expected_json = yaml_to_json(expected_group);
+
+            if i >= actual_groups.len() {
+                return Err(format!(
+                    "expected at least {} groups, got {}",
+                    i + 1, actual_groups.len()
+                ));
+            }
+
+            // Find matching group in actual - first try positional, then by key
+            let expected_key = expected_json.get("key").cloned().unwrap_or(serde_json::Value::Null);
+            let actual_group = if let Some(ag) = actual_groups.get(i) {
+                let actual_key = ag.get("key").cloned().unwrap_or(serde_json::Value::Null);
+                if actual_key == expected_key {
+                    ag
+                } else {
+                    // Search by key
+                    actual_groups.iter().find(|g| {
+                        g.get("key").cloned().unwrap_or(serde_json::Value::Null) == expected_key
+                    }).ok_or_else(|| format!(
+                        "groups[{}]: expected group with key {:?}, not found in actual groups",
+                        i, expected_key
+                    ))?
+                }
+            } else {
+                return Err(format!("groups[{}]: not enough actual groups", i));
+            };
+
+            // Check group results (partial match on each result)
+            if let Some(expected_results) = expected_json.get("results").and_then(|v| v.as_array()) {
+                let actual_results = actual_group.get("results")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| format!("groups[{}]: expected 'results' array", i))?;
+
+                for (j, expected_item) in expected_results.iter().enumerate() {
+                    if j >= actual_results.len() {
+                        return Err(format!(
+                            "groups[{}]: expected at least {} results, got {}",
+                            i, j + 1, actual_results.len()
+                        ));
+                    }
+                    check_partial_match(&actual_results[j], expected_item, &format!("groups[{}].results[{}]", i, j))?;
+                }
+            }
+
+            // Check group summaries
+            if let Some(expected_summaries) = expected_json.get("summaries") {
+                let actual_summaries = actual_group.get("summaries")
+                    .ok_or_else(|| format!("groups[{}]: expected 'summaries'", i))?;
+                check_partial_match(actual_summaries, expected_summaries, &format!("groups[{}].summaries", i))?;
+            }
+        }
+    }
+
+    // Check count
+    if let Some(expected_count) = expected.count {
+        let actual_count = actual.get("meta")
+            .and_then(|m| m.get("total_count"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        if actual_count != Some(expected_count) {
+            return Err(format!(
+                "expected count={}, got {:?}",
+                expected_count, actual_count
+            ));
+        }
+    }
+
+    // Check paths
+    if let Some(expected_paths) = &expected.paths {
+        let actual_results = actual.get("results")
+            .and_then(|v| v.as_array())
+            .ok_or("expected 'results' for paths check")?;
+        let actual_paths: Vec<&str> = actual_results.iter()
+            .filter_map(|r| r.get("path").and_then(|v| v.as_str()))
+            .collect();
+        for ep in expected_paths {
+            if !actual_paths.contains(&ep.as_str()) {
+                return Err(format!("expected path '{}' in results, got {:?}", ep, actual_paths));
+            }
+        }
+    }
+
+    // Check link (parse_link result)
+    if let Some(expected_link) = &expected.link {
+        let actual_link = actual.get("link")
+            .ok_or("expected 'link' in result")?;
+        let expected_json = yaml_to_json(expected_link);
+        check_partial_match(actual_link, &expected_json, "link")?;
+    }
+
+    // Check resolved_path
+    if let Some(expected_rp) = &expected.resolved_path {
+        let actual_rp = actual.get("resolved_path");
+        let expected_json = yaml_to_json(expected_rp);
+        match actual_rp {
+            Some(val) => {
+                let expected_val = &expected_json;
+                if val != expected_val {
+                    return Err(format!("resolved_path: expected {:?}, got {:?}", expected_val, val));
+                }
+            }
+            None => return Err(format!("expected resolved_path in result, got {:?}", actual)),
+        }
+    }
+
+    // Check results_count
+    if let Some(expected_count) = expected.results_count {
+        let actual_results = actual.get("results")
+            .and_then(|v| v.as_array())
+            .ok_or("expected 'results' array for results_count check")?;
+        if actual_results.len() != expected_count {
+            return Err(format!("expected {} results, got {}", expected_count, actual_results.len()));
         }
     }
 

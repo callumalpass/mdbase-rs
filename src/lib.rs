@@ -333,8 +333,14 @@ impl Collection {
             if let Some((_, expr)) = computed.iter().find(|(n, _)| n == field_name) {
                 let ctx = EvalContext {
                     frontmatter: frontmatter.clone(),
+                    raw_frontmatter: None,
                     file_path: Some(path.to_string()),
                     body: body.map(String::from),
+                    file_size: None, file_mtime: None, file_ctime: None,
+                    this_context: None,
+                    all_files: None,
+                    traversal_depth: std::cell::Cell::new(0),
+                    backlinks_index: None,
                 };
                 if let Ok(parsed) = ExprParser::parse(expr) {
                     match eval_expr(&parsed, &ctx) {
@@ -672,6 +678,178 @@ impl Collection {
         let mut files = Vec::new();
         self.scan_dir_recursive(&self.root, &mut files);
         files
+    }
+
+    /// Build all files data for asFile() traversal in expressions.
+    pub fn build_all_files_data(&self) -> Vec<crate::expressions::evaluator::ResolvedFileData> {
+        let files = self.scan_collection_files();
+        files.iter()
+            .filter_map(|fp| {
+                let rp = fp.strip_prefix(&self.root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+                    .replace('\\', "/");
+                let content = std::fs::read_to_string(fp).ok()?;
+                let doc = parse_document(&content);
+                let fm = match &doc.frontmatter {
+                    Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
+                    _ => serde_json::json!({}),
+                };
+                let type_names = self.determine_types_for_path(&fm, Some(&rp));
+                let effective = self.apply_defaults(&fm, &type_names);
+                let effective = self.coerce_types(&effective, &type_names);
+                Some(crate::expressions::evaluator::ResolvedFileData {
+                    path: rp,
+                    frontmatter: effective,
+                    body: doc.body,
+                })
+            })
+            .collect()
+    }
+
+    /// Build backlinks index from all files data.
+    /// Returns a map: target_path → Vec<source_path> (deduplicated).
+    pub fn build_backlinks_index(&self, all_files: &[crate::expressions::evaluator::ResolvedFileData]) -> HashMap<String, Vec<String>> {
+        use crate::expressions::evaluator::{extract_links_from_body, extract_embeds_from_body, extract_links_from_fm_value};
+
+        let mut index: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Collect all known file paths for resolution
+        let known_paths: Vec<&str> = all_files.iter().map(|f| f.path.as_str()).collect();
+
+        for file_data in all_files {
+            let source_path = &file_data.path;
+            let mut targets: Vec<String> = Vec::new();
+
+            // Extract links from frontmatter values
+            if let serde_json::Value::Object(ref map) = file_data.frontmatter {
+                for (_key, val) in map {
+                    extract_links_from_fm_value(val, &mut targets);
+                }
+            }
+
+            // Extract links from body
+            let body_links = extract_links_from_body(&file_data.body);
+            targets.extend(body_links);
+
+            // Extract embeds from body
+            let body_embeds = extract_embeds_from_body(&file_data.body);
+            targets.extend(body_embeds);
+
+            // Resolve each target and add to backlinks index
+            let mut seen_targets: Vec<String> = Vec::new();
+            for target in &targets {
+                // Resolve the target to a file path
+                let resolved = self.resolve_link_target(target, source_path, &known_paths);
+                if let Some(resolved_path) = resolved {
+                    if !seen_targets.contains(&resolved_path) {
+                        seen_targets.push(resolved_path.clone());
+                        index.entry(resolved_path)
+                            .or_insert_with(Vec::new)
+                            .push(source_path.clone());
+                    }
+                }
+            }
+        }
+
+        // Deduplicate source entries per target
+        for sources in index.values_mut() {
+            sources.sort();
+            sources.dedup();
+        }
+
+        index
+    }
+
+    /// Resolve a link target string to a file path.
+    fn resolve_link_target(&self, target: &str, source_path: &str, known_paths: &[&str]) -> Option<String> {
+        // Strip wikilink syntax
+        let target = if target.starts_with("[[") && target.ends_with("]]") {
+            let inner = &target[2..target.len()-2];
+            inner.split('|').next().unwrap_or(inner).split('#').next().unwrap_or(inner).trim()
+        } else {
+            // Strip anchor from markdown links
+            target.split('#').next().unwrap_or(target).trim()
+        };
+
+        if target.is_empty() { return None; }
+
+        // Handle relative paths (./foo, ../foo)
+        let resolved_target = if target.starts_with("./") || target.starts_with("../") {
+            let source_dir = std::path::Path::new(source_path)
+                .parent()
+                .unwrap_or(std::path::Path::new(""));
+            let joined = source_dir.join(target);
+            // Normalize path
+            let mut components = Vec::new();
+            for c in joined.components() {
+                match c {
+                    std::path::Component::ParentDir => { components.pop(); }
+                    std::path::Component::CurDir => {}
+                    _ => { components.push(c); }
+                }
+            }
+            let normalized: PathBuf = components.iter().collect();
+            normalized.to_string_lossy().to_string().replace('\\', "/")
+        } else {
+            target.to_string()
+        };
+
+        // Exact path match
+        if known_paths.contains(&resolved_target.as_str()) {
+            return Some(resolved_target.clone());
+        }
+
+        // With .md extension
+        if !resolved_target.ends_with(".md") && !resolved_target.ends_with(".mdx") {
+            let with_md = format!("{}.md", resolved_target);
+            if known_paths.contains(&with_md.as_str()) {
+                return Some(with_md);
+            }
+        }
+
+        // Basename match (for wikilinks without path)
+        if !resolved_target.contains('/') {
+            let target_lower = resolved_target.to_lowercase();
+            for path in known_paths {
+                let basename = std::path::Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                if basename == resolved_target || basename.to_lowercase() == target_lower {
+                    return Some(path.to_string());
+                }
+            }
+            // Also try matching against ID field and title in frontmatter
+            let files = self.scan_collection_files();
+            for fp in &files {
+                let rp = fp.strip_prefix(&self.root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+                    .replace('\\', "/");
+                if !known_paths.contains(&rp.as_str()) { continue; }
+                if let Ok(content) = std::fs::read_to_string(fp) {
+                    let doc = parse_document(&content);
+                    if let Some(serde_yaml::Value::Mapping(m)) = &doc.frontmatter {
+                        let fm = yaml_mapping_to_json(m);
+                        // Check ID field
+                        if let Some(id) = fm.get(&self.settings.id_field).and_then(|v| v.as_str()) {
+                            if id == resolved_target || id.to_lowercase() == target_lower {
+                                return Some(rp);
+                            }
+                        }
+                        // Check title field
+                        if let Some(title) = fm.get("title").and_then(|v| v.as_str()) {
+                            if title == resolved_target || title.to_lowercase() == target_lower {
+                                return Some(rp);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn scan_dir_recursive(&self, dir: &Path, files: &mut Vec<PathBuf>) {
@@ -1216,6 +1394,7 @@ impl Collection {
             "path": path,
             "types": type_names,
             "frontmatter": effective,
+            "raw_frontmatter": raw_frontmatter,
             "body": doc.body,
             "file": {
                 "name": file_name,
@@ -1512,20 +1691,472 @@ impl Collection {
             Some(p) => p,
             None => return op_error(INVALID_PATH, "path is required"),
         };
+        let check_backlinks = input.get("check_backlinks").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let full_path = self.root.join(path);
         if !full_path.exists() {
             return op_error(FILE_NOT_FOUND, &format!("File not found: {}", path));
         }
 
+        // Check backlinks before deletion
+        let mut broken_links: Vec<serde_json::Value> = Vec::new();
+        if check_backlinks {
+            let all_files = self.build_all_files_data();
+            let bl_index = self.build_backlinks_index(&all_files);
+            if let Some(sources) = bl_index.get(path) {
+                for source in sources {
+                    broken_links.push(serde_json::json!({
+                        "path": source,
+                    }));
+                }
+            }
+        }
+
         if let Err(e) = std::fs::remove_file(&full_path) {
             return op_error("io_error", &format!("Failed to delete: {}", e));
         }
 
-        serde_json::json!({
+        let mut result = serde_json::json!({
             "path": path,
             "deleted": true,
+        });
+        if !broken_links.is_empty() {
+            result["broken_links"] = serde_json::Value::Array(broken_links);
+        }
+        result
+    }
+
+    /// Batch update files matching a where clause (§12.7).
+    pub fn batch_update(&self, input: &serde_json::Value, simulate_io_error: Option<&str>, skip_dependents: bool) -> serde_json::Value {
+        let dry_run = input.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // Two modes: where+fields or updates (explicit list)
+        if let Some(updates) = input.get("updates").and_then(|v| v.as_array()) {
+            return self.batch_update_explicit(updates, dry_run, simulate_io_error);
+        }
+
+        let where_clause = match input.get("where") {
+            Some(v) => v.clone(),
+            None => return op_error("invalid_input", "batch_update requires 'where' or 'updates'"),
+        };
+        let fields = input.get("fields").cloned().unwrap_or(serde_json::json!({}));
+
+        // Find matching files using query logic
+        let matching_paths = self.query_matching_paths(&serde_json::Value::String(
+            where_clause.as_str().unwrap_or("").to_string()
+        ));
+
+        let total = matching_paths.len();
+        if total == 0 {
+            return serde_json::json!({
+                "batch_result": {
+                    "total": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "details": [],
+                }
+            });
+        }
+
+        // Validate-all-then-execute: validate all files first
+        if self.settings.default_validation == "error" {
+            for path in &matching_paths {
+                let full_path = self.root.join(path);
+                let content = match std::fs::read_to_string(&full_path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let doc = parse_document(&content);
+                let existing_mapping = match &doc.frontmatter {
+                    Some(serde_yaml::Value::Mapping(m)) => m.clone(),
+                    _ => serde_yaml::Mapping::new(),
+                };
+                let merged = serializer::merge_fields(&existing_mapping, &fields, &self.settings.write_nulls);
+                let merged_json = yaml_mapping_to_json(&merged);
+                let type_names = self.determine_types(&merged_json);
+                let effective = self.apply_defaults(&merged_json, &type_names);
+                let validation = self.validate(&effective, &type_names, path);
+                if !validation.valid {
+                    let issues: Vec<serde_json::Value> = validation.issues.iter().map(issue_to_json).collect();
+                    return serde_json::json!({
+                        "error": {
+                            "code": VALIDATION_FAILED,
+                            "message": "Validation failed",
+                            "issues": issues,
+                        }
+                    });
+                }
+            }
+        }
+
+        if dry_run {
+            return serde_json::json!({
+                "batch_result": {
+                    "total": total,
+                    "succeeded": total,
+                    "failed": 0,
+                }
+            });
+        }
+
+        // Execute updates
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        let mut skipped = 0usize;
+        let mut details: Vec<serde_json::Value> = Vec::new();
+        let mut failed_paths: Vec<String> = Vec::new();
+
+        // Build backlinks index for skip_dependents checking
+        let bl_index_for_skip = if skip_dependents {
+            let all_files = self.build_all_files_data();
+            Some(self.build_backlinks_index(&all_files))
+        } else {
+            None
+        };
+
+        for path in &matching_paths {
+            // Check skip_dependents: if this file has a link TO a failed file, skip it
+            // Use backlinks index: if a failed file has this file as a backlink source,
+            // then this file links to the failed file and should be skipped
+            if skip_dependents && !failed_paths.is_empty() {
+                if let Some(ref bl_index) = bl_index_for_skip {
+                    // Check if any failed path lists this file as a source (backlink)
+                    let has_dep = failed_paths.iter().any(|fp| {
+                        bl_index.get(fp).map_or(false, |sources| sources.contains(path))
+                    });
+                    if has_dep {
+                        skipped += 1;
+                        details.push(serde_json::json!({
+                            "path": path,
+                            "status": "skipped",
+                        }));
+                        continue;
+                    }
+                }
+            }
+
+            // Check simulated I/O error
+            if let Some(err_path) = simulate_io_error {
+                if path == err_path {
+                    failed += 1;
+                    failed_paths.push(path.clone());
+                    details.push(serde_json::json!({
+                        "path": path,
+                        "status": "failed",
+                    }));
+                    continue;
+                }
+            }
+
+            let update_result = self.update(&serde_json::json!({
+                "path": path,
+                "fields": fields,
+            }));
+
+            if update_result.get("error").is_some() {
+                failed += 1;
+                failed_paths.push(path.clone());
+                details.push(serde_json::json!({
+                    "path": path,
+                    "status": "failed",
+                }));
+            } else {
+                succeeded += 1;
+                details.push(serde_json::json!({
+                    "path": path,
+                    "status": "success",
+                }));
+            }
+        }
+
+        let mut result = serde_json::json!({
+            "batch_result": {
+                "total": total,
+                "succeeded": succeeded,
+                "failed": failed,
+                "details": details,
+            }
+        });
+        if skipped > 0 {
+            result["batch_result"]["skipped"] = serde_json::json!(skipped);
+        }
+        result
+    }
+
+    /// Batch update with explicit update list (validate-all-then-execute).
+    fn batch_update_explicit(&self, updates: &[serde_json::Value], dry_run: bool, simulate_io_error: Option<&str>) -> serde_json::Value {
+        // Validate all first
+        if self.settings.default_validation == "error" {
+            for update in updates {
+                let path = match update.get("path").and_then(|v| v.as_str()) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let fields = update.get("fields").cloned().unwrap_or(serde_json::json!({}));
+                let full_path = self.root.join(path);
+                let content = match std::fs::read_to_string(&full_path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let doc = parse_document(&content);
+                let existing_mapping = match &doc.frontmatter {
+                    Some(serde_yaml::Value::Mapping(m)) => m.clone(),
+                    _ => serde_yaml::Mapping::new(),
+                };
+                let merged = serializer::merge_fields(&existing_mapping, &fields, &self.settings.write_nulls);
+                let merged_json = yaml_mapping_to_json(&merged);
+                let type_names = self.determine_types(&merged_json);
+                let effective = self.apply_defaults(&merged_json, &type_names);
+                let validation = self.validate(&effective, &type_names, path);
+                if !validation.valid {
+                    let issues: Vec<serde_json::Value> = validation.issues.iter().map(issue_to_json).collect();
+                    return serde_json::json!({
+                        "error": {
+                            "code": VALIDATION_FAILED,
+                            "message": "Validation failed",
+                            "issues": issues,
+                        }
+                    });
+                }
+            }
+        }
+
+        let total = updates.len();
+        if dry_run {
+            return serde_json::json!({
+                "batch_result": {
+                    "total": total,
+                    "succeeded": total,
+                    "failed": 0,
+                }
+            });
+        }
+
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        let mut details: Vec<serde_json::Value> = Vec::new();
+
+        for update in updates {
+            let path = match update.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => continue,
+            };
+            let fields = update.get("fields").cloned().unwrap_or(serde_json::json!({}));
+
+            if let Some(err_path) = simulate_io_error {
+                if path == err_path {
+                    failed += 1;
+                    details.push(serde_json::json!({ "path": path, "status": "failed" }));
+                    continue;
+                }
+            }
+
+            let result = self.update(&serde_json::json!({ "path": path, "fields": fields }));
+            if result.get("error").is_some() {
+                failed += 1;
+                details.push(serde_json::json!({ "path": path, "status": "failed" }));
+            } else {
+                succeeded += 1;
+                details.push(serde_json::json!({ "path": path, "status": "success" }));
+            }
+        }
+
+        serde_json::json!({
+            "batch_result": {
+                "total": total,
+                "succeeded": succeeded,
+                "failed": failed,
+                "details": details,
+            }
         })
+    }
+
+    /// Batch delete files matching a where clause (§12.4, §12.7).
+    pub fn batch_delete(&self, input: &serde_json::Value, simulate_io_error: Option<&str>) -> serde_json::Value {
+        let dry_run = input.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+        let check_backlinks = input.get("check_backlinks").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let where_clause = match input.get("where") {
+            Some(v) => v.clone(),
+            None => return op_error("invalid_input", "batch_delete requires 'where'"),
+        };
+
+        let matching_paths = self.query_matching_paths(&serde_json::Value::String(
+            where_clause.as_str().unwrap_or("").to_string()
+        ));
+
+        let total = matching_paths.len();
+        if total == 0 {
+            return serde_json::json!({
+                "batch_result": {
+                    "total": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "details": [],
+                }
+            });
+        }
+
+        // Check backlinks before deletion
+        let mut broken_links: Vec<serde_json::Value> = Vec::new();
+        if check_backlinks {
+            let all_files = self.build_all_files_data();
+            let bl_index = self.build_backlinks_index(&all_files);
+            for path in &matching_paths {
+                if let Some(sources) = bl_index.get(path) {
+                    for source in sources {
+                        // Only report if the source is not also being deleted
+                        if !matching_paths.contains(source) {
+                            broken_links.push(serde_json::json!({
+                                "target": path,
+                                "referrer": source,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        if dry_run {
+            let mut result = serde_json::json!({
+                "batch_result": {
+                    "total": total,
+                }
+            });
+            if !broken_links.is_empty() {
+                result["broken_links"] = serde_json::Value::Array(broken_links);
+            }
+            return result;
+        }
+
+        // Execute deletes
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        let mut details: Vec<serde_json::Value> = Vec::new();
+
+        for path in &matching_paths {
+            if let Some(err_path) = simulate_io_error {
+                if path == err_path {
+                    failed += 1;
+                    details.push(serde_json::json!({ "path": path, "status": "failed" }));
+                    continue;
+                }
+            }
+
+            let full_path = self.root.join(path);
+            match std::fs::remove_file(&full_path) {
+                Ok(_) => {
+                    succeeded += 1;
+                    details.push(serde_json::json!({ "path": path, "status": "success" }));
+                }
+                Err(_) => {
+                    failed += 1;
+                    details.push(serde_json::json!({ "path": path, "status": "failed" }));
+                }
+            }
+        }
+
+        let mut result = serde_json::json!({
+            "batch_result": {
+                "total": total,
+                "succeeded": succeeded,
+                "failed": failed,
+                "details": details,
+            }
+        });
+        if !broken_links.is_empty() {
+            result["broken_links"] = serde_json::Value::Array(broken_links);
+        }
+        result
+    }
+
+    /// Query matching file paths (reuses query logic but only returns paths).
+    fn query_matching_paths(&self, where_clause: &serde_json::Value) -> Vec<String> {
+        let files = self.scan_collection_files();
+        let mut matching: Vec<String> = Vec::new();
+
+        // Build all_files data for asFile() traversal in where clauses
+        let all_files_data: Vec<crate::expressions::evaluator::ResolvedFileData> = files.iter()
+            .filter_map(|fp| {
+                let rp = fp.strip_prefix(&self.root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+                    .replace('\\', "/");
+                let content = std::fs::read_to_string(fp).ok()?;
+                let doc = parse_document(&content);
+                let fm = match &doc.frontmatter {
+                    Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
+                    _ => serde_json::json!({}),
+                };
+                let type_names = self.determine_types_for_path(&fm, Some(&rp));
+                let effective = self.apply_defaults(&fm, &type_names);
+                let effective = self.coerce_types(&effective, &type_names);
+                Some(crate::expressions::evaluator::ResolvedFileData {
+                    path: rp,
+                    frontmatter: effective,
+                    body: doc.body,
+                })
+            })
+            .collect();
+        let all_files_arc = std::sync::Arc::new(all_files_data);
+        let backlinks_index = self.build_backlinks_index(&all_files_arc);
+        let backlinks_arc = std::sync::Arc::new(backlinks_index);
+
+        for file_path in &files {
+            let rel_path = file_path.strip_prefix(&self.root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+                .replace('\\', "/");
+
+            let content = match std::fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let doc = parse_document(&content);
+
+            let raw_frontmatter = match &doc.frontmatter {
+                Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
+                _ => serde_json::json!({}),
+            };
+
+            let type_names = self.determine_types_for_path(&raw_frontmatter, Some(&rel_path));
+            let effective = self.apply_defaults(&raw_frontmatter, &type_names);
+            let effective = self.coerce_types(&effective, &type_names);
+            let effective = self.evaluate_computed_fields(effective, &type_names, &rel_path, Some(doc.body.as_str()));
+
+            let file_metadata = std::fs::metadata(file_path).ok();
+            let file_size = file_metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            let file_mtime = file_metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            });
+            let file_ctime = file_metadata.as_ref().and_then(|m| m.created().ok()).map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            });
+
+            let eval_ctx = QueryEvalContext {
+                frontmatter: &effective,
+                raw_frontmatter: &raw_frontmatter,
+                file_path: &rel_path,
+                body: &doc.body,
+                type_names: &type_names,
+                formulas: &serde_json::Map::new(),
+                file_size,
+                file_mtime: file_mtime.as_deref(),
+                file_ctime: file_ctime.as_deref(),
+                this_context: None,
+                all_files: Some(all_files_arc.clone()),
+                backlinks_index: Some(backlinks_arc.clone()),
+            };
+
+            if self.evaluate_where(&eval_ctx, where_clause) {
+                matching.push(rel_path);
+            }
+        }
+
+        matching.sort();
+        matching
     }
 
     /// Rename a file (§12.5).
@@ -1902,6 +2533,1381 @@ impl Collection {
             "valid": !has_errors,
             "issues": issues_json,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Query operation (§10)
+    // -----------------------------------------------------------------------
+
+    /// Parse a link value into its components.
+    pub fn parse_link(&self, input: &serde_json::Value) -> serde_json::Value {
+        let value = match input.get("value").and_then(|v| v.as_str()) {
+            Some(v) => v,
+            None => return serde_json::json!({"error": {"code": "invalid_input", "message": "parse_link requires 'value' field"}}),
+        };
+
+        let raw = value.to_string();
+
+        // Wikilink: [[target]], [[target|alias]], [[target#anchor]], [[target#anchor|alias]]
+        if value.starts_with("[[") && value.ends_with("]]") {
+            let inner = &value[2..value.len()-2];
+            // Split on | for alias
+            let (target_part, alias) = if let Some(pipe_idx) = inner.find('|') {
+                (&inner[..pipe_idx], Some(inner[pipe_idx+1..].to_string()))
+            } else {
+                (inner, None)
+            };
+            // Split on # for anchor
+            let (target, anchor) = if let Some(hash_idx) = target_part.find('#') {
+                (target_part[..hash_idx].to_string(), Some(target_part[hash_idx+1..].to_string()))
+            } else {
+                (target_part.to_string(), None)
+            };
+            let is_relative = target.starts_with("./") || target.starts_with("../");
+            return serde_json::json!({
+                "link": {
+                    "raw": raw,
+                    "target": target,
+                    "alias": alias,
+                    "anchor": anchor,
+                    "format": "wikilink",
+                    "is_relative": is_relative,
+                }
+            });
+        }
+
+        // Markdown link: [text](path) or [text](path#anchor)
+        if value.starts_with('[') && value.contains("](") && value.ends_with(')') {
+            let bracket_end = value.find("](").unwrap();
+            let text = &value[1..bracket_end];
+            let path_str = &value[bracket_end+2..value.len()-1];
+            let (path, anchor) = if let Some(hash_idx) = path_str.find('#') {
+                (path_str[..hash_idx].to_string(), Some(path_str[hash_idx+1..].to_string()))
+            } else {
+                (path_str.to_string(), None)
+            };
+            let is_relative = path.starts_with("./") || path.starts_with("../");
+            let alias = Some(text.to_string());
+            return serde_json::json!({
+                "link": {
+                    "raw": raw,
+                    "target": path,
+                    "alias": alias,
+                    "anchor": anchor,
+                    "format": "markdown",
+                    "is_relative": is_relative,
+                }
+            });
+        }
+
+        // Bare/path
+        let is_relative = value.starts_with("./") || value.starts_with("../");
+        serde_json::json!({
+            "link": {
+                "raw": raw,
+                "target": value,
+                "alias": serde_json::Value::Null,
+                "anchor": serde_json::Value::Null,
+                "format": "path",
+                "is_relative": is_relative,
+            }
+        })
+    }
+
+    /// Resolve a link field to a target file path.
+    pub fn resolve_link(&self, input: &serde_json::Value) -> serde_json::Value {
+        let source_path = match input.get("path").and_then(|v| v.as_str()) {
+            Some(v) => v,
+            None => return serde_json::json!({"error": {"code": "invalid_input", "message": "resolve_link requires 'path' field"}}),
+        };
+        let field_name = match input.get("field").and_then(|v| v.as_str()) {
+            Some(v) => v,
+            None => return serde_json::json!({"error": {"code": "invalid_input", "message": "resolve_link requires 'field' field"}}),
+        };
+
+        // Read the source file to get the field value
+        let read_result = self.read(&serde_json::json!({"path": source_path}));
+        let fm = match read_result.get("frontmatter") {
+            Some(fm) => fm,
+            None => return serde_json::json!({"error": {"code": "file_not_found", "message": format!("Cannot read {}", source_path)}}),
+        };
+
+        let field_val = match fm.get(field_name).and_then(|v| v.as_str()) {
+            Some(v) => v.to_string(),
+            None => return serde_json::json!({"resolved_path": serde_json::Value::Null}),
+        };
+
+        // Parse the link value
+        let parse_result = self.parse_link(&serde_json::json!({"value": field_val}));
+        let target = match parse_result.get("link").and_then(|l| l.get("target")).and_then(|t| t.as_str()) {
+            Some(t) => t.to_string(),
+            None => return serde_json::json!({"resolved_path": serde_json::Value::Null}),
+        };
+        let is_relative = parse_result.get("link")
+            .and_then(|l| l.get("is_relative"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let format = parse_result.get("link")
+            .and_then(|l| l.get("format"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("wikilink");
+
+        let source_dir = Path::new(source_path).parent().and_then(|p| p.to_str()).unwrap_or("");
+
+        // Determine field type constraints
+        let target_type = self.get_field_target_type(source_path, field_name);
+
+        // Resolution logic
+        let resolved = if target.starts_with('/') {
+            // Leading slash: resolve from collection root
+            Some(target.trim_start_matches('/').to_string())
+        } else if is_relative || format == "markdown" || format == "path" {
+            // Relative path resolution
+            self.resolve_relative_link(&target, source_dir)
+        } else if target.contains('/') {
+            // Absolute-like path in wikilink
+            if target.starts_with('/') {
+                // Resolve from root
+                Some(target.trim_start_matches('/').to_string())
+            } else {
+                // Resolve from root
+                Some(target.clone())
+            }
+        } else {
+            // Simple name - try id_field, then filename
+            self.resolve_simple_name(&target, source_dir, target_type.as_deref())
+        };
+
+        // Check for path traversal
+        if let Some(ref path) = resolved {
+            if path.starts_with("../") || path.contains("/../") {
+                return serde_json::json!({
+                    "error": {"code": "path_traversal", "message": "Link escapes collection root"},
+                    "issues": [{"code": "path_traversal", "field": field_name, "severity": "error"}]
+                });
+            }
+        }
+
+        // Try adding .md extension if needed
+        if let Some(ref path) = resolved {
+            let full_path = self.root.join(path);
+            if full_path.exists() {
+                return serde_json::json!({"resolved_path": path});
+            }
+            // Try with .md
+            let md_path = format!("{}.md", path);
+            let md_full = self.root.join(&md_path);
+            if md_full.exists() {
+                return serde_json::json!({"resolved_path": md_path});
+            }
+            // Try configured extensions
+            for ext in &self.settings.extensions {
+                let ext_path = format!("{}.{}", path, ext);
+                let ext_full = self.root.join(&ext_path);
+                if ext_full.exists() {
+                    return serde_json::json!({"resolved_path": ext_path});
+                }
+            }
+        }
+
+        serde_json::json!({"resolved_path": serde_json::Value::Null})
+    }
+
+    /// Resolve a relative link path.
+    fn resolve_relative_link(&self, target: &str, source_dir: &str) -> Option<String> {
+        let base = if target.starts_with("./") || target.starts_with("../") {
+            // Relative to source directory
+            if source_dir.is_empty() {
+                target.to_string()
+            } else {
+                format!("{}/{}", source_dir, target)
+            }
+        } else {
+            // Markdown links are relative to containing file directory
+            if source_dir.is_empty() {
+                target.to_string()
+            } else {
+                format!("{}/{}", source_dir, target)
+            }
+        };
+
+        // Normalize path (resolve . and ..)
+        let mut segments: Vec<&str> = Vec::new();
+        for seg in base.split('/') {
+            match seg {
+                "." => {}
+                ".." => { segments.pop(); }
+                s if !s.is_empty() => { segments.push(s); }
+                _ => {}
+            }
+        }
+        Some(segments.join("/"))
+    }
+
+    /// Resolve a simple name (no path separators) via id_field, then filename.
+    fn resolve_simple_name(&self, name: &str, source_dir: &str, target_type: Option<&str>) -> Option<String> {
+        let files = self.scan_collection_files();
+        let id_field_name = if self.settings.id_field.is_empty() { "id" } else { &self.settings.id_field };
+
+        let mut id_matches: Vec<String> = Vec::new();
+        let mut filename_matches: Vec<String> = Vec::new();
+
+        for file_path in &files {
+            let rel_path = file_path.strip_prefix(&self.root).ok()
+                .and_then(|p| p.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Read file content once
+            let content = match std::fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let doc = crate::frontmatter::parser::parse_document(&content);
+            let fm = if let Some(ref yaml_fm) = doc.frontmatter {
+                crate::frontmatter::parser::yaml_to_json(yaml_fm)
+            } else {
+                continue;
+            };
+
+            // Check target type constraint
+            if let Some(constraint_type) = target_type {
+                let file_types = self.determine_types_for_path(&fm, Some(&rel_path));
+                if !file_types.iter().any(|t| t.to_lowercase() == constraint_type.to_lowercase()) {
+                    continue;
+                }
+            }
+
+            // Check id_field match
+            if let Some(id_val) = fm.get(id_field_name).and_then(|v| v.as_str()) {
+                if id_val == name {
+                    id_matches.push(rel_path.clone());
+                }
+            }
+
+            // Check filename match
+            let basename = Path::new(&rel_path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if basename == name {
+                filename_matches.push(rel_path.clone());
+            }
+        }
+
+        // Prefer id matches over filename matches
+        let candidates = if !id_matches.is_empty() { id_matches } else { filename_matches };
+
+        if candidates.is_empty() {
+            return None;
+        }
+        if candidates.len() == 1 {
+            return Some(candidates[0].clone());
+        }
+
+        // Tiebreaker: same directory > shortest path > alphabetical
+        let mut sorted = candidates;
+        sorted.sort_by(|a, b| {
+            let a_same = Path::new(a).parent().and_then(|p| p.to_str()).unwrap_or("") == source_dir;
+            let b_same = Path::new(b).parent().and_then(|p| p.to_str()).unwrap_or("") == source_dir;
+            if a_same != b_same {
+                return if a_same { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+            }
+            let a_depth = a.matches('/').count();
+            let b_depth = b.matches('/').count();
+            if a_depth != b_depth {
+                return a_depth.cmp(&b_depth);
+            }
+            a.cmp(b)
+        });
+        Some(sorted[0].clone())
+    }
+
+    /// Get the target type constraint for a field.
+    fn get_field_target_type(&self, source_path: &str, field_name: &str) -> Option<String> {
+        // Read source file to get its type, then look up the field definition
+        let read_result = self.read(&serde_json::json!({"path": source_path}));
+        let fm = read_result.get("frontmatter")?;
+        let file_types = self.determine_types_for_path(fm, Some(source_path));
+        for type_name in &file_types {
+            if let Some(type_def) = self.types.get(&type_name.to_lowercase()) {
+                if let Some(field_def) = type_def.fields.get(field_name) {
+                    return field_def.target.clone();
+                }
+            }
+        }
+        None
+    }
+
+    // -----------------------------------------------------------------------
+
+    /// Execute a query against the collection.
+    pub fn query(&self, input: &serde_json::Value) -> serde_json::Value {
+        // Extract query parameters - support both input.query.X and input.X
+        let query = input.get("query").unwrap_or(input);
+
+        let filter_types: Vec<String> = query.get("types")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_lowercase())).collect())
+            .unwrap_or_default();
+
+        let folder = query.get("folder").and_then(|v| v.as_str());
+        let where_clause = query.get("where");
+        let order_by = query.get("order_by").and_then(|v| v.as_array());
+        let limit = query.get("limit").and_then(|v| v.as_u64());
+        let offset = query.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+        let include_body = query.get("include_body").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // GroupBy clause
+        let group_by = query.get("groupBy").or_else(|| query.get("group_by"));
+
+        // Property summaries: field → summary_type (e.g., "priority" → "Average")
+        let property_summaries: HashMap<String, String> = query.get("property_summaries")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Custom summaries: name → formula expression
+        let custom_summaries: HashMap<String, String> = query.get("summaries")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Formulas (Query+ profile)
+        let formulas: HashMap<String, String> = query.get("formulas")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Build 'this' context from context_file if provided
+        let this_context: Option<Box<EvalContext>> = query.get("context_file")
+            .or_else(|| input.get("context_file"))
+            .and_then(|v| v.as_str())
+            .and_then(|cf_path| {
+                let read_result = self.read(&serde_json::json!({"path": cf_path}));
+                if read_result.get("error").is_some() { return None; }
+                let fm = read_result.get("frontmatter").cloned()
+                    .unwrap_or(serde_json::json!({}));
+                let raw_fm = read_result.get("raw_frontmatter").cloned();
+                let body = read_result.get("body").and_then(|v| v.as_str()).map(String::from);
+                let file_size = read_result.pointer("/file/size").and_then(|v| v.as_u64());
+                let file_mtime = read_result.pointer("/file/mtime").and_then(|v| v.as_str()).map(String::from);
+                Some(Box::new(EvalContext {
+                    frontmatter: fm,
+                    raw_frontmatter: raw_fm,
+                    file_path: Some(cf_path.to_string()),
+                    body,
+                    file_size,
+                    file_mtime,
+                    file_ctime: None,
+                    this_context: None,
+                    all_files: None,
+                    traversal_depth: std::cell::Cell::new(0),
+                    backlinks_index: None,
+                }))
+            });
+
+        // Pre-validate where clause expressions
+        if let Some(where_val) = where_clause {
+            if let Err(err) = self.validate_where_clause(where_val) {
+                return err;
+            }
+        }
+
+        // Pre-validate formula expressions and check for circular references
+        if !formulas.is_empty() {
+            if let Err(err) = self.validate_formulas(&formulas) {
+                return err;
+            }
+        }
+
+        // Scan all files and build result candidates
+        let files = self.scan_collection_files();
+
+        // Pre-build all_files data for asFile() traversal
+        let all_files_data: Vec<crate::expressions::evaluator::ResolvedFileData> = files.iter()
+            .filter_map(|fp| {
+                let rp = fp.strip_prefix(&self.root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+                    .replace('\\', "/");
+                let content = std::fs::read_to_string(fp).ok()?;
+                let doc = parse_document(&content);
+                let fm = match &doc.frontmatter {
+                    Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
+                    _ => serde_json::json!({}),
+                };
+                let type_names = self.determine_types_for_path(&fm, Some(&rp));
+                let effective = self.apply_defaults(&fm, &type_names);
+                let effective = self.coerce_types(&effective, &type_names);
+                Some(crate::expressions::evaluator::ResolvedFileData {
+                    path: rp,
+                    frontmatter: effective,
+                    body: doc.body,
+                })
+            })
+            .collect();
+        let all_files_arc = std::sync::Arc::new(all_files_data);
+        let backlinks_index = self.build_backlinks_index(&all_files_arc);
+        let backlinks_arc = std::sync::Arc::new(backlinks_index);
+
+        let mut candidates: Vec<serde_json::Value> = Vec::new();
+
+        for file_path in &files {
+            let rel_path = file_path.strip_prefix(&self.root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // Normalize backslashes to forward slashes
+            let rel_path = rel_path.replace('\\', "/");
+
+            // Folder filter
+            if let Some(folder_prefix) = folder {
+                let folder_prefix = folder_prefix.trim_end_matches('/');
+                if !rel_path.starts_with(folder_prefix)
+                    || (rel_path.len() > folder_prefix.len()
+                        && rel_path.as_bytes()[folder_prefix.len()] != b'/') {
+                    continue;
+                }
+            }
+
+            // Read file content
+            let content = match std::fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let doc = parse_document(&content);
+
+            // Get frontmatter
+            let raw_frontmatter = match &doc.frontmatter {
+                Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
+                _ => serde_json::json!({}),
+            };
+
+            // Determine types
+            let type_names = self.determine_types_for_path(&raw_frontmatter, Some(&rel_path));
+
+            // Type filter
+            if !filter_types.is_empty() {
+                let matches_type = type_names.iter().any(|t| filter_types.contains(t));
+                if !matches_type {
+                    continue;
+                }
+            }
+
+            // Apply defaults for effective frontmatter
+            let effective = self.apply_defaults(&raw_frontmatter, &type_names);
+            let effective = self.coerce_types(&effective, &type_names);
+            let effective = self.evaluate_computed_fields(effective, &type_names, &rel_path, Some(doc.body.as_str()));
+
+            // Evaluate formulas in dependency order
+            let formula_order = self.topological_sort_formulas(&formulas);
+            let mut formula_values = serde_json::Map::new();
+            let mut formula_error: Option<serde_json::Value> = None;
+            for fname in &formula_order {
+                let fexpr = match formulas.get(fname) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                // Build frontmatter with formula results available
+                let mut fm_with_formulas = match effective.as_object() {
+                    Some(m) => m.clone(),
+                    None => serde_json::Map::new(),
+                };
+                // Add formula namespace: formula.X accessible as nested object
+                let formula_obj = serde_json::Value::Object(formula_values.clone());
+                fm_with_formulas.insert("formula".to_string(), formula_obj);
+
+                let fctx = EvalContext {
+                    frontmatter: serde_json::Value::Object(fm_with_formulas),
+                    raw_frontmatter: None,
+                    file_path: Some(rel_path.clone()),
+                    body: Some(doc.body.clone()),
+                    file_size: None, file_mtime: None, file_ctime: None,
+                    this_context: None,
+                    all_files: None,
+                    traversal_depth: std::cell::Cell::new(0),
+                    backlinks_index: None,
+                };
+                match ExprParser::parse(fexpr) {
+                    Ok(parsed) => {
+                        match eval_expr(&parsed, &fctx) {
+                            Ok(val) => { formula_values.insert(fname.clone(), val); }
+                            Err(e) => {
+                                // Propagate fatal formula errors as query-level errors
+                                if e.code == "division_by_zero" || e.code == "unknown_function"
+                                    || (e.code == "type_error" && !e.message.contains("null")) {
+                                    formula_error = Some(serde_json::json!({
+                                        "error": { "code": "formula_evaluation_error", "message": format!("Formula '{}': {}", fname, e.message) }
+                                    }));
+                                    break;
+                                }
+                                formula_values.insert(fname.clone(), serde_json::Value::Null);
+                            }
+                        }
+                    }
+                    Err(_) => { formula_values.insert(fname.clone(), serde_json::Value::Null); }
+                }
+            }
+            if let Some(err) = formula_error {
+                return err;
+            }
+
+            // Compute file metadata early (needed for where clause evaluation)
+            let file_name = Path::new(&rel_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let file_folder = Path::new(&rel_path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or("");
+            let file_metadata = std::fs::metadata(file_path).ok();
+            let file_size = file_metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            let file_mtime = file_metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            });
+            let file_ctime = file_metadata.as_ref().and_then(|m| m.created().ok()).map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            });
+
+            // Build eval context for where clause (includes formulas and types)
+            let eval_ctx = QueryEvalContext {
+                frontmatter: &effective,
+                raw_frontmatter: &raw_frontmatter,
+                file_path: &rel_path,
+                body: &doc.body,
+                type_names: &type_names,
+                formulas: &formula_values,
+                file_size,
+                file_mtime: file_mtime.as_deref(),
+                file_ctime: file_ctime.as_deref(),
+                this_context: this_context.clone(),
+                all_files: Some(all_files_arc.clone()),
+                backlinks_index: Some(backlinks_arc.clone()),
+            };
+
+            // Where filter
+            if let Some(where_val) = where_clause {
+                if !self.evaluate_where(&eval_ctx, where_val) {
+                    continue;
+                }
+            }
+
+            // Extract body metadata
+            let body_tags = crate::expressions::evaluator::extract_tags_from_body(&doc.body);
+            let body_links = crate::expressions::evaluator::extract_links_from_body(&doc.body);
+            let body_embeds = crate::expressions::evaluator::extract_embeds_from_body(&doc.body);
+
+            // Combine frontmatter tags + body tags
+            let mut all_tags: Vec<String> = Vec::new();
+            if let Some(fm_tags) = effective.get("tags").and_then(|v| v.as_array()) {
+                for t in fm_tags {
+                    if let Some(s) = t.as_str() {
+                        all_tags.push(s.to_string());
+                    }
+                }
+            }
+            for t in &body_tags {
+                if !all_tags.contains(t) {
+                    all_tags.push(t.clone());
+                }
+            }
+
+            let mut entry = serde_json::json!({
+                "path": rel_path,
+                "types": type_names,
+                "frontmatter": effective,
+                "body": if include_body { serde_json::Value::String(doc.body.clone()) } else { serde_json::Value::Null },
+                "file": {
+                    "name": file_name,
+                    "folder": file_folder,
+                    "size": file_size,
+                    "mtime": file_mtime.as_deref().unwrap_or(""),
+                    "tags": all_tags,
+                    "links": body_links,
+                    "embeds": body_embeds,
+                },
+            });
+
+            if !formula_values.is_empty() {
+                entry["formulas"] = serde_json::Value::Object(formula_values);
+            }
+
+            candidates.push(entry);
+        }
+
+        // Sort
+        if let Some(order_by_clauses) = order_by {
+            let sort_specs: Vec<(String, bool)> = order_by_clauses.iter().map(|clause| {
+                let field = clause.get("field").and_then(|v| v.as_str()).unwrap_or("");
+                let direction = clause.get("direction").and_then(|v| v.as_str()).unwrap_or("asc");
+                (field.to_string(), direction == "asc")
+            }).collect();
+
+            candidates.sort_by(|a, b| {
+                for (field, ascending) in &sort_specs {
+                    let av = self.get_sort_value(a, field);
+                    let bv = self.get_sort_value(b, field);
+                    let cmp = self.compare_sort_values(&av, &bv, field, a, b);
+                    let cmp = if *ascending { cmp } else { cmp.reverse() };
+                    if cmp != std::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                // Tiebreaker: ascending file.path
+                let ap = a.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let bp = b.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                ap.cmp(bp)
+            });
+        } else {
+            // Default sort: by file.path ascending
+            candidates.sort_by(|a, b| {
+                let ap = a.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let bp = b.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                ap.cmp(bp)
+            });
+        }
+
+        // GroupBy handling
+        if let Some(gb) = group_by {
+            let gb_property = gb.get("property").and_then(|v| v.as_str()).unwrap_or("");
+            let gb_direction = gb.get("direction").and_then(|v| v.as_str()).unwrap_or("ASC");
+
+            // Group candidates by property value (preserve insertion order with Vec)
+            let mut group_keys_ordered: Vec<serde_json::Value> = Vec::new();
+            let mut groups_map: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+            for candidate in &candidates {
+                let key = candidate.get("frontmatter")
+                    .and_then(|fm| fm.get(gb_property))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let key_str = if key.is_null() { "\0null".to_string() } else { key.to_string() };
+                if !groups_map.contains_key(&key_str) {
+                    group_keys_ordered.push(key);
+                }
+                groups_map.entry(key_str).or_default().push(candidate.clone());
+            }
+
+            // Sort groups by key
+            let mut group_keys = group_keys_ordered;
+            group_keys.sort_by(|a, b| {
+                // Null sorts last in ASC, first in DESC
+                match (a.is_null(), b.is_null()) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    _ => {
+                        let a_str = match a { serde_json::Value::String(s) => s.clone(), _ => a.to_string() };
+                        let b_str = match b { serde_json::Value::String(s) => s.clone(), _ => b.to_string() };
+                        a_str.cmp(&b_str)
+                    }
+                }
+            });
+            if gb_direction.eq_ignore_ascii_case("DESC") {
+                group_keys.reverse();
+            }
+
+            // Build group results
+            let mut groups_result: Vec<serde_json::Value> = Vec::new();
+            for key in &group_keys {
+                let key_str = if key.is_null() { "\0null".to_string() } else { key.to_string() };
+                let group_candidates = groups_map.get(&key_str).unwrap();
+                let mut group_obj = serde_json::json!({
+                    "key": key,
+                    "results": group_candidates,
+                });
+
+                // Compute per-group summaries if property_summaries present
+                if !property_summaries.is_empty() {
+                    let summaries = self.compute_summaries(group_candidates, &property_summaries, &custom_summaries);
+                    group_obj["summaries"] = summaries;
+                }
+
+                groups_result.push(group_obj);
+            }
+
+            return serde_json::json!({
+                "groups": groups_result,
+                "meta": {
+                    "total_count": candidates.len(),
+                    "has_more": false,
+                },
+            });
+        }
+
+        // Pagination
+        let total_count = candidates.len();
+        let offset = offset as usize;
+        let results = if let Some(lim) = limit {
+            let lim = lim as usize;
+            if offset >= candidates.len() {
+                Vec::new()
+            } else {
+                candidates[offset..].iter().take(lim).cloned().collect()
+            }
+        } else {
+            if offset >= candidates.len() {
+                Vec::new()
+            } else {
+                candidates[offset..].to_vec()
+            }
+        };
+
+        let has_more = if let Some(lim) = limit {
+            offset + (lim as usize) < total_count
+        } else {
+            false
+        };
+
+        // Compute summaries
+        let mut result = serde_json::json!({
+            "results": results,
+            "meta": {
+                "total_count": total_count,
+                "has_more": has_more,
+            },
+        });
+
+        if !property_summaries.is_empty() {
+            let summaries = self.compute_summaries(&candidates, &property_summaries, &custom_summaries);
+            result["summaries"] = summaries;
+        }
+
+        result
+    }
+
+    /// Compute property summaries over a set of candidates.
+    fn compute_summaries(
+        &self,
+        candidates: &[serde_json::Value],
+        property_summaries: &HashMap<String, String>,
+        custom_summaries: &HashMap<String, String>,
+    ) -> serde_json::Value {
+        let mut summaries = serde_json::Map::new();
+
+        for (field, summary_type) in property_summaries {
+            // Collect values for this field from all candidates
+            let values: Vec<&serde_json::Value> = candidates.iter()
+                .filter_map(|c| c.get("frontmatter").and_then(|fm| fm.get(field)))
+                .collect();
+
+            let result = if let Some(formula) = custom_summaries.get(summary_type) {
+                // Custom summary: evaluate formula with `values` array in context
+                self.evaluate_custom_summary(formula, field, candidates)
+            } else {
+                match summary_type.as_str() {
+                    "Average" => {
+                        let nums: Vec<f64> = values.iter()
+                            .filter_map(|v| v.as_f64())
+                            .collect();
+                        if nums.is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            let sum: f64 = nums.iter().sum();
+                            let avg = sum / nums.len() as f64;
+                            // Return integer if it's a whole number
+                            if avg == avg.floor() && avg.abs() < i64::MAX as f64 {
+                                serde_json::json!(avg as i64)
+                            } else {
+                                serde_json::json!(avg)
+                            }
+                        }
+                    }
+                    "Sum" => {
+                        let nums: Vec<f64> = values.iter()
+                            .filter_map(|v| v.as_f64())
+                            .collect();
+                        let has_float = values.iter().any(|v| v.is_f64() && !v.is_i64() && !v.is_u64());
+                        if nums.is_empty() {
+                            serde_json::json!(0)
+                        } else {
+                            let sum: f64 = nums.iter().sum();
+                            if !has_float && sum == sum.floor() && sum.abs() < i64::MAX as f64 {
+                                serde_json::json!(sum as i64)
+                            } else {
+                                serde_json::json!(sum)
+                            }
+                        }
+                    }
+                    "Min" => {
+                        let nums: Vec<f64> = values.iter()
+                            .filter_map(|v| v.as_f64())
+                            .collect();
+                        if nums.is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            let min = nums.iter().cloned().fold(f64::INFINITY, f64::min);
+                            if min == min.floor() && min.abs() < i64::MAX as f64 {
+                                serde_json::json!(min as i64)
+                            } else {
+                                serde_json::json!(min)
+                            }
+                        }
+                    }
+                    "Max" => {
+                        let nums: Vec<f64> = values.iter()
+                            .filter_map(|v| v.as_f64())
+                            .collect();
+                        if nums.is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            let max = nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                            if max == max.floor() && max.abs() < i64::MAX as f64 {
+                                serde_json::json!(max as i64)
+                            } else {
+                                serde_json::json!(max)
+                            }
+                        }
+                    }
+                    "Earliest" => {
+                        let strs: Vec<&str> = values.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect();
+                        strs.iter().min().map(|s| serde_json::json!(s)).unwrap_or(serde_json::Value::Null)
+                    }
+                    "Latest" => {
+                        let strs: Vec<&str> = values.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect();
+                        strs.iter().max().map(|s| serde_json::json!(s)).unwrap_or(serde_json::Value::Null)
+                    }
+                    "Checked" => {
+                        let count = values.iter()
+                            .filter(|v| v.as_bool() == Some(true))
+                            .count();
+                        serde_json::json!(count)
+                    }
+                    "Unchecked" => {
+                        let count = values.iter()
+                            .filter(|v| v.as_bool() == Some(false))
+                            .count();
+                        serde_json::json!(count)
+                    }
+                    "Empty" => {
+                        let count = candidates.iter()
+                            .filter(|c| {
+                                let val = c.get("frontmatter").and_then(|fm| fm.get(field));
+                                val.is_none() || val == Some(&serde_json::Value::Null)
+                                    || val.and_then(|v| v.as_str()) == Some("")
+                            })
+                            .count();
+                        serde_json::json!(count)
+                    }
+                    "Filled" => {
+                        let count = candidates.iter()
+                            .filter(|c| {
+                                let val = c.get("frontmatter").and_then(|fm| fm.get(field));
+                                val.is_some() && val != Some(&serde_json::Value::Null)
+                                    && val.and_then(|v| v.as_str()) != Some("")
+                            })
+                            .count();
+                        serde_json::json!(count)
+                    }
+                    "Unique" => {
+                        let mut unique_vals: Vec<serde_json::Value> = Vec::new();
+                        for v in &values {
+                            if !unique_vals.contains(v) {
+                                unique_vals.push((*v).clone());
+                            }
+                        }
+                        serde_json::json!(unique_vals.len())
+                    }
+                    _ => serde_json::Value::Null,
+                }
+            };
+
+            summaries.insert(field.clone(), result);
+        }
+
+        serde_json::Value::Object(summaries)
+    }
+
+    /// Evaluate a custom summary formula with `values` array in context.
+    fn evaluate_custom_summary(
+        &self,
+        formula: &str,
+        field: &str,
+        candidates: &[serde_json::Value],
+    ) -> serde_json::Value {
+        // Collect numeric values for the field
+        let values: Vec<serde_json::Value> = candidates.iter()
+            .filter_map(|c| c.get("frontmatter").and_then(|fm| fm.get(field)).cloned())
+            .collect();
+
+        let values_array = serde_json::Value::Array(values);
+
+        // Build context with `values` as a top-level field
+        let ctx = EvalContext {
+            frontmatter: serde_json::json!({"values": values_array}),
+            raw_frontmatter: None,
+            file_path: None,
+            body: None,
+            file_size: None, file_mtime: None, file_ctime: None,
+            this_context: None,
+            all_files: None,
+            traversal_depth: std::cell::Cell::new(0),
+            backlinks_index: None,
+        };
+
+        match ExprParser::parse(formula) {
+            Ok(parsed) => {
+                match eval_expr(&parsed, &ctx) {
+                    Ok(val) => val,
+                    Err(_) => serde_json::Value::Null,
+                }
+            }
+            Err(_) => serde_json::Value::Null,
+        }
+    }
+
+    /// Get a value for sorting from a result entry.
+    fn get_sort_value(&self, entry: &serde_json::Value, field: &str) -> serde_json::Value {
+        // Handle formula.X fields
+        if let Some(formula_field) = field.strip_prefix("formula.") {
+            return entry.get("formulas")
+                .and_then(|f| f.get(formula_field))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+        }
+        // Handle file.X fields (including nested like file.embeds.length)
+        if let Some(file_field) = field.strip_prefix("file.") {
+            if let Some(file_obj) = entry.get("file") {
+                // Handle nested properties like embeds.length, tags.length
+                if let Some((prop, sub)) = file_field.split_once('.') {
+                    let prop_val = file_obj.get(prop).cloned().unwrap_or(serde_json::Value::Null);
+                    return match sub {
+                        "length" => {
+                            if let Some(arr) = prop_val.as_array() {
+                                serde_json::json!(arr.len())
+                            } else if let Some(s) = prop_val.as_str() {
+                                serde_json::json!(s.len())
+                            } else {
+                                serde_json::json!(0)
+                            }
+                        }
+                        _ => serde_json::Value::Null,
+                    };
+                }
+                return file_obj.get(file_field).cloned().unwrap_or(serde_json::Value::Null);
+            }
+            return serde_json::Value::Null;
+        }
+        // Regular frontmatter field
+        entry.get("frontmatter")
+            .and_then(|fm| fm.get(field))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Compare two sort values with null handling and enum order.
+    fn compare_sort_values(
+        &self,
+        a: &serde_json::Value,
+        b: &serde_json::Value,
+        field: &str,
+        a_entry: &serde_json::Value,
+        b_entry: &serde_json::Value,
+    ) -> std::cmp::Ordering {
+        let a_null = a.is_null();
+        let b_null = b.is_null();
+
+        // Null handling: nulls sort last in ascending (we handle reversal in caller)
+        if a_null && b_null { return std::cmp::Ordering::Equal; }
+        if a_null { return std::cmp::Ordering::Greater; }
+        if b_null { return std::cmp::Ordering::Less; }
+
+        // Check if this is an enum field - need to find field def from types
+        if !field.starts_with("formula.") && !field.starts_with("file.") {
+            if let Some(enum_values) = self.get_enum_values_for_field(field, a_entry, b_entry) {
+                let a_str = a.as_str().unwrap_or("");
+                let b_str = b.as_str().unwrap_or("");
+                let a_idx = enum_values.iter().position(|v| v == a_str).unwrap_or(usize::MAX);
+                let b_idx = enum_values.iter().position(|v| v == b_str).unwrap_or(usize::MAX);
+                return a_idx.cmp(&b_idx);
+            }
+        }
+
+        // Standard comparison
+        match (a, b) {
+            (serde_json::Value::Number(an), serde_json::Value::Number(bn)) => {
+                let af = an.as_f64().unwrap_or(0.0);
+                let bf = bn.as_f64().unwrap_or(0.0);
+                af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            (serde_json::Value::String(a_s), serde_json::Value::String(b_s)) => a_s.cmp(b_s),
+            (serde_json::Value::Bool(ab), serde_json::Value::Bool(bb)) => ab.cmp(bb),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
+    /// Find enum values for a field from the types of result entries.
+    fn get_enum_values_for_field(
+        &self,
+        field: &str,
+        a_entry: &serde_json::Value,
+        _b_entry: &serde_json::Value,
+    ) -> Option<Vec<String>> {
+        // Look up field definition from the entry's types
+        let type_names = a_entry.get("types")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        for tn in &type_names {
+            if let Some(td) = self.types.get(tn) {
+                if let Some(fd) = td.fields.get(field) {
+                    if fd.field_type == "enum" {
+                        if let Some(ref vals) = fd.values {
+                            return Some(vals.clone());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Evaluate a where clause (string expression or YAML and/or/not structure).
+    fn evaluate_where(&self, ctx: &QueryEvalContext, where_val: &serde_json::Value) -> bool {
+        match where_val {
+            serde_json::Value::String(expr_str) => {
+                self.evaluate_where_expr(ctx, expr_str)
+            }
+            serde_json::Value::Object(map) => {
+                if let Some(and_val) = map.get("and") {
+                    if let Some(arr) = and_val.as_array() {
+                        return arr.iter().all(|clause| self.evaluate_where(ctx, clause));
+                    }
+                }
+                if let Some(or_val) = map.get("or") {
+                    if let Some(arr) = or_val.as_array() {
+                        return arr.iter().any(|clause| self.evaluate_where(ctx, clause));
+                    }
+                }
+                if let Some(not_val) = map.get("not") {
+                    return !self.evaluate_where(ctx, not_val);
+                }
+                // Unknown structure - treat as false
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Validate a where clause (pre-check before scanning files).
+    /// Returns Err with error JSON if the clause has a syntax error.
+    fn validate_where_clause(&self, where_val: &serde_json::Value) -> Result<(), serde_json::Value> {
+        match where_val {
+            serde_json::Value::String(expr_str) => {
+                self.validate_single_expr(expr_str)
+            }
+            serde_json::Value::Object(map) => {
+                if let Some(and_val) = map.get("and") {
+                    if let Some(arr) = and_val.as_array() {
+                        for clause in arr {
+                            self.validate_where_clause(clause)?;
+                        }
+                    }
+                }
+                if let Some(or_val) = map.get("or") {
+                    if let Some(arr) = or_val.as_array() {
+                        for clause in arr {
+                            self.validate_where_clause(clause)?;
+                        }
+                    }
+                }
+                if let Some(not_val) = map.get("not") {
+                    self.validate_where_clause(not_val)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Validate a single expression string - check for parse errors, unknown functions, etc.
+    fn validate_single_expr(&self, expr_str: &str) -> Result<(), serde_json::Value> {
+        match ExprParser::parse(expr_str) {
+            Ok(parsed) => {
+                // Try evaluating with empty context to catch static errors
+                let ctx = EvalContext::empty();
+                match eval_expr(&parsed, &ctx) {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        match e.code.as_str() {
+                            "wrong_argument_count" | "expression_depth_exceeded" => {
+                                Err(serde_json::json!({
+                                    "error": { "code": e.code, "message": e.message }
+                                }))
+                            }
+                            "unknown_function" => {
+                                // ext:: functions are expected to be unknown — don't abort the query
+                                if e.message.contains("ext.") || e.message.contains("ext::") || e.message.contains("extension") {
+                                    Ok(())
+                                } else {
+                                    Err(serde_json::json!({
+                                        "error": { "code": e.code, "message": e.message }
+                                    }))
+                                }
+                            }
+                            _ => Ok(()),  // Other errors depend on context
+                        }
+                    }
+                }
+            }
+            Err(msg) => {
+                let code = if msg.contains("expression_depth_exceeded") {
+                    "expression_depth_exceeded"
+                } else {
+                    "invalid_expression"
+                };
+                Err(serde_json::json!({
+                    "error": { "code": code, "message": msg }
+                }))
+            }
+        }
+    }
+
+    /// Validate formula expressions for syntax errors and circular references.
+    fn validate_formulas(&self, formulas: &HashMap<String, String>) -> Result<(), serde_json::Value> {
+        // Check for circular references between formulas
+        for (name, expr_str) in formulas {
+            // Check if formula references itself
+            if expr_str.contains(&format!("formula.{}", name)) {
+                return Err(serde_json::json!({
+                    "error": { "code": "circular_formula", "message": format!("Formula '{}' references itself", name) }
+                }));
+            }
+        }
+
+        // Check for circular chains: A -> B -> A
+        for (name, expr_str) in formulas {
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(name.clone());
+            let mut to_check: Vec<String> = Vec::new();
+            // Find formula references in this expression
+            for (other_name, _) in formulas {
+                if other_name != name && expr_str.contains(&format!("formula.{}", other_name)) {
+                    to_check.push(other_name.clone());
+                }
+            }
+            while let Some(dep) = to_check.pop() {
+                if !visited.insert(dep.clone()) {
+                    return Err(serde_json::json!({
+                        "error": { "code": "circular_formula", "message": format!("Circular formula reference involving '{}'", name) }
+                    }));
+                }
+                if let Some(dep_expr) = formulas.get(&dep) {
+                    for (other_name, _) in formulas {
+                        if dep_expr.contains(&format!("formula.{}", other_name)) {
+                            to_check.push(other_name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Validate each formula expression syntax
+        for (name, expr_str) in formulas {
+            match ExprParser::parse(expr_str) {
+                Ok(parsed) => {
+                    // Check for literal division by zero
+                    if Self::has_literal_div_by_zero(&parsed) {
+                        return Err(serde_json::json!({
+                            "error": { "code": "formula_evaluation_error", "message": format!("Formula '{}': Division by zero", name) }
+                        }));
+                    }
+                    // Try evaluating with empty context to catch static errors
+                    let ctx = EvalContext::empty();
+                    match eval_expr(&parsed, &ctx) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            match e.code.as_str() {
+                                "unknown_function" | "wrong_argument_count" => {
+                                    return Err(serde_json::json!({
+                                        "error": { "code": "formula_evaluation_error", "message": format!("Formula '{}': {}", name, e.message) }
+                                    }));
+                                }
+                                _ => {} // Other errors might depend on per-file context
+                            }
+                        }
+                    }
+                }
+                Err(msg) => {
+                    return Err(serde_json::json!({
+                        "error": { "code": "invalid_formula", "message": format!("Formula '{}': {}", name, msg) }
+                    }));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if an expression AST contains a literal division by zero (e.g., `x / 0`).
+    fn has_literal_div_by_zero(expr: &crate::expressions::ast::Expr) -> bool {
+        use crate::expressions::ast::{Expr, BinOp};
+        match expr {
+            Expr::BinOp(left, BinOp::Div, right) | Expr::BinOp(left, BinOp::Mod, right) => {
+                if let Expr::Number(n) = right.as_ref() {
+                    if *n == 0.0 {
+                        return true;
+                    }
+                }
+                Self::has_literal_div_by_zero(left) || Self::has_literal_div_by_zero(right)
+            }
+            Expr::BinOp(left, _, right) => {
+                Self::has_literal_div_by_zero(left) || Self::has_literal_div_by_zero(right)
+            }
+            Expr::UnaryOp(_, inner) => Self::has_literal_div_by_zero(inner),
+            Expr::NullCoalesce(left, right) => {
+                Self::has_literal_div_by_zero(left) || Self::has_literal_div_by_zero(right)
+            }
+            Expr::Call(base, args) => {
+                Self::has_literal_div_by_zero(base) || args.iter().any(|a| Self::has_literal_div_by_zero(a))
+            }
+            Expr::Conditional(cond, then, else_) => {
+                Self::has_literal_div_by_zero(cond) || Self::has_literal_div_by_zero(then) || Self::has_literal_div_by_zero(else_)
+            }
+            Expr::Dot(inner, _) => Self::has_literal_div_by_zero(inner),
+            Expr::Index(left, right) => {
+                Self::has_literal_div_by_zero(left) || Self::has_literal_div_by_zero(right)
+            }
+            Expr::Array(items) => items.iter().any(|i| Self::has_literal_div_by_zero(i)),
+            _ => false,
+        }
+    }
+
+    /// Sort formulas in dependency order (topological sort).
+    fn topological_sort_formulas(&self, formulas: &HashMap<String, String>) -> Vec<String> {
+        // Build dependency graph
+        let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, expr) in formulas {
+            let mut name_deps = Vec::new();
+            for (other, _) in formulas {
+                if other != name && expr.contains(&format!("formula.{}", other)) {
+                    name_deps.push(other.clone());
+                }
+            }
+            deps.insert(name.clone(), name_deps);
+        }
+
+        let mut result = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut visiting = std::collections::HashSet::new();
+
+        fn visit(
+            name: &str,
+            deps: &HashMap<String, Vec<String>>,
+            visited: &mut std::collections::HashSet<String>,
+            visiting: &mut std::collections::HashSet<String>,
+            result: &mut Vec<String>,
+        ) {
+            if visited.contains(name) { return; }
+            if visiting.contains(name) { return; } // circular, handled elsewhere
+            visiting.insert(name.to_string());
+            if let Some(d) = deps.get(name) {
+                for dep in d {
+                    visit(dep, deps, visited, visiting, result);
+                }
+            }
+            visiting.remove(name);
+            visited.insert(name.to_string());
+            result.push(name.to_string());
+        }
+
+        // Sort formula names for deterministic ordering
+        let mut names: Vec<&String> = formulas.keys().collect();
+        names.sort();
+        for name in names {
+            visit(name, &deps, &mut visited, &mut visiting, &mut result);
+        }
+
+        result
+    }
+
+    /// Evaluate a single where expression string against file context.
+    fn evaluate_where_expr(&self, ctx: &QueryEvalContext, expr_str: &str) -> bool {
+        let parsed = match ExprParser::parse(expr_str) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        // Build an enriched frontmatter that includes special query namespaces
+        let mut enriched_fm = ctx.frontmatter.clone();
+
+        // Add types array to context
+        if let serde_json::Value::Object(ref mut map) = enriched_fm {
+            let types_arr: Vec<serde_json::Value> = ctx.type_names.iter()
+                .map(|t| serde_json::Value::String(t.clone()))
+                .collect();
+            map.insert("types".to_string(), serde_json::Value::Array(types_arr));
+        }
+
+        // Add formula namespace values
+        if !ctx.formulas.is_empty() {
+            if let serde_json::Value::Object(ref mut map) = enriched_fm {
+                map.insert("formula".to_string(), serde_json::Value::Object(ctx.formulas.clone()));
+            }
+        }
+
+        let eval_ctx = EvalContext {
+            frontmatter: enriched_fm,
+            raw_frontmatter: Some(ctx.raw_frontmatter.clone()),
+            file_path: Some(ctx.file_path.to_string()),
+            body: Some(ctx.body.to_string()),
+            file_size: Some(ctx.file_size),
+            file_mtime: ctx.file_mtime.map(String::from),
+            file_ctime: ctx.file_ctime.map(String::from),
+            this_context: ctx.this_context.clone(),
+            all_files: ctx.all_files.clone(),
+            traversal_depth: std::cell::Cell::new(0),
+            backlinks_index: ctx.backlinks_index.clone(),
+        };
+
+        match eval_expr(&parsed, &eval_ctx) {
+            Ok(val) => is_truthy_value(&val),
+            Err(_) => false,
+        }
+    }
+}
+
+/// Context for evaluating query where clauses.
+struct QueryEvalContext<'a> {
+    frontmatter: &'a serde_json::Value,
+    raw_frontmatter: &'a serde_json::Value,
+    file_path: &'a str,
+    body: &'a str,
+    type_names: &'a [String],
+    formulas: &'a serde_json::Map<String, serde_json::Value>,
+    file_size: u64,
+    file_mtime: Option<&'a str>,
+    file_ctime: Option<&'a str>,
+    this_context: Option<Box<EvalContext>>,
+    all_files: Option<std::sync::Arc<Vec<crate::expressions::evaluator::ResolvedFileData>>>,
+    backlinks_index: Option<std::sync::Arc<HashMap<String, Vec<String>>>>,
+}
+
+/// Check if a JSON value is truthy (for where clause evaluation).
+fn is_truthy_value(val: &serde_json::Value) -> bool {
+    match val {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().map_or(false, |f| f != 0.0),
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(_) => true,
     }
 }
 

@@ -238,7 +238,10 @@ impl Lexer {
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: u32,
 }
+
+const MAX_PARSE_DEPTH: u32 = 64;
 
 impl Parser {
     pub fn parse(input: &str) -> Result<Expr, String> {
@@ -247,12 +250,20 @@ impl Parser {
         }
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize()?;
-        let mut parser = Parser { tokens, pos: 0 };
+        let mut parser = Parser { tokens, pos: 0, depth: 0 };
         let expr = parser.parse_ternary()?;
         if parser.peek() != &Token::Eof {
             return Err(format!("Unexpected token: {:?}", parser.peek()));
         }
         Ok(expr)
+    }
+
+    fn check_depth(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err("expression_depth_exceeded".to_string());
+        }
+        Ok(())
     }
 
     fn peek(&self) -> &Token {
@@ -286,6 +297,7 @@ impl Parser {
     // . [] () (postfix)
 
     fn parse_ternary(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
         let expr = self.parse_null_coalesce()?;
         if self.peek() == &Token::Question {
             self.advance();
