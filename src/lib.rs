@@ -1534,6 +1534,20 @@ impl Collection {
             }
         } else if self.settings.default_validation == "warn" {
             let validation = self.validate(&effective, &type_names, &path);
+            // §5.5: strict: true causes validation failure regardless of validation level
+            let has_strict_errors = validation.issues.iter().any(|i| {
+                i.code == UNKNOWN_FIELD && i.severity == Severity::Error
+            });
+            if has_strict_errors {
+                let issues: Vec<serde_json::Value> = validation.issues.iter().map(issue_to_json).collect();
+                return serde_json::json!({
+                    "error": {
+                        "code": VALIDATION_FAILED,
+                        "message": "Validation failed",
+                        "issues": issues,
+                    }
+                });
+            }
             for issue in &validation.issues {
                 result_warnings.push(issue_to_json(issue));
             }
