@@ -526,8 +526,18 @@ fn conformance_tests() {
                                                 let _ = fs::create_dir_all(parent);
                                             }
                                             let _ = fs::write(&full_path, &content);
-                                            // Ensure mtime changes
-                                            std::thread::sleep(std::time::Duration::from_millis(10));
+                                            // Ensure mtime differs from original: explicitly set
+                                            // mtime to 1s after original to guarantee detection
+                                            // regardless of filesystem timestamp granularity.
+                                            if let Some(orig_ms) = original_mtime_ms {
+                                                let bumped = std::time::UNIX_EPOCH
+                                                    + std::time::Duration::from_millis(orig_ms + 1000);
+                                                let times = std::fs::FileTimes::new()
+                                                    .set_modified(bumped);
+                                                if let Ok(f) = std::fs::File::options().write(true).open(&full_path) {
+                                                    let _ = f.set_times(times);
+                                                }
+                                            }
 
                                             if test_case.name.contains("concurrent") {
                                                 let new_mtime_ms = fs::metadata(&full_path).ok()

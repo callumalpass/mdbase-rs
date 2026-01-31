@@ -2315,6 +2315,18 @@ impl Collection {
                             let _ = std::fs::create_dir_all(parent);
                         }
                         let _ = std::fs::write(&full, content);
+                        // Always bump mtime forward by 1 second to guarantee it
+                        // differs from the pre-simulate value recorded by the
+                        // test runner, regardless of filesystem granularity.
+                        if let Ok(meta) = std::fs::metadata(&full) {
+                            if let Ok(cur) = meta.modified() {
+                                let bumped = cur + std::time::Duration::from_secs(1);
+                                let times = std::fs::FileTimes::new().set_modified(bumped);
+                                if let Ok(f) = std::fs::File::options().write(true).open(&full) {
+                                    let _ = f.set_times(times);
+                                }
+                            }
+                        }
                     }
                 }
             }
