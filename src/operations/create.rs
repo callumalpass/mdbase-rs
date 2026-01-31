@@ -1,1 +1,176 @@
 //! Create operation (§12.1).
+
+use crate::errors::*;
+use crate::frontmatter;
+use crate::frontmatter::serializer;
+use crate::generated::derive_path;
+use crate::Collection;
+
+impl Collection {
+    /// Create a file (§12.1).
+    pub fn create(&self, input: &serde_json::Value) -> serde_json::Value {
+        let type_name = input.get("type").and_then(|v| v.as_str());
+        let frontmatter_input = input.get("frontmatter")
+            .or_else(|| input.get("fields"))
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let body = input.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        let path_input = input.get("path").and_then(|v| v.as_str());
+
+        // Determine type names
+        let mut type_names: Vec<String> = Vec::new();
+        if let Some(tn) = type_name {
+            let tn_lower = tn.to_lowercase();
+            if !self.types.contains_key(&tn_lower) {
+                return op_error(UNKNOWN_TYPE, &format!("Unknown type: {}", tn));
+            }
+            type_names.push(tn_lower);
+        }
+        // Also check frontmatter for type key
+        let fm_types = self.determine_types(&frontmatter_input);
+        for t in fm_types {
+            if !type_names.contains(&t) {
+                type_names.push(t);
+            }
+        }
+
+        // Determine path
+        let path = match path_input {
+            Some(p) => {
+                // Empty path check
+                if p.is_empty() {
+                    return op_error(PATH_REQUIRED, "path must not be empty");
+                }
+                // Null byte check
+                if p.contains('\0') {
+                    return op_error(INVALID_PATH, "Path contains null bytes");
+                }
+                // Path traversal check
+                if p.contains("..") {
+                    return op_error(INVALID_PATH, "Path contains path traversal");
+                }
+                p.to_string()
+            }
+            None => {
+                // Try to derive from filename_pattern
+                if let Some(tn) = type_names.first() {
+                    if let Some(type_def) = self.types.get(tn) {
+                        if let Some(pattern) = &type_def.filename_pattern {
+                            match derive_path(pattern, &frontmatter_input) {
+                                Some(p) => p,
+                                None => return op_error(PATH_REQUIRED, "Cannot determine path"),
+                            }
+                        } else {
+                            return op_error(PATH_REQUIRED, "No path provided and no filename_pattern");
+                        }
+                    } else {
+                        return op_error(PATH_REQUIRED, "Cannot determine path");
+                    }
+                } else {
+                    return op_error(PATH_REQUIRED, "No path provided");
+                }
+            }
+        };
+
+        // Check existence
+        let full_path = self.root.join(&path);
+        if full_path.exists() {
+            return op_error(PATH_CONFLICT, &format!("File already exists: {}", path));
+        }
+
+        // Build frontmatter
+        let mut fm_obj = match frontmatter_input.as_object() {
+            Some(o) => o.clone(),
+            None => serde_json::Map::new(),
+        };
+
+        // Add type key if specified
+        if let Some(tn) = type_name {
+            if !fm_obj.contains_key("type") && !fm_obj.contains_key("types") {
+                fm_obj.insert("type".to_string(), serde_json::Value::String(tn.to_string()));
+            }
+        }
+
+        // Generate values
+        self.apply_generated(&mut fm_obj, &type_names, true);
+
+        // Apply defaults for effective frontmatter (for validation and output)
+        let effective = self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
+
+        // Validate
+        let mut result_warnings: Vec<serde_json::Value> = Vec::new();
+        if self.settings.default_validation == "error" {
+            let validation = self.validate(&effective, &type_names, &path);
+            if !validation.valid {
+                let issues: Vec<serde_json::Value> = validation.issues.iter().map(issue_to_json).collect();
+                return serde_json::json!({
+                    "error": {
+                        "code": VALIDATION_FAILED,
+                        "message": "Validation failed",
+                        "issues": issues,
+                    }
+                });
+            }
+        } else if self.settings.default_validation == "warn" {
+            let validation = self.validate(&effective, &type_names, &path);
+            // §5.5: strict: true causes validation failure regardless of validation level
+            let has_strict_errors = validation.issues.iter().any(|i| {
+                i.code == UNKNOWN_FIELD && i.severity == Severity::Error
+            });
+            if has_strict_errors {
+                let issues: Vec<serde_json::Value> = validation.issues.iter().map(issue_to_json).collect();
+                return serde_json::json!({
+                    "error": {
+                        "code": VALIDATION_FAILED,
+                        "message": "Validation failed",
+                        "issues": issues,
+                    }
+                });
+            }
+            for issue in &validation.issues {
+                result_warnings.push(issue_to_json(issue));
+            }
+        }
+        for type_name in &type_names {
+            if let Some(type_def) = self.types.get(type_name) {
+                for (field_name, field_def) in &type_def.fields {
+                    if field_def.deprecated.is_some() && fm_obj.contains_key(field_name) {
+                        result_warnings.push(serde_json::json!({
+                            "code": "deprecated_field",
+                            "message": format!("Field '{}' is deprecated", field_name),
+                            "field": field_name,
+                        }));
+                    }
+                }
+            }
+        }
+
+        // Write file
+        let yaml_mapping = frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(fm_obj));
+        let content = serializer::serialize_document(&yaml_mapping, body);
+
+        if let Some(parent) = full_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        if let Err(e) = std::fs::write(&full_path, &content) {
+            let error_str = e.to_string();
+            if error_str.contains("NUL") || error_str.contains("null byte") {
+                return op_error(INVALID_PATH, &format!("Invalid path: {}", e));
+            }
+            return op_error("io_error", &format!("Failed to write file: {}", e));
+        }
+
+        let mut result = serde_json::json!({
+            "path": path,
+            "types": type_names,
+            "frontmatter": effective,
+            "body": body,
+            "valid": true,
+        });
+        if !result_warnings.is_empty() {
+            result["warnings"] = serde_json::Value::Array(result_warnings);
+        }
+        result
+    }
+}

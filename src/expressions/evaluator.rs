@@ -87,7 +87,7 @@ impl EvalContext {
 pub fn evaluate(expr: &Expr, ctx: &EvalContext) -> Result<Value, EvalError> {
     EVAL_DEPTH.with(|d| {
         let depth = d.get();
-        if depth >= MAX_EVAL_DEPTH {
+        if depth > MAX_EVAL_DEPTH {
             return Err(EvalError::expression_depth_exceeded());
         }
         d.set(depth + 1);

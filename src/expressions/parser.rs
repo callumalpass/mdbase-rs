@@ -266,6 +266,10 @@ impl Parser {
         Ok(())
     }
 
+    fn dec_depth(&mut self) {
+        self.depth -= 1;
+    }
+
     fn peek(&self) -> &Token {
         self.tokens.get(self.pos).unwrap_or(&Token::Eof)
     }
@@ -297,13 +301,14 @@ impl Parser {
     // . [] () (postfix)
 
     fn parse_ternary(&mut self) -> Result<Expr, String> {
-        self.check_depth()?;
         let expr = self.parse_null_coalesce()?;
         if self.peek() == &Token::Question {
+            self.check_depth()?;
             self.advance();
             let then_expr = self.parse_ternary()?;
             self.expect(&Token::Colon)?;
             let else_expr = self.parse_ternary()?;
+            self.dec_depth();
             return Ok(Expr::Conditional(Box::new(expr), Box::new(then_expr), Box::new(else_expr)));
         }
         Ok(expr)
@@ -430,9 +435,11 @@ impl Parser {
                     };
                     // Check for method call: .name(args)
                     if self.peek() == &Token::LParen {
+                        self.check_depth()?;
                         self.advance(); // consume (
                         let args = self.parse_args()?;
                         self.expect(&Token::RParen)?;
+                        self.dec_depth();
                         expr = Expr::Call(
                             Box::new(Expr::Dot(Box::new(expr), name)),
                             args,
@@ -449,9 +456,11 @@ impl Parser {
                 }
                 Token::LParen => {
                     // Function call: expr(args)
+                    self.check_depth()?;
                     self.advance();
                     let args = self.parse_args()?;
                     self.expect(&Token::RParen)?;
+                    self.dec_depth();
                     expr = Expr::Call(Box::new(expr), args);
                 }
                 _ => break,
@@ -468,9 +477,11 @@ impl Parser {
             Token::Str(s) => { let s = s.clone(); self.advance(); Ok(Expr::Str(s)) }
             Token::Ident(s) => { let s = s.clone(); self.advance(); Ok(Expr::Ident(s)) }
             Token::LParen => {
+                self.check_depth()?;
                 self.advance();
                 let expr = self.parse_ternary()?;
                 self.expect(&Token::RParen)?;
+                self.dec_depth();
                 Ok(expr)
             }
             Token::LBracket => {

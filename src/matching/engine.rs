@@ -367,3 +367,151 @@ fn to_f64(v: &serde_json::Value) -> Option<f64> {
         _ => None,
     }
 }
+
+// --- impl Collection methods for matching ---
+
+use crate::matching::glob::match_glob_pattern;
+use crate::Collection;
+
+impl Collection {
+    /// Check if a path is excluded from the collection.
+    pub(crate) fn is_excluded(&self, rel_path: &str) -> bool {
+        // Check types folder
+        if rel_path.starts_with(&format!("{}/", self.settings.types_folder))
+            || rel_path == self.settings.types_folder
+        {
+            return true;
+        }
+
+        // Check cache folder
+        if rel_path.starts_with(&format!("{}/", self.settings.cache_folder))
+            || rel_path == self.settings.cache_folder
+        {
+            return true;
+        }
+
+        // Check default .mdbase even if custom cache_folder
+        if self.settings.cache_folder != ".mdbase"
+            && (rel_path.starts_with(".mdbase/") || rel_path == ".mdbase")
+        {
+            return true;
+        }
+
+        // Check mdbase.yaml
+        if rel_path == "mdbase.yaml" {
+            return true;
+        }
+
+        // Check exclude patterns
+        for pattern in &self.settings.exclude {
+            if match_glob_pattern(pattern, rel_path) {
+                return true;
+            }
+        }
+
+        // Check include_subfolders
+        if !self.settings.include_subfolders && rel_path.contains('/') {
+            return true;
+        }
+
+        // Check nested collection boundary (§2.8)
+        // If any parent directory of this path contains mdbase.yaml,
+        // the file is inside a nested collection and not part of this one.
+        if self.is_in_nested_collection(rel_path) {
+            return true;
+        }
+
+        false
+    }
+
+    /// Check if a relative path is inside a nested collection.
+    /// Returns true if any parent directory along the path contains a mdbase.yaml file.
+    pub(crate) fn is_in_nested_collection(&self, rel_path: &str) -> bool {
+        let path = std::path::Path::new(rel_path);
+        let mut current = std::path::PathBuf::new();
+        // Check each parent directory component (not the file itself)
+        for component in path.parent().into_iter().flat_map(|p| p.components()) {
+            current.push(component);
+            let config_path = self.root.join(&current).join("mdbase.yaml");
+            if config_path.exists() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a file extension is valid for this collection.
+    pub(crate) fn is_valid_extension(&self, path: &str) -> bool {
+        if path.ends_with(".md") {
+            return true;
+        }
+        for ext in &self.settings.extensions {
+            if path.ends_with(&format!(".{}", ext)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Determine the type(s) of a file from its frontmatter.
+    /// Type names are canonicalized to lowercase for lookup.
+    pub(crate) fn determine_types(&self, frontmatter: &serde_json::Value) -> Vec<String> {
+        self.determine_types_for_path(frontmatter, None)
+    }
+
+    /// Determine types for a file at the given path.
+    /// If explicit type keys are found in frontmatter, uses those (and stops match rule evaluation).
+    /// Otherwise evaluates match rules from all types.
+    pub fn determine_types_for_path(
+        &self,
+        frontmatter: &serde_json::Value,
+        rel_path: Option<&str>,
+    ) -> Vec<String> {
+        let mut types = Vec::new();
+        let mut has_explicit = false;
+
+        if let Some(obj) = frontmatter.as_object() {
+            for key in &self.settings.explicit_type_keys {
+                if let Some(val) = obj.get(key) {
+                    match val {
+                        serde_json::Value::String(s) => {
+                            if !s.is_empty() {
+                                types.push(s.to_lowercase());
+                                has_explicit = true;
+                            }
+                        }
+                        serde_json::Value::Array(arr) => {
+                            for item in arr {
+                                if let Some(s) = item.as_str() {
+                                    types.push(s.to_lowercase());
+                                    has_explicit = true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // If explicit types found, stop here (§6.6)
+        if has_explicit {
+            return types;
+        }
+
+        // Evaluate match rules from all types
+        if let Some(path) = rel_path {
+            for (type_name, type_def) in &self.types {
+                if let Some(ref rules) = type_def.match_rules {
+                    if matches_rules(rules, path, frontmatter) {
+                        if !types.contains(type_name) {
+                            types.push(type_name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        types
+    }
+}

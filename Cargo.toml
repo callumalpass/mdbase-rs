@@ -3,6 +3,10 @@ name = "mdbase"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "mdb"
+path = "src/main.rs"
+
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +21,7 @@ uuid = { version = "1", features = ["v4"] }
 notify = "7"
 thiserror = "2"
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 insta = "1"

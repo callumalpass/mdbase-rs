@@ -132,3 +132,33 @@ pub enum MdbaseError {
     #[error(transparent)]
     Yaml(#[from] serde_yaml::Error),
 }
+
+/// Create a JSON error response for an operation error.
+pub(crate) fn op_error(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": { "code": code, "message": message }
+    })
+}
+
+/// Convert an Issue to a JSON value.
+pub(crate) fn issue_to_json(issue: &Issue) -> serde_json::Value {
+    let mut obj = serde_json::json!({
+        "code": issue.code,
+        "message": issue.message,
+        "severity": match issue.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+        },
+    });
+    if let Some(ref path) = issue.path {
+        obj["path"] = serde_json::Value::String(path.clone());
+    }
+    if let Some(ref field) = issue.field {
+        obj["field"] = serde_json::Value::String(field.clone());
+    }
+    if let Some(ref tn) = issue.type_name {
+        obj["type"] = serde_json::Value::String(tn.clone());
+    }
+    obj
+}
