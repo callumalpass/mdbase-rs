@@ -111,6 +111,12 @@ struct TestExpectation {
     partial_updates: Option<serde_yaml::Value>,
     #[serde(alias = "type_loaded")]
     type_loaded: Option<bool>,
+    // Watch-specific fields (§15)
+    events: Option<Vec<serde_yaml::Value>>,
+    events_ordered: Option<Vec<serde_yaml::Value>>,
+    events_contain: Option<Vec<serde_yaml::Value>>,
+    max_event_count: Option<usize>,
+    listener_query: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,6 +432,38 @@ fn conformance_tests() {
                         fallback_tmp.path()
                     }
                 };
+
+                // Handle watch operations specially - bypass normal simulate handling
+                if test_case.operation == "watch" {
+                    // Collect simulate from test_case.simulate and/or input.simulate
+                    let input_json = yaml_to_json(&test_case.input);
+                    let sim_json = test_case.simulate.as_ref()
+                        .map(|s| yaml_to_json(s))
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let input_sim_json = input_json.get("simulate").cloned();
+
+                    let watch_result = mdbase::watch::simulate_watch(
+                        root,
+                        &sim_json,
+                        input_sim_json.as_ref(),
+                    );
+
+                    let events = watch_result.events;
+
+                    match check_watch_expectation(root, &events, &test_case.expect) {
+                        Ok(()) => {
+                            passed += 1;
+                            println!("    ✓ {}", test_case.name);
+                        }
+                        Err(msg) => {
+                            failed += 1;
+                            let err = format!("[{}] {}: {}", filename, test_case.name, msg);
+                            println!("    ✗ {}: {}", test_case.name, msg);
+                            errors.push(err);
+                        }
+                    }
+                    continue;
+                }
 
                 // Apply simulate actions before the operation
                 // For concurrent modification testing: record mtime before modify,
@@ -1690,6 +1728,279 @@ fn check_expectation(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Watch expectation checking
+// ---------------------------------------------------------------------------
+
+/// Check watch-specific expectations against actual events.
+fn check_watch_expectation(
+    root: &Path,
+    actual_events: &[serde_json::Value],
+    expect: &TestExpectation,
+) -> Result<(), String> {
+    // Check max_event_count
+    if let Some(max_count) = expect.max_event_count {
+        if actual_events.len() > max_count {
+            return Err(format!(
+                "expected max {} events, got {} events: {:?}",
+                max_count, actual_events.len(),
+                actual_events.iter().map(|e| e.get("event").and_then(|v| v.as_str()).unwrap_or("?")).collect::<Vec<_>>()
+            ));
+        }
+        // If max_event_count is 0 and events is empty, that's correct
+        if max_count == 0 && actual_events.is_empty() {
+            return Ok(());
+        }
+    }
+
+    // Check events (partial match on each event in order)
+    if let Some(expected_events) = &expect.events {
+        let expected_json: Vec<serde_json::Value> = expected_events.iter()
+            .map(yaml_to_json)
+            .collect();
+
+        if expected_json.is_empty() {
+            // Expect no events
+            if !actual_events.is_empty() {
+                return Err(format!(
+                    "expected no events, got {} events: {:?}",
+                    actual_events.len(),
+                    actual_events.iter().map(|e| e.get("event").and_then(|v| v.as_str()).unwrap_or("?")).collect::<Vec<_>>()
+                ));
+            }
+            // Check listener_query even if events are empty
+            if let Some(listener_query) = &expect.listener_query {
+                return check_listener_query(root, listener_query);
+            }
+            return Ok(());
+        }
+
+        // Match expected events against actual events
+        // Each expected event should match a corresponding actual event
+        // For partial matching, we look for events by event type and path
+        for (i, expected_event) in expected_json.iter().enumerate() {
+            let expected_type = expected_event.get("event").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Find matching actual event (by type and path, in order)
+            let actual_event = actual_events.iter()
+                .filter(|e| {
+                    e.get("event").and_then(|v| v.as_str()) == Some(expected_type)
+                })
+                .nth(
+                    // Count how many previous expected events have the same type
+                    expected_json[..i].iter()
+                        .filter(|prev| prev.get("event").and_then(|v| v.as_str()) == Some(expected_type))
+                        .count()
+                );
+
+            let actual_event = match actual_event {
+                Some(e) => e,
+                None => {
+                    return Err(format!(
+                        "events[{}]: expected {} event, not found in actual events {:?}",
+                        i, expected_type,
+                        actual_events.iter().map(|e| {
+                            format!("{}:{}",
+                                e.get("event").and_then(|v| v.as_str()).unwrap_or("?"),
+                                e.get("path").and_then(|v| v.as_str()).unwrap_or("?"))
+                        }).collect::<Vec<_>>()
+                    ));
+                }
+            };
+
+            // Partial match each expected field
+            check_watch_event_match(actual_event, &expected_event, &format!("events[{}]", i))?;
+        }
+    }
+
+    // Check events_ordered (strict order, partial match on each)
+    if let Some(expected_ordered) = &expect.events_ordered {
+        let expected_json: Vec<serde_json::Value> = expected_ordered.iter()
+            .map(yaml_to_json)
+            .collect();
+
+        if actual_events.len() < expected_json.len() {
+            return Err(format!(
+                "events_ordered: expected at least {} events, got {}",
+                expected_json.len(), actual_events.len()
+            ));
+        }
+
+        for (i, expected_event) in expected_json.iter().enumerate() {
+            if i >= actual_events.len() {
+                return Err(format!("events_ordered[{}]: not enough actual events", i));
+            }
+            check_watch_event_match(&actual_events[i], expected_event, &format!("events_ordered[{}]", i))?;
+        }
+    }
+
+    // Check events_contain (each expected event must appear somewhere)
+    if let Some(expected_contain) = &expect.events_contain {
+        let expected_json: Vec<serde_json::Value> = expected_contain.iter()
+            .map(yaml_to_json)
+            .collect();
+
+        for (i, expected_event) in expected_json.iter().enumerate() {
+            let found = actual_events.iter().any(|actual| {
+                check_watch_event_match(actual, expected_event, "").is_ok()
+            });
+            if !found {
+                return Err(format!(
+                    "events_contain[{}]: expected event {:?} not found in actual events",
+                    i, expected_event
+                ));
+            }
+        }
+    }
+
+    // Check listener_query
+    if let Some(listener_query) = &expect.listener_query {
+        check_listener_query(root, listener_query)?;
+    }
+
+    Ok(())
+}
+
+/// Check that an actual watch event matches expected fields (partial match).
+fn check_watch_event_match(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
+    if let Some(expected_obj) = expected.as_object() {
+        for (key, expected_val) in expected_obj {
+            match key.as_str() {
+                // timestamp_present: check timestamp field exists and is non-empty
+                "timestamp_present" if expected_val == &serde_json::Value::Bool(true) => {
+                    let ts = actual.get("timestamp");
+                    if ts.is_none() || ts == Some(&serde_json::Value::Null) {
+                        return Err(format!("{}.timestamp_present: timestamp not found", path));
+                    }
+                }
+                // has_fields: check that all listed fields exist
+                "has_fields" => {
+                    if let Some(fields) = expected_val.as_array() {
+                        for field in fields {
+                            if let Some(field_name) = field.as_str() {
+                                if actual.get(field_name).is_none() {
+                                    return Err(format!(
+                                        "{}.has_fields: field '{}' not found in event {:?}",
+                                        path, field_name, actual
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                // affected_files_not_contain: negative check
+                "affected_files_not_contain" => {
+                    if let Some(forbidden) = expected_val.as_array() {
+                        if let Some(actual_files) = actual.get("affected_files").and_then(|v| v.as_array()) {
+                            for f in forbidden {
+                                if let Some(f_str) = f.as_str() {
+                                    let found = actual_files.iter().any(|af| af.as_str() == Some(f_str));
+                                    if found {
+                                        return Err(format!(
+                                            "{}.affected_files_not_contain: '{}' found in {:?}",
+                                            path, f_str, actual_files
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // type field in expected maps to type_name in actual (for type_changed)
+                "type" => {
+                    // Check both "type" and "type_name" in actual
+                    let actual_val = actual.get("type")
+                        .or_else(|| actual.get("type_name"));
+                    if let Some(expected_str) = expected_val.as_str() {
+                        let actual_str = actual_val.and_then(|v| v.as_str());
+                        if actual_str != Some(expected_str) {
+                            return Err(format!(
+                                "{}.type: expected '{}', got {:?}",
+                                path, expected_str, actual_str
+                            ));
+                        }
+                    }
+                }
+                // issues: set-based matching (each expected issue must match some actual issue)
+                "issues" => {
+                    if let Some(expected_issues) = expected_val.as_array() {
+                        let actual_issues = actual.get("issues")
+                            .and_then(|v| v.as_array())
+                            .ok_or_else(|| format!("{}.issues: expected issues array", path))?;
+                        for (j, exp_issue) in expected_issues.iter().enumerate() {
+                            let found = actual_issues.iter().any(|actual_issue| {
+                                check_partial_match(actual_issue, exp_issue, "").is_ok()
+                            });
+                            if !found {
+                                return Err(format!(
+                                    "{}.issues[{}]: expected {:?} not found in {:?}",
+                                    path, j, exp_issue, actual_issues
+                                ));
+                            }
+                        }
+                    }
+                }
+                // Skip interval_ms (test metadata, not part of event)
+                "interval_ms" => {}
+                // Standard fields: partial match
+                _ => {
+                    if let Some(actual_val) = actual.get(key) {
+                        check_partial_match(actual_val, expected_val, &format!("{}.{}", path, key))?;
+                    } else {
+                        return Err(format!(
+                            "{}.{}: expected field missing from event. Event: {:?}",
+                            path, key, actual
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check listener_query: execute a follow-up operation and verify expectations.
+fn check_listener_query(
+    root: &Path,
+    listener_query: &serde_yaml::Value,
+) -> Result<(), String> {
+    let lq_json = yaml_to_json(listener_query);
+    let operation = lq_json.get("operation").and_then(|v| v.as_str())
+        .ok_or_else(|| "listener_query: missing 'operation'".to_string())?;
+    let input = lq_json.get("input").cloned().unwrap_or(serde_json::json!({}));
+    let expect = lq_json.get("expect").cloned().unwrap_or(serde_json::json!({}));
+
+    // Convert input back to YAML for execute_operation
+    let input_yaml_str = serde_json::to_string(&input).unwrap_or_default();
+    let input_yaml: serde_yaml::Value = serde_yaml::from_str(&input_yaml_str).unwrap_or_default();
+
+    // Deserialize expect into TestExpectation
+    let expect_yaml_str = serde_json::to_string(&expect).unwrap_or_default();
+    let step_expect: TestExpectation = serde_yaml::from_str(&expect_yaml_str).unwrap_or_default();
+
+    match execute_operation(root, operation, &input_yaml, None) {
+        Ok(result) => {
+            check_expectation(&result, &step_expect)
+                .map_err(|msg| format!("listener_query ({}): {}", operation, msg))
+        }
+        Err(err) => {
+            // If listener_query expects an error, check if codes match
+            if let Some(expected_error) = &step_expect.error {
+                if let Some(expected_code) = &expected_error.code {
+                    if err.contains(expected_code) {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(format!("listener_query ({}): {}", operation, err))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
