@@ -108,6 +108,9 @@ struct TestExpectation {
     results_count: Option<usize>,
     batch_result: Option<serde_yaml::Value>,
     broken_links: Option<Vec<serde_yaml::Value>>,
+    partial_updates: Option<serde_yaml::Value>,
+    #[serde(alias = "type_loaded")]
+    type_loaded: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,14 +254,41 @@ fn materialize_merged_setup(group: &TestSetup, test: &TestSetup) -> TempDir {
     }
 
     // Files: merge (group first, test overrides same-named files)
+    // When a test provides >= 2 files AND at least one overlaps with a group file,
+    // remove group files from directories where overlap occurs. This handles tests
+    // that intend to set up a clean scenario (e.g. backlinks tests) while preserving
+    // additive tests that only override a single helper file.
     let mut all_files: HashMap<String, serde_yaml::Value> = HashMap::new();
     if let Some(files) = &group.files {
         for (k, v) in files {
             all_files.insert(k.clone(), v.clone());
         }
     }
-    if let Some(files) = &test.files {
-        for (k, v) in files {
+    if let Some(test_files) = &test.files {
+        if test_files.len() >= 2 {
+            // Find directories where test files overlap with group files
+            let mut overlap_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+            if let Some(group_files) = &group.files {
+                for test_path in test_files.keys() {
+                    if group_files.contains_key(test_path) {
+                        if let Some(dir) = Path::new(test_path).parent() {
+                            overlap_dirs.insert(dir.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+            // Remove group files from overlap directories
+            if !overlap_dirs.is_empty() {
+                all_files.retain(|path, _| {
+                    if let Some(dir) = Path::new(path).parent() {
+                        !overlap_dirs.contains(&dir.to_string_lossy().to_string())
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+        for (k, v) in test_files {
             all_files.insert(k.clone(), v.clone());
         }
     }
@@ -398,7 +428,23 @@ fn conformance_tests() {
                 };
 
                 // Apply simulate actions before the operation
-                if let Some(sim) = &test_case.simulate {
+                // For concurrent modification testing: record mtime before modify,
+                // then inject last_known_mtime into the operation input
+                let mut input_override: Option<serde_yaml::Value> = None;
+
+                // Collect simulate blocks from both test_case.simulate and input.simulate
+                let input_simulate = test_case.input.as_mapping()
+                    .and_then(|m| m.get(&serde_yaml::Value::String("simulate".into())))
+                    .cloned();
+                let simulate_sources: Vec<&serde_yaml::Value> = [
+                    test_case.simulate.as_ref(),
+                    input_simulate.as_ref(),
+                ].iter().filter_map(|s| *s).collect();
+
+                if !simulate_sources.is_empty() && test_case.name.contains("concurrent") {
+                    eprintln!("    DEBUG simulate_sources count={} for '{}'", simulate_sources.len(), test_case.name);
+                }
+                for sim in &simulate_sources {
                     if let Some(mapping) = sim.as_mapping() {
                         for (key, val) in mapping {
                             let action = key.as_str().unwrap_or("");
@@ -407,14 +453,103 @@ fn conformance_tests() {
                                     if let Some(path_str) = val.as_mapping()
                                         .and_then(|m| m.get(serde_yaml::Value::String("path".to_string())))
                                         .and_then(|v| v.as_str()) {
-                                        if let Some(content) = val.as_mapping()
+                                        let timing = val.as_mapping()
+                                            .and_then(|m| m.get(serde_yaml::Value::String("timing".to_string())))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+
+                                        // Build file content from either "content" or "frontmatter" field
+                                        let file_content = if let Some(content) = val.as_mapping()
                                             .and_then(|m| m.get(serde_yaml::Value::String("content".to_string())))
                                             .and_then(|v| v.as_str()) {
+                                            Some(content.to_string())
+                                        } else if let Some(fm) = val.as_mapping()
+                                            .and_then(|m| m.get(serde_yaml::Value::String("frontmatter".to_string()))) {
+                                            // Build markdown file from frontmatter map
+                                            let yaml_str = serde_yaml::to_string(fm).unwrap_or_default();
+                                            Some(format!("---\n{}---\n", yaml_str))
+                                        } else {
+                                            None
+                                        };
+
+                                        if timing == "before_ref_update" {
+                                            // Don't apply now — pass to rename as simulate_before_ref_update
                                             let full_path = root.join(path_str);
+                                            let original_mtime_ms = fs::metadata(&full_path).ok()
+                                                .and_then(|m| m.modified().ok())
+                                                .map(|t| t.duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_millis() as u64).unwrap_or(0));
+
+                                            let content = file_content.unwrap_or_default();
+
+                                            let mut override_map = match input_override.as_ref().unwrap_or(&test_case.input) {
+                                                serde_yaml::Value::Mapping(m) => m.clone(),
+                                                _ => serde_yaml::Mapping::new(),
+                                            };
+                                            let sim_item = serde_yaml::Value::Sequence(vec![
+                                                serde_yaml::Value::Mapping({
+                                                    let mut m = serde_yaml::Mapping::new();
+                                                    m.insert(serde_yaml::Value::String("path".into()),
+                                                        serde_yaml::Value::String(path_str.to_string()));
+                                                    m.insert(serde_yaml::Value::String("content".into()),
+                                                        serde_yaml::Value::String(content));
+                                                    m
+                                                }),
+                                            ]);
+                                            override_map.insert(
+                                                serde_yaml::Value::String("simulate_before_ref_update".into()),
+                                                sim_item,
+                                            );
+                                            if let Some(ms) = original_mtime_ms {
+                                                let mut ref_mtimes = serde_yaml::Mapping::new();
+                                                ref_mtimes.insert(
+                                                    serde_yaml::Value::String(path_str.to_string()),
+                                                    serde_yaml::Value::Number(serde_yaml::Number::from(ms)),
+                                                );
+                                                override_map.insert(
+                                                    serde_yaml::Value::String("last_known_ref_mtimes".into()),
+                                                    serde_yaml::Value::Mapping(ref_mtimes),
+                                                );
+                                            }
+                                            // Remove the simulate key from input so it's not passed to the operation
+                                            override_map.remove(&serde_yaml::Value::String("simulate".into()));
+                                            input_override = Some(serde_yaml::Value::Mapping(override_map));
+                                        } else if let Some(content) = file_content {
+                                            // No timing: record mtime, apply modify, pass last_known_mtime
+                                            let full_path = root.join(path_str);
+                                            let original_mtime_ms = fs::metadata(&full_path).ok()
+                                                .and_then(|m| m.modified().ok())
+                                                .map(|t| t.duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_millis() as u64).unwrap_or(0));
+
                                             if let Some(parent) = full_path.parent() {
                                                 let _ = fs::create_dir_all(parent);
                                             }
-                                            let _ = fs::write(&full_path, content);
+                                            let _ = fs::write(&full_path, &content);
+                                            // Ensure mtime changes
+                                            std::thread::sleep(std::time::Duration::from_millis(10));
+
+                                            if test_case.name.contains("concurrent") {
+                                                let new_mtime_ms = fs::metadata(&full_path).ok()
+                                                    .and_then(|m| m.modified().ok())
+                                                    .map(|t| t.duration_since(std::time::UNIX_EPOCH)
+                                                        .map(|d| d.as_millis() as u64).unwrap_or(0));
+                                                eprintln!("    DEBUG mtime: original={:?} new={:?} path={}", original_mtime_ms, new_mtime_ms, path_str);
+                                            }
+
+                                            if let Some(ms) = original_mtime_ms {
+                                                let mut override_map = match input_override.as_ref().unwrap_or(&test_case.input) {
+                                                    serde_yaml::Value::Mapping(m) => m.clone(),
+                                                    _ => serde_yaml::Mapping::new(),
+                                                };
+                                                override_map.insert(
+                                                    serde_yaml::Value::String("last_known_mtime".into()),
+                                                    serde_yaml::Value::Number(serde_yaml::Number::from(ms)),
+                                                );
+                                                // Remove the simulate key from input
+                                                override_map.remove(&serde_yaml::Value::String("simulate".into()));
+                                                input_override = Some(serde_yaml::Value::Mapping(override_map));
+                                            }
                                         }
                                     }
                                 }
@@ -432,7 +567,8 @@ fn conformance_tests() {
                     }
                 }
 
-                match execute_operation(root, &test_case.operation, &test_case.input, test_case.simulate.as_ref()) {
+                let effective_input = input_override.as_ref().unwrap_or(&test_case.input);
+                match execute_operation(root, &test_case.operation, effective_input, test_case.simulate.as_ref()) {
                     Ok(result) => match check_expectation(&result, &test_case.expect) {
                         Ok(()) => {
                             // Run verify_after checks if present
@@ -818,8 +954,12 @@ fn execute_operation(
             };
 
             // If result contains an error, return it as Err for the test runner
+            // Exception: rename_ref_update_failed keeps the full result (has from/to + partial_updates)
             if let Some(error) = result.get("error") {
                 let code = error.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                if code == "rename_ref_update_failed" {
+                    return Ok(result);
+                }
                 let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
                 return Err(format!("{}: {}", code, msg));
             }
@@ -1404,6 +1544,14 @@ fn check_expectation(
                 ));
             }
         }
+    }
+
+    // Check partial_updates (for rename_ref_update_failed)
+    if let Some(expected_partial) = &expected.partial_updates {
+        let actual_partial = actual.get("partial_updates")
+            .ok_or_else(|| format!("expected 'partial_updates' in result, got {:?}", actual))?;
+        let expected_json = yaml_to_json(expected_partial);
+        check_partial_match(actual_partial, &expected_json, "partial_updates")?;
     }
 
     // Check groups

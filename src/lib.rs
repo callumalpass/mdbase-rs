@@ -1599,6 +1599,23 @@ impl Collection {
             return op_error(FILE_NOT_FOUND, &format!("File not found: {}", path));
         }
 
+        // Concurrent modification detection: record mtime at read time
+        let read_mtime = std::fs::metadata(&full_path)
+            .and_then(|m| m.modified())
+            .ok();
+
+        // If caller provides last_known_mtime, check for external modifications
+        if let Some(known_ms) = input.get("last_known_mtime").and_then(|v| v.as_u64()) {
+            if let Some(current) = &read_mtime {
+                let current_ms = current.duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64).unwrap_or(0);
+                if current_ms != known_ms {
+                    return op_error(CONCURRENT_MODIFICATION,
+                        &format!("File '{}' was modified externally", path));
+                }
+            }
+        }
+
         let content = match std::fs::read_to_string(&full_path) {
             Ok(c) => c,
             Err(e) => return op_error(FILE_NOT_FOUND, &format!("Failed to read: {}", e)),
@@ -1648,6 +1665,16 @@ impl Collection {
                         "issues": issues,
                     }
                 });
+            }
+        }
+
+        // Concurrent modification check before write
+        if let Some(recorded) = &read_mtime {
+            if let Ok(current) = std::fs::metadata(&full_path).and_then(|m| m.modified()) {
+                if current != *recorded {
+                    return op_error(CONCURRENT_MODIFICATION,
+                        &format!("File '{}' was modified during operation", path));
+                }
             }
         }
 
@@ -1708,6 +1735,20 @@ impl Collection {
         let full_path = self.root.join(path);
         if !full_path.exists() {
             return op_error(FILE_NOT_FOUND, &format!("File not found: {}", path));
+        }
+
+        // Concurrent modification detection
+        if let Some(known_ms) = input.get("last_known_mtime").and_then(|v| v.as_u64()) {
+            if let Ok(meta) = std::fs::metadata(&full_path) {
+                if let Ok(mtime) = meta.modified() {
+                    let current_ms = mtime.duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64).unwrap_or(0);
+                    if current_ms != known_ms {
+                        return op_error(CONCURRENT_MODIFICATION,
+                            &format!("File '{}' was modified externally", path));
+                    }
+                }
+            }
         }
 
         // Check backlinks before deletion
@@ -2218,6 +2259,20 @@ impl Collection {
             return op_error(INVALID_PATH, "Path contains null bytes");
         }
 
+        // Concurrent modification detection for source file
+        if let Some(known_ms) = input.get("last_known_mtime").and_then(|v| v.as_u64()) {
+            if let Ok(meta) = std::fs::metadata(&from_path) {
+                if let Ok(mtime) = meta.modified() {
+                    let current_ms = mtime.duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64).unwrap_or(0);
+                    if current_ms != known_ms {
+                        return op_error(CONCURRENT_MODIFICATION,
+                            &format!("File '{}' was modified externally", from));
+                    }
+                }
+            }
+        }
+
         // Read the source file's id before rename (for id-stability check)
         let source_id = std::fs::read_to_string(&from_path).ok().and_then(|content| {
             let doc = parse_document(&content);
@@ -2244,11 +2299,51 @@ impl Collection {
 
         let mut references_updated: Vec<serde_json::Value> = Vec::new();
         let mut warnings: Vec<serde_json::Value> = Vec::new();
+        let mut ref_update_failures: Vec<serde_json::Value> = Vec::new();
 
         if update_refs {
-            self.update_references_after_rename(
+            // Apply simulate.external_modify with timing: before_ref_update
+            // This is passed as "simulate_before_ref_update" in the input
+            if let Some(sim_arr) = input.get("simulate_before_ref_update").and_then(|v| v.as_array()) {
+                for sim in sim_arr {
+                    if let (Some(path), Some(content)) = (
+                        sim.get("path").and_then(|v| v.as_str()),
+                        sim.get("content").and_then(|v| v.as_str()),
+                    ) {
+                        let full = self.root.join(path);
+                        if let Some(parent) = full.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(&full, content);
+                    }
+                }
+            }
+
+            // Record mtimes of all collection files before updating refs
+            let files = self.scan_collection_files();
+            let mut file_mtimes: std::collections::HashMap<String, std::time::SystemTime> = std::collections::HashMap::new();
+            for file_path in &files {
+                if let Ok(meta) = std::fs::metadata(file_path) {
+                    if let Ok(mtime) = meta.modified() {
+                        let rel = file_path.strip_prefix(&self.root)
+                            .map(|p| p.to_string_lossy().to_string().replace('\\', "/"))
+                            .unwrap_or_default();
+                        file_mtimes.insert(rel, mtime);
+                    }
+                }
+            }
+
+            // Also check for last_known_ref_mtimes provided by the test runner
+            let ref_mtime_overrides: std::collections::HashMap<String, u64> = input
+                .get("last_known_ref_mtimes")
+                .and_then(|v| v.as_object())
+                .map(|obj| obj.iter().filter_map(|(k, v)| v.as_u64().map(|ms| (k.clone(), ms))).collect())
+                .unwrap_or_default();
+
+            self.update_references_after_rename_with_mtime(
                 from, to, &source_id,
-                &mut references_updated, &mut warnings,
+                &mut references_updated, &mut warnings, &mut ref_update_failures,
+                &file_mtimes, &ref_mtime_overrides,
             );
         }
 
@@ -2262,17 +2357,29 @@ impl Collection {
         if !warnings.is_empty() {
             result["warnings"] = serde_json::Value::Array(warnings);
         }
+        if !ref_update_failures.is_empty() {
+            result["error"] = serde_json::json!({
+                "code": RENAME_REF_UPDATE_FAILED,
+                "message": "Some reference updates failed due to concurrent modification",
+            });
+            result["partial_updates"] = serde_json::json!({
+                "failed": ref_update_failures,
+            });
+        }
         result
     }
 
-    /// Update references in all collection files after a rename.
-    fn update_references_after_rename(
+    /// Update references in all collection files after a rename (with mtime checking).
+    fn update_references_after_rename_with_mtime(
         &self,
         from: &str,
         to: &str,
         source_id: &Option<String>,
         references_updated: &mut Vec<serde_json::Value>,
         warnings: &mut Vec<serde_json::Value>,
+        ref_update_failures: &mut Vec<serde_json::Value>,
+        recorded_mtimes: &std::collections::HashMap<String, std::time::SystemTime>,
+        mtime_overrides: &std::collections::HashMap<String, u64>,
     ) {
         let from_stem = std::path::Path::new(from).file_stem()
             .and_then(|s| s.to_str()).unwrap_or("").to_string();
@@ -2332,6 +2439,35 @@ impl Collection {
 
             // Write back if changed
             if fm_changed || body_changed {
+                // Check for concurrent modification before writing
+                let mtime_conflict = if let Some(&override_ms) = mtime_overrides.get(&rel_path) {
+                    // Use test-provided override mtime
+                    if let Ok(meta) = std::fs::metadata(file_path) {
+                        if let Ok(current) = meta.modified() {
+                            let current_ms = current.duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64).unwrap_or(0);
+                            current_ms != override_ms
+                        } else { false }
+                    } else { false }
+                } else if let Some(recorded) = recorded_mtimes.get(&rel_path) {
+                    // Use recorded mtime from before ref updates
+                    if let Ok(meta) = std::fs::metadata(file_path) {
+                        if let Ok(current) = meta.modified() {
+                            current != *recorded
+                        } else { false }
+                    } else { false }
+                } else {
+                    false
+                };
+
+                if mtime_conflict {
+                    ref_update_failures.push(serde_json::json!({
+                        "path": rel_path,
+                        "reason": "concurrent_modification",
+                    }));
+                    continue;
+                }
+
                 let new_fm = if fm_changed { &fm_yaml } else { doc.frontmatter.as_ref().unwrap() };
                 let mut output = String::new();
                 output.push_str("---\n");
