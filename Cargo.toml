@@ -22,6 +22,7 @@ notify = "7"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+rand = "0.8"
 
 [dev-dependencies]
 insta = "1"

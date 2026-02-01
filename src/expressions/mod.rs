@@ -135,6 +135,9 @@ impl Collection {
                     all_files: None,
                     traversal_depth: std::cell::Cell::new(0),
                     backlinks_index: None,
+                    type_names: None,
+                    types: None,
+                    string_concat: true,
                 };
                 if let Ok(parsed) = ExprParser::parse(expr) {
                     match eval_expr(&parsed, &ctx) {

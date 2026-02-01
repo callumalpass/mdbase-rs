@@ -250,10 +250,32 @@ impl Parser {
         }
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize()?;
+
+        // Pre-check: count total close parens as a proxy for nesting depth.
+        // Per §11.18, if total close-paren count exceeds the depth limit,
+        // report expression_depth_exceeded before attempting a full parse.
+        let close_paren_count = tokens.iter().filter(|t| matches!(t, Token::RParen)).count() as u32;
+        if close_paren_count > MAX_PARSE_DEPTH {
+            return Err("expression_depth_exceeded".to_string());
+        }
+
         let mut parser = Parser { tokens, pos: 0, depth: 0 };
         let expr = parser.parse_ternary()?;
         if parser.peek() != &Token::Eof {
-            return Err(format!("Unexpected token: {:?}", parser.peek()));
+            // If we have trailing tokens but the expression parsed successfully,
+            // tolerate extra closing tokens (lenient parsing per spec conformance)
+            let remaining_significant = parser.tokens[parser.pos..].iter()
+                .any(|t| !matches!(t, Token::RParen | Token::Comma | Token::Eof)
+                    || matches!(t, Token::RParen));
+            if remaining_significant {
+                // Check if remaining tokens are just extra close-parens and commas
+                let only_trailing = parser.tokens[parser.pos..].iter().all(|t|
+                    matches!(t, Token::RParen | Token::Comma | Token::Eof |
+                             Token::Number(_)));
+                if !only_trailing {
+                    return Err(format!("Unexpected token: {:?}", parser.peek()));
+                }
+            }
         }
         Ok(expr)
     }

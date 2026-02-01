@@ -424,6 +424,21 @@ impl Collection {
         false
     }
 
+    /// Check if a path is excluded by user-configured exclude patterns only.
+    /// Unlike is_excluded, this does NOT exclude system folders (types, cache).
+    /// Used by read operations which should be able to access type definition files.
+    pub(crate) fn is_user_excluded(&self, rel_path: &str) -> bool {
+        for pattern in &self.settings.exclude {
+            if match_glob_pattern(pattern, rel_path) {
+                return true;
+            }
+        }
+        if self.is_in_nested_collection(rel_path) {
+            return true;
+        }
+        false
+    }
+
     /// Check if a relative path is inside a nested collection.
     /// Returns true if any parent directory along the path contains a mdbase.yaml file.
     pub(crate) fn is_in_nested_collection(&self, rel_path: &str) -> bool {

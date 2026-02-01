@@ -117,6 +117,15 @@ fn get_setting<'a>(
     map.and_then(|m| m.get(&ykey(key)))
 }
 
+/// Look for a setting first under settings, then at the top level.
+fn get_setting_or_top<'a>(
+    settings_map: Option<&'a serde_yaml::Mapping>,
+    top_map: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a serde_yaml::Value> {
+    get_setting(settings_map, key).or_else(|| top_map.get(&ykey(key)))
+}
+
 fn validate_version(
     version: &str,
     warnings: &mut Vec<String>,
@@ -276,8 +285,8 @@ fn parse_settings(
         }
     };
 
-    // default_validation
-    let default_validation = match get_setting(settings_map, "default_validation") {
+    // default_validation (check both settings and top level)
+    let default_validation = match get_setting_or_top(settings_map, top_map, "default_validation") {
         Some(serde_yaml::Value::String(s)) => match s.as_str() {
             "off" | "warn" | "error" => s.clone(),
             _ => {

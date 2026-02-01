@@ -63,6 +63,12 @@ pub struct EvalContext {
     pub traversal_depth: std::cell::Cell<u32>,
     /// Backlinks index: target path → list of source paths that link to it.
     pub backlinks_index: Option<std::sync::Arc<std::collections::HashMap<String, Vec<String>>>>,
+    /// Type names for this file (for display_name_key lookup).
+    pub type_names: Option<Vec<String>>,
+    /// Types map for display_name_key lookup.
+    pub types: Option<std::sync::Arc<std::collections::HashMap<String, crate::types::schema::TypeDef>>>,
+    /// Whether string + number should concatenate (true in formulas) or return type error (false in where clauses).
+    pub string_concat: bool,
 }
 
 impl EvalContext {
@@ -79,6 +85,9 @@ impl EvalContext {
             all_files: None,
             traversal_depth: std::cell::Cell::new(0),
             backlinks_index: None,
+            type_names: None,
+            types: None,
+            string_concat: true,
         }
     }
 }
@@ -168,9 +177,10 @@ fn eval_dot(obj_expr: &Expr, field: &str, ctx: &EvalContext) -> Result<Value, Ev
         if name == "file" {
             return eval_file_property(field, ctx);
         }
-        // note.* namespace accesses raw frontmatter
+        // note.* namespace accesses raw frontmatter (pre-defaults)
         if name == "note" {
-            return Ok(ctx.frontmatter.get(field).cloned().unwrap_or(Value::Null));
+            let fm = ctx.raw_frontmatter.as_ref().unwrap_or(&ctx.frontmatter);
+            return Ok(fm.get(field).cloned().unwrap_or(Value::Null));
         }
         // formula.* namespace
         if name == "formula" {
@@ -267,8 +277,9 @@ fn eval_file_property(field: &str, ctx: &EvalContext) -> Result<Value, EvalError
         }
         "body" => Ok(ctx.body.clone().map(Value::String).unwrap_or(Value::Null)),
         "properties" => {
-            // file.properties returns the raw frontmatter object
-            Ok(ctx.frontmatter.clone())
+            // file.properties returns the raw frontmatter object (pre-defaults)
+            let fm = ctx.raw_frontmatter.as_ref().unwrap_or(&ctx.frontmatter);
+            Ok(fm.clone())
         }
         "tags" => {
             // Extract tags from body + frontmatter tags field
@@ -318,6 +329,36 @@ fn eval_file_property(field: &str, ctx: &EvalContext) -> Result<Value, EvalError
         "embeds" => {
             let embeds = ctx.body.as_deref().map(extract_embeds_from_body).unwrap_or_default();
             Ok(Value::Array(embeds.into_iter().map(Value::String).collect()))
+        }
+        "display_name" => {
+            // file.display_name: use display_name_key from type if available, else file.basename
+            if let Some(ref type_names) = ctx.type_names {
+                for tn in type_names {
+                    if let Some(ref types_map) = ctx.types {
+                        if let Some(type_def) = types_map.get(tn) {
+                            if let Some(ref key) = type_def.display_name_key {
+                                if let Some(val) = ctx.frontmatter.get(key) {
+                                    if let Some(s) = val.as_str() {
+                                        if !s.is_empty() {
+                                            return Ok(Value::String(s.to_string()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Fallback to file.basename
+            if let Some(ref p) = ctx.file_path {
+                let stem = std::path::Path::new(p)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                Ok(Value::String(stem.to_string()))
+            } else {
+                Ok(Value::Null)
+            }
         }
         "size" => {
             Ok(ctx.file_size.map(|s| Value::Number(s.into())).unwrap_or(Value::Null))
@@ -563,7 +604,7 @@ fn eval_binop(left: &Expr, op: &BinOp, right: &Expr, ctx: &EvalContext) -> Resul
     let rval = evaluate(right, ctx)?;
 
     match op {
-        BinOp::Add => eval_add(&lval, &rval),
+        BinOp::Add => eval_add(&lval, &rval, ctx.string_concat),
         BinOp::Sub => eval_arithmetic(&lval, &rval, "-"),
         BinOp::Mul => eval_arithmetic(&lval, &rval, "*"),
         BinOp::Div => eval_arithmetic(&lval, &rval, "/"),
@@ -578,7 +619,23 @@ fn eval_binop(left: &Expr, op: &BinOp, right: &Expr, ctx: &EvalContext) -> Resul
     }
 }
 
-fn eval_add(left: &Value, right: &Value) -> Result<Value, EvalError> {
+fn value_to_concat_string(v: &Value) -> Result<String, EvalError> {
+    match v {
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(i.to_string())
+            } else {
+                Ok(n.as_f64().map(|f| f.to_string()).unwrap_or_default())
+            }
+        }
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Null => Ok("null".to_string()),
+        _ => Err(EvalError::type_error(&format!("Cannot concatenate {}", type_name(v)))),
+    }
+}
+
+fn eval_add(left: &Value, right: &Value, string_concat: bool) -> Result<Value, EvalError> {
     // Date + duration string arithmetic
     if let (Value::String(date_str), Value::String(dur_str)) = (left, right) {
         if is_date_string(date_str) || is_datetime_string(date_str) {
@@ -603,12 +660,22 @@ fn eval_add(left: &Value, right: &Value) -> Result<Value, EvalError> {
     if left.is_array() || right.is_array() {
         return Err(EvalError::type_error(&format!("Cannot add {} and {}", type_name(left), type_name(right))));
     }
-    // String concatenation: only if both sides are strings
-    if let (Value::String(ls), Value::String(rs)) = (left, right) {
-        return Ok(Value::String(format!("{}{}", ls, rs)));
-    }
-    // String + non-string is type_error
+    // String concatenation: if either side is a string, coerce the other to string
+    // Only allowed in formula context (string_concat=true), not in where clauses
     if left.is_string() || right.is_string() {
+        // String + String is always concatenation
+        if left.is_string() && right.is_string() {
+            let ls = value_to_concat_string(left)?;
+            let rs = value_to_concat_string(right)?;
+            return Ok(Value::String(format!("{}{}", ls, rs)));
+        }
+        // String + non-string: depends on context
+        if string_concat {
+            let ls = value_to_concat_string(left)?;
+            let rs = value_to_concat_string(right)?;
+            return Ok(Value::String(format!("{}{}", ls, rs)));
+        }
+        // In where context: type mismatch
         return Err(EvalError::type_error(&format!("Cannot add {} and {}", type_name(left), type_name(right))));
     }
     eval_arithmetic(left, right, "+")
@@ -1298,6 +1365,9 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
                     all_files: ctx.all_files.clone(),
                     traversal_depth: ctx.traversal_depth.clone(),
                     backlinks_index: ctx.backlinks_index.clone(),
+                    type_names: ctx.type_names.clone(),
+                    types: ctx.types.clone(),
+                    string_concat: ctx.string_concat,
                 };
                 match evaluate(&args[0], &item_ctx) {
                     Ok(val) => {
@@ -1331,6 +1401,9 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
                     all_files: ctx.all_files.clone(),
                     traversal_depth: ctx.traversal_depth.clone(),
                     backlinks_index: ctx.backlinks_index.clone(),
+                    type_names: ctx.type_names.clone(),
+                    types: ctx.types.clone(),
+                    string_concat: ctx.string_concat,
                 };
                 match evaluate(&args[0], &item_ctx) {
                     Ok(val) => result.push(val),
@@ -1340,8 +1413,8 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
             Ok(Value::Array(result))
         }
         "reduce" => {
-            if args.len() < 1 || args.len() > 2 {
-                return Err(EvalError::wrong_argument_count("reduce() requires 1-2 arguments"));
+            if args.len() != 2 {
+                return Err(EvalError::wrong_argument_count("reduce() requires 2 arguments"));
             }
             let mut acc = if args.len() > 1 {
                 evaluate(&args[1], ctx)?
@@ -1364,6 +1437,9 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
                     all_files: ctx.all_files.clone(),
                     traversal_depth: ctx.traversal_depth.clone(),
                     backlinks_index: ctx.backlinks_index.clone(),
+                    type_names: ctx.type_names.clone(),
+                    types: ctx.types.clone(),
+                    string_concat: ctx.string_concat,
                 };
                 acc = evaluate(&args[0], &item_ctx)?;
             }
@@ -2045,11 +2121,12 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
     let mut i = 0;
 
     while i < len {
-        // Wikilink: [[target]] or [[target|alias]]  (but NOT ![[embed]])
+        // Wikilink: [[target]] or [[target|alias]]  (but NOT ![[embed]] or \[[escaped]])
         if i + 1 < len && chars[i] == '[' && chars[i + 1] == '[' {
-            // Check this is not an embed (preceded by !)
+            // Check this is not an embed (preceded by !) or escaped (preceded by \)
             let is_embed = i > 0 && chars[i - 1] == '!';
-            if !is_embed {
+            let is_escaped = i > 0 && chars[i - 1] == '\\';
+            if !is_embed && !is_escaped {
                 i += 2; // skip [[
                 let start = i;
                 while i < len && !(chars[i] == ']' && i + 1 < len && chars[i + 1] == ']') {
@@ -2066,7 +2143,14 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
                     i += 2; // skip ]]
                 }
             } else {
-                i += 2;
+                // Skip past the escaped/embed wikilink content and closing ]]
+                i += 2; // skip [[
+                while i < len && !(chars[i] == ']' && i + 1 < len && chars[i + 1] == ']') {
+                    i += 1;
+                }
+                if i < len {
+                    i += 2; // skip ]]
+                }
             }
         }
         // Markdown link: [text](path) - but NOT ![text](path) which is an image

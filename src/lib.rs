@@ -10,6 +10,7 @@ pub mod config;
 pub mod expressions;
 pub mod frontmatter;
 pub mod generated;
+pub mod init;
 pub mod links;
 pub mod matching;
 pub mod operations;
@@ -253,6 +254,36 @@ impl Collection {
                     "valid": false,
                     "error": { "code": "circular_computed", "message": format!("Computed field '{}' references itself", name) }
                 }));
+            }
+        }
+
+        // Check that match rules don't reference computed fields (§6.4)
+        if !computed_fields.is_empty() {
+            if let Some(ref match_rules) = type_def.match_rules {
+                // Check where clause field names
+                if let Some(ref where_clause) = match_rules.where_clause {
+                    if let Some(obj) = where_clause.as_object() {
+                        for field_name in obj.keys() {
+                            if computed_fields.iter().any(|(name, _)| *name == field_name) {
+                                return Err(serde_json::json!({
+                                    "valid": false,
+                                    "error": { "code": "invalid_type_definition", "message": format!("Match rule 'where' cannot reference computed field '{}'", field_name) }
+                                }));
+                            }
+                        }
+                    }
+                }
+                // Check fields_present
+                if let Some(ref fields_present) = match_rules.fields_present {
+                    for field_name in fields_present {
+                        if computed_fields.iter().any(|(name, _)| *name == field_name) {
+                            return Err(serde_json::json!({
+                                "valid": false,
+                                "error": { "code": "invalid_type_definition", "message": format!("Match rule 'fields_present' cannot reference computed field '{}'", field_name) }
+                            }));
+                        }
+                    }
+                }
             }
         }
 

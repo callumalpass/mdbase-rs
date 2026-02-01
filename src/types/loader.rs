@@ -93,6 +93,88 @@ pub fn load_types_with_warnings(
             ));
         }
 
+        // Validate field definitions
+        for (field_name, field_def) in &type_def.fields {
+            // Empty enum values list
+            if field_def.field_type == "enum" {
+                if let Some(ref values) = field_def.values {
+                    if values.is_empty() {
+                        return Err(format!(
+                            "Type '{}' field '{}': enum must have at least one value",
+                            type_def.name, field_name
+                        ));
+                    }
+                }
+            }
+            // Random generation with invalid length
+            if let Some(ref gen) = field_def.generated {
+                if let GeneratedStrategy::Derived { ref from, .. } = gen {
+                    // Check if "from" is "file.name" etc (circular with path_pattern)
+                    if from.starts_with("file.") {
+                        if type_def.path_pattern.is_some() || type_def.filename_pattern.is_some() {
+                            let pattern = type_def.path_pattern.as_deref()
+                                .or(type_def.filename_pattern.as_deref())
+                                .unwrap_or("");
+                            if pattern.contains(&format!("{{{}}}", field_name)) {
+                                return Err(format!(
+                                    "Type '{}': circular dependency between path_pattern and generated field '{}'",
+                                    type_def.name, field_name
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            // Validate generated strategies
+            if let Some(ref gen) = field_def.generated {
+                match gen {
+                    GeneratedStrategy::Random(len) => {
+                        if *len == 0 {
+                            return Err(format!(
+                                "Type '{}' field '{}': random generation length must be > 0",
+                                type_def.name, field_name
+                            ));
+                        }
+                    }
+                    GeneratedStrategy::Sequence(_) => {
+                        if field_def.field_type != "integer" {
+                            return Err(format!(
+                                "Type '{}' field '{}': sequence generation requires integer type",
+                                type_def.name, field_name
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Validate path_pattern field references
+        let pattern = type_def.path_pattern.as_deref()
+            .or(type_def.filename_pattern.as_deref());
+        if let Some(pattern) = pattern {
+            let re = regex::Regex::new(r"\{(\w+)\}").unwrap();
+            for cap in re.captures_iter(pattern) {
+                let field = &cap[1];
+                if !type_def.fields.contains_key(field) {
+                    warnings.push(format!(
+                        "Type '{}': path_pattern references unknown field '{}'",
+                        type_def.name, field
+                    ));
+                } else {
+                    // Check if referenced field is a computed field
+                    if let Some(fd) = type_def.fields.get(field) {
+                        if fd.computed.is_some() {
+                            return Err(format!(
+                                "Type '{}': path_pattern cannot reference computed field '{}'",
+                                type_def.name, field
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // Canonicalize name to lowercase
         let canonical_name = type_def.name.to_lowercase();
         let mut type_def = type_def;
@@ -184,6 +266,16 @@ fn parse_type_file(content: &str, path: &Path) -> Result<TypeDef, String> {
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    let path_pattern = mapping
+        .get(&ykey("path_pattern"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let display_name_key = mapping
+        .get(&ykey("display_name_key"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     let fields = match mapping.get(&ykey("fields")) {
         Some(serde_yaml::Value::Mapping(fields_map)) => parse_fields(fields_map)?,
         _ => HashMap::new(),
@@ -197,6 +289,8 @@ fn parse_type_file(content: &str, path: &Path) -> Result<TypeDef, String> {
         extends,
         strict,
         filename_pattern,
+        path_pattern,
+        display_name_key,
         fields,
         match_rules,
     })
@@ -377,10 +471,25 @@ fn parse_generated(value: &serde_yaml::Value) -> GeneratedStrategy {
             "uuid" => GeneratedStrategy::Uuid,
             "now" => GeneratedStrategy::Now,
             "now_on_write" => GeneratedStrategy::NowOnWrite,
+            "sequence" => GeneratedStrategy::Sequence(1),
             _ => GeneratedStrategy::Now, // fallback
         },
         serde_yaml::Value::Mapping(m) => {
             let ykey = |s: &str| serde_yaml::Value::String(s.to_string());
+            // Check for random key (e.g., {random: 8})
+            if let Some(random_val) = m.get(&ykey("random")) {
+                let len = random_val.as_u64().unwrap_or(0);
+                return GeneratedStrategy::Random(len);
+            }
+            // Check for sequence key (e.g., {sequence: {start: 100}})
+            if let Some(seq_val) = m.get(&ykey("sequence")) {
+                let start = if let Some(seq_map) = seq_val.as_mapping() {
+                    seq_map.get(&ykey("start")).and_then(|v| v.as_i64()).unwrap_or(1)
+                } else {
+                    1
+                };
+                return GeneratedStrategy::Sequence(start);
+            }
             // Check for strategy key first (e.g., {strategy: uuid})
             if let Some(strategy) = m.get(&ykey("strategy")).and_then(|v| v.as_str()) {
                 match strategy {
@@ -389,6 +498,7 @@ fn parse_generated(value: &serde_yaml::Value) -> GeneratedStrategy {
                     "now" => GeneratedStrategy::Now,
                     "now_on_write" => GeneratedStrategy::NowOnWrite,
                     "timestamp" => GeneratedStrategy::Now, // timestamp maps to Now
+                    "sequence" => GeneratedStrategy::Sequence(1),
                     _ => GeneratedStrategy::Now,
                 }
             } else {

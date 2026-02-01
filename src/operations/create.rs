@@ -4,6 +4,7 @@ use crate::errors::*;
 use crate::frontmatter;
 use crate::frontmatter::serializer;
 use crate::generated::derive_path;
+use crate::matching::engine::matches_rules;
 use crate::Collection;
 
 impl Collection {
@@ -34,6 +35,28 @@ impl Collection {
             }
         }
 
+        // Build frontmatter early so path_pattern can use generated/default values
+        let mut fm_obj = match frontmatter_input.as_object() {
+            Some(o) => o.clone(),
+            None => serde_json::Map::new(),
+        };
+
+        // Add type key if specified and explicit_type_keys is non-empty
+        if let Some(tn) = type_name {
+            if !self.settings.explicit_type_keys.is_empty()
+                && !fm_obj.contains_key("type")
+                && !fm_obj.contains_key("types")
+            {
+                fm_obj.insert("type".to_string(), serde_json::Value::String(tn.to_string()));
+            }
+        }
+
+        // Generate values before path derivation so path_pattern can use them
+        self.apply_generated(&mut fm_obj, &type_names, true);
+
+        // Apply defaults to a temporary copy for path derivation
+        let fm_with_defaults = self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
+
         // Determine path
         let path = match path_input {
             Some(p) => {
@@ -52,11 +75,13 @@ impl Collection {
                 p.to_string()
             }
             None => {
-                // Try to derive from filename_pattern
+                // Try to derive from path_pattern or filename_pattern
                 if let Some(tn) = type_names.first() {
                     if let Some(type_def) = self.types.get(tn) {
-                        if let Some(pattern) = &type_def.filename_pattern {
-                            match derive_path(pattern, &frontmatter_input) {
+                        let pattern = type_def.path_pattern.as_ref()
+                            .or(type_def.filename_pattern.as_ref());
+                        if let Some(pattern) = pattern {
+                            match derive_path(pattern, &fm_with_defaults) {
                                 Some(p) => p,
                                 None => return op_error(PATH_REQUIRED, "Cannot determine path"),
                             }
@@ -78,24 +103,21 @@ impl Collection {
             return op_error(PATH_CONFLICT, &format!("File already exists: {}", path));
         }
 
-        // Build frontmatter
-        let mut fm_obj = match frontmatter_input.as_object() {
-            Some(o) => o.clone(),
-            None => serde_json::Map::new(),
-        };
-
-        // Add type key if specified
-        if let Some(tn) = type_name {
-            if !fm_obj.contains_key("type") && !fm_obj.contains_key("types") {
-                fm_obj.insert("type".to_string(), serde_json::Value::String(tn.to_string()));
-            }
-        }
-
-        // Generate values
-        self.apply_generated(&mut fm_obj, &type_names, true);
-
         // Apply defaults for effective frontmatter (for validation and output)
         let effective = self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
+
+        // Check match rules (§6.3, §6.4): created file must satisfy type match rules
+        for tn in &type_names {
+            if let Some(type_def) = self.types.get(tn) {
+                if let Some(ref rules) = type_def.match_rules {
+                    if !matches_rules(rules, &path, &effective) {
+                        return op_error("match_failed", &format!(
+                            "Created file does not satisfy match rules for type '{}'", tn
+                        ));
+                    }
+                }
+            }
+        }
 
         // Validate
         let mut result_warnings: Vec<serde_json::Value> = Vec::new();

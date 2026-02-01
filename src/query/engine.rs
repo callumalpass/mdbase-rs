@@ -99,6 +99,9 @@ impl Collection {
                     all_files: None,
                     traversal_depth: std::cell::Cell::new(0),
                     backlinks_index: None,
+                    type_names: None,
+                    types: None,
+                    string_concat: true,
                 }))
             });
 
@@ -178,6 +181,9 @@ impl Collection {
                     all_files: None,
                     traversal_depth: std::cell::Cell::new(0),
                     backlinks_index: None,
+                    type_names: None,
+                    types: None,
+                    string_concat: true,
                 };
                 match ExprParser::parse(fexpr) {
                     Ok(parsed) => {
@@ -495,6 +501,14 @@ impl Collection {
             }
             (serde_json::Value::String(a_s), serde_json::Value::String(b_s)) => a_s.cmp(b_s),
             (serde_json::Value::Bool(ab), serde_json::Value::Bool(bb)) => ab.cmp(bb),
+            // §10.3: Lists sort by length
+            (serde_json::Value::Array(a_arr), serde_json::Value::Array(b_arr)) => {
+                a_arr.len().cmp(&b_arr.len())
+            }
+            // §10.3: Objects sort by key count
+            (serde_json::Value::Object(a_obj), serde_json::Value::Object(b_obj)) => {
+                a_obj.len().cmp(&b_obj.len())
+            }
             _ => std::cmp::Ordering::Equal,
         }
     }
@@ -664,6 +678,9 @@ impl Collection {
             all_files: ctx.all_files.clone(),
             traversal_depth: std::cell::Cell::new(0),
             backlinks_index: ctx.backlinks_index.clone(),
+            type_names: Some(ctx.type_names.to_vec()),
+            types: Some(std::sync::Arc::new(self.types.clone())),
+            string_concat: false,
         };
 
         match eval_expr(&parsed, &eval_ctx) {

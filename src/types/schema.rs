@@ -36,6 +36,8 @@ pub enum GeneratedStrategy {
     Uuid,
     Now,
     NowOnWrite,
+    Sequence(i64),  // start value, default 1
+    Random(u64),
     Derived { from: String, transform: String },
 }
 
@@ -47,6 +49,8 @@ pub struct TypeDef {
     pub extends: Option<String>,
     pub strict: Option<StrictMode>,
     pub filename_pattern: Option<String>,
+    pub path_pattern: Option<String>,
+    pub display_name_key: Option<String>,
     pub fields: HashMap<String, FieldDef>,
     pub match_rules: Option<MatchRules>,
 }
