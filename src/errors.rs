@@ -63,6 +63,11 @@ pub const PATH_TRAVERSAL: &str = "path_traversal";
 // Rename Operations
 pub const RENAME_REF_UPDATE_FAILED: &str = "rename_ref_update_failed";
 
+// Migration Operations
+pub const INVALID_MIGRATION: &str = "invalid_migration";
+pub const MIGRATION_FAILED: &str = "migration_failed";
+pub const INVALID_REQUEST: &str = "invalid_request";
+
 // Configuration Errors
 pub const INVALID_CONFIG: &str = "invalid_config";
 pub const MISSING_CONFIG: &str = "missing_config";
