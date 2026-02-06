@@ -394,12 +394,10 @@ impl Collection {
             } else {
                 candidates[offset..].iter().take(lim).cloned().collect()
             }
+        } else if offset >= candidates.len() {
+            Vec::new()
         } else {
-            if offset >= candidates.len() {
-                Vec::new()
-            } else {
-                candidates[offset..].to_vec()
-            }
+            candidates[offset..].to_vec()
         };
 
         let has_more = if let Some(lim) = limit {

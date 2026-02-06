@@ -574,7 +574,7 @@ fn process_rapid_changes(
         let mut events = Vec::new();
 
         // Files that were created and NOT deleted: emit file_created with final state
-        for (path, _content) in &created {
+        for path in created.keys() {
             if !deleted.contains(path) {
                 let fresh = crate::Collection::open(collection_root).ok()?;
                 let (frontmatter, types) = read_effective_frontmatter(collection_root, path, &fresh)

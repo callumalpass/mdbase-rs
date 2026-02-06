@@ -199,10 +199,10 @@ fn materialize_setup(setup: &TestSetup) -> TempDir {
                 }
                 serde_yaml::Value::Mapping(map) => {
                     let key = |s: &str| serde_yaml::Value::String(s.to_string());
-                    let content_str = map.get(&key("content"))
+                    let content_str = map.get(key("content"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let encoding = map.get(&key("encoding"))
+                    let encoding = map.get(key("encoding"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("utf-8");
                     if encoding == "latin-1" || encoding == "iso-8859-1" {
@@ -309,10 +309,10 @@ fn materialize_merged_setup(group: &TestSetup, test: &TestSetup) -> TempDir {
             }
             serde_yaml::Value::Mapping(map) => {
                 let key = |s: &str| serde_yaml::Value::String(s.to_string());
-                let content_str = map.get(&key("content"))
+                let content_str = map.get(key("content"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let encoding = map.get(&key("encoding"))
+                let encoding = map.get(key("encoding"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("utf-8");
                 if encoding == "latin-1" || encoding == "iso-8859-1" {
@@ -409,7 +409,7 @@ fn conformance_tests() {
                 .map(|s| s.config.is_none())
                 .unwrap_or(false);
             let shared_tmp = if group_has_null_config {
-                group.setup.as_ref().map(|s| materialize_setup(s))
+                group.setup.as_ref().map(materialize_setup)
             } else {
                 None
             };
@@ -457,7 +457,7 @@ fn conformance_tests() {
                     // Collect simulate from test_case.simulate and/or input.simulate
                     let input_json = yaml_to_json(&test_case.input);
                     let sim_json = test_case.simulate.as_ref()
-                        .map(|s| yaml_to_json(s))
+                        .map(yaml_to_json)
                         .unwrap_or_else(|| serde_json::json!({}));
                     let input_sim_json = input_json.get("simulate").cloned();
 
@@ -491,7 +491,7 @@ fn conformance_tests() {
 
                 // Collect simulate blocks from both test_case.simulate and input.simulate
                 let input_simulate = test_case.input.as_mapping()
-                    .and_then(|m| m.get(&serde_yaml::Value::String("simulate".into())))
+                    .and_then(|m| m.get(serde_yaml::Value::String("simulate".into())))
                     .cloned();
                 let simulate_sources: Vec<&serde_yaml::Value> = [
                     test_case.simulate.as_ref(),
@@ -569,7 +569,7 @@ fn conformance_tests() {
                                                 );
                                             }
                                             // Remove the simulate key from input so it's not passed to the operation
-                                            override_map.remove(&serde_yaml::Value::String("simulate".into()));
+                                            override_map.remove(serde_yaml::Value::String("simulate".into()));
                                             input_override = Some(serde_yaml::Value::Mapping(override_map));
                                         } else if let Some(content) = file_content {
                                             // No timing: record mtime, apply modify, pass last_known_mtime
@@ -614,7 +614,7 @@ fn conformance_tests() {
                                                     serde_yaml::Value::Number(serde_yaml::Number::from(ms)),
                                                 );
                                                 // Remove the simulate key from input
-                                                override_map.remove(&serde_yaml::Value::String("simulate".into()));
+                                                override_map.remove(serde_yaml::Value::String("simulate".into()));
                                                 input_override = Some(serde_yaml::Value::Mapping(override_map));
                                             }
                                         }
@@ -797,7 +797,7 @@ fn execute_operation(
         }
         "read" | "create" | "update" | "delete" | "rename" | "validate"
         | "load_types" | "get_types" | "get_type" | "create_type"
-        | "cache_rebuild" | "cache_clear" => {
+        | "cache_rebuild" | "cache_clear" | "backfill" | "migrate" => {
             let collection_result = mdbase::Collection::open(collection_root);
             let collection = match collection_result {
                 Ok(c) => c,
@@ -939,7 +939,7 @@ fn execute_operation(
                     let _ = std::fs::create_dir_all(&types_dir);
 
                     // Validate type name
-                    if let Err(_) = mdbase::types::loader::validate_type_name(name) {
+                    if mdbase::types::loader::validate_type_name(name).is_err() {
                         return Ok(serde_json::json!({
                             "error": { "code": "invalid_type_definition", "message": format!("Invalid type name: '{}'", name) }
                         }));
@@ -1056,6 +1056,8 @@ fn execute_operation(
                         Err(e) => return Err(format!("io_error: {}", e)),
                     }
                 }
+                "backfill" => collection.backfill(&input_json),
+                "migrate" => collection.migrate(&input_json),
                 _ => unreachable!(),
             };
 
@@ -1180,7 +1182,7 @@ fn execute_operation(
             // Extract simulate parameters from both top-level simulate and input.simulate
             let sim_io_error: Option<String> = simulate
                 .and_then(|s| s.as_mapping())
-                .and_then(|m| m.get(&serde_yaml::Value::String("io_error_on".to_string())))
+                .and_then(|m| m.get(serde_yaml::Value::String("io_error_on".to_string())))
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .or_else(|| {
@@ -1191,7 +1193,7 @@ fn execute_operation(
                 });
             let skip_dependents: bool = simulate
                 .and_then(|s| s.as_mapping())
-                .and_then(|m| m.get(&serde_yaml::Value::String("skip_dependents".to_string())))
+                .and_then(|m| m.get(serde_yaml::Value::String("skip_dependents".to_string())))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
                 || input_json.get("simulate")
@@ -1659,7 +1661,7 @@ fn check_expectation(
             } else {
                 // For query result items, expected fields like "value" may be in frontmatter
                 // rather than at the top level. Merge frontmatter into top-level for matching.
-                if let (serde_json::Value::Object(actual_map), serde_json::Value::Object(expected_map)) = (actual_item, expected_item) {
+                if let (serde_json::Value::Object(actual_map), serde_json::Value::Object(_expected_map)) = (actual_item, expected_item) {
                     let mut augmented = actual_map.clone();
                     if let Some(serde_json::Value::Object(fm)) = actual_map.get("frontmatter") {
                         for (k, v) in fm {
@@ -1939,7 +1941,7 @@ fn check_watch_expectation(
             };
 
             // Partial match each expected field
-            check_watch_event_match(actual_event, &expected_event, &format!("events[{}]", i))?;
+            check_watch_event_match(actual_event, expected_event, &format!("events[{}]", i))?;
         }
     }
 
@@ -2226,7 +2228,7 @@ fn check_partial_match(
                         let val = actual_map.get(base_key).ok_or_else(|| {
                             format!("{}.{}: expected field '{}' to be present", path, key, base_key)
                         })?;
-                        if val.is_null() || val.as_str().map_or(false, |s| s.is_empty()) {
+                        if val.is_null() || val.as_str().is_some_and(|s| s.is_empty()) {
                             return Err(format!(
                                 "{}.{}: expected field '{}' to be present and non-empty, got {:?}",
                                 path, key, base_key, val
@@ -2240,8 +2242,8 @@ fn check_partial_match(
                         let val = actual_map.get(base_key).ok_or_else(|| {
                             format!("{}.{}: expected field '{}' to be present", path, key, base_key)
                         })?;
-                        let is_positive = val.as_i64().map_or(false, |n| n > 0)
-                            || val.as_f64().map_or(false, |n| n > 0.0);
+                        let is_positive = val.as_i64().is_some_and(|n| n > 0)
+                            || val.as_f64().is_some_and(|n| n > 0.0);
                         if !is_positive {
                             return Err(format!(
                                 "{}.{}: expected field '{}' to be positive, got {:?}",

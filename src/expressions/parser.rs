@@ -75,9 +75,9 @@ impl Lexer {
                 '.' => {
                     self.advance();
                     // Check if next char starts a digit (decimal number like .5)
-                    if self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                    if self.peek().is_some_and(|c| c.is_ascii_digit()) {
                         let mut num_str = String::from("0.");
-                        while self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
                             num_str.push(self.advance().unwrap());
                         }
                         let n: f64 = num_str.parse().map_err(|_| "Invalid number".to_string())?;
@@ -177,7 +177,7 @@ impl Lexer {
                 }
                 c if c.is_ascii_digit() => {
                     let mut num_str = String::new();
-                    while self.peek().map_or(false, |c| c.is_ascii_digit() || c == '.') {
+                    while self.peek().is_some_and(|c| c.is_ascii_digit() || c == '.') {
                         num_str.push(self.advance().unwrap());
                     }
                     // Handle scientific notation
@@ -186,7 +186,7 @@ impl Lexer {
                         if self.peek() == Some('+') || self.peek() == Some('-') {
                             num_str.push(self.advance().unwrap());
                         }
-                        while self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
                             num_str.push(self.advance().unwrap());
                         }
                     }
@@ -195,7 +195,7 @@ impl Lexer {
                 }
                 c if c.is_ascii_alphabetic() || c == '_' => {
                     let mut ident = String::new();
-                    while self.peek().map_or(false, |c| c.is_ascii_alphanumeric() || c == '_') {
+                    while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
                         ident.push(self.advance().unwrap());
                     }
                     // Handle ext::name syntax
@@ -206,12 +206,12 @@ impl Lexer {
                             self.advance(); // second ':'
                             // Read the function name after ::
                             let mut func_name = String::new();
-                            while self.peek().map_or(false, |c| c.is_ascii_alphanumeric() || c == '_') {
+                            while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
                                 func_name.push(self.advance().unwrap());
                             }
                             if func_name.is_empty() {
                                 // ext:: with nothing after it
-                                tokens.push(Token::Ident(format!("ext::")));
+                                tokens.push(Token::Ident("ext::".to_string()));
                             } else {
                                 tokens.push(Token::Ident(format!("ext::{}", func_name)));
                             }
@@ -494,8 +494,8 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.peek().clone() {
             Token::Null => { self.advance(); Ok(Expr::Null) }
-            Token::Bool(b) => { let b = b; self.advance(); Ok(Expr::Bool(b)) }
-            Token::Number(n) => { let n = n; self.advance(); Ok(Expr::Number(n)) }
+            Token::Bool(b) => { self.advance(); Ok(Expr::Bool(b)) }
+            Token::Number(n) => { self.advance(); Ok(Expr::Number(n)) }
             Token::Str(s) => { let s = s.clone(); self.advance(); Ok(Expr::Str(s)) }
             Token::Ident(s) => { let s = s.clone(); self.advance(); Ok(Expr::Ident(s)) }
             Token::LParen => {

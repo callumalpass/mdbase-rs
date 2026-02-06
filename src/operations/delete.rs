@@ -1,6 +1,7 @@
 //! Delete operation (§12.4).
 
 use crate::errors::*;
+use crate::operations::ensure_safe_relative_path;
 use crate::Collection;
 
 impl Collection {
@@ -10,6 +11,9 @@ impl Collection {
             Some(p) => p,
             None => return op_error(INVALID_PATH, "path is required"),
         };
+        if let Err(msg) = ensure_safe_relative_path(path) {
+            return op_error(INVALID_PATH, msg);
+        }
         let check_backlinks = input.get("check_backlinks").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let full_path = self.root.join(path);

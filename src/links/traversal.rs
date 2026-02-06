@@ -70,7 +70,7 @@ impl Collection {
                     if !seen_targets.contains(&resolved_path) {
                         seen_targets.push(resolved_path.clone());
                         index.entry(resolved_path)
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(source_path.clone());
                     }
                 }

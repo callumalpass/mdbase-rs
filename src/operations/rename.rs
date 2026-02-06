@@ -4,6 +4,7 @@ use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::links::parser::normalize_link_path;
 use crate::links::resolver::compute_relative_path;
+use crate::operations::ensure_safe_relative_path;
 use crate::Collection;
 
 impl Collection {
@@ -20,6 +21,12 @@ impl Collection {
             Some(p) => p,
             None => return op_error(PATH_REQUIRED, "'to' is required"),
         };
+        if let Err(msg) = ensure_safe_relative_path(from) {
+            return op_error(INVALID_PATH, msg);
+        }
+        if let Err(msg) = ensure_safe_relative_path(to) {
+            return op_error(INVALID_PATH, msg);
+        }
 
         let from_path = self.root.join(from);
         let to_path = self.root.join(to);
@@ -35,11 +42,6 @@ impl Collection {
         // Create parent dirs
         if let Some(parent) = to_path.parent() {
             let _ = std::fs::create_dir_all(parent);
-        }
-
-        // Check for null bytes in paths
-        if to.contains('\0') || from.contains('\0') {
-            return op_error(INVALID_PATH, "Path contains null bytes");
         }
 
         // Concurrent modification detection for source file
@@ -165,6 +167,7 @@ impl Collection {
     }
 
     /// Update references in all collection files after a rename (with mtime checking).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update_references_after_rename_with_mtime(
         &self,
         from: &str,
@@ -207,6 +210,7 @@ impl Collection {
 
             let mut fm_changed = false;
             let mut body_changed = false;
+            let mut pending_updates: Vec<serde_json::Value> = Vec::new();
             let mut fm_yaml = match &doc.frontmatter {
                 Some(v @ serde_yaml::Value::Mapping(_)) => v.clone(),
                 _ => continue,
@@ -216,7 +220,7 @@ impl Collection {
             self.update_fm_links(
                 &mut fm_yaml, from, to, &from_stem, &to_stem,
                 from_no_ext, to_no_ext, &source_dir, &rel_path,
-                source_id, &mut fm_changed, references_updated, warnings,
+                source_id, &mut fm_changed, &mut pending_updates, warnings,
             );
 
             // Update body links
@@ -226,7 +230,7 @@ impl Collection {
                 from_no_ext, to_no_ext, &source_dir,
             ) {
                 body_changed = true;
-                references_updated.push(serde_json::json!({
+                pending_updates.push(serde_json::json!({
                     "path": rel_path,
                     "location": "body",
                 }));
@@ -263,7 +267,11 @@ impl Collection {
                     continue;
                 }
 
-                let new_fm = if fm_changed { &fm_yaml } else { doc.frontmatter.as_ref().unwrap() };
+                let new_fm = if fm_changed {
+                    &fm_yaml
+                } else {
+                    doc.frontmatter.as_ref().expect("frontmatter exists for fm_changed=false")
+                };
                 let mut output = String::new();
                 output.push_str("---\n");
                 let yaml_str = serde_yaml::to_string(new_fm).unwrap_or_default();
@@ -278,7 +286,15 @@ impl Collection {
                         output.push('\n');
                     }
                 }
-                let _ = std::fs::write(file_path, output);
+                if let Err(e) = std::fs::write(file_path, output) {
+                    ref_update_failures.push(serde_json::json!({
+                        "path": rel_path,
+                        "reason": "io_error",
+                        "message": e.to_string(),
+                    }));
+                    continue;
+                }
+                references_updated.extend(pending_updates);
             }
         }
     }
@@ -327,18 +343,18 @@ impl Collection {
         }
 
         // Check stem match for simple wikilinks (only wikilinks can match by stem)
-        if is_wikilink && !target.contains('/') && !target.contains('.') {
-            if target == from_stem {
+        if is_wikilink && !target.contains('/') && !target.contains('.')
+            && target == from_stem {
                 return true;
             }
-        }
 
         false
     }
 
     /// Rewrite a link value to point to the new path.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn rewrite_link_value(&self, link_val: &str, from_stem: &str, to_stem: &str,
-                          from_no_ext: &str, to_no_ext: &str, to_path: &str, source_dir: &str) -> String {
+                          _from_no_ext: &str, to_no_ext: &str, to_path: &str, source_dir: &str) -> String {
         if link_val.starts_with("[[") && link_val.ends_with("]]") {
             // Wikilink: [[target]], [[target|alias]], [[target#anchor]]
             let inner = &link_val[2..link_val.len()-2];
@@ -375,7 +391,7 @@ impl Collection {
             let path_and_anchor = &rest[..paren_end];
             let suffix = &rest[paren_end..]; // the closing ")"
 
-            let (path_part, anchor) = if let Some(hash_pos) = path_and_anchor.find('#') {
+            let (_path_part, anchor) = if let Some(hash_pos) = path_and_anchor.find('#') {
                 (&path_and_anchor[..hash_pos], &path_and_anchor[hash_pos..])
             } else {
                 (path_and_anchor, "")
@@ -386,7 +402,7 @@ impl Collection {
             format!("{}{}{}{}", prefix, new_rel, anchor, suffix)
         } else {
             // Bare path
-            let (path_part, anchor) = if let Some(hash_pos) = link_val.find('#') {
+            let (_path_part, anchor) = if let Some(hash_pos) = link_val.find('#') {
                 (&link_val[..hash_pos], &link_val[hash_pos..])
             } else {
                 (link_val, "")
@@ -397,6 +413,7 @@ impl Collection {
     }
 
     /// Update frontmatter link fields to point to the new path.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update_fm_links(
         &self,
         fm: &mut serde_yaml::Value,
@@ -487,8 +504,8 @@ impl Collection {
                 let target = inner.split('|').next().unwrap_or(inner).split('#').next().unwrap_or(inner).trim();
                 // Simple name (no path separators or extensions) that matches the
                 // renamed file's id_field value -> potentially id-stable
-                if !target.contains('/') && !target.contains('.') {
-                    if target == id.as_str() {
+                if !target.contains('/') && !target.contains('.')
+                    && target == id.as_str() {
                         // Only skip if the link field has a typed target constraint,
                         // meaning it resolves via id lookup rather than filename.
                         // Generic link fields (no target type) resolve by filename
@@ -497,7 +514,6 @@ impl Collection {
                             return true;
                         }
                     }
-                }
             }
         }
         false
@@ -545,6 +561,7 @@ impl Collection {
 
     /// Update body links (wikilinks and markdown links) to point to the new path.
     /// Returns true if any changes were made.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update_body_links(
         &self,
         body: &mut String,
@@ -614,6 +631,7 @@ impl Collection {
     }
 
     /// Replace link references in a single line (outside code blocks).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn replace_links_in_line(
         &self,
         line: &str,
@@ -698,8 +716,8 @@ impl Collection {
                             i += 1;
                         }
                         let href: String = chars[paren_start..i-1].iter().collect();
-                        if !href.starts_with("http://") && !href.starts_with("https://") {
-                            if self.link_resolves_to(&href, _from, from_stem, from_no_ext, source_dir) {
+                        if !href.starts_with("http://") && !href.starts_with("https://")
+                            && self.link_resolves_to(&href, _from, from_stem, from_no_ext, source_dir) {
                                 let text_part: String = chars[link_start..paren_start-1].iter().collect();
                                 let (_, anchor) = if let Some(hp) = href.find('#') {
                                     (&href[..hp], &href[hp..])
@@ -711,7 +729,6 @@ impl Collection {
                                 result.push(')');
                                 continue;
                             }
-                        }
                         for c in &chars[link_start..i] { result.push(*c); }
                         continue;
                     }
@@ -763,8 +780,8 @@ impl Collection {
                         i += 1;
                     }
                     let href: String = chars[paren_start..i-1].iter().collect();
-                    if !href.starts_with("http://") && !href.starts_with("https://") {
-                        if self.link_resolves_to(&href, _from, from_stem, from_no_ext, source_dir) {
+                    if !href.starts_with("http://") && !href.starts_with("https://")
+                        && self.link_resolves_to(&href, _from, from_stem, from_no_ext, source_dir) {
                             let text_part: String = chars[link_start..paren_start-1].iter().collect();
                             let (_, anchor) = if let Some(hp) = href.find('#') {
                                 (&href[..hp], &href[hp..])
@@ -776,7 +793,6 @@ impl Collection {
                             result.push(')');
                             continue;
                         }
-                    }
                     for c in &chars[link_start..i] { result.push(*c); }
                     continue;
                 }
@@ -792,8 +808,8 @@ impl Collection {
     }
 
     /// Rewrite the inner content of a wikilink (without the [[ ]] brackets).
-    pub(crate) fn rewrite_wikilink_inner(&self, inner: &str, from_stem: &str, to_stem: &str,
-                               from_no_ext: &str, to_no_ext: &str) -> String {
+    pub(crate) fn rewrite_wikilink_inner(&self, inner: &str, _from_stem: &str, to_stem: &str,
+                               _from_no_ext: &str, to_no_ext: &str) -> String {
         let (target_part, rest) = if let Some(pipe_pos) = inner.find('|') {
             (&inner[..pipe_pos], &inner[pipe_pos..])
         } else {

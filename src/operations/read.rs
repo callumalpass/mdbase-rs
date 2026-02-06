@@ -3,6 +3,7 @@
 use std::path::Path;
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, is_parse_error, yaml_mapping_to_json};
+use crate::operations::ensure_safe_relative_path;
 use crate::Collection;
 
 impl Collection {
@@ -12,6 +13,9 @@ impl Collection {
             Some(p) => p,
             None => return op_error(INVALID_PATH, "path is required"),
         };
+        if let Err(msg) = ensure_safe_relative_path(path) {
+            return op_error(INVALID_PATH, msg);
+        }
 
         // Check exclusions
         if self.is_excluded(path) || !self.is_valid_extension(path) {

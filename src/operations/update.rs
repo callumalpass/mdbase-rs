@@ -3,6 +3,7 @@
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::frontmatter::serializer;
+use crate::operations::ensure_safe_relative_path;
 use crate::Collection;
 
 impl Collection {
@@ -12,6 +13,9 @@ impl Collection {
             Some(p) => p,
             None => return op_error(INVALID_PATH, "path is required"),
         };
+        if let Err(msg) = ensure_safe_relative_path(path) {
+            return op_error(INVALID_PATH, msg);
+        }
 
         let fields = input.get("fields")
             .or_else(|| input.get("frontmatter"))
@@ -65,7 +69,7 @@ impl Collection {
             Some(o) => o.clone(),
             None => serde_json::Map::new(),
         };
-        self.apply_generated(&mut merged_obj, &type_names, false);
+        self.apply_generated(&mut merged_obj, &type_names, false, Some(path));
 
         // Apply defaults for effective frontmatter
         let effective = self.apply_defaults(&serde_json::Value::Object(merged_obj.clone()), &type_names);
@@ -103,8 +107,23 @@ impl Collection {
             }
         }
 
+        // Build frontmatter for writing (honor write_defaults/write_nulls)
+        let mut write_obj = merged_obj.clone();
+        if self.settings.write_defaults {
+            if let Some(eff_map) = effective.as_object() {
+                for (k, v) in eff_map {
+                    if !write_obj.contains_key(k) {
+                        write_obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        if self.settings.write_nulls == "omit" {
+            write_obj.retain(|_, v| !v.is_null());
+        }
+
         // Write file
-        let write_mapping = crate::frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(merged_obj));
+        let write_mapping = crate::frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
         let body = match new_body {
             Some(b) => b,
             None => &doc.body,

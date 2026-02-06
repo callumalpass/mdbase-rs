@@ -73,7 +73,7 @@ impl Collection {
                         if !obj.contains_key(field_name) {
                             // Field is missing — apply default
                             obj.insert(field_name.clone(), default.clone());
-                        } else if obj.get(field_name).map_or(false, |v| v.is_null()) && field_def.generated.is_some() {
+                        } else if obj.get(field_name).is_some_and(|v| v.is_null()) && field_def.generated.is_some() {
                             // Field is null AND was generated (e.g., derived with missing source)
                             // Apply default as effective value
                             obj.insert(field_name.clone(), default.clone());

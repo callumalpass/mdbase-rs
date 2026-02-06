@@ -939,7 +939,6 @@ fn validate_link(
                 line: None,
                 column: None,
             });
-            return;
         }
     } else if link_str.starts_with('[') {
         // Markdown link format: [text](url)
@@ -976,7 +975,6 @@ fn validate_link(
                     line: None,
                     column: None,
                 });
-                return;
             }
         }
     }

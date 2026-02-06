@@ -148,17 +148,6 @@ fn main() {
     let is_tty = atty_check();
     let pretty = cli.pretty || is_tty;
 
-    // Cache commands that don't need a full Collection
-    if let Command::Cache { action: CacheAction::Clear } = &cli.command {
-        let cache_dir = root.join(".mdbase");
-        let db_path = cache_dir.join("cache.db");
-        if db_path.exists() {
-            let _ = std::fs::remove_file(&db_path);
-        }
-        output_json(&serde_json::json!({ "success": true }), pretty);
-        process::exit(EXIT_SUCCESS);
-    }
-
     let collection = match mdbase::Collection::open(&root) {
         Ok(c) => c,
         Err(e) => {
@@ -233,7 +222,7 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             let input = serde_json::json!({
                 "from": from,
                 "to": to,
-                "update_references": update_refs,
+                "update_refs": update_refs,
             });
             let result = collection.rename(&input);
             let exit = if result.get("error").is_some() {

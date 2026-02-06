@@ -612,11 +612,10 @@ impl Collection {
                     if let Some(serde_yaml::Value::Mapping(m)) = &doc.frontmatter {
                         let json = yaml_mapping_to_json(m);
                         if let Some(id_val) = json.get(&self.settings.id_field).and_then(|v| v.as_str()) {
-                            if id_val == original {
-                                if !matches.iter().any(|m| *m == rel_path) {
+                            if id_val == original
+                                && !matches.contains(&rel_path) {
                                     matches.push(rel_path);
                                 }
-                            }
                         }
                     }
                 }

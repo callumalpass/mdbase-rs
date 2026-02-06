@@ -112,7 +112,7 @@ impl Collection {
                 if let Some(ref bl_index) = bl_index_for_skip {
                     // Check if any failed path lists this file as a source (backlink)
                     let has_dep = failed_paths.iter().any(|fp| {
-                        bl_index.get(fp).map_or(false, |sources| sources.contains(path))
+                        bl_index.get(fp).is_some_and(|sources| sources.contains(path))
                     });
                     if has_dep {
                         skipped += 1;
@@ -371,6 +371,7 @@ impl Collection {
     }
 
     /// Query matching file paths (reuses query logic but only returns paths).
+    #[allow(dead_code)]
     pub(crate) fn query_matching_paths(&self, where_clause: &serde_json::Value) -> Vec<String> {
         self.query_matching_paths_with_types(Some(where_clause), &[])
     }

@@ -7,7 +7,7 @@ use std::fs;
 pub fn init_collection(root: &Path, input: &serde_json::Value) -> serde_json::Value {
     // Determine types folder
     let mut types_folder = "_types".to_string();
-    let mut config_yaml = "spec_version: \"0.1.0\"\n".to_string();
+    let mut config_yaml = "spec_version: \"0.2.0\"\n".to_string();
 
     if let Some(config_input) = input.get("config") {
         if let Some(obj) = config_input.as_object() {
@@ -16,7 +16,7 @@ pub fn init_collection(root: &Path, input: &serde_json::Value) -> serde_json::Va
             if let Some(sv) = obj.get("spec_version").and_then(|v| v.as_str()) {
                 lines.push(format!("spec_version: \"{}\"", sv));
             } else {
-                lines.push("spec_version: \"0.1.0\"".to_string());
+                lines.push("spec_version: \"0.2.0\"".to_string());
             }
             if let Some(settings) = obj.get("settings").and_then(|v| v.as_object()) {
                 lines.push("settings:".to_string());

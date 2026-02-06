@@ -34,9 +34,12 @@ pub struct Settings {
     pub exclude: Vec<String>,
     pub include_subfolders: bool,
     pub types_folder: String,
+    pub migrations_folder: String,
     pub explicit_type_keys: Vec<String>,
+    pub write_defaults: bool,
     pub default_validation: String,
     pub default_strict: serde_json::Value,
+    pub timezone: Option<String>,
     pub id_field: String,
     pub id_field_explicit: bool,
     pub write_nulls: String,
@@ -52,9 +55,12 @@ impl Default for Settings {
             exclude: vec![".git".into(), "node_modules".into(), ".mdbase".into()],
             include_subfolders: true,
             types_folder: "_types".into(),
+            migrations_folder: "_types/_migrations".into(),
             explicit_type_keys: vec!["type".into(), "types".into()],
+            write_defaults: true,
             default_validation: "warn".into(),
             default_strict: serde_json::Value::Bool(false),
+            timezone: None,
             id_field: "id".into(),
             id_field_explicit: false,
             write_nulls: "omit".into(),
@@ -76,7 +82,7 @@ pub struct Collection {
 impl Collection {
     /// Open a collection from a root directory.
     pub fn open(root: &Path) -> Result<Self, serde_json::Value> {
-        let config_result = config::load_config(root);
+        let config_result = config::load_config_for_open(root);
         if config_result.get("valid") != Some(&serde_json::Value::Bool(true)) {
             return Err(config_result);
         }
@@ -95,12 +101,15 @@ impl Collection {
                 .unwrap_or_else(|| vec![".git".into(), "node_modules".into(), ".mdbase".into()]),
             include_subfolders: settings_json["include_subfolders"].as_bool().unwrap_or(true),
             types_folder: settings_json["types_folder"].as_str().unwrap_or("_types").to_string(),
+            migrations_folder: settings_json["migrations_folder"].as_str().unwrap_or("_types/_migrations").to_string(),
             explicit_type_keys: settings_json["explicit_type_keys"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_else(|| vec!["type".into(), "types".into()]),
+            write_defaults: settings_json["write_defaults"].as_bool().unwrap_or(true),
             default_validation: settings_json["default_validation"].as_str().unwrap_or("warn").to_string(),
             default_strict: settings_json["default_strict"].clone(),
+            timezone: settings_json["timezone"].as_str().map(|s| s.to_string()),
             id_field: settings_json["id_field"].as_str().unwrap_or("id").to_string(),
             id_field_explicit: settings_json["id_field_explicit"].as_bool().unwrap_or(false),
             write_nulls: settings_json["write_nulls"].as_str().unwrap_or("omit").to_string(),
@@ -110,7 +119,11 @@ impl Collection {
         };
 
         // Load types
-        let load_result = loader::load_types_with_warnings(root, &settings.types_folder)
+        let load_result = loader::load_types_with_warnings(
+            root,
+            &settings.types_folder,
+            &settings.migrations_folder,
+        )
             .map_err(|e| serde_json::json!({
                 "valid": false,
                 "error": { "code": "invalid_type_definition", "message": e }

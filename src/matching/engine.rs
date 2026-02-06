@@ -192,15 +192,16 @@ fn evaluate_field_condition(
                 }
             }
             "neq" => {
-                match field_value {
-                    Some(actual) => if values_equal(actual, expected) { return false; }
-                    None => {} // missing != anything is true
+                if let Some(actual) = field_value {
+                    if values_equal(actual, expected) {
+                        return false;
+                    }
                 }
             }
             "gt" => {
                 match field_value {
                     Some(actual) => {
-                        if compare_values(actual, expected).map_or(true, |ord| ord != std::cmp::Ordering::Greater) {
+                        if compare_values(actual, expected) != Some(std::cmp::Ordering::Greater) {
                             return false;
                         }
                     }
@@ -210,7 +211,7 @@ fn evaluate_field_condition(
             "gte" => {
                 match field_value {
                     Some(actual) => {
-                        if compare_values(actual, expected).map_or(true, |ord| ord == std::cmp::Ordering::Less) {
+                        if compare_values(actual, expected).is_none_or(|ord| ord == std::cmp::Ordering::Less) {
                             return false;
                         }
                     }
@@ -220,7 +221,7 @@ fn evaluate_field_condition(
             "lt" => {
                 match field_value {
                     Some(actual) => {
-                        if compare_values(actual, expected).map_or(true, |ord| ord != std::cmp::Ordering::Less) {
+                        if compare_values(actual, expected) != Some(std::cmp::Ordering::Less) {
                             return false;
                         }
                     }
@@ -230,7 +231,7 @@ fn evaluate_field_condition(
             "lte" => {
                 match field_value {
                     Some(actual) => {
-                        if compare_values(actual, expected).map_or(true, |ord| ord == std::cmp::Ordering::Greater) {
+                        if compare_values(actual, expected).is_none_or(|ord| ord == std::cmp::Ordering::Greater) {
                             return false;
                         }
                     }
@@ -239,7 +240,7 @@ fn evaluate_field_condition(
             }
             "exists" => {
                 let should_exist = expected.as_bool().unwrap_or(true);
-                let does_exist = field_value.map_or(false, |v| !v.is_null());
+                let does_exist = field_value.is_some_and(|v| !v.is_null());
                 if should_exist != does_exist {
                     return false;
                 }
@@ -390,6 +391,13 @@ impl Collection {
             return true;
         }
 
+        // Check migrations folder
+        if rel_path.starts_with(&format!("{}/", self.settings.migrations_folder))
+            || rel_path == self.settings.migrations_folder
+        {
+            return true;
+        }
+
         // Check default .mdbase even if custom cache_folder
         if self.settings.cache_folder != ".mdbase"
             && (rel_path.starts_with(".mdbase/") || rel_path == ".mdbase")
@@ -427,6 +435,7 @@ impl Collection {
     /// Check if a path is excluded by user-configured exclude patterns only.
     /// Unlike is_excluded, this does NOT exclude system folders (types, cache).
     /// Used by read operations which should be able to access type definition files.
+    #[allow(dead_code)]
     pub(crate) fn is_user_excluded(&self, rel_path: &str) -> bool {
         for pattern in &self.settings.exclude {
             if match_glob_pattern(pattern, rel_path) {
@@ -518,11 +527,10 @@ impl Collection {
         if let Some(path) = rel_path {
             for (type_name, type_def) in &self.types {
                 if let Some(ref rules) = type_def.match_rules {
-                    if matches_rules(rules, path, frontmatter) {
-                        if !types.contains(type_name) {
+                    if matches_rules(rules, path, frontmatter)
+                        && !types.contains(type_name) {
                             types.push(type_name.clone());
                         }
-                    }
                 }
             }
         }

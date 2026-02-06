@@ -24,7 +24,7 @@ impl Collection {
             visited.insert(name.clone());
             let mut to_check: Vec<String> = Vec::new();
             // Find formula references in this expression
-            for (other_name, _) in formulas {
+            for other_name in formulas.keys() {
                 if other_name != name && expr_str.contains(&format!("formula.{}", other_name)) {
                     to_check.push(other_name.clone());
                 }
@@ -36,7 +36,7 @@ impl Collection {
                     }));
                 }
                 if let Some(dep_expr) = formulas.get(&dep) {
-                    for (other_name, _) in formulas {
+                    for other_name in formulas.keys() {
                         if dep_expr.contains(&format!("formula.{}", other_name)) {
                             to_check.push(other_name.clone());
                         }
@@ -102,7 +102,7 @@ impl Collection {
                 Self::has_literal_div_by_zero(left) || Self::has_literal_div_by_zero(right)
             }
             Expr::Call(base, args) => {
-                Self::has_literal_div_by_zero(base) || args.iter().any(|a| Self::has_literal_div_by_zero(a))
+                Self::has_literal_div_by_zero(base) || args.iter().any(Self::has_literal_div_by_zero)
             }
             Expr::Conditional(cond, then, else_) => {
                 Self::has_literal_div_by_zero(cond) || Self::has_literal_div_by_zero(then) || Self::has_literal_div_by_zero(else_)
@@ -111,7 +111,7 @@ impl Collection {
             Expr::Index(left, right) => {
                 Self::has_literal_div_by_zero(left) || Self::has_literal_div_by_zero(right)
             }
-            Expr::Array(items) => items.iter().any(|i| Self::has_literal_div_by_zero(i)),
+            Expr::Array(items) => items.iter().any(Self::has_literal_div_by_zero),
             _ => false,
         }
     }
@@ -122,7 +122,7 @@ impl Collection {
         let mut deps: HashMap<String, Vec<String>> = HashMap::new();
         for (name, expr) in formulas {
             let mut name_deps = Vec::new();
-            for (other, _) in formulas {
+            for other in formulas.keys() {
                 if other != name && expr.contains(&format!("formula.{}", other)) {
                     name_deps.push(other.clone());
                 }

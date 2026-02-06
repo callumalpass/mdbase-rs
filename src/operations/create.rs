@@ -52,7 +52,7 @@ impl Collection {
         }
 
         // Generate values before path derivation so path_pattern can use them
-        self.apply_generated(&mut fm_obj, &type_names, true);
+        self.apply_generated(&mut fm_obj, &type_names, true, path_input);
 
         // Apply defaults to a temporary copy for path derivation
         let fm_with_defaults = self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
@@ -167,8 +167,23 @@ impl Collection {
             }
         }
 
+        // Build frontmatter for writing (honor write_defaults/write_nulls)
+        let mut write_obj = fm_obj.clone();
+        if self.settings.write_defaults {
+            if let Some(eff_map) = effective.as_object() {
+                for (k, v) in eff_map {
+                    if !write_obj.contains_key(k) {
+                        write_obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        if self.settings.write_nulls == "omit" {
+            write_obj.retain(|_, v| !v.is_null());
+        }
+
         // Write file
-        let yaml_mapping = frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(fm_obj));
+        let yaml_mapping = frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
         let content = serializer::serialize_document(&yaml_mapping, body);
 
         if let Some(parent) = full_path.parent() {

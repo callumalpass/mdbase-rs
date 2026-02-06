@@ -59,12 +59,10 @@ pub(crate) fn find_deleted(conn: &Connection, root: &Path) -> Vec<String> {
     };
 
     let mut deleted = Vec::new();
-    for row in rows {
-        if let Ok(rel_path) = row {
-            let abs = root.join(&rel_path);
-            if !abs.exists() {
-                deleted.push(rel_path);
-            }
+    for rel_path in rows.flatten() {
+        let abs = root.join(&rel_path);
+        if !abs.exists() {
+            deleted.push(rel_path);
         }
     }
     deleted

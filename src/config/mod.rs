@@ -8,6 +8,15 @@ use std::path::Path;
 /// - `{ "valid": true, "config": {...}, "warnings": [...] }` on success
 /// - `{ "valid": false, "error": { "code": "...", "message": "..." } }` on failure
 pub fn load_config(collection_root: &Path) -> serde_json::Value {
+    load_config_internal(collection_root, false)
+}
+
+/// Load config for collection opening, allowing forward-minor versions.
+pub(crate) fn load_config_for_open(collection_root: &Path) -> serde_json::Value {
+    load_config_internal(collection_root, true)
+}
+
+fn load_config_internal(collection_root: &Path, allow_future_minor: bool) -> serde_json::Value {
     let config_path = collection_root.join("mdbase.yaml");
 
     if !config_path.exists() {
@@ -34,24 +43,24 @@ pub fn load_config(collection_root: &Path) -> serde_json::Value {
     let mut warnings = Vec::new();
 
     // spec_version (required)
-    let spec_version_raw = match map.get(&ykey("spec_version")) {
+    let spec_version_raw = match map.get(ykey("spec_version")) {
         Some(serde_yaml::Value::String(v)) => v.clone(),
         Some(_) => return error_json("invalid_config", "spec_version must be a string"),
         None => return error_json("invalid_config", "spec_version is required"),
     };
 
-    let spec_version = match validate_version(&spec_version_raw, &mut warnings) {
+    let spec_version = match validate_version(&spec_version_raw, &mut warnings, allow_future_minor) {
         Ok(v) => v,
         Err(e) => return e,
     };
 
     // Optional top-level fields
     let name = map
-        .get(&ykey("name"))
+        .get(ykey("name"))
         .and_then(|v| v.as_str())
         .map(String::from);
     let description = map
-        .get(&ykey("description"))
+        .get(ykey("description"))
         .and_then(|v| v.as_str())
         .map(String::from);
 
@@ -114,7 +123,7 @@ fn get_setting<'a>(
     map: Option<&'a serde_yaml::Mapping>,
     key: &str,
 ) -> Option<&'a serde_yaml::Value> {
-    map.and_then(|m| m.get(&ykey(key)))
+    map.and_then(|m| m.get(ykey(key)))
 }
 
 /// Look for a setting first under settings, then at the top level.
@@ -123,12 +132,13 @@ fn get_setting_or_top<'a>(
     top_map: &'a serde_yaml::Mapping,
     key: &str,
 ) -> Option<&'a serde_yaml::Value> {
-    get_setting(settings_map, key).or_else(|| top_map.get(&ykey(key)))
+    get_setting(settings_map, key).or_else(|| top_map.get(ykey(key)))
 }
 
 fn validate_version(
     version: &str,
     warnings: &mut Vec<String>,
+    allow_future_minor: bool,
 ) -> Result<String, serde_json::Value> {
     let parts: Vec<&str> = version.split('.').collect();
 
@@ -161,14 +171,30 @@ fn validate_version(
         _ => return Err(error_json("invalid_config", "Invalid spec_version format")),
     };
 
-    if major != 0 || minor != 1 {
+    let supported_major = 0u32;
+    let supported_minor = 2u32;
+
+    if major != supported_major {
         return Err(error_json(
             "unsupported_version",
             &format!(
-                "Unsupported spec version: {}. This implementation supports 0.1.x",
+                "Unsupported spec version: {}. This implementation supports 0.2.x",
                 version
             ),
         ));
+    }
+    if minor != supported_minor {
+        if allow_future_minor && minor > supported_minor {
+            // Allow forward minor versions when opening a collection
+        } else {
+            return Err(error_json(
+                "unsupported_version",
+                &format!(
+                    "Unsupported spec version: {}. This implementation supports 0.2.x",
+                    version
+                ),
+            ));
+        }
     }
 
     Ok(format!("{}.{}.{}", major, minor, patch))
@@ -178,7 +204,7 @@ fn parse_settings(
     top_map: &serde_yaml::Mapping,
     warnings: &mut Vec<String>,
 ) -> Result<serde_json::Value, serde_json::Value> {
-    let settings_map = match top_map.get(&ykey("settings")) {
+    let settings_map = match top_map.get(ykey("settings")) {
         Some(serde_yaml::Value::Mapping(m)) => Some(m),
         Some(serde_yaml::Value::Null) | None => None,
         Some(_) => return Err(error_json("invalid_config", "settings must be a mapping")),
@@ -268,6 +294,18 @@ fn parse_settings(
         }
     };
 
+    // migrations_folder
+    let migrations_folder = match get_setting(settings_map, "migrations_folder") {
+        Some(serde_yaml::Value::String(s)) => s.clone(),
+        Some(serde_yaml::Value::Null) | None => format!("{}/_migrations", types_folder),
+        Some(_) => {
+            return Err(error_json(
+                "invalid_config",
+                "settings.migrations_folder must be a string",
+            ))
+        }
+    };
+
     // explicit_type_keys
     let explicit_type_keys = match get_setting(settings_map, "explicit_type_keys") {
         Some(serde_yaml::Value::Sequence(seq)) => seq
@@ -281,6 +319,18 @@ fn parse_settings(
             return Err(error_json(
                 "invalid_config",
                 "settings.explicit_type_keys must be a list",
+            ))
+        }
+    };
+
+    // write_defaults
+    let write_defaults = match get_setting(settings_map, "write_defaults") {
+        Some(serde_yaml::Value::Bool(b)) => *b,
+        Some(serde_yaml::Value::Null) | None => true,
+        Some(_) => {
+            return Err(error_json(
+                "invalid_config",
+                "settings.write_defaults must be a boolean",
             ))
         }
     };
@@ -319,6 +369,18 @@ fn parse_settings(
             return Err(error_json(
                 "invalid_config",
                 "settings.default_strict must be a boolean or 'warn'",
+            ))
+        }
+    };
+
+    // timezone
+    let timezone = match get_setting(settings_map, "timezone") {
+        Some(serde_yaml::Value::String(s)) => Some(s.clone()),
+        Some(serde_yaml::Value::Null) | None => None,
+        Some(_) => {
+            return Err(error_json(
+                "invalid_config",
+                "settings.timezone must be a string",
             ))
         }
     };
@@ -402,9 +464,12 @@ fn parse_settings(
             "exclude",
             "include_subfolders",
             "types_folder",
+            "migrations_folder",
             "explicit_type_keys",
+            "write_defaults",
             "default_validation",
             "default_strict",
+            "timezone",
             "id_field",
             "write_nulls",
             "write_empty_lists",
@@ -426,8 +491,11 @@ fn parse_settings(
         "include_subfolders": include_subfolders,
         "types_folder": types_folder,
         "explicit_type_keys": explicit_type_keys,
+        "migrations_folder": migrations_folder,
+        "write_defaults": write_defaults,
         "default_validation": default_validation,
         "default_strict": default_strict,
+        "timezone": timezone,
         "id_field": id_field,
         "id_field_explicit": id_field_explicit,
         "write_nulls": write_nulls,

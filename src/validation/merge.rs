@@ -118,15 +118,14 @@ fn check_field_conflicts(
     let generated: Vec<&GeneratedStrategy> = defs.iter()
         .filter_map(|(_, fd)| fd.generated.as_ref())
         .collect();
-    if generated.len() >= 2 {
-        if !all_generated_same(&generated) {
+    if generated.len() >= 2
+        && !all_generated_same(&generated) {
             issues.push(type_conflict_issue(
                 field_name,
                 path,
                 &format!("Conflicting generated strategies for field '{}'", field_name),
             ));
         }
-    }
 
     // 8. Check conflicting link targets
     let targets: Vec<&String> = defs.iter()

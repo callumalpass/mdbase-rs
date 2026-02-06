@@ -44,7 +44,7 @@ pub(crate) fn is_truthy_value(val: &serde_json::Value) -> bool {
     match val {
         serde_json::Value::Null => false,
         serde_json::Value::Bool(b) => *b,
-        serde_json::Value::Number(n) => n.as_f64().map_or(false, |f| f != 0.0),
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
         serde_json::Value::String(s) => !s.is_empty(),
         serde_json::Value::Array(a) => !a.is_empty(),
         serde_json::Value::Object(_) => true,

@@ -20,9 +20,6 @@ impl EvalError {
     fn wrong_argument_count(msg: &str) -> Self {
         EvalError { code: "wrong_argument_count".to_string(), message: msg.to_string() }
     }
-    fn division_by_zero() -> Self {
-        EvalError { code: "division_by_zero".to_string(), message: "Division by zero".to_string() }
-    }
     fn unknown_function(msg: &str) -> Self {
         EvalError { code: "unknown_function".to_string(), message: msg.to_string() }
     }
@@ -418,7 +415,7 @@ fn eval_file_method(method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Va
             // Check raw frontmatter (pre-defaults) if available, otherwise effective
             let fm = ctx.raw_frontmatter.as_ref().unwrap_or(&ctx.frontmatter);
             let has = fm.as_object()
-                .map_or(false, |m| m.contains_key(prop_str));
+                .is_some_and(|m| m.contains_key(prop_str));
             Ok(Value::Bool(has))
         }
         "inFolder" => {
@@ -772,8 +769,7 @@ fn eval_call(func_expr: &Expr, args: &[Expr], ctx: &EvalContext) -> Result<Value
     // Free function calls: func(args)
     if let Expr::Ident(name) = func_expr {
         // Handle ext::name() calls
-        if name.starts_with("ext::") {
-            let func_name = &name[5..];
+        if let Some(func_name) = name.strip_prefix("ext::") {
             if func_name.is_empty() {
                 return Err(EvalError::invalid_expression("ext:: with no function name"));
             }
@@ -794,7 +790,7 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
             // exists() checks if a field exists in frontmatter (even if null)
             if let Expr::Ident(ref field) = args[0] {
                 let has = ctx.frontmatter.as_object()
-                    .map_or(false, |m| m.contains_key(field));
+                    .is_some_and(|m| m.contains_key(field));
                 Ok(Value::Bool(has))
             } else {
                 let val = evaluate(&args[0], ctx)?;
@@ -1265,7 +1261,7 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
             Ok(Value::Bool(arr.iter().any(|item| values_equal(item, &needle))))
         }
         "join" => {
-            let sep = if args.len() > 0 {
+            let sep = if !args.is_empty() {
                 evaluate(&args[0], ctx)?.as_str().unwrap_or(",").to_string()
             } else {
                 ",".to_string()
@@ -1369,13 +1365,10 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
                     types: ctx.types.clone(),
                     string_concat: ctx.string_concat,
                 };
-                match evaluate(&args[0], &item_ctx) {
-                    Ok(val) => {
-                        if is_truthy(&val) {
-                            result.push(item.clone());
-                        }
+                if let Ok(val) = evaluate(&args[0], &item_ctx) {
+                    if is_truthy(&val) {
+                        result.push(item.clone());
                     }
-                    Err(_) => {} // Skip items that error
                 }
             }
             Ok(Value::Array(result))
@@ -1480,7 +1473,7 @@ fn is_truthy(val: &Value) -> bool {
     match val {
         Value::Null => false,
         Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map_or(false, |f| f != 0.0),
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
         Value::String(s) => !s.is_empty(),
         Value::Array(a) => !a.is_empty(),
         Value::Object(_) => true,
@@ -1513,7 +1506,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         }
         // Cross-type numeric equality
         (Value::Number(_), Value::String(s)) | (Value::String(s), Value::Number(_)) => {
-            if let Some(n) = s.parse::<f64>().ok() {
+            if let Ok(n) = s.parse::<f64>() {
                 let other = if a.is_number() { a.as_f64().unwrap_or(f64::NAN) } else { b.as_f64().unwrap_or(f64::NAN) };
                 n == other
             } else {
@@ -1547,8 +1540,7 @@ fn parse_datetime_for_compare(s: &str) -> Option<i64> {
         return Some(dt.timestamp_millis());
     }
     // Try ISO 8601 with Z suffix
-    if s.ends_with('Z') {
-        let without_z = &s[..s.len()-1];
+    if let Some(without_z) = s.strip_suffix('Z') {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(without_z, "%Y-%m-%dT%H:%M:%S") {
             return Some(dt.and_utc().timestamp_millis());
         }

@@ -24,6 +24,12 @@ pub(crate) struct FileRecord {
     pub file_ctime_iso: Option<String>,
 }
 
+type QueryData = (
+    Vec<FileRecord>,
+    Arc<Vec<ResolvedFileData>>,
+    Arc<HashMap<String, Vec<String>>>,
+);
+
 /// Convert nanoseconds-since-epoch to ISO 8601 string.
 fn ns_to_iso(ns: i64) -> String {
     use chrono::{TimeZone, Utc};
@@ -155,10 +161,8 @@ impl Collection {
             Ok(r) => r,
             Err(_) => return map,
         };
-        for row in rows {
-            if let Ok((path, type_name)) = row {
-                map.entry(path).or_default().push(type_name);
-            }
+        for (path, type_name) in rows.flatten() {
+            map.entry(path).or_default().push(type_name);
         }
         map
     }
@@ -222,7 +226,7 @@ impl Collection {
     /// Returns (file_records, all_files_data arc, backlinks_index arc).
     pub(crate) fn load_query_data(
         &self,
-    ) -> (Vec<FileRecord>, Arc<Vec<ResolvedFileData>>, Arc<HashMap<String, Vec<String>>>) {
+    ) -> QueryData {
         let file_records = if let Some(conn) = self.try_open_cache() {
             self.refresh_cache(&conn);
             self.load_file_records_from_cache(&conn)

@@ -109,7 +109,7 @@ pub fn validate_frontmatter_full_multi(
 
         for key in obj.keys() {
             // In multi-type mode, a field known in any type is not unknown
-            let in_union = union_fields.map_or(false, |uf| uf.contains(key));
+            let in_union = union_fields.is_some_and(|uf| uf.contains(key));
             if !type_def.fields.contains_key(key) && !implicit_keys.iter().any(|k| k == key) && !in_union {
                 let severity = if *strict == StrictMode::Error {
                     Severity::Error

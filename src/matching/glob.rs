@@ -2,8 +2,7 @@
 
 /// Simple glob pattern matcher for exclude patterns.
 pub(crate) fn match_glob_pattern(pattern: &str, path: &str) -> bool {
-    if pattern.ends_with("/**") {
-        let prefix = &pattern[..pattern.len() - 3];
+    if let Some(prefix) = pattern.strip_suffix("/**") {
         return path.starts_with(&format!("{}/", prefix)) || path == prefix;
     }
 

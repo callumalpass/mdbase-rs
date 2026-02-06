@@ -78,10 +78,10 @@ pub fn parse_document(content: &str) -> ParsedDocument {
     // Skip the newline after closing ---
     let body = if body_start < content.len() {
         let b = &content[body_start..];
-        if b.starts_with('\n') {
-            b[1..].to_string()
-        } else if b.starts_with("\r\n") {
-            b[2..].to_string()
+        if let Some(stripped) = b.strip_prefix('\n') {
+            stripped.to_string()
+        } else if let Some(stripped) = b.strip_prefix("\r\n") {
+            stripped.to_string()
         } else {
             b.to_string()
         }

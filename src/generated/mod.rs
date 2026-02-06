@@ -95,6 +95,7 @@ impl Collection {
         frontmatter: &mut serde_json::Map<String, serde_json::Value>,
         type_names: &[String],
         is_create: bool,
+        file_path: Option<&str>,
     ) {
         // Collect all generated fields across all matching types
         let mut generated_fields: Vec<(String, GeneratedStrategy)> = Vec::new();
@@ -138,18 +139,19 @@ impl Collection {
             };
 
             if should_generate {
-                let value = self.generate_value(strategy, field_name, type_names, frontmatter);
+                let value = self.generate_value(strategy, field_name, type_names, frontmatter, file_path);
                 frontmatter.insert(field_name.clone(), value);
             }
         }
     }
 
-    fn generate_value(
+    pub(crate) fn generate_value(
         &self,
         strategy: &GeneratedStrategy,
         field_name: &str,
         type_names: &[String],
         frontmatter: &serde_json::Map<String, serde_json::Value>,
+        file_path: Option<&str>,
     ) -> serde_json::Value {
         match strategy {
             GeneratedStrategy::Ulid => {
@@ -186,7 +188,37 @@ impl Collection {
                 serde_json::Value::String(s)
             }
             GeneratedStrategy::Derived { from, transform } => {
-                if let Some(source) = frontmatter.get(from) {
+                if from.starts_with("file.") {
+                    let value = match file_path {
+                        Some(path) => {
+                            let p = std::path::Path::new(path);
+                            match from.as_str() {
+                                "file.name" => p.file_name()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| serde_json::Value::String(s.to_string())),
+                                "file.basename" => p.file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| serde_json::Value::String(s.to_string())),
+                                "file.ext" => p.extension()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| serde_json::Value::String(s.to_string())),
+                                "file.path" => Some(serde_json::Value::String(path.to_string())),
+                                "file.folder" => {
+                                    let folder = p.parent()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("");
+                                    Some(serde_json::Value::String(folder.to_string()))
+                                }
+                                _ => None,
+                            }
+                        }
+                        None => None,
+                    };
+                    match value {
+                        Some(v) => apply_transform(&v, transform),
+                        None => serde_json::Value::Null,
+                    }
+                } else if let Some(source) = frontmatter.get(from) {
                     if source.is_null() {
                         serde_json::Value::Null
                     } else {
