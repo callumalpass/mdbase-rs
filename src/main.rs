@@ -21,6 +21,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Initialize a new collection
+    Init {
+        /// Config YAML string to write into mdbase.yaml
+        #[arg(long, conflicts_with = "config_file")]
+        config: Option<String>,
+
+        /// Path to a config YAML file
+        #[arg(long, conflicts_with = "config")]
+        config_file: Option<String>,
+    },
+
     /// Read file metadata and frontmatter
     Read {
         /// File path (relative to collection root)
@@ -112,6 +123,48 @@ enum Command {
         path: Option<String>,
     },
 
+    /// Backfill missing defaults/generated values
+    Backfill {
+        /// Restrict backfill to a type
+        #[arg(long = "type")]
+        file_type: Option<String>,
+
+        /// Filter expression for matching files
+        #[arg(long = "where")]
+        where_clause: Option<String>,
+
+        /// Comma-separated fields to backfill
+        #[arg(long)]
+        fields: Option<String>,
+
+        /// Dry run only (do not write files)
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Apply default values
+        #[arg(long)]
+        apply_defaults: Option<bool>,
+
+        /// Apply generated values
+        #[arg(long)]
+        apply_generated: Option<bool>,
+    },
+
+    /// Run a migration manifest
+    Migrate {
+        /// Migration id to resolve from migrations folder
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Explicit migration manifest path
+        #[arg(long)]
+        path: Option<String>,
+
+        /// Dry run only
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Cache management
     Cache {
         #[command(subcommand)]
@@ -148,6 +201,40 @@ fn main() {
     let is_tty = atty_check();
     let pretty = cli.pretty || is_tty;
 
+    if let Command::Init { config, config_file } = cli.command {
+        let config_value = match (config, config_file) {
+            (Some(c), None) => Some(c),
+            (None, Some(path)) => match std::fs::read_to_string(&path) {
+                Ok(content) => Some(content),
+                Err(e) => {
+                    let err = serde_json::json!({
+                        "error": {
+                            "code": "invalid_path",
+                            "message": format!("Failed to read --config-file '{}': {}", path, e),
+                        }
+                    });
+                    output_json(&err, pretty);
+                    process::exit(EXIT_GENERAL_ERROR);
+                }
+            },
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!(),
+        };
+
+        let mut input = serde_json::Map::new();
+        if let Some(cfg) = config_value {
+            input.insert("config".to_string(), serde_json::Value::String(cfg));
+        }
+        let result = mdbase::init::init_collection(&root, &serde_json::Value::Object(input));
+        let exit_code = if result.get("error").is_some() {
+            error_to_exit_code(&result)
+        } else {
+            EXIT_SUCCESS
+        };
+        output_json(&result, pretty);
+        process::exit(exit_code);
+    }
+
     let collection = match mdbase::Collection::open(&root) {
         Ok(c) => c,
         Err(e) => {
@@ -163,6 +250,16 @@ fn main() {
 
 fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_json::Value, i32) {
     match command {
+        Command::Init { .. } => {
+            let result = serde_json::json!({
+                "error": {
+                    "code": "invalid_request",
+                    "message": "init must be executed before collection open"
+                }
+            });
+            (result, EXIT_GENERAL_ERROR)
+        }
+
         Command::Read { path } => {
             let input = serde_json::json!({ "path": path });
             let result = collection.read(&input);
@@ -292,6 +389,73 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
                 error_to_exit_code(&result)
             } else if result.get("valid") == Some(&serde_json::Value::Bool(false)) {
                 EXIT_VALIDATION_ERROR
+            } else {
+                EXIT_SUCCESS
+            };
+            (result, exit)
+        }
+
+        Command::Backfill {
+            file_type,
+            where_clause,
+            fields,
+            dry_run,
+            apply_defaults,
+            apply_generated,
+        } => {
+            let mut input = serde_json::Map::new();
+            if let Some(t) = file_type {
+                input.insert("type".to_string(), serde_json::Value::String(t));
+            }
+            if let Some(w) = where_clause {
+                input.insert("where".to_string(), serde_json::Value::String(w));
+            }
+            if let Some(f) = fields {
+                let field_list: Vec<serde_json::Value> = f
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| serde_json::Value::String(s.to_string()))
+                    .collect();
+                input.insert("fields".to_string(), serde_json::Value::Array(field_list));
+            }
+            if dry_run {
+                input.insert("dry_run".to_string(), serde_json::Value::Bool(true));
+            }
+            if apply_defaults.is_some() || apply_generated.is_some() {
+                let mut apply = serde_json::Map::new();
+                if let Some(v) = apply_defaults {
+                    apply.insert("defaults".to_string(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = apply_generated {
+                    apply.insert("generated".to_string(), serde_json::Value::Bool(v));
+                }
+                input.insert("apply".to_string(), serde_json::Value::Object(apply));
+            }
+
+            let result = collection.backfill(&serde_json::Value::Object(input));
+            let exit = if result.get("error").is_some() {
+                error_to_exit_code(&result)
+            } else {
+                EXIT_SUCCESS
+            };
+            (result, exit)
+        }
+
+        Command::Migrate { id, path, dry_run } => {
+            let mut input = serde_json::Map::new();
+            if let Some(v) = id {
+                input.insert("id".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = path {
+                input.insert("path".to_string(), serde_json::Value::String(v));
+            }
+            if dry_run {
+                input.insert("dry_run".to_string(), serde_json::Value::Bool(true));
+            }
+            let result = collection.migrate(&serde_json::Value::Object(input));
+            let exit = if result.get("error").is_some() {
+                error_to_exit_code(&result)
             } else {
                 EXIT_SUCCESS
             };

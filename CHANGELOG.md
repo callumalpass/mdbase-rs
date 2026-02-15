@@ -22,4 +22,4 @@ All notable changes to this project are documented in this file.
 
 ### Tests
 - Conformance runner supports `backfill` and `migrate` operations.
-- v0.2.0 conformance suite now passes at Level 6 (1794/1794).
+- v0.2.0 conformance suite passes at Level 6 in the latest full run.
