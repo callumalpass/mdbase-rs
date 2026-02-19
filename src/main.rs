@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process;
 
@@ -194,14 +195,18 @@ const EXIT_PERMISSION_DENIED: i32 = 5;
 fn main() {
     let cli = Cli::parse();
 
-    let root = cli.root.unwrap_or_else(|| {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    });
+    let root = cli
+        .root
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     let is_tty = atty_check();
     let pretty = cli.pretty || is_tty;
 
-    if let Command::Init { config, config_file } = cli.command {
+    if let Command::Init {
+        config,
+        config_file,
+    } = cli.command
+    {
         let config_value = match (config, config_file) {
             (Some(c), None) => Some(c),
             (None, Some(path)) => match std::fs::read_to_string(&path) {
@@ -271,7 +276,11 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             (result, exit)
         }
 
-        Command::Create { path, file_type, fields } => {
+        Command::Create {
+            path,
+            file_type,
+            fields,
+        } => {
             let fields_value = parse_fields_or_stdin(fields.as_deref());
             let mut input = serde_json::json!({ "fields": fields_value });
             if let Some(p) = path {
@@ -301,7 +310,10 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             (result, exit)
         }
 
-        Command::Delete { path, check_backlinks } => {
+        Command::Delete {
+            path,
+            check_backlinks,
+        } => {
             let mut input = serde_json::json!({ "path": path });
             if check_backlinks {
                 input["check_backlinks"] = serde_json::Value::Bool(true);
@@ -315,7 +327,11 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             (result, exit)
         }
 
-        Command::Rename { from, to, update_refs } => {
+        Command::Rename {
+            from,
+            to,
+            update_refs,
+        } => {
             let input = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -330,11 +346,20 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             (result, exit)
         }
 
-        Command::Query { types, where_clause, folder, order_by, limit, offset, include_body } => {
+        Command::Query {
+            types,
+            where_clause,
+            folder,
+            order_by,
+            limit,
+            offset,
+            include_body,
+        } => {
             let mut query = serde_json::Map::new();
 
             if let Some(t) = types {
-                let type_list: Vec<serde_json::Value> = t.split(',')
+                let type_list: Vec<serde_json::Value> = t
+                    .split(',')
                     .map(|s| serde_json::Value::String(s.trim().to_string()))
                     .collect();
                 query.insert("types".to_string(), serde_json::Value::Array(type_list));
@@ -346,7 +371,8 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
                 query.insert("folder".to_string(), serde_json::Value::String(f));
             }
             if let Some(ob) = order_by {
-                let order_list: Vec<serde_json::Value> = ob.split(',')
+                let order_list: Vec<serde_json::Value> = ob
+                    .split(',')
                     .map(|s| {
                         let s = s.trim();
                         if let Some(field) = s.strip_prefix('-') {
@@ -492,7 +518,9 @@ fn parse_fields_or_stdin(fields_arg: Option<&str>) -> serde_json::Value {
         // Try reading from stdin if not a TTY
         if !atty_check_stdin() {
             let mut input = String::new();
-            if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_ok() && !input.trim().is_empty() {
+            if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_ok()
+                && !input.trim().is_empty()
+            {
                 return serde_json::from_str(&input).unwrap_or_else(|e| {
                     eprintln!("Error parsing stdin JSON: {}", e);
                     process::exit(EXIT_GENERAL_ERROR);
@@ -505,15 +533,19 @@ fn parse_fields_or_stdin(fields_arg: Option<&str>) -> serde_json::Value {
 
 /// Map error codes to exit codes.
 fn error_to_exit_code(result: &serde_json::Value) -> i32 {
-    let code = result.pointer("/error/code")
+    let code = result
+        .pointer("/error/code")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
     match code {
         "file_not_found" | "not_found" => EXIT_NOT_FOUND,
         "validation_failed" => EXIT_VALIDATION_ERROR,
-        "invalid_config" | "config_error" | "invalid_type_definition"
-            | "circular_inheritance" | "missing_parent_type" => EXIT_CONFIG_ERROR,
+        "invalid_config"
+        | "config_error"
+        | "invalid_type_definition"
+        | "circular_inheritance"
+        | "missing_parent_type" => EXIT_CONFIG_ERROR,
         _ => EXIT_GENERAL_ERROR,
     }
 }
@@ -537,15 +569,10 @@ fn output_json_stderr(value: &serde_json::Value) {
 
 /// Check if stdout is a TTY.
 fn atty_check() -> bool {
-    unsafe { libc_isatty(1) != 0 }
+    std::io::stdout().is_terminal()
 }
 
 /// Check if stdin is a TTY.
 fn atty_check_stdin() -> bool {
-    unsafe { libc_isatty(0) != 0 }
-}
-
-extern "C" {
-    #[link_name = "isatty"]
-    fn libc_isatty(fd: i32) -> i32;
+    std::io::stdin().is_terminal()
 }
