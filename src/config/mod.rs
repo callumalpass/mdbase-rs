@@ -25,9 +25,7 @@ fn load_config_internal(collection_root: &Path, allow_future_minor: bool) -> ser
 
     let content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
-        Err(e) => {
-            return error_json("invalid_config", &format!("Failed to read config: {}", e))
-        }
+        Err(e) => return error_json("invalid_config", &format!("Failed to read config: {}", e)),
     };
 
     let yaml: serde_yaml::Value = match serde_yaml::from_str(&content) {
@@ -49,7 +47,8 @@ fn load_config_internal(collection_root: &Path, allow_future_minor: bool) -> ser
         None => return error_json("invalid_config", "spec_version is required"),
     };
 
-    let spec_version = match validate_version(&spec_version_raw, &mut warnings, allow_future_minor) {
+    let spec_version = match validate_version(&spec_version_raw, &mut warnings, allow_future_minor)
+    {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -141,8 +140,11 @@ fn validate_version(
     allow_future_minor: bool,
 ) -> Result<String, serde_json::Value> {
     let parts: Vec<&str> = version.split('.').collect();
+    let supported_major = 0u32;
+    let supported_minor = 2u32;
+    let supported_patch = 1u32;
 
-    let (major, minor, patch) = match parts.len() {
+    let (major, minor, mut patch) = match parts.len() {
         2 => {
             let major = parts[0]
                 .parse::<u32>()
@@ -151,8 +153,8 @@ fn validate_version(
                 .parse::<u32>()
                 .map_err(|_| error_json("invalid_config", "Invalid spec_version format"))?;
             warnings.push(format!(
-                "spec_version '{}' interpreted as '{}.0'",
-                version, version
+                "spec_version '{}' interpreted as major.minor alias",
+                version
             ));
             (major, minor, 0u32)
         }
@@ -170,9 +172,6 @@ fn validate_version(
         }
         _ => return Err(error_json("invalid_config", "Invalid spec_version format")),
     };
-
-    let supported_major = 0u32;
-    let supported_minor = 2u32;
 
     if major != supported_major {
         return Err(error_json(
@@ -195,6 +194,11 @@ fn validate_version(
                 ),
             ));
         }
+    }
+
+    // Canonicalize 0.2 alias to the current default patch release.
+    if parts.len() == 2 && major == supported_major && minor == supported_minor {
+        patch = supported_patch;
     }
 
     Ok(format!("{}.{}.{}", major, minor, patch))
@@ -386,7 +390,10 @@ fn parse_settings(
     };
 
     // id_field
-    let id_field_explicit = matches!(get_setting(settings_map, "id_field"), Some(serde_yaml::Value::String(_)));
+    let id_field_explicit = matches!(
+        get_setting(settings_map, "id_field"),
+        Some(serde_yaml::Value::String(_))
+    );
     let id_field = match get_setting(settings_map, "id_field") {
         Some(serde_yaml::Value::String(s)) => s.clone(),
         Some(serde_yaml::Value::Null) | None => "id".to_string(),
