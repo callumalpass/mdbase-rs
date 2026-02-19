@@ -1,22 +1,22 @@
 //! Create operation (§12.1).
 
+use crate::api::operations::{CreateInput, CreateOutput};
 use crate::errors::*;
 use crate::frontmatter;
 use crate::frontmatter::serializer;
 use crate::generated::derive_path;
 use crate::matching::engine::matches_rules;
+use crate::operations::ensure_safe_relative_path;
 use crate::Collection;
 
 impl Collection {
     /// Create a file (§12.1).
     pub fn create(&self, input: &serde_json::Value) -> serde_json::Value {
-        let type_name = input.get("type").and_then(|v| v.as_str());
-        let frontmatter_input = input.get("frontmatter")
-            .or_else(|| input.get("fields"))
-            .cloned()
-            .unwrap_or(serde_json::json!({}));
-        let body = input.get("body").and_then(|v| v.as_str()).unwrap_or("");
-        let path_input = input.get("path").and_then(|v| v.as_str());
+        let input = CreateInput::parse(input);
+        let type_name = input.type_name.as_deref();
+        let frontmatter_input = input.frontmatter;
+        let body = input.body.as_str();
+        let path_input = input.path.as_deref();
 
         // Determine type names
         let mut type_names: Vec<String> = Vec::new();
@@ -47,7 +47,10 @@ impl Collection {
                 && !fm_obj.contains_key("type")
                 && !fm_obj.contains_key("types")
             {
-                fm_obj.insert("type".to_string(), serde_json::Value::String(tn.to_string()));
+                fm_obj.insert(
+                    "type".to_string(),
+                    serde_json::Value::String(tn.to_string()),
+                );
             }
         }
 
@@ -55,7 +58,8 @@ impl Collection {
         self.apply_generated(&mut fm_obj, &type_names, true, path_input);
 
         // Apply defaults to a temporary copy for path derivation
-        let fm_with_defaults = self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
+        let fm_with_defaults =
+            self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
 
         // Determine path
         let path = match path_input {
@@ -64,13 +68,8 @@ impl Collection {
                 if p.is_empty() {
                     return op_error(PATH_REQUIRED, "path must not be empty");
                 }
-                // Null byte check
-                if p.contains('\0') {
-                    return op_error(INVALID_PATH, "Path contains null bytes");
-                }
-                // Path traversal check
-                if p.contains("..") {
-                    return op_error(INVALID_PATH, "Path contains path traversal");
+                if let Err(msg) = ensure_safe_relative_path(p) {
+                    return op_error(INVALID_PATH, msg);
                 }
                 p.to_string()
             }
@@ -78,7 +77,9 @@ impl Collection {
                 // Try to derive from path_pattern or filename_pattern
                 if let Some(tn) = type_names.first() {
                     if let Some(type_def) = self.types.get(tn) {
-                        let pattern = type_def.path_pattern.as_ref()
+                        let pattern = type_def
+                            .path_pattern
+                            .as_ref()
                             .or(type_def.filename_pattern.as_ref());
                         if let Some(pattern) = pattern {
                             match derive_path(pattern, &fm_with_defaults) {
@@ -86,7 +87,10 @@ impl Collection {
                                 None => return op_error(PATH_REQUIRED, "Cannot determine path"),
                             }
                         } else {
-                            return op_error(PATH_REQUIRED, "No path provided and no filename_pattern");
+                            return op_error(
+                                PATH_REQUIRED,
+                                "No path provided and no filename_pattern",
+                            );
                         }
                     } else {
                         return op_error(PATH_REQUIRED, "Cannot determine path");
@@ -96,6 +100,12 @@ impl Collection {
                 }
             }
         };
+        if path.is_empty() {
+            return op_error(PATH_REQUIRED, "path must not be empty");
+        }
+        if let Err(msg) = ensure_safe_relative_path(&path) {
+            return op_error(INVALID_PATH, msg);
+        }
 
         // Check existence
         let full_path = self.root.join(&path);
@@ -104,16 +114,21 @@ impl Collection {
         }
 
         // Apply defaults for effective frontmatter (for validation and output)
-        let effective = self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
+        let effective =
+            self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
 
         // Check match rules (§6.3, §6.4): created file must satisfy type match rules
         for tn in &type_names {
             if let Some(type_def) = self.types.get(tn) {
                 if let Some(ref rules) = type_def.match_rules {
                     if !matches_rules(rules, &path, &effective) {
-                        return op_error("match_failed", &format!(
-                            "Created file does not satisfy match rules for type '{}'", tn
-                        ));
+                        return op_error(
+                            "match_failed",
+                            &format!(
+                                "Created file does not satisfy match rules for type '{}'",
+                                tn
+                            ),
+                        );
                     }
                 }
             }
@@ -124,30 +139,17 @@ impl Collection {
         if self.settings.default_validation == "error" {
             let validation = self.validate(&effective, &type_names, &path);
             if !validation.valid {
-                let issues: Vec<serde_json::Value> = validation.issues.iter().map(issue_to_json).collect();
-                return serde_json::json!({
-                    "error": {
-                        "code": VALIDATION_FAILED,
-                        "message": "Validation failed",
-                        "issues": issues,
-                    }
-                });
+                return validation_failed_error(&validation.issues);
             }
         } else if self.settings.default_validation == "warn" {
             let validation = self.validate(&effective, &type_names, &path);
             // §5.5: strict: true causes validation failure regardless of validation level
-            let has_strict_errors = validation.issues.iter().any(|i| {
-                i.code == UNKNOWN_FIELD && i.severity == Severity::Error
-            });
+            let has_strict_errors = validation
+                .issues
+                .iter()
+                .any(|i| i.code == UNKNOWN_FIELD && i.severity == Severity::Error);
             if has_strict_errors {
-                let issues: Vec<serde_json::Value> = validation.issues.iter().map(issue_to_json).collect();
-                return serde_json::json!({
-                    "error": {
-                        "code": VALIDATION_FAILED,
-                        "message": "Validation failed",
-                        "issues": issues,
-                    }
-                });
+                return validation_failed_error(&validation.issues);
             }
             for issue in &validation.issues {
                 result_warnings.push(issue_to_json(issue));
@@ -183,7 +185,8 @@ impl Collection {
         }
 
         // Write file
-        let yaml_mapping = frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
+        let yaml_mapping =
+            frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
         let content = serializer::serialize_document(&yaml_mapping, body);
 
         if let Some(parent) = full_path.parent() {
@@ -198,16 +201,14 @@ impl Collection {
             return op_error("io_error", &format!("Failed to write file: {}", e));
         }
 
-        let mut result = serde_json::json!({
-            "path": path,
-            "types": type_names,
-            "frontmatter": effective,
-            "body": body,
-            "valid": true,
-        });
-        if !result_warnings.is_empty() {
-            result["warnings"] = serde_json::Value::Array(result_warnings);
+        CreateOutput {
+            path,
+            types: type_names,
+            frontmatter: effective,
+            body: body.to_string(),
+            valid: true,
+            warnings: result_warnings,
         }
-        result
+        .into_json()
     }
 }
