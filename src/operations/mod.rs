@@ -1,7 +1,7 @@
 //! CRUD and batch operations (§12).
 
-pub mod batch;
 pub mod backfill;
+pub mod batch;
 pub mod create;
 pub mod delete;
 pub mod migrate;
