@@ -1,8 +1,8 @@
 //! Validation orchestrator (§9).
 
+use super::fields::validate_field;
 use crate::errors::*;
 use crate::types::schema::*;
-use super::fields::validate_field;
 
 /// Validate frontmatter against a type definition.
 pub fn validate_frontmatter(
@@ -31,7 +31,14 @@ pub fn validate_frontmatter_full(
     config_strict: Option<&StrictMode>,
     explicit_type_keys: Option<&[String]>,
 ) -> ValidationResult {
-    validate_frontmatter_full_multi(frontmatter, type_def, path, config_strict, explicit_type_keys, None)
+    validate_frontmatter_full_multi(
+        frontmatter,
+        type_def,
+        path,
+        config_strict,
+        explicit_type_keys,
+        None,
+    )
 }
 
 /// Validate frontmatter against a type definition with multi-type union support.
@@ -99,7 +106,9 @@ pub fn validate_frontmatter_full_multi(
 
     // Check for unknown fields (strict mode)
     let default = StrictMode::Off;
-    let strict = type_def.strict.as_ref()
+    let strict = type_def
+        .strict
+        .as_ref()
         .or(config_strict)
         .unwrap_or(&default);
     if *strict != StrictMode::Off {
@@ -110,7 +119,10 @@ pub fn validate_frontmatter_full_multi(
         for key in obj.keys() {
             // In multi-type mode, a field known in any type is not unknown
             let in_union = union_fields.is_some_and(|uf| uf.contains(key));
-            if !type_def.fields.contains_key(key) && !implicit_keys.iter().any(|k| k == key) && !in_union {
+            if !type_def.fields.contains_key(key)
+                && !implicit_keys.iter().any(|k| k == key)
+                && !in_union
+            {
                 let severity = if *strict == StrictMode::Error {
                     Severity::Error
                 } else {
@@ -141,11 +153,11 @@ pub fn validate_frontmatter_full_multi(
 
 // --- impl Collection methods for validation ---
 
-use std::collections::HashMap;
-use crate::validation::merge::detect_type_conflicts;
-use crate::frontmatter::parser::{parse_document, is_parse_error, yaml_mapping_to_json};
+use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to_json};
 use crate::generated::derive_path;
+use crate::validation::merge::detect_type_conflicts;
 use crate::Collection;
+use std::collections::HashMap;
 
 impl Collection {
     /// Validate frontmatter against matched types.
@@ -160,7 +172,8 @@ impl Collection {
 
         // Detect multi-type conflicts
         if type_names.len() > 1 {
-            let type_defs: Vec<&crate::types::schema::TypeDef> = type_names.iter()
+            let type_defs: Vec<&crate::types::schema::TypeDef> = type_names
+                .iter()
                 .filter_map(|tn| self.types.get(tn))
                 .collect();
             let conflict_issues = detect_type_conflicts(&type_defs, path);
@@ -169,14 +182,19 @@ impl Collection {
 
         // Build union of all field names for multi-type strict mode
         let union_fields: std::collections::HashSet<String> = if type_names.len() > 1 {
-            type_names.iter()
+            type_names
+                .iter()
                 .filter_map(|tn| self.types.get(tn))
                 .flat_map(|td| td.fields.keys().cloned())
                 .collect()
         } else {
             std::collections::HashSet::new()
         };
-        let union_ref = if type_names.len() > 1 { Some(&union_fields) } else { None };
+        let union_ref = if type_names.len() > 1 {
+            Some(&union_fields)
+        } else {
+            None
+        };
 
         for type_name in type_names {
             if let Some(type_def) = self.types.get(type_name) {
@@ -202,9 +220,33 @@ impl Collection {
     /// Check cross-file uniqueness for a file being created or updated.
     /// Returns issues for duplicate id_field and unique field values.
     /// `exclude_path` is the relative path of the file being updated (to exclude self from checks).
-    pub(crate) fn check_uniqueness(&self, frontmatter: &serde_json::Value, type_names: &[String], exclude_path: &str) -> Vec<Issue> {
+    pub(crate) fn check_uniqueness(
+        &self,
+        frontmatter: &serde_json::Value,
+        type_names: &[String],
+        exclude_path: &str,
+    ) -> Vec<Issue> {
         let mut issues = Vec::new();
-        let files = self.scan_collection_files();
+        let exclude_normalized = exclude_path.replace('\\', "/");
+
+        // Preload frontmatter for every file once to avoid repeated full rescans.
+        let scanned_frontmatters: Vec<(String, serde_json::Value)> = self
+            .scan_collection_files()
+            .into_iter()
+            .filter_map(|file_path| {
+                let rel_path = file_path
+                    .strip_prefix(&self.root)
+                    .map(|p| p.to_string_lossy().to_string().replace('\\', "/"))
+                    .ok()?;
+                let content = std::fs::read_to_string(&file_path).ok()?;
+                let doc = parse_document(&content);
+                let other_fm = match &doc.frontmatter {
+                    Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
+                    _ => return None,
+                };
+                Some((rel_path, other_fm))
+            })
+            .collect();
 
         for type_name in type_names {
             let type_def = match self.types.get(type_name) {
@@ -212,29 +254,15 @@ impl Collection {
                 None => continue,
             };
 
-            // Collect unique fields to check
-            let mut unique_fields: Vec<(&str, &str)> = Vec::new(); // (field_name, value_str)
-            let mut unique_values_temp: Vec<String> = Vec::new();
-            for (field_name, field_def) in &type_def.fields {
-                if field_def.unique {
-                    if let Some(val) = frontmatter.get(field_name) {
-                        if !val.is_null() {
-                            let val_str = match val.as_str() {
-                                Some(s) => s.to_string(),
-                                None => val.to_string(),
-                            };
-                            unique_values_temp.push(val_str);
-                            unique_fields.push((field_name.as_str(), ""));
-                        }
-                    }
-                }
-            }
-            // Fix lifetime: store separately
-            let unique_checks: Vec<(String, String)> = type_def.fields.iter()
+            let unique_checks: Vec<(String, String)> = type_def
+                .fields
+                .iter()
                 .filter(|(_, fd)| fd.unique)
                 .filter_map(|(fname, _)| {
                     frontmatter.get(fname).and_then(|val| {
-                        if val.is_null() { return None; }
+                        if val.is_null() {
+                            return None;
+                        }
                         let val_str = match val.as_str() {
                             Some(s) => s.to_string(),
                             None => val.to_string(),
@@ -247,32 +275,21 @@ impl Collection {
             // Check id_field
             let id_field = &self.settings.id_field;
             let id_value = frontmatter.get(id_field).and_then(|v| {
-                if v.is_null() { None }
-                else { Some(match v.as_str() { Some(s) => s.to_string(), None => v.to_string() }) }
+                if v.is_null() {
+                    None
+                } else {
+                    Some(match v.as_str() {
+                        Some(s) => s.to_string(),
+                        None => v.to_string(),
+                    })
+                }
             });
 
-            // Scan other files
-            for file_path in &files {
-                let rel_path = file_path.strip_prefix(&self.root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                // Normalize path separators for comparison
-                let rel_normalized = rel_path.replace('\\', "/");
-                let exclude_normalized = exclude_path.replace('\\', "/");
-                if rel_normalized == exclude_normalized {
+            // Check against all other files using the preloaded frontmatter snapshot.
+            for (rel_path, other_fm) in &scanned_frontmatters {
+                if rel_path == &exclude_normalized {
                     continue;
                 }
-
-                let content = match std::fs::read_to_string(file_path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-
-                let doc = parse_document(&content);
-                let other_fm = match &doc.frontmatter {
-                    Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
-                    _ => continue,
-                };
 
                 // Check id_field duplicate
                 if let Some(ref our_id) = id_value {
@@ -285,7 +302,10 @@ impl Collection {
                             if &other_str == our_id {
                                 issues.push(Issue {
                                     code: "duplicate_id".to_string(),
-                                    message: format!("Duplicate {} value '{}' (also in {})", id_field, our_id, rel_path),
+                                    message: format!(
+                                        "Duplicate {} value '{}' (also in {})",
+                                        id_field, our_id, rel_path
+                                    ),
                                     path: Some(exclude_path.to_string()),
                                     field: Some(id_field.clone()),
                                     severity: Severity::Error,
@@ -311,7 +331,10 @@ impl Collection {
                             if &other_str == our_val {
                                 issues.push(Issue {
                                     code: "duplicate_value".to_string(),
-                                    message: format!("Duplicate unique value '{}' for field '{}' (also in {})", our_val, field_name, rel_path),
+                                    message: format!(
+                                        "Duplicate unique value '{}' for field '{}' (also in {})",
+                                        our_val, field_name, rel_path
+                                    ),
                                     path: Some(exclude_path.to_string()),
                                     field: Some(field_name.clone()),
                                     severity: Severity::Error,
@@ -335,7 +358,10 @@ impl Collection {
     pub fn validate_op(&self, input: &serde_json::Value) -> serde_json::Value {
         let path = input.get("path").and_then(|v| v.as_str());
         let _type_filter = input.get("type").and_then(|v| v.as_str());
-        let collection_only = input.get("collection_only").and_then(|v| v.as_bool()).unwrap_or(false);
+        let collection_only = input
+            .get("collection_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // collection_only mode: just check that collection is valid
         if collection_only {
@@ -356,13 +382,18 @@ impl Collection {
                 // Check if file exists
                 let full_path = self.root.join(path);
                 if !full_path.exists() {
-                    return crate::errors::op_error(FILE_NOT_FOUND, &format!("File not found: {}", path));
+                    return crate::errors::op_error(
+                        FILE_NOT_FOUND,
+                        &format!("File not found: {}", path),
+                    );
                 }
 
                 // Read and parse
                 let content = match std::fs::read_to_string(&full_path) {
                     Ok(c) => c,
-                    Err(_) => return crate::errors::op_error(INVALID_FRONTMATTER, "Failed to read file"),
+                    Err(_) => {
+                        return crate::errors::op_error(INVALID_FRONTMATTER, "Failed to read file")
+                    }
                 };
 
                 let doc = parse_document(&content);
@@ -428,7 +459,8 @@ impl Collection {
 
             // Detect multi-type conflicts
             if type_names.len() > 1 {
-                let type_defs: Vec<&crate::types::schema::TypeDef> = type_names.iter()
+                let type_defs: Vec<&crate::types::schema::TypeDef> = type_names
+                    .iter()
                     .filter_map(|tn| self.types.get(tn))
                     .collect();
                 let conflict_issues = detect_type_conflicts(&type_defs, path);
@@ -439,14 +471,19 @@ impl Collection {
             // Build union of all field names across all types for multi-type strict mode
             let config_strict = self.config_strict_mode();
             let union_fields: std::collections::HashSet<String> = if type_names.len() > 1 {
-                type_names.iter()
+                type_names
+                    .iter()
                     .filter_map(|tn| self.types.get(tn))
                     .flat_map(|td| td.fields.keys().cloned())
                     .collect()
             } else {
                 std::collections::HashSet::new()
             };
-            let union_ref = if type_names.len() > 1 { Some(&union_fields) } else { None };
+            let union_ref = if type_names.len() > 1 {
+                Some(&union_fields)
+            } else {
+                None
+            };
 
             for type_name in &type_names {
                 if let Some(type_def) = self.types.get(type_name) {
@@ -495,7 +532,10 @@ impl Collection {
             all_issues.extend(link_issues);
 
             let has_errors = all_issues.iter().any(|i| i.severity == Severity::Error);
-            let issues_json: Vec<serde_json::Value> = all_issues.iter().map(crate::errors::issue_to_json).collect();
+            let issues_json: Vec<serde_json::Value> = all_issues
+                .iter()
+                .map(crate::errors::issue_to_json)
+                .collect();
 
             return serde_json::json!({
                 "valid": !has_errors,
@@ -510,11 +550,13 @@ impl Collection {
         let files = self.scan_collection_files();
 
         // Track unique values per (type, field) and id values per type
-        let mut unique_values: HashMap<(String, String), HashMap<String, Vec<String>>> = HashMap::new();
+        let mut unique_values: HashMap<(String, String), HashMap<String, Vec<String>>> =
+            HashMap::new();
         let mut id_values: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
 
         for file_path in &files {
-            let rel_path = file_path.strip_prefix(&self.root)
+            let rel_path = file_path
+                .strip_prefix(&self.root)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
 
@@ -535,7 +577,8 @@ impl Collection {
 
             // Detect multi-type conflicts
             if type_names.len() > 1 {
-                let type_defs_coll: Vec<&crate::types::schema::TypeDef> = type_names.iter()
+                let type_defs_coll: Vec<&crate::types::schema::TypeDef> = type_names
+                    .iter()
                     .filter_map(|tn| self.types.get(tn))
                     .collect();
                 let conflict_issues = detect_type_conflicts(&type_defs_coll, &rel_path);
@@ -545,14 +588,19 @@ impl Collection {
             // Validate individual file
             let config_strict = self.config_strict_mode();
             let union_fields_coll: std::collections::HashSet<String> = if type_names.len() > 1 {
-                type_names.iter()
+                type_names
+                    .iter()
                     .filter_map(|tn| self.types.get(tn))
                     .flat_map(|td| td.fields.keys().cloned())
                     .collect()
             } else {
                 std::collections::HashSet::new()
             };
-            let union_ref_coll = if type_names.len() > 1 { Some(&union_fields_coll) } else { None };
+            let union_ref_coll = if type_names.len() > 1 {
+                Some(&union_fields_coll)
+            } else {
+                None
+            };
 
             for tn in &type_names {
                 if let Some(type_def) = self.types.get(tn) {
@@ -576,7 +624,8 @@ impl Collection {
                                         Some(s) => s.to_string(),
                                         None => val.to_string(),
                                     };
-                                    unique_values.entry(key)
+                                    unique_values
+                                        .entry(key)
                                         .or_default()
                                         .entry(val_str)
                                         .or_default()
@@ -594,7 +643,8 @@ impl Collection {
                                 Some(s) => s.to_string(),
                                 None => val.to_string(),
                             };
-                            id_values.entry(tn.clone())
+                            id_values
+                                .entry(tn.clone())
                                 .or_default()
                                 .entry(val_str)
                                 .or_default()
@@ -612,7 +662,10 @@ impl Collection {
                     for p in paths {
                         all_issues.push(Issue {
                             code: DUPLICATE_VALUE.to_string(),
-                            message: format!("Duplicate value '{}' for unique field '{}' in type '{}'", val, field_name, type_name),
+                            message: format!(
+                                "Duplicate value '{}' for unique field '{}' in type '{}'",
+                                val, field_name, type_name
+                            ),
                             path: Some(p.clone()),
                             field: Some(field_name.clone()),
                             severity: Severity::Error,
@@ -650,7 +703,10 @@ impl Collection {
         }
 
         let has_errors = all_issues.iter().any(|i| i.severity == Severity::Error);
-        let issues_json: Vec<serde_json::Value> = all_issues.iter().map(crate::errors::issue_to_json).collect();
+        let issues_json: Vec<serde_json::Value> = all_issues
+            .iter()
+            .map(crate::errors::issue_to_json)
+            .collect();
 
         serde_json::json!({
             "valid": !has_errors,
