@@ -7,8 +7,16 @@ use crate::query::engine::QueryEvalContext;
 use crate::Collection;
 
 impl Collection {
-    pub fn batch_update(&self, input: &serde_json::Value, simulate_io_error: Option<&str>, skip_dependents: bool) -> serde_json::Value {
-        let dry_run = input.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    pub fn batch_update(
+        &self,
+        input: &serde_json::Value,
+        simulate_io_error: Option<&str>,
+        skip_dependents: bool,
+    ) -> serde_json::Value {
+        let dry_run = input
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Two modes: where+fields or updates (explicit list)
         if let Some(updates) = input.get("updates").and_then(|v| v.as_array()) {
@@ -17,24 +25,33 @@ impl Collection {
 
         // Support both input.query.where and input.where formats
         let query = input.get("query");
-        let where_clause = query.and_then(|q| q.get("where"))
+        let where_clause = query
+            .and_then(|q| q.get("where"))
             .or_else(|| input.get("where"));
-        let filter_types: Vec<String> = query.and_then(|q| q.get("types"))
+        let filter_types: Vec<String> = query
+            .and_then(|q| q.get("types"))
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_lowercase())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .collect()
+            })
             .unwrap_or_default();
-        let fields = input.get("fields").cloned().unwrap_or(serde_json::json!({}));
+        let fields = input
+            .get("fields")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
 
         // If neither where clause nor query.types provided, error
         if where_clause.is_none() && filter_types.is_empty() {
-            return op_error("invalid_input", "batch_update requires 'where' or 'updates'");
+            return op_error(
+                "invalid_input",
+                "batch_update requires 'where' or 'updates'",
+            );
         }
 
         // Find matching files using query logic
-        let matching_paths = self.query_matching_paths_with_types(
-            where_clause,
-            &filter_types,
-        );
+        let matching_paths = self.query_matching_paths_with_types(where_clause, &filter_types);
 
         let total = matching_paths.len();
         if total == 0 {
@@ -61,20 +78,17 @@ impl Collection {
                     Some(serde_yaml::Value::Mapping(m)) => m.clone(),
                     _ => serde_yaml::Mapping::new(),
                 };
-                let merged = serializer::merge_fields(&existing_mapping, &fields, &self.settings.write_nulls);
+                let merged = serializer::merge_fields(
+                    &existing_mapping,
+                    &fields,
+                    &self.settings.write_nulls,
+                );
                 let merged_json = yaml_mapping_to_json(&merged);
                 let type_names = self.determine_types(&merged_json);
                 let effective = self.apply_defaults(&merged_json, &type_names);
                 let validation = self.validate(&effective, &type_names, path);
                 if !validation.valid {
-                    let issues: Vec<serde_json::Value> = validation.issues.iter().map(issue_to_json).collect();
-                    return serde_json::json!({
-                        "error": {
-                            "code": VALIDATION_FAILED,
-                            "message": "Validation failed",
-                            "issues": issues,
-                        }
-                    });
+                    return validation_failed_error(&validation.issues);
                 }
             }
         }
@@ -112,7 +126,9 @@ impl Collection {
                 if let Some(ref bl_index) = bl_index_for_skip {
                     // Check if any failed path lists this file as a source (backlink)
                     let has_dep = failed_paths.iter().any(|fp| {
-                        bl_index.get(fp).is_some_and(|sources| sources.contains(path))
+                        bl_index
+                            .get(fp)
+                            .is_some_and(|sources| sources.contains(path))
                     });
                     if has_dep {
                         skipped += 1;
@@ -174,7 +190,12 @@ impl Collection {
     }
 
     /// Batch update with explicit update list (validate-all-then-execute).
-    pub(crate) fn batch_update_explicit(&self, updates: &[serde_json::Value], dry_run: bool, simulate_io_error: Option<&str>) -> serde_json::Value {
+    pub(crate) fn batch_update_explicit(
+        &self,
+        updates: &[serde_json::Value],
+        dry_run: bool,
+        simulate_io_error: Option<&str>,
+    ) -> serde_json::Value {
         // Validate all first
         if self.settings.default_validation == "error" {
             for update in updates {
@@ -182,7 +203,10 @@ impl Collection {
                     Some(p) => p,
                     None => continue,
                 };
-                let fields = update.get("fields").cloned().unwrap_or(serde_json::json!({}));
+                let fields = update
+                    .get("fields")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
                 let full_path = self.root.join(path);
                 let content = match std::fs::read_to_string(&full_path) {
                     Ok(c) => c,
@@ -193,20 +217,17 @@ impl Collection {
                     Some(serde_yaml::Value::Mapping(m)) => m.clone(),
                     _ => serde_yaml::Mapping::new(),
                 };
-                let merged = serializer::merge_fields(&existing_mapping, &fields, &self.settings.write_nulls);
+                let merged = serializer::merge_fields(
+                    &existing_mapping,
+                    &fields,
+                    &self.settings.write_nulls,
+                );
                 let merged_json = yaml_mapping_to_json(&merged);
                 let type_names = self.determine_types(&merged_json);
                 let effective = self.apply_defaults(&merged_json, &type_names);
                 let validation = self.validate(&effective, &type_names, path);
                 if !validation.valid {
-                    let issues: Vec<serde_json::Value> = validation.issues.iter().map(issue_to_json).collect();
-                    return serde_json::json!({
-                        "error": {
-                            "code": VALIDATION_FAILED,
-                            "message": "Validation failed",
-                            "issues": issues,
-                        }
-                    });
+                    return validation_failed_error(&validation.issues);
                 }
             }
         }
@@ -231,7 +252,10 @@ impl Collection {
                 Some(p) => p,
                 None => continue,
             };
-            let fields = update.get("fields").cloned().unwrap_or(serde_json::json!({}));
+            let fields = update
+                .get("fields")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
 
             if let Some(err_path) = simulate_io_error {
                 if path == err_path {
@@ -262,17 +286,33 @@ impl Collection {
     }
 
     /// Batch delete files matching a where clause (§12.4, §12.7).
-    pub fn batch_delete(&self, input: &serde_json::Value, simulate_io_error: Option<&str>) -> serde_json::Value {
-        let dry_run = input.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
-        let check_backlinks = input.get("check_backlinks").and_then(|v| v.as_bool()).unwrap_or(false);
+    pub fn batch_delete(
+        &self,
+        input: &serde_json::Value,
+        simulate_io_error: Option<&str>,
+    ) -> serde_json::Value {
+        let dry_run = input
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let check_backlinks = input
+            .get("check_backlinks")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Support both input.query.where and input.where formats
         let query = input.get("query");
-        let where_clause = query.and_then(|q| q.get("where"))
+        let where_clause = query
+            .and_then(|q| q.get("where"))
             .or_else(|| input.get("where"));
-        let filter_types: Vec<String> = query.and_then(|q| q.get("types"))
+        let filter_types: Vec<String> = query
+            .and_then(|q| q.get("types"))
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_lowercase())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         // If neither where clause nor query.types provided, error
@@ -280,10 +320,7 @@ impl Collection {
             return op_error("invalid_input", "batch_delete requires 'where'");
         }
 
-        let matching_paths = self.query_matching_paths_with_types(
-            where_clause,
-            &filter_types,
-        );
+        let matching_paths = self.query_matching_paths_with_types(where_clause, &filter_types);
 
         let total = matching_paths.len();
         if total == 0 {
@@ -377,14 +414,20 @@ impl Collection {
     }
 
     /// Query matching file paths with optional type filtering.
-    pub(crate) fn query_matching_paths_with_types(&self, where_clause: Option<&serde_json::Value>, filter_types: &[String]) -> Vec<String> {
+    pub(crate) fn query_matching_paths_with_types(
+        &self,
+        where_clause: Option<&serde_json::Value>,
+        filter_types: &[String],
+    ) -> Vec<String> {
         let files = self.scan_collection_files();
         let mut matching: Vec<String> = Vec::new();
 
         // Build all_files data for asFile() traversal in where clauses
-        let all_files_data: Vec<crate::expressions::evaluator::ResolvedFileData> = files.iter()
+        let all_files_data: Vec<crate::expressions::evaluator::ResolvedFileData> = files
+            .iter()
             .filter_map(|fp| {
-                let rp = fp.strip_prefix(&self.root)
+                let rp = fp
+                    .strip_prefix(&self.root)
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default()
                     .replace('\\', "/");
@@ -409,7 +452,8 @@ impl Collection {
         let backlinks_arc = std::sync::Arc::new(backlinks_index);
 
         for file_path in &files {
-            let rel_path = file_path.strip_prefix(&self.root)
+            let rel_path = file_path
+                .strip_prefix(&self.root)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default()
                 .replace('\\', "/");
@@ -437,20 +481,31 @@ impl Collection {
 
             let effective = self.apply_defaults(&raw_frontmatter, &type_names);
             let effective = self.coerce_types(&effective, &type_names);
-            let effective = self.evaluate_computed_fields(effective, &type_names, &rel_path, Some(doc.body.as_str()));
+            let effective = self.evaluate_computed_fields(
+                effective,
+                &type_names,
+                &rel_path,
+                Some(doc.body.as_str()),
+            );
 
             // If no where clause, match all (type-filtered) files
             let matches = if let Some(where_val) = where_clause {
                 let file_metadata = std::fs::metadata(file_path).ok();
                 let file_size = file_metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-                let file_mtime = file_metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
-                    let dt: chrono::DateTime<chrono::Utc> = t.into();
-                    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-                });
-                let file_ctime = file_metadata.as_ref().and_then(|m| m.created().ok()).map(|t| {
-                    let dt: chrono::DateTime<chrono::Utc> = t.into();
-                    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-                });
+                let file_mtime = file_metadata
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| {
+                        let dt: chrono::DateTime<chrono::Utc> = t.into();
+                        dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                    });
+                let file_ctime = file_metadata
+                    .as_ref()
+                    .and_then(|m| m.created().ok())
+                    .map(|t| {
+                        let dt: chrono::DateTime<chrono::Utc> = t.into();
+                        dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                    });
 
                 let eval_ctx = QueryEvalContext {
                     frontmatter: &effective,

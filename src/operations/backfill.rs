@@ -26,20 +26,24 @@ impl Collection {
     pub fn backfill(&self, input: &serde_json::Value) -> serde_json::Value {
         let type_filter = input.get("type").and_then(|v| v.as_str());
         let where_clause = input.get("where");
-        let dry_run = input.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+        let dry_run = input
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-        let apply_defaults = input.get("apply")
+        let apply_defaults = input
+            .get("apply")
             .and_then(|v| v.get("defaults"))
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        let apply_generated = input.get("apply")
+        let apply_generated = input
+            .get("apply")
             .and_then(|v| v.get("generated"))
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        let fields_filter: Option<HashSet<String>> = input.get("fields")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
+        let fields_filter: Option<HashSet<String>> =
+            input.get("fields").and_then(|v| v.as_array()).map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect()
@@ -116,7 +120,10 @@ impl Collection {
                                 continue;
                             }
                             if seen.insert(field_name.clone()) {
-                                generated_fields.push((field_name.clone(), field_def.generated.clone().unwrap()));
+                                generated_fields.push((
+                                    field_name.clone(),
+                                    field_def.generated.clone().unwrap(),
+                                ));
                             }
                         }
                     }
@@ -144,7 +151,13 @@ impl Collection {
                     if working.contains_key(&field_name) {
                         continue;
                     }
-                    let value = self.generate_value(&strategy, &field_name, &type_names, &working, Some(path));
+                    let value = self.generate_value(
+                        &strategy,
+                        &field_name,
+                        &type_names,
+                        &working,
+                        Some(path),
+                    );
                     working.insert(field_name.clone(), value.clone());
                     changes.insert(field_name.clone(), value);
                     change_kinds.insert(field_name.clone(), ChangeKind::Generated);
@@ -196,24 +209,20 @@ impl Collection {
 
             // Validation (abort all on first failure)
             if self.settings.default_validation == "error" {
-                let effective = self.apply_defaults(&serde_json::Value::Object(working.clone()), &type_names);
+                let effective =
+                    self.apply_defaults(&serde_json::Value::Object(working.clone()), &type_names);
                 let validation = self.validate(&effective, &type_names, path);
                 if !validation.valid {
-                    let issues: Vec<serde_json::Value> = validation.issues.iter().map(issue_to_json).collect();
-                    return serde_json::json!({
-                        "error": {
-                            "code": VALIDATION_FAILED,
-                            "message": "Validation failed",
-                            "issues": issues,
-                        }
-                    });
+                    return validation_failed_error(&validation.issues);
                 }
             }
 
             // Build write map honoring write_defaults/write_nulls
             let mut write_obj = raw_obj.clone();
             for (field, value) in &changes {
-                if change_kinds.get(field) == Some(&ChangeKind::Default) && !self.settings.write_defaults {
+                if change_kinds.get(field) == Some(&ChangeKind::Default)
+                    && !self.settings.write_defaults
+                {
                     continue;
                 }
                 if self.settings.write_nulls == "omit" && value.is_null() {
@@ -247,7 +256,9 @@ impl Collection {
 
         for plan in plans {
             let full_path = self.root.join(&plan.path);
-            let yaml_mapping = crate::frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(plan.write_obj));
+            let yaml_mapping = crate::frontmatter::parser::json_to_yaml_mapping(
+                &serde_json::Value::Object(plan.write_obj),
+            );
             let output = serializer::serialize_document(&yaml_mapping, &plan.body);
             if let Err(e) = std::fs::write(&full_path, &output) {
                 failed += 1;

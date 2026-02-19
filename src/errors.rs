@@ -145,6 +145,23 @@ pub(crate) fn op_error(code: &str, message: &str) -> serde_json::Value {
     })
 }
 
+/// Create a standardized validation_failed JSON error payload.
+pub(crate) fn validation_failed_error(issues: &[Issue]) -> serde_json::Value {
+    let issues_json: Vec<serde_json::Value> = issues.iter().map(issue_to_json).collect();
+    validation_failed_error_json(issues_json)
+}
+
+/// Create a standardized validation_failed JSON error payload from pre-serialized issues.
+pub(crate) fn validation_failed_error_json(issues: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "code": VALIDATION_FAILED,
+            "message": "Validation failed",
+            "issues": issues,
+        }
+    })
+}
+
 /// Convert an Issue to a JSON value.
 pub(crate) fn issue_to_json(issue: &Issue) -> serde_json::Value {
     let mut obj = serde_json::json!({
