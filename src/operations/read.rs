@@ -1,30 +1,31 @@
 //! Read operation (§12.2).
 
-use std::path::Path;
+use crate::api::operations::ReadInput;
 use crate::errors::*;
-use crate::frontmatter::parser::{parse_document, is_parse_error, yaml_mapping_to_json};
+use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to_json};
 use crate::operations::ensure_safe_relative_path;
 use crate::Collection;
+use std::path::Path;
 
 impl Collection {
     /// Read a file (§12.2).
     pub fn read(&self, input: &serde_json::Value) -> serde_json::Value {
-        let path = match input.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return op_error(INVALID_PATH, "path is required"),
+        let input = match ReadInput::parse(input) {
+            Ok(parsed) => parsed,
+            Err(err) => return err,
         };
-        if let Err(msg) = ensure_safe_relative_path(path) {
+        if let Err(msg) = ensure_safe_relative_path(&input.path) {
             return op_error(INVALID_PATH, msg);
         }
 
         // Check exclusions
-        if self.is_excluded(path) || !self.is_valid_extension(path) {
-            return op_error(FILE_NOT_FOUND, &format!("File not found: {}", path));
+        if self.is_excluded(&input.path) || !self.is_valid_extension(&input.path) {
+            return op_error(FILE_NOT_FOUND, &format!("File not found: {}", input.path));
         }
 
-        let full_path = self.root.join(path);
+        let full_path = self.root.join(&input.path);
         if !full_path.exists() {
-            return op_error(FILE_NOT_FOUND, &format!("File not found: {}", path));
+            return op_error(FILE_NOT_FOUND, &format!("File not found: {}", input.path));
         }
 
         let content = match std::fs::read_to_string(&full_path) {
@@ -74,7 +75,7 @@ impl Collection {
         };
 
         // Determine types (using path for match rule evaluation)
-        let type_names = self.determine_types_for_path(&raw_frontmatter, Some(path));
+        let type_names = self.determine_types_for_path(&raw_frontmatter, Some(&input.path));
 
         // Apply defaults for effective frontmatter
         let effective = self.apply_defaults(&raw_frontmatter, &type_names);
@@ -83,32 +84,44 @@ impl Collection {
         let effective = self.coerce_types(&effective, &type_names);
 
         // Evaluate computed fields (§5.12)
-        let effective = self.evaluate_computed_fields(effective, &type_names, path, Some(doc.body.as_str()));
+        let effective = self.evaluate_computed_fields(
+            effective,
+            &type_names,
+            &input.path,
+            Some(doc.body.as_str()),
+        );
 
         // File metadata
-        let file_name = Path::new(path)
+        let file_name = Path::new(&input.path)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        let folder = Path::new(path)
+        let folder = Path::new(&input.path)
             .parent()
             .and_then(|p| p.to_str())
             .unwrap_or("");
         let file_metadata = std::fs::metadata(&full_path).ok();
         let file_size = file_metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-        let file_mtime = file_metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
-            let dt: chrono::DateTime<chrono::Utc> = t.into();
-            dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-        });
+        let file_mtime = file_metadata
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            });
 
         // Validation
         let validation_level = &self.settings.default_validation;
         let validation = if validation_level == "off" {
-            ValidationResult { valid: true, issues: Vec::new() }
+            ValidationResult {
+                valid: true,
+                issues: Vec::new(),
+            }
         } else {
-            self.validate(&effective, &type_names, path)
+            self.validate(&effective, &type_names, &input.path)
         };
-        let issues_json: Vec<serde_json::Value> = validation.issues.iter().map(issue_to_json).collect();
+        let issues_json: Vec<serde_json::Value> =
+            validation.issues.iter().map(issue_to_json).collect();
 
         // At "warn" level, validation issues don't make the result invalid
         let effective_valid = if validation_level == "warn" {
@@ -118,7 +131,7 @@ impl Collection {
         };
 
         let mut result = serde_json::json!({
-            "path": path,
+            "path": input.path,
             "types": type_names,
             "frontmatter": effective,
             "raw_frontmatter": raw_frontmatter,

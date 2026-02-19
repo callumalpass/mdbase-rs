@@ -1,5 +1,6 @@
 //! Update operation (§12.3).
 
+use crate::api::operations::{UpdateInput, UpdateOutput};
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::frontmatter::serializer;
@@ -9,21 +10,22 @@ use crate::Collection;
 impl Collection {
     /// Update a file (§12.3).
     pub fn update(&self, input: &serde_json::Value) -> serde_json::Value {
-        let path = match input.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return op_error(INVALID_PATH, "path is required"),
+        let input = match UpdateInput::parse(input) {
+            Ok(parsed) => parsed,
+            Err(err) => return err,
         };
-        if let Err(msg) = ensure_safe_relative_path(path) {
+        let UpdateInput {
+            path,
+            fields,
+            body: new_body,
+            last_known_mtime,
+        } = input;
+        if let Err(msg) = ensure_safe_relative_path(&path) {
             return op_error(INVALID_PATH, msg);
         }
 
-        let fields = input.get("fields")
-            .or_else(|| input.get("frontmatter"))
-            .cloned()
-            .unwrap_or(serde_json::json!({}));
-        let new_body = input.get("body").and_then(|v| v.as_str());
-
-        let full_path = self.root.join(path);
+        let new_body = new_body.as_deref();
+        let full_path = self.root.join(&path);
         if !full_path.exists() {
             return op_error(FILE_NOT_FOUND, &format!("File not found: {}", path));
         }
@@ -34,13 +36,17 @@ impl Collection {
             .ok();
 
         // If caller provides last_known_mtime, check for external modifications
-        if let Some(known_ms) = input.get("last_known_mtime").and_then(|v| v.as_u64()) {
+        if let Some(known_ms) = last_known_mtime {
             if let Some(current) = &read_mtime {
-                let current_ms = current.duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64).unwrap_or(0);
+                let current_ms = current
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
                 if current_ms != known_ms {
-                    return op_error(CONCURRENT_MODIFICATION,
-                        &format!("File '{}' was modified externally", path));
+                    return op_error(
+                        CONCURRENT_MODIFICATION,
+                        &format!("File '{}' was modified externally", path),
+                    );
                 }
             }
         }
@@ -58,7 +64,8 @@ impl Collection {
         };
 
         // Merge fields
-        let merged = serializer::merge_fields(&existing_mapping, &fields, &self.settings.write_nulls);
+        let merged =
+            serializer::merge_fields(&existing_mapping, &fields, &self.settings.write_nulls);
         let merged_json = yaml_mapping_to_json(&merged);
 
         // Determine types
@@ -69,31 +76,25 @@ impl Collection {
             Some(o) => o.clone(),
             None => serde_json::Map::new(),
         };
-        self.apply_generated(&mut merged_obj, &type_names, false, Some(path));
+        self.apply_generated(&mut merged_obj, &type_names, false, Some(&path));
 
         // Apply defaults for effective frontmatter
-        let effective = self.apply_defaults(&serde_json::Value::Object(merged_obj.clone()), &type_names);
+        let effective =
+            self.apply_defaults(&serde_json::Value::Object(merged_obj.clone()), &type_names);
 
         // Validate
         if self.settings.default_validation == "error" {
-            let mut validation = self.validate(&effective, &type_names, path);
+            let mut validation = self.validate(&effective, &type_names, &path);
 
             // Cross-file uniqueness checks for update
-            let uniqueness_issues = self.check_uniqueness(&effective, &type_names, path);
+            let uniqueness_issues = self.check_uniqueness(&effective, &type_names, &path);
             validation.issues.extend(uniqueness_issues.iter().cloned());
             if !uniqueness_issues.is_empty() {
                 validation.valid = false;
             }
 
             if !validation.valid {
-                let issues: Vec<serde_json::Value> = validation.issues.iter().map(issue_to_json).collect();
-                return serde_json::json!({
-                    "error": {
-                        "code": VALIDATION_FAILED,
-                        "message": "Validation failed",
-                        "issues": issues,
-                    }
-                });
+                return validation_failed_error(&validation.issues);
             }
         }
 
@@ -101,8 +102,10 @@ impl Collection {
         if let Some(recorded) = &read_mtime {
             if let Ok(current) = std::fs::metadata(&full_path).and_then(|m| m.modified()) {
                 if current != *recorded {
-                    return op_error(CONCURRENT_MODIFICATION,
-                        &format!("File '{}' was modified during operation", path));
+                    return op_error(
+                        CONCURRENT_MODIFICATION,
+                        &format!("File '{}' was modified during operation", path),
+                    );
                 }
             }
         }
@@ -123,7 +126,8 @@ impl Collection {
         }
 
         // Write file
-        let write_mapping = crate::frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
+        let write_mapping =
+            crate::frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
         let body = match new_body {
             Some(b) => b,
             None => &doc.body,
@@ -155,16 +159,14 @@ impl Collection {
         }
 
         // Evaluate computed fields for the returned result (not written to disk)
-        let effective = self.evaluate_computed_fields(effective, &type_names, path, Some(body));
+        let effective = self.evaluate_computed_fields(effective, &type_names, &path, Some(body));
 
-        let mut result = serde_json::json!({
-            "path": path,
-            "frontmatter": effective,
-            "body": body,
-        });
-        if !result_warnings.is_empty() {
-            result["warnings"] = serde_json::Value::Array(result_warnings);
+        UpdateOutput {
+            path,
+            frontmatter: effective,
+            body: body.to_string(),
+            warnings: result_warnings,
         }
-        result
+        .into_json()
     }
 }

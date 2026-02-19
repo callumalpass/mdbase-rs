@@ -5,6 +5,7 @@
 
 pub mod errors;
 
+pub mod api;
 pub mod cache;
 pub mod config;
 pub mod expressions;
@@ -22,10 +23,10 @@ pub mod watch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::types::schema::*;
-use crate::types::loader;
-use crate::types::inheritance;
 use crate::expressions::expression_references_field;
+use crate::types::inheritance;
+use crate::types::loader;
+use crate::types::schema::*;
 
 /// Parsed config settings used at runtime.
 #[derive(Debug, Clone)]
@@ -93,29 +94,65 @@ impl Collection {
         let settings = Settings {
             extensions: settings_json["extensions"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
             exclude: settings_json["exclude"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_else(|| vec![".git".into(), "node_modules".into(), ".mdbase".into()]),
-            include_subfolders: settings_json["include_subfolders"].as_bool().unwrap_or(true),
-            types_folder: settings_json["types_folder"].as_str().unwrap_or("_types").to_string(),
-            migrations_folder: settings_json["migrations_folder"].as_str().unwrap_or("_types/_migrations").to_string(),
+            include_subfolders: settings_json["include_subfolders"]
+                .as_bool()
+                .unwrap_or(true),
+            types_folder: settings_json["types_folder"]
+                .as_str()
+                .unwrap_or("_types")
+                .to_string(),
+            migrations_folder: settings_json["migrations_folder"]
+                .as_str()
+                .unwrap_or("_types/_migrations")
+                .to_string(),
             explicit_type_keys: settings_json["explicit_type_keys"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_else(|| vec!["type".into(), "types".into()]),
             write_defaults: settings_json["write_defaults"].as_bool().unwrap_or(true),
-            default_validation: settings_json["default_validation"].as_str().unwrap_or("warn").to_string(),
+            default_validation: settings_json["default_validation"]
+                .as_str()
+                .unwrap_or("warn")
+                .to_string(),
             default_strict: settings_json["default_strict"].clone(),
             timezone: settings_json["timezone"].as_str().map(|s| s.to_string()),
-            id_field: settings_json["id_field"].as_str().unwrap_or("id").to_string(),
-            id_field_explicit: settings_json["id_field_explicit"].as_bool().unwrap_or(false),
-            write_nulls: settings_json["write_nulls"].as_str().unwrap_or("omit").to_string(),
+            id_field: settings_json["id_field"]
+                .as_str()
+                .unwrap_or("id")
+                .to_string(),
+            id_field_explicit: settings_json["id_field_explicit"]
+                .as_bool()
+                .unwrap_or(false),
+            write_nulls: settings_json["write_nulls"]
+                .as_str()
+                .unwrap_or("omit")
+                .to_string(),
             write_empty_lists: settings_json["write_empty_lists"].as_bool().unwrap_or(true),
-            rename_update_refs: settings_json["rename_update_refs"].as_bool().unwrap_or(true),
-            cache_folder: settings_json["cache_folder"].as_str().unwrap_or(".mdbase").to_string(),
+            rename_update_refs: settings_json["rename_update_refs"]
+                .as_bool()
+                .unwrap_or(true),
+            cache_folder: settings_json["cache_folder"]
+                .as_str()
+                .unwrap_or(".mdbase")
+                .to_string(),
         };
 
         // Load types
@@ -124,30 +161,31 @@ impl Collection {
             &settings.types_folder,
             &settings.migrations_folder,
         )
-            .map_err(|e| serde_json::json!({
+        .map_err(|e| {
+            serde_json::json!({
                 "valid": false,
                 "error": { "code": "invalid_type_definition", "message": e }
-            }))?;
+            })
+        })?;
 
         let mut types = load_result.types;
         let type_warnings = load_result.warnings;
 
         // Resolve inheritance
-        inheritance::resolve_inheritance(&mut types)
-            .map_err(|e| {
-                // Determine error code based on the message
-                let code = if e.contains("Circular") {
-                    "circular_inheritance"
-                } else if e.contains("Unknown type") || e.contains("extends unknown") {
-                    "missing_parent_type"
-                } else {
-                    "invalid_type_definition"
-                };
-                serde_json::json!({
-                    "valid": false,
-                    "error": { "code": code, "message": e }
-                })
-            })?;
+        inheritance::resolve_inheritance(&mut types).map_err(|e| {
+            // Determine error code based on the message
+            let code = if e.contains("Circular") {
+                "circular_inheritance"
+            } else if e.contains("Unknown type") || e.contains("extends unknown") {
+                "missing_parent_type"
+            } else {
+                "invalid_type_definition"
+            };
+            serde_json::json!({
+                "valid": false,
+                "error": { "code": code, "message": e }
+            })
+        })?;
 
         // Validate computed fields (§5.12)
         for type_def in types.values() {
@@ -197,7 +235,8 @@ impl Collection {
         if computed_fields.len() > 1 {
             // Build dependency graph: for each computed field, find which other
             // computed fields its expression references
-            let computed_names: std::collections::HashSet<&str> = computed_fields.iter().map(|(n, _)| *n).collect();
+            let computed_names: std::collections::HashSet<&str> =
+                computed_fields.iter().map(|(n, _)| *n).collect();
 
             // Simple dependency detection: check if expression contains field name as identifier
             for (name, expr) in &computed_fields {
@@ -334,7 +373,8 @@ impl Collection {
 
             if path.is_dir() {
                 if self.settings.include_subfolders {
-                    let rel = path.strip_prefix(&self.root)
+                    let rel = path
+                        .strip_prefix(&self.root)
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_default();
                     if !self.is_excluded(&rel) {
@@ -342,7 +382,8 @@ impl Collection {
                     }
                 }
             } else if path.is_file() {
-                let rel = path.strip_prefix(&self.root)
+                let rel = path
+                    .strip_prefix(&self.root)
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default();
                 if !self.is_excluded(&rel) && self.is_valid_extension(&rel) {
