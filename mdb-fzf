@@ -94,12 +94,35 @@ discover_types() {
     | sort -fu
 }
 
+query_untyped_results() {
+  local all_json typed_paths_json
+  local -a known_types=("$@")
+
+  all_json="$(run_mdb query)"
+
+  typed_paths_json="$({
+    local t
+    for t in "${known_types[@]}"; do
+      [[ -n "$t" ]] || continue
+      run_mdb query --types "$t" | jq -r '.results[].path'
+    done
+  } | sed '/^$/d' | sort -u | jq -R . | jq -s .)"
+
+  jq --argjson typed "$typed_paths_json" '
+    .results |= map(select((.path as $p | $typed | index($p)) | not))
+    | .meta.total_count = (.results | length)
+    | .meta.has_more = false
+  ' <<<"$all_json"
+}
+
 type_count() {
   local type_name="$1"
+  shift || true
+  local -a known_types=("$@")
   local q
 
   if [[ "$type_name" == "untype" ]]; then
-    q="$(run_mdb query --where "type == null")"
+    q="$(query_untyped_results "${known_types[@]}")"
   else
     q="$(run_mdb query --types "$type_name")"
   fi
@@ -117,7 +140,7 @@ pick_type() {
   visible_lines+=($'type\tcount')
 
   key_lines+=("untype")
-  visible_lines+=("untype"$'\t'"$(type_count untype)")
+  visible_lines+=("untype"$'\t'"$(type_count untype "${discovered[@]}")")
 
   local t
   for t in "${discovered[@]}"; do
@@ -304,11 +327,13 @@ main() {
   fi
 
   local selected_type results_json result_count fields_json selected_path
+  local -a discovered_types=()
 
+  mapfile -t discovered_types < <(discover_types)
   selected_type="$(pick_type)" || exit 0
 
   if [[ "$selected_type" == "untype" ]]; then
-    results_json="$(run_mdb query --where "type == null")"
+    results_json="$(query_untyped_results "${discovered_types[@]}")"
   else
     results_json="$(run_mdb query --types "$selected_type")"
   fi

@@ -154,7 +154,12 @@ impl Collection {
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_else(|| raw_frontmatter.clone());
 
-            let type_names = types_map.get(&path).cloned().unwrap_or_default();
+            let mut type_names = types_map.get(&path).cloned().unwrap_or_default();
+            if type_names.is_empty() {
+                // Older cache DBs can have files rows without file_types rows.
+                // Recompute types from cached frontmatter so --types stays correct.
+                type_names = self.determine_types_for_path(&raw_frontmatter, Some(&path));
+            }
 
             let file_mtime_iso = if mtime_ns != 0 {
                 Some(ns_to_iso(mtime_ns))

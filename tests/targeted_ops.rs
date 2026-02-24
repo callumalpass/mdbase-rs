@@ -307,3 +307,46 @@ fn delete_with_backlink_check_reports_referrers() {
         .and_then(|v| v.as_str());
     assert_eq!(broken, Some("b.md"));
 }
+
+#[test]
+fn query_types_works_when_cache_file_types_rows_are_missing() {
+    let tmp = TempDir::new().expect("tempdir");
+    write_file(
+        &tmp.path().join("mdbase.yaml"),
+        "spec_version: 0.2.1\nsettings:\n  explicit_type_keys: []\n",
+    );
+    write_file(
+        &tmp.path().join("_types/person.md"),
+        "---\nname: person\nmatch:\n  where:\n    tags:\n      contains: person\nfields:\n  tags:\n    type: list\n    items:\n      type: string\n---\n",
+    );
+    write_file(
+        &tmp.path().join("alice.md"),
+        "---\ntags: [person]\n---\n",
+    );
+
+    let collection = open_collection(tmp.path());
+    let rebuild = collection.cache_rebuild();
+    assert_eq!(rebuild.get("success").and_then(|v| v.as_bool()), Some(true));
+
+    // Simulate an old/partial cache: files row exists but file_types rows are missing.
+    let db_path = tmp.path().join(".mdbase").join("cache.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open cache db");
+    conn.execute("DELETE FROM file_types", [])
+        .expect("clear file_types rows");
+
+    let result = collection.query(&serde_json::json!({
+        "query": {
+            "types": ["person"]
+        }
+    }));
+
+    assert!(result.get("error").is_none(), "query failed: {result}");
+    assert_eq!(
+        result.pointer("/meta/total_count").and_then(|v| v.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        result.pointer("/results/0/path").and_then(|v| v.as_str()),
+        Some("alice.md")
+    );
+}
