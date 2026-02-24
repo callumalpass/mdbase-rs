@@ -1,9 +1,9 @@
 //! Query result envelope.
 
-use std::collections::HashMap;
-use crate::expressions::evaluator::{EvalContext, evaluate as eval_expr};
+use crate::expressions::evaluator::{evaluate as eval_expr, EvalContext};
 use crate::expressions::parser::Parser as ExprParser;
 use crate::Collection;
+use std::collections::HashMap;
 
 impl Collection {
     /// Compute property summaries over a set of candidates.
@@ -17,7 +17,8 @@ impl Collection {
 
         for (field, summary_type) in property_summaries {
             // Collect values for this field from all candidates
-            let values: Vec<&serde_json::Value> = candidates.iter()
+            let values: Vec<&serde_json::Value> = candidates
+                .iter()
                 .filter_map(|c| c.get("frontmatter").and_then(|fm| fm.get(field)))
                 .collect();
 
@@ -27,9 +28,7 @@ impl Collection {
             } else {
                 match summary_type.as_str() {
                     "Average" => {
-                        let nums: Vec<f64> = values.iter()
-                            .filter_map(|v| v.as_f64())
-                            .collect();
+                        let nums: Vec<f64> = values.iter().filter_map(|v| v.as_f64()).collect();
                         if nums.is_empty() {
                             serde_json::Value::Null
                         } else {
@@ -44,10 +43,10 @@ impl Collection {
                         }
                     }
                     "Sum" => {
-                        let nums: Vec<f64> = values.iter()
-                            .filter_map(|v| v.as_f64())
-                            .collect();
-                        let has_float = values.iter().any(|v| v.is_f64() && !v.is_i64() && !v.is_u64());
+                        let nums: Vec<f64> = values.iter().filter_map(|v| v.as_f64()).collect();
+                        let has_float = values
+                            .iter()
+                            .any(|v| v.is_f64() && !v.is_i64() && !v.is_u64());
                         if nums.is_empty() {
                             serde_json::json!(0)
                         } else {
@@ -60,9 +59,7 @@ impl Collection {
                         }
                     }
                     "Min" => {
-                        let nums: Vec<f64> = values.iter()
-                            .filter_map(|v| v.as_f64())
-                            .collect();
+                        let nums: Vec<f64> = values.iter().filter_map(|v| v.as_f64()).collect();
                         if nums.is_empty() {
                             serde_json::Value::Null
                         } else {
@@ -75,9 +72,7 @@ impl Collection {
                         }
                     }
                     "Max" => {
-                        let nums: Vec<f64> = values.iter()
-                            .filter_map(|v| v.as_f64())
-                            .collect();
+                        let nums: Vec<f64> = values.iter().filter_map(|v| v.as_f64()).collect();
                         if nums.is_empty() {
                             serde_json::Value::Null
                         } else {
@@ -90,44 +85,46 @@ impl Collection {
                         }
                     }
                     "Earliest" => {
-                        let strs: Vec<&str> = values.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect();
-                        strs.iter().min().map(|s| serde_json::json!(s)).unwrap_or(serde_json::Value::Null)
+                        let strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+                        strs.iter()
+                            .min()
+                            .map(|s| serde_json::json!(s))
+                            .unwrap_or(serde_json::Value::Null)
                     }
                     "Latest" => {
-                        let strs: Vec<&str> = values.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect();
-                        strs.iter().max().map(|s| serde_json::json!(s)).unwrap_or(serde_json::Value::Null)
+                        let strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+                        strs.iter()
+                            .max()
+                            .map(|s| serde_json::json!(s))
+                            .unwrap_or(serde_json::Value::Null)
                     }
                     "Checked" => {
-                        let count = values.iter()
-                            .filter(|v| v.as_bool() == Some(true))
-                            .count();
+                        let count = values.iter().filter(|v| v.as_bool() == Some(true)).count();
                         serde_json::json!(count)
                     }
                     "Unchecked" => {
-                        let count = values.iter()
-                            .filter(|v| v.as_bool() == Some(false))
-                            .count();
+                        let count = values.iter().filter(|v| v.as_bool() == Some(false)).count();
                         serde_json::json!(count)
                     }
                     "Empty" => {
-                        let count = candidates.iter()
+                        let count = candidates
+                            .iter()
                             .filter(|c| {
                                 let val = c.get("frontmatter").and_then(|fm| fm.get(field));
-                                val.is_none() || val == Some(&serde_json::Value::Null)
+                                val.is_none()
+                                    || val == Some(&serde_json::Value::Null)
                                     || val.and_then(|v| v.as_str()) == Some("")
                             })
                             .count();
                         serde_json::json!(count)
                     }
                     "Filled" => {
-                        let count = candidates.iter()
+                        let count = candidates
+                            .iter()
                             .filter(|c| {
                                 let val = c.get("frontmatter").and_then(|fm| fm.get(field));
-                                val.is_some() && val != Some(&serde_json::Value::Null)
+                                val.is_some()
+                                    && val != Some(&serde_json::Value::Null)
                                     && val.and_then(|v| v.as_str()) != Some("")
                             })
                             .count();
@@ -160,7 +157,8 @@ impl Collection {
         candidates: &[serde_json::Value],
     ) -> serde_json::Value {
         // Collect numeric values for the field
-        let values: Vec<serde_json::Value> = candidates.iter()
+        let values: Vec<serde_json::Value> = candidates
+            .iter()
             .filter_map(|c| c.get("frontmatter").and_then(|fm| fm.get(field)).cloned())
             .collect();
 
@@ -172,7 +170,9 @@ impl Collection {
             raw_frontmatter: None,
             file_path: None,
             body: None,
-            file_size: None, file_mtime: None, file_ctime: None,
+            file_size: None,
+            file_mtime: None,
+            file_ctime: None,
             this_context: None,
             all_files: None,
             traversal_depth: std::cell::Cell::new(0),
@@ -183,12 +183,10 @@ impl Collection {
         };
 
         match ExprParser::parse(formula) {
-            Ok(parsed) => {
-                match eval_expr(&parsed, &ctx) {
-                    Ok(val) => val,
-                    Err(_) => serde_json::Value::Null,
-                }
-            }
+            Ok(parsed) => match eval_expr(&parsed, &ctx) {
+                Ok(val) => val,
+                Err(_) => serde_json::Value::Null,
+            },
             Err(_) => serde_json::Value::Null,
         }
     }

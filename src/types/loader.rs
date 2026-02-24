@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::frontmatter::parser::{parse_document, is_parse_error, yaml_to_json};
 use super::schema::*;
+use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_to_json};
 
 /// Result of loading types, including warnings.
 pub struct LoadTypesResult {
@@ -29,7 +29,10 @@ pub fn validate_type_name(name: &str) -> Result<(), String> {
 
     // Must not start with underscore (reserved)
     if name.starts_with('_') {
-        return Err(format!("Type name '{}' starting with underscore is reserved", name));
+        return Err(format!(
+            "Type name '{}' starting with underscore is reserved",
+            name
+        ));
     }
 
     // Must not exceed 64 characters (strict: >= 64 is rejected)
@@ -38,7 +41,10 @@ pub fn validate_type_name(name: &str) -> Result<(), String> {
     }
 
     // Must only contain alphanumeric, hyphens, underscores
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(format!("Type name '{}' contains invalid characters", name));
     }
 
@@ -115,17 +121,20 @@ pub fn load_types_with_warnings(
             if let Some(GeneratedStrategy::Derived { from, .. }) = field_def.generated.as_ref() {
                 // Check if "from" is "file.name" etc (circular with path_pattern)
                 if from.starts_with("file.")
-                    && (type_def.path_pattern.is_some() || type_def.filename_pattern.is_some()) {
-                        let pattern = type_def.path_pattern.as_deref()
-                            .or(type_def.filename_pattern.as_deref())
-                            .unwrap_or("");
-                        if pattern.contains(&format!("{{{}}}", field_name)) {
-                            return Err(format!(
+                    && (type_def.path_pattern.is_some() || type_def.filename_pattern.is_some())
+                {
+                    let pattern = type_def
+                        .path_pattern
+                        .as_deref()
+                        .or(type_def.filename_pattern.as_deref())
+                        .unwrap_or("");
+                    if pattern.contains(&format!("{{{}}}", field_name)) {
+                        return Err(format!(
                                 "Type '{}': circular dependency between path_pattern and generated field '{}'",
                                 type_def.name, field_name
                             ));
-                        }
                     }
+                }
             }
             // Validate generated strategies
             if let Some(ref gen) = field_def.generated {
@@ -152,7 +161,9 @@ pub fn load_types_with_warnings(
         }
 
         // Validate path_pattern field references
-        let pattern = type_def.path_pattern.as_deref()
+        let pattern = type_def
+            .path_pattern
+            .as_deref()
             .or(type_def.filename_pattern.as_deref());
         if let Some(pattern) = pattern {
             for cap in placeholder_re.captures_iter(pattern) {
@@ -188,10 +199,13 @@ pub fn load_types_with_warnings(
 }
 
 /// Recursively collect all type files (.md, .yaml, .yml) from a directory.
-fn collect_type_files(dir: &Path, migrations_dir: Option<&Path>) -> Result<Vec<std::path::PathBuf>, String> {
+fn collect_type_files(
+    dir: &Path,
+    migrations_dir: Option<&Path>,
+) -> Result<Vec<std::path::PathBuf>, String> {
     let mut files = Vec::new();
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("Failed to read types directory: {}", e))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("Failed to read types directory: {}", e))?;
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read dir entry: {}", e))?;
@@ -230,7 +244,12 @@ fn parse_type_file(content: &str, path: &Path) -> Result<TypeDef, String> {
 
     let mapping = match yaml.as_mapping() {
         Some(m) => m,
-        None => return Err(format!("Type file {:?} frontmatter must be a mapping", path)),
+        None => {
+            return Err(format!(
+                "Type file {:?} frontmatter must be a mapping",
+                path
+            ))
+        }
     };
 
     let ykey = |s: &str| serde_yaml::Value::String(s.to_string());
@@ -258,14 +277,12 @@ fn parse_type_file(content: &str, path: &Path) -> Result<TypeDef, String> {
         }
     };
 
-    let strict = mapping
-        .get(ykey("strict"))
-        .map(|v| match v {
-            serde_yaml::Value::Bool(true) => StrictMode::Error,
-            serde_yaml::Value::Bool(false) => StrictMode::Off,
-            serde_yaml::Value::String(s) if s == "warn" => StrictMode::Warn,
-            _ => StrictMode::Off,
-        });
+    let strict = mapping.get(ykey("strict")).map(|v| match v {
+        serde_yaml::Value::Bool(true) => StrictMode::Error,
+        serde_yaml::Value::Bool(false) => StrictMode::Off,
+        serde_yaml::Value::String(s) if s == "warn" => StrictMode::Warn,
+        _ => StrictMode::Off,
+    });
 
     let filename_pattern = mapping
         .get(ykey("filename_pattern"))
@@ -303,9 +320,7 @@ fn parse_type_file(content: &str, path: &Path) -> Result<TypeDef, String> {
 }
 
 /// Parse a fields mapping from YAML.
-fn parse_fields(
-    fields_map: &serde_yaml::Mapping,
-) -> Result<HashMap<String, FieldDef>, String> {
+fn parse_fields(fields_map: &serde_yaml::Mapping) -> Result<HashMap<String, FieldDef>, String> {
     let mut fields = HashMap::new();
 
     for (key, value) in fields_map {
@@ -350,26 +365,20 @@ fn parse_field_def(value: &serde_yaml::Value) -> Result<FieldDef, String> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let default = mapping
-        .get(ykey("default"))
-        .map(yaml_to_json);
+    let default = mapping.get(ykey("default")).map(yaml_to_json);
 
-    let generated = mapping
-        .get(ykey("generated"))
-        .map(parse_generated);
+    let generated = mapping.get(ykey("generated")).map(parse_generated);
 
     let description = mapping
         .get(ykey("description"))
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let deprecated = mapping
-        .get(ykey("deprecated"))
-        .map(|v| match v {
-            serde_yaml::Value::String(s) => s.clone(),
-            serde_yaml::Value::Bool(true) => "deprecated".to_string(),
-            _ => "deprecated".to_string(),
-        });
+    let deprecated = mapping.get(ykey("deprecated")).map(|v| match v {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Bool(true) => "deprecated".to_string(),
+        _ => "deprecated".to_string(),
+    });
 
     let unique = mapping
         .get(ykey("unique"))
@@ -378,8 +387,14 @@ fn parse_field_def(value: &serde_yaml::Value) -> Result<FieldDef, String> {
 
     let min = mapping.get(ykey("min")).and_then(|v| v.as_f64());
     let max = mapping.get(ykey("max")).and_then(|v| v.as_f64());
-    let min_length = mapping.get(ykey("min_length")).and_then(|v| v.as_u64()).map(|v| v as usize);
-    let max_length = mapping.get(ykey("max_length")).and_then(|v| v.as_u64()).map(|v| v as usize);
+    let min_length = mapping
+        .get(ykey("min_length"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let max_length = mapping
+        .get(ykey("max_length"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
 
     let pattern = mapping
         .get(ykey("pattern"))
@@ -422,8 +437,14 @@ fn parse_field_def(value: &serde_yaml::Value) -> Result<FieldDef, String> {
         _ => None,
     };
 
-    let min_items = mapping.get(ykey("min_items")).and_then(|v| v.as_u64()).map(|v| v as usize);
-    let max_items = mapping.get(ykey("max_items")).and_then(|v| v.as_u64()).map(|v| v as usize);
+    let min_items = mapping
+        .get(ykey("min_items"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let max_items = mapping
+        .get(ykey("max_items"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
 
     let list_unique = mapping
         .get(ykey("unique"))
@@ -490,7 +511,10 @@ fn parse_generated(value: &serde_yaml::Value) -> GeneratedStrategy {
             // Check for sequence key (e.g., {sequence: {start: 100}})
             if let Some(seq_val) = m.get(ykey("sequence")) {
                 let start = if let Some(seq_map) = seq_val.as_mapping() {
-                    seq_map.get(ykey("start")).and_then(|v| v.as_i64()).unwrap_or(1)
+                    seq_map
+                        .get(ykey("start"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(1)
                 } else {
                     1
                 };
@@ -529,7 +553,13 @@ fn parse_generated(value: &serde_yaml::Value) -> GeneratedStrategy {
 fn parse_match_rules(value: &serde_yaml::Value) -> MatchRules {
     let mapping = match value.as_mapping() {
         Some(m) => m,
-        None => return MatchRules { path_glob: None, fields_present: None, where_clause: None },
+        None => {
+            return MatchRules {
+                path_glob: None,
+                fields_present: None,
+                where_clause: None,
+            }
+        }
     };
 
     let ykey = |s: &str| serde_yaml::Value::String(s.to_string());

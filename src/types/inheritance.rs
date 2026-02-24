@@ -1,7 +1,7 @@
 //! Resolve extends chains (§5.4).
 
-use std::collections::HashMap;
 use super::schema::TypeDef;
+use std::collections::HashMap;
 
 /// Resolve inheritance for all types, merging parent fields into children.
 /// Child fields completely replace parent fields of the same name.

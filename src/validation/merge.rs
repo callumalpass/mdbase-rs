@@ -3,16 +3,13 @@
 //! When a file matches multiple types, their field definitions must be
 //! compatible. This module detects conflicts during validation.
 
-use std::collections::HashMap;
 use crate::errors::*;
 use crate::types::schema::*;
+use std::collections::HashMap;
 
 /// Check for conflicts between multiple type definitions.
 /// Returns issues for any incompatible field definitions.
-pub fn detect_type_conflicts(
-    types: &[&TypeDef],
-    path: &str,
-) -> Vec<Issue> {
+pub fn detect_type_conflicts(types: &[&TypeDef], path: &str) -> Vec<Issue> {
     if types.len() < 2 {
         return Vec::new();
     }
@@ -23,7 +20,8 @@ pub fn detect_type_conflicts(
     let mut all_fields: HashMap<&str, Vec<(&str, &FieldDef)>> = HashMap::new();
     for td in types {
         for (fname, fdef) in &td.fields {
-            all_fields.entry(fname.as_str())
+            all_fields
+                .entry(fname.as_str())
                 .or_default()
                 .push((td.name.as_str(), fdef));
         }
@@ -66,9 +64,8 @@ fn check_field_conflicts(
 
     // 2. Check enum intersection
     if first.field_type == "enum" {
-        let enum_sets: Vec<Option<&Vec<String>>> = defs.iter()
-            .map(|(_, fd)| fd.values.as_ref())
-            .collect();
+        let enum_sets: Vec<Option<&Vec<String>>> =
+            defs.iter().map(|(_, fd)| fd.values.as_ref()).collect();
         if enum_sets.iter().all(|s| s.is_some()) {
             let sets: Vec<&Vec<String>> = enum_sets.into_iter().flatten().collect();
             if sets.len() >= 2 {
@@ -90,16 +87,41 @@ fn check_field_conflicts(
     }
 
     // 3. Check numeric min/max range
-    check_range_conflict(field_name, defs, path, issues, |fd| fd.min, |fd| fd.max, "numeric");
+    check_range_conflict(
+        field_name,
+        defs,
+        path,
+        issues,
+        |fd| fd.min,
+        |fd| fd.max,
+        "numeric",
+    );
 
     // 4. Check string length range
-    check_range_conflict_usize(field_name, defs, path, issues, |fd| fd.min_length, |fd| fd.max_length, "length");
+    check_range_conflict_usize(
+        field_name,
+        defs,
+        path,
+        issues,
+        |fd| fd.min_length,
+        |fd| fd.max_length,
+        "length",
+    );
 
     // 5. Check list items range
-    check_range_conflict_usize(field_name, defs, path, issues, |fd| fd.min_items, |fd| fd.max_items, "items");
+    check_range_conflict_usize(
+        field_name,
+        defs,
+        path,
+        issues,
+        |fd| fd.min_items,
+        |fd| fd.max_items,
+        "items",
+    );
 
     // 6. Check conflicting defaults
-    let defaults: Vec<&serde_json::Value> = defs.iter()
+    let defaults: Vec<&serde_json::Value> = defs
+        .iter()
         .filter_map(|(_, fd)| fd.default.as_ref())
         .collect();
     if defaults.len() >= 2 {
@@ -115,20 +137,24 @@ fn check_field_conflicts(
     }
 
     // 7. Check conflicting generated strategies
-    let generated: Vec<&GeneratedStrategy> = defs.iter()
+    let generated: Vec<&GeneratedStrategy> = defs
+        .iter()
         .filter_map(|(_, fd)| fd.generated.as_ref())
         .collect();
-    if generated.len() >= 2
-        && !all_generated_same(&generated) {
-            issues.push(type_conflict_issue(
-                field_name,
-                path,
-                &format!("Conflicting generated strategies for field '{}'", field_name),
-            ));
-        }
+    if generated.len() >= 2 && !all_generated_same(&generated) {
+        issues.push(type_conflict_issue(
+            field_name,
+            path,
+            &format!(
+                "Conflicting generated strategies for field '{}'",
+                field_name
+            ),
+        ));
+    }
 
     // 8. Check conflicting link targets
-    let targets: Vec<&String> = defs.iter()
+    let targets: Vec<&String> = defs
+        .iter()
         .filter_map(|(_, fd)| fd.target.as_ref())
         .collect();
     if targets.len() >= 2 {
@@ -144,9 +170,8 @@ fn check_field_conflicts(
 
     // 9. Check list item type conflicts (recursive)
     if first.field_type == "list" {
-        let item_defs: Vec<Option<&FieldDef>> = defs.iter()
-            .map(|(_, fd)| fd.items.as_deref())
-            .collect();
+        let item_defs: Vec<Option<&FieldDef>> =
+            defs.iter().map(|(_, fd)| fd.items.as_deref()).collect();
         if item_defs.iter().all(|d| d.is_some()) {
             let items: Vec<&FieldDef> = item_defs.into_iter().flatten().collect();
             if items.len() >= 2 {
@@ -170,16 +195,16 @@ fn check_field_conflicts(
 
     // 10. Check object sub-field conflicts (recursive)
     if first.field_type == "object" {
-        let nested_maps: Vec<Option<&HashMap<String, FieldDef>>> = defs.iter()
-            .map(|(_, fd)| fd.fields.as_ref())
-            .collect();
+        let nested_maps: Vec<Option<&HashMap<String, FieldDef>>> =
+            defs.iter().map(|(_, fd)| fd.fields.as_ref()).collect();
         if nested_maps.iter().any(|m| m.is_some()) {
             // Collect sub-fields from all types
             let mut sub_fields: HashMap<&str, Vec<(&str, &FieldDef)>> = HashMap::new();
             for (type_name, fd) in defs {
                 if let Some(ref fields) = fd.fields {
                     for (sf_name, sf_def) in fields {
-                        sub_fields.entry(sf_name.as_str())
+                        sub_fields
+                            .entry(sf_name.as_str())
                             .or_default()
                             .push((type_name, sf_def));
                     }
@@ -214,7 +239,10 @@ fn check_range_conflict(
             issues.push(type_conflict_issue(
                 field_name,
                 path,
-                &format!("Impossible range for field '{}': min {} > max {}", field_name, merged_min, merged_max),
+                &format!(
+                    "Impossible range for field '{}': min {} > max {}",
+                    field_name, merged_min, merged_max
+                ),
             ));
         }
     }
@@ -239,7 +267,10 @@ fn check_range_conflict_usize(
             issues.push(type_conflict_issue(
                 field_name,
                 path,
-                &format!("Impossible range for field '{}': min {} > max {}", field_name, merged_min, merged_max),
+                &format!(
+                    "Impossible range for field '{}': min {} > max {}",
+                    field_name, merged_min, merged_max
+                ),
             ));
         }
     }
@@ -274,8 +305,16 @@ fn generated_eq(a: &GeneratedStrategy, b: &GeneratedStrategy) -> bool {
         (GeneratedStrategy::Uuid, GeneratedStrategy::Uuid) => true,
         (GeneratedStrategy::Now, GeneratedStrategy::Now) => true,
         (GeneratedStrategy::NowOnWrite, GeneratedStrategy::NowOnWrite) => true,
-        (GeneratedStrategy::Derived { from: f1, transform: t1 },
-         GeneratedStrategy::Derived { from: f2, transform: t2 }) => f1 == f2 && t1 == t2,
+        (
+            GeneratedStrategy::Derived {
+                from: f1,
+                transform: t1,
+            },
+            GeneratedStrategy::Derived {
+                from: f2,
+                transform: t2,
+            },
+        ) => f1 == f2 && t1 == t2,
         _ => false,
     }
 }

@@ -3,18 +3,23 @@
 use rusqlite::Connection;
 use std::path::Path;
 
-use crate::Collection;
-use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json, is_parse_error};
 use crate::expressions::evaluator::{
-    extract_links_from_body, extract_embeds_from_body, extract_links_from_fm_value,
+    extract_embeds_from_body, extract_links_from_body, extract_links_from_fm_value,
 };
+use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to_json};
+use crate::Collection;
 
 /// Parse and index a single file into the cache database.
 ///
 /// `abs_path` is the absolute path on disk; `rel_path` is the forward-slash
 /// separated path relative to the collection root.
 #[allow(dead_code)]
-pub(crate) fn reindex_file(conn: &Connection, collection: &Collection, abs_path: &Path, rel_path: &str) {
+pub(crate) fn reindex_file(
+    conn: &Connection,
+    collection: &Collection,
+    abs_path: &Path,
+    rel_path: &str,
+) {
     // 1. Read file contents
     let content = match std::fs::read_to_string(abs_path) {
         Ok(c) => c,
@@ -183,10 +188,22 @@ fn insert_unique_values(
 /// Remove a file (by relative path) from all cache tables.
 #[allow(dead_code)]
 pub(crate) fn remove_file(conn: &Connection, rel_path: &str) {
-    let _ = conn.execute("DELETE FROM links WHERE source_path = ?1", rusqlite::params![rel_path]);
-    let _ = conn.execute("DELETE FROM file_types WHERE path = ?1", rusqlite::params![rel_path]);
-    let _ = conn.execute("DELETE FROM unique_values WHERE path = ?1", rusqlite::params![rel_path]);
-    let _ = conn.execute("DELETE FROM files WHERE path = ?1", rusqlite::params![rel_path]);
+    let _ = conn.execute(
+        "DELETE FROM links WHERE source_path = ?1",
+        rusqlite::params![rel_path],
+    );
+    let _ = conn.execute(
+        "DELETE FROM file_types WHERE path = ?1",
+        rusqlite::params![rel_path],
+    );
+    let _ = conn.execute(
+        "DELETE FROM unique_values WHERE path = ?1",
+        rusqlite::params![rel_path],
+    );
+    let _ = conn.execute(
+        "DELETE FROM files WHERE path = ?1",
+        rusqlite::params![rel_path],
+    );
 }
 
 /// Full rebuild: delete everything and reindex all files.

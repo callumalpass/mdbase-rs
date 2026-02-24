@@ -18,15 +18,15 @@ pub struct FieldDef {
     pub min_length: Option<usize>,
     pub max_length: Option<usize>,
     pub pattern: Option<String>,
-    pub values: Option<Vec<String>>,     // enum values
-    pub items: Option<Box<FieldDef>>,    // list item type
+    pub values: Option<Vec<String>>,               // enum values
+    pub items: Option<Box<FieldDef>>,              // list item type
     pub fields: Option<HashMap<String, FieldDef>>, // object fields
     pub min_items: Option<usize>,
     pub max_items: Option<usize>,
-    pub list_unique: bool,               // unique constraint on list items
-    pub target: Option<String>,          // link target type
-    pub validate_exists: Option<bool>,   // link existence validation
-    pub computed: Option<String>,        // computed field expression (§5.12)
+    pub list_unique: bool,             // unique constraint on list items
+    pub target: Option<String>,        // link target type
+    pub validate_exists: Option<bool>, // link existence validation
+    pub computed: Option<String>,      // computed field expression (§5.12)
 }
 
 /// Generated field strategy (§7.15).
@@ -36,7 +36,7 @@ pub enum GeneratedStrategy {
     Uuid,
     Now,
     NowOnWrite,
-    Sequence(i64),  // start value, default 1
+    Sequence(i64), // start value, default 1
     Random(u64),
     Derived { from: String, transform: String },
 }
@@ -58,9 +58,9 @@ pub struct TypeDef {
 /// Strictness mode for unknown fields.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StrictMode {
-    Off,     // false - allow unknown fields
-    Warn,    // "warn" - warn about unknown fields
-    Error,   // true - error on unknown fields
+    Off,   // false - allow unknown fields
+    Warn,  // "warn" - warn about unknown fields
+    Error, // true - error on unknown fields
 }
 
 /// Match rules for auto-association (§6).

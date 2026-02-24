@@ -5,11 +5,7 @@ use crate::types::schema::MatchRules;
 /// Check if a file matches the given match rules.
 /// `rel_path` is the file path relative to the collection root (forward slashes).
 /// `frontmatter` is the parsed frontmatter JSON object.
-pub fn matches_rules(
-    rules: &MatchRules,
-    rel_path: &str,
-    frontmatter: &serde_json::Value,
-) -> bool {
+pub fn matches_rules(rules: &MatchRules, rel_path: &str, frontmatter: &serde_json::Value) -> bool {
     // All conditions in a match rule are AND'd together
     if let Some(ref path_glob) = rules.path_glob {
         if !matches_path_glob(rel_path, path_glob) {
@@ -185,12 +181,14 @@ fn evaluate_field_condition(
 ) -> bool {
     for (op, expected) in operators {
         match op.as_str() {
-            "eq" => {
-                match field_value {
-                    Some(actual) => if !values_equal(actual, expected) { return false; }
-                    None => return false,
+            "eq" => match field_value {
+                Some(actual) => {
+                    if !values_equal(actual, expected) {
+                        return false;
+                    }
                 }
-            }
+                None => return false,
+            },
             "neq" => {
                 if let Some(actual) = field_value {
                     if values_equal(actual, expected) {
@@ -198,46 +196,42 @@ fn evaluate_field_condition(
                     }
                 }
             }
-            "gt" => {
-                match field_value {
-                    Some(actual) => {
-                        if compare_values(actual, expected) != Some(std::cmp::Ordering::Greater) {
-                            return false;
-                        }
+            "gt" => match field_value {
+                Some(actual) => {
+                    if compare_values(actual, expected) != Some(std::cmp::Ordering::Greater) {
+                        return false;
                     }
-                    None => return false,
                 }
-            }
-            "gte" => {
-                match field_value {
-                    Some(actual) => {
-                        if compare_values(actual, expected).is_none_or(|ord| ord == std::cmp::Ordering::Less) {
-                            return false;
-                        }
+                None => return false,
+            },
+            "gte" => match field_value {
+                Some(actual) => {
+                    if compare_values(actual, expected)
+                        .is_none_or(|ord| ord == std::cmp::Ordering::Less)
+                    {
+                        return false;
                     }
-                    None => return false,
                 }
-            }
-            "lt" => {
-                match field_value {
-                    Some(actual) => {
-                        if compare_values(actual, expected) != Some(std::cmp::Ordering::Less) {
-                            return false;
-                        }
+                None => return false,
+            },
+            "lt" => match field_value {
+                Some(actual) => {
+                    if compare_values(actual, expected) != Some(std::cmp::Ordering::Less) {
+                        return false;
                     }
-                    None => return false,
                 }
-            }
-            "lte" => {
-                match field_value {
-                    Some(actual) => {
-                        if compare_values(actual, expected).is_none_or(|ord| ord == std::cmp::Ordering::Greater) {
-                            return false;
-                        }
+                None => return false,
+            },
+            "lte" => match field_value {
+                Some(actual) => {
+                    if compare_values(actual, expected)
+                        .is_none_or(|ord| ord == std::cmp::Ordering::Greater)
+                    {
+                        return false;
                     }
-                    None => return false,
                 }
-            }
+                None => return false,
+            },
             "exists" => {
                 let should_exist = expected.as_bool().unwrap_or(true);
                 let does_exist = field_value.is_some_and(|v| !v.is_null());
@@ -245,87 +239,84 @@ fn evaluate_field_condition(
                     return false;
                 }
             }
-            "contains" => {
-                match field_value {
-                    Some(serde_json::Value::Array(arr)) => {
-                        if !arr.iter().any(|item| values_equal(item, expected)) {
+            "contains" => match field_value {
+                Some(serde_json::Value::Array(arr)) => {
+                    if !arr.iter().any(|item| values_equal(item, expected)) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            },
+            "containsAll" => match field_value {
+                Some(serde_json::Value::Array(arr)) => {
+                    if let Some(expected_arr) = expected.as_array() {
+                        for exp in expected_arr {
+                            if !arr.iter().any(|item| values_equal(item, exp)) {
+                                return false;
+                            }
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                _ => return false,
+            },
+            "containsAny" => match field_value {
+                Some(serde_json::Value::Array(arr)) => {
+                    if let Some(expected_arr) = expected.as_array() {
+                        if !expected_arr
+                            .iter()
+                            .any(|exp| arr.iter().any(|item| values_equal(item, exp)))
+                        {
                             return false;
                         }
+                    } else {
+                        return false;
                     }
-                    _ => return false,
                 }
-            }
-            "containsAll" => {
-                match field_value {
-                    Some(serde_json::Value::Array(arr)) => {
-                        if let Some(expected_arr) = expected.as_array() {
-                            for exp in expected_arr {
-                                if !arr.iter().any(|item| values_equal(item, exp)) {
+                _ => return false,
+            },
+            "startsWith" => match field_value {
+                Some(serde_json::Value::String(s)) => {
+                    if let Some(prefix) = expected.as_str() {
+                        if !s.starts_with(prefix) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                _ => return false,
+            },
+            "endsWith" => match field_value {
+                Some(serde_json::Value::String(s)) => {
+                    if let Some(suffix) = expected.as_str() {
+                        if !s.ends_with(suffix) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                _ => return false,
+            },
+            "matches" => match field_value {
+                Some(serde_json::Value::String(s)) => {
+                    if let Some(pattern) = expected.as_str() {
+                        match fancy_regex::Regex::new(pattern) {
+                            Ok(re) => {
+                                if !re.is_match(s).unwrap_or(false) {
                                     return false;
                                 }
                             }
-                        } else {
-                            return false;
+                            Err(_) => return false,
                         }
+                    } else {
+                        return false;
                     }
-                    _ => return false,
                 }
-            }
-            "containsAny" => {
-                match field_value {
-                    Some(serde_json::Value::Array(arr)) => {
-                        if let Some(expected_arr) = expected.as_array() {
-                            if !expected_arr.iter().any(|exp| arr.iter().any(|item| values_equal(item, exp))) {
-                                return false;
-                            }
-                        } else {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                }
-            }
-            "startsWith" => {
-                match field_value {
-                    Some(serde_json::Value::String(s)) => {
-                        if let Some(prefix) = expected.as_str() {
-                            if !s.starts_with(prefix) { return false; }
-                        } else {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                }
-            }
-            "endsWith" => {
-                match field_value {
-                    Some(serde_json::Value::String(s)) => {
-                        if let Some(suffix) = expected.as_str() {
-                            if !s.ends_with(suffix) { return false; }
-                        } else {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                }
-            }
-            "matches" => {
-                match field_value {
-                    Some(serde_json::Value::String(s)) => {
-                        if let Some(pattern) = expected.as_str() {
-                            match fancy_regex::Regex::new(pattern) {
-                                Ok(re) => {
-                                    if !re.is_match(s).unwrap_or(false) { return false; }
-                                }
-                                Err(_) => return false,
-                            }
-                        } else {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                }
-            }
+                _ => return false,
+            },
             _ => {} // Unknown operator - ignore
         }
     }
@@ -527,10 +518,9 @@ impl Collection {
         if let Some(path) = rel_path {
             for (type_name, type_def) in &self.types {
                 if let Some(ref rules) = type_def.match_rules {
-                    if matches_rules(rules, path, frontmatter)
-                        && !types.contains(type_name) {
-                            types.push(type_name.clone());
-                        }
+                    if matches_rules(rules, path, frontmatter) && !types.contains(type_name) {
+                        types.push(type_name.clone());
+                    }
                 }
             }
         }

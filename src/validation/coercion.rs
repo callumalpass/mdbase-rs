@@ -1,7 +1,10 @@
 //! Type coercion (§7.16).
 
 /// Coerce a value to the expected field type (§7.16).
-pub(crate) fn coerce_value(value: &serde_json::Value, target_type: &str) -> Option<serde_json::Value> {
+pub(crate) fn coerce_value(
+    value: &serde_json::Value,
+    target_type: &str,
+) -> Option<serde_json::Value> {
     match target_type {
         "string" => match value {
             serde_json::Value::String(_) => None, // already correct
@@ -29,11 +32,10 @@ pub(crate) fn coerce_value(value: &serde_json::Value, target_type: &str) -> Opti
         },
         "number" => match value {
             serde_json::Value::Number(_) => None, // already correct
-            serde_json::Value::String(s) => {
-                s.parse::<f64>().ok().and_then(|f| {
-                    serde_json::Number::from_f64(f).map(serde_json::Value::Number)
-                })
-            }
+            serde_json::Value::String(s) => s
+                .parse::<f64>()
+                .ok()
+                .and_then(|f| serde_json::Number::from_f64(f).map(serde_json::Value::Number)),
             _ => None,
         },
         "boolean" => match value {
@@ -73,7 +75,9 @@ impl Collection {
                         if !obj.contains_key(field_name) {
                             // Field is missing — apply default
                             obj.insert(field_name.clone(), default.clone());
-                        } else if obj.get(field_name).is_some_and(|v| v.is_null()) && field_def.generated.is_some() {
+                        } else if obj.get(field_name).is_some_and(|v| v.is_null())
+                            && field_def.generated.is_some()
+                        {
                             // Field is null AND was generated (e.g., derived with missing source)
                             // Apply default as effective value
                             obj.insert(field_name.clone(), default.clone());

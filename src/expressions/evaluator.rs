@@ -12,19 +12,34 @@ pub struct EvalError {
 
 impl EvalError {
     fn type_error(msg: &str) -> Self {
-        EvalError { code: "type_error".to_string(), message: msg.to_string() }
+        EvalError {
+            code: "type_error".to_string(),
+            message: msg.to_string(),
+        }
     }
     fn invalid_expression(msg: &str) -> Self {
-        EvalError { code: "invalid_expression".to_string(), message: msg.to_string() }
+        EvalError {
+            code: "invalid_expression".to_string(),
+            message: msg.to_string(),
+        }
     }
     fn wrong_argument_count(msg: &str) -> Self {
-        EvalError { code: "wrong_argument_count".to_string(), message: msg.to_string() }
+        EvalError {
+            code: "wrong_argument_count".to_string(),
+            message: msg.to_string(),
+        }
     }
     fn unknown_function(msg: &str) -> Self {
-        EvalError { code: "unknown_function".to_string(), message: msg.to_string() }
+        EvalError {
+            code: "unknown_function".to_string(),
+            message: msg.to_string(),
+        }
     }
     fn expression_depth_exceeded() -> Self {
-        EvalError { code: "expression_depth_exceeded".to_string(), message: "Expression nesting depth limit exceeded".to_string() }
+        EvalError {
+            code: "expression_depth_exceeded".to_string(),
+            message: "Expression nesting depth limit exceeded".to_string(),
+        }
     }
 }
 
@@ -63,7 +78,8 @@ pub struct EvalContext {
     /// Type names for this file (for display_name_key lookup).
     pub type_names: Option<Vec<String>>,
     /// Types map for display_name_key lookup.
-    pub types: Option<std::sync::Arc<std::collections::HashMap<String, crate::types::schema::TypeDef>>>,
+    pub types:
+        Option<std::sync::Arc<std::collections::HashMap<String, crate::types::schema::TypeDef>>>,
     /// Whether string + number should concatenate (true in formulas) or return type error (false in where clauses).
     pub string_concat: bool,
 }
@@ -181,7 +197,9 @@ fn eval_dot(obj_expr: &Expr, field: &str, ctx: &EvalContext) -> Result<Value, Ev
         }
         // formula.* namespace
         if name == "formula" {
-            return Ok(ctx.frontmatter.get("formula")
+            return Ok(ctx
+                .frontmatter
+                .get("formula")
                 .and_then(|f| f.get(field))
                 .cloned()
                 .unwrap_or(Value::Null));
@@ -194,7 +212,11 @@ fn eval_dot(obj_expr: &Expr, field: &str, ctx: &EvalContext) -> Result<Value, Ev
                     return Ok(Value::Null);
                 }
                 // this.fieldName → access context file's frontmatter
-                return Ok(this_ctx.frontmatter.get(field).cloned().unwrap_or(Value::Null));
+                return Ok(this_ctx
+                    .frontmatter
+                    .get(field)
+                    .cloned()
+                    .unwrap_or(Value::Null));
             }
             return Ok(Value::Null);
         }
@@ -214,12 +236,10 @@ fn eval_dot(obj_expr: &Expr, field: &str, ctx: &EvalContext) -> Result<Value, Ev
                 _ => Ok(Value::Null),
             }
         }
-        Value::Array(arr) => {
-            match field {
-                "length" => Ok(Value::Number(arr.len().into())),
-                _ => Ok(Value::Null),
-            }
-        }
+        Value::Array(arr) => match field {
+            "length" => Ok(Value::Number(arr.len().into())),
+            _ => Ok(Value::Null),
+        },
         Value::Null => Ok(Value::Null),
         _ => Ok(Value::Null),
     }
@@ -227,7 +247,11 @@ fn eval_dot(obj_expr: &Expr, field: &str, ctx: &EvalContext) -> Result<Value, Ev
 
 fn eval_file_property(field: &str, ctx: &EvalContext) -> Result<Value, EvalError> {
     match field {
-        "path" => Ok(ctx.file_path.clone().map(Value::String).unwrap_or(Value::Null)),
+        "path" => Ok(ctx
+            .file_path
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null)),
         "name" => {
             if let Some(ref p) = ctx.file_path {
                 let name = std::path::Path::new(p)
@@ -280,7 +304,11 @@ fn eval_file_property(field: &str, ctx: &EvalContext) -> Result<Value, EvalError
         }
         "tags" => {
             // Extract tags from body + frontmatter tags field
-            let body_tags = ctx.body.as_deref().map(extract_tags_from_body).unwrap_or_default();
+            let body_tags = ctx
+                .body
+                .as_deref()
+                .map(extract_tags_from_body)
+                .unwrap_or_default();
             let mut all_tags = Vec::new();
             // Add frontmatter tags first (handle both array and string)
             if let Some(fm_tags_val) = ctx.frontmatter.get("tags") {
@@ -303,29 +331,45 @@ fn eval_file_property(field: &str, ctx: &EvalContext) -> Result<Value, EvalError
                     all_tags.push(t);
                 }
             }
-            Ok(Value::Array(all_tags.into_iter().map(Value::String).collect()))
+            Ok(Value::Array(
+                all_tags.into_iter().map(Value::String).collect(),
+            ))
         }
         "links" => {
             let mut all_links: Vec<String> = Vec::new();
             // Extract links from frontmatter values (string fields containing [[...]] or link paths)
             if let Some(obj) = ctx.frontmatter.as_object() {
                 for (key, val) in obj {
-                    if key == "tags" || key == "type" || key == "types" { continue; }
+                    if key == "tags" || key == "type" || key == "types" {
+                        continue;
+                    }
                     extract_links_from_fm_value(val, &mut all_links);
                 }
             }
             // Extract links from body
-            let body_links = ctx.body.as_deref().map(extract_links_from_body).unwrap_or_default();
+            let body_links = ctx
+                .body
+                .as_deref()
+                .map(extract_links_from_body)
+                .unwrap_or_default();
             for link in body_links {
                 if !all_links.contains(&link) {
                     all_links.push(link);
                 }
             }
-            Ok(Value::Array(all_links.into_iter().map(Value::String).collect()))
+            Ok(Value::Array(
+                all_links.into_iter().map(Value::String).collect(),
+            ))
         }
         "embeds" => {
-            let embeds = ctx.body.as_deref().map(extract_embeds_from_body).unwrap_or_default();
-            Ok(Value::Array(embeds.into_iter().map(Value::String).collect()))
+            let embeds = ctx
+                .body
+                .as_deref()
+                .map(extract_embeds_from_body)
+                .unwrap_or_default();
+            Ok(Value::Array(
+                embeds.into_iter().map(Value::String).collect(),
+            ))
         }
         "display_name" => {
             // file.display_name: use display_name_key from type if available, else file.basename
@@ -357,40 +401,46 @@ fn eval_file_property(field: &str, ctx: &EvalContext) -> Result<Value, EvalError
                 Ok(Value::Null)
             }
         }
-        "size" => {
-            Ok(ctx.file_size.map(|s| Value::Number(s.into())).unwrap_or(Value::Null))
-        }
-        "mtime" => {
-            Ok(ctx.file_mtime.as_ref().map(|s| Value::String(s.clone())).unwrap_or(Value::Null))
-        }
-        "ctime" => {
-            Ok(ctx.file_ctime.as_ref().map(|s| Value::String(s.clone())).unwrap_or(Value::Null))
-        }
+        "size" => Ok(ctx
+            .file_size
+            .map(|s| Value::Number(s.into()))
+            .unwrap_or(Value::Null)),
+        "mtime" => Ok(ctx
+            .file_mtime
+            .as_ref()
+            .map(|s| Value::String(s.clone()))
+            .unwrap_or(Value::Null)),
+        "ctime" => Ok(ctx
+            .file_ctime
+            .as_ref()
+            .map(|s| Value::String(s.clone()))
+            .unwrap_or(Value::Null)),
         "backlinks" => {
             if let (Some(ref path), Some(ref bl_index)) = (&ctx.file_path, &ctx.backlinks_index) {
-                let sources = bl_index.get(path)
-                    .cloned()
-                    .unwrap_or_default();
+                let sources = bl_index.get(path).cloned().unwrap_or_default();
                 // Return array of objects with file metadata
-                let backlink_objects: Vec<Value> = sources.into_iter().map(|source_path| {
-                    let name = std::path::Path::new(&source_path)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let folder = std::path::Path::new(&source_path)
-                        .parent()
-                        .and_then(|p| p.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    serde_json::json!({
-                        "file": {
-                            "path": source_path,
-                            "name": name,
-                            "folder": folder,
-                        }
+                let backlink_objects: Vec<Value> = sources
+                    .into_iter()
+                    .map(|source_path| {
+                        let name = std::path::Path::new(&source_path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let folder = std::path::Path::new(&source_path)
+                            .parent()
+                            .and_then(|p| p.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        serde_json::json!({
+                            "file": {
+                                "path": source_path,
+                                "name": name,
+                                "folder": folder,
+                            }
+                        })
                     })
-                }).collect();
+                    .collect();
                 Ok(Value::Array(backlink_objects))
             } else if ctx.backlinks_index.is_some() {
                 // Index available but no file path — return empty array
@@ -408,28 +458,30 @@ fn eval_file_method(method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Va
     match method {
         "hasProperty" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("hasProperty() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "hasProperty() requires 1 argument",
+                ));
             }
             let prop_name = evaluate(&args[0], ctx)?;
             let prop_str = prop_name.as_str().unwrap_or("");
             // Check raw frontmatter (pre-defaults) if available, otherwise effective
             let fm = ctx.raw_frontmatter.as_ref().unwrap_or(&ctx.frontmatter);
-            let has = fm.as_object()
-                .is_some_and(|m| m.contains_key(prop_str));
+            let has = fm.as_object().is_some_and(|m| m.contains_key(prop_str));
             Ok(Value::Bool(has))
         }
         "inFolder" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("inFolder() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "inFolder() requires 1 argument",
+                ));
             }
             let folder = evaluate(&args[0], ctx)?;
             let folder_str = folder.as_str().unwrap_or("");
             if let Some(ref p) = ctx.file_path {
                 // Check if the file's path starts with the folder
-                let in_folder = p.starts_with(folder_str) && (
-                    p.len() == folder_str.len() ||
-                    p.as_bytes().get(folder_str.len()) == Some(&b'/')
-                );
+                let in_folder = p.starts_with(folder_str)
+                    && (p.len() == folder_str.len()
+                        || p.as_bytes().get(folder_str.len()) == Some(&b'/'));
                 Ok(Value::Bool(in_folder))
             } else {
                 Ok(Value::Bool(false))
@@ -437,10 +489,16 @@ fn eval_file_method(method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Va
         }
         "hasTag" => {
             if args.is_empty() {
-                return Err(EvalError::wrong_argument_count("hasTag() requires at least 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "hasTag() requires at least 1 argument",
+                ));
             }
             // Collect all tags from body + frontmatter
-            let body_tags = ctx.body.as_deref().map(extract_tags_from_body).unwrap_or_default();
+            let body_tags = ctx
+                .body
+                .as_deref()
+                .map(extract_tags_from_body)
+                .unwrap_or_default();
             let mut all_tags = Vec::new();
             if let Some(fm_tags_val) = ctx.frontmatter.get("tags") {
                 if let Some(arr) = fm_tags_val.as_array() {
@@ -466,8 +524,9 @@ fn eval_file_method(method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Va
                 let arg_val = evaluate(arg_expr, ctx)?;
                 if let Some(tag_name) = arg_val.as_str() {
                     for existing_tag in &all_tags {
-                        if existing_tag == tag_name ||
-                           existing_tag.starts_with(&format!("{}/", tag_name)) {
+                        if existing_tag == tag_name
+                            || existing_tag.starts_with(&format!("{}/", tag_name))
+                        {
                             return Ok(Value::Bool(true));
                         }
                     }
@@ -477,17 +536,25 @@ fn eval_file_method(method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Va
         }
         "hasLink" => {
             if args.is_empty() {
-                return Err(EvalError::wrong_argument_count("hasLink() requires at least 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "hasLink() requires at least 1 argument",
+                ));
             }
             // Collect all links (same as file.links)
             let mut all_links: Vec<String> = Vec::new();
             if let Some(obj) = ctx.frontmatter.as_object() {
                 for (key, val) in obj {
-                    if key == "tags" || key == "type" || key == "types" { continue; }
+                    if key == "tags" || key == "type" || key == "types" {
+                        continue;
+                    }
                     extract_links_from_fm_value(val, &mut all_links);
                 }
             }
-            let body_links = ctx.body.as_deref().map(extract_links_from_body).unwrap_or_default();
+            let body_links = ctx
+                .body
+                .as_deref()
+                .map(extract_links_from_body)
+                .unwrap_or_default();
             for link in body_links {
                 if !all_links.contains(&link) {
                     all_links.push(link);
@@ -497,18 +564,24 @@ fn eval_file_method(method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Va
             let arg_val = evaluate(&args[0], ctx)?;
             if let Some(link_target) = arg_val.as_str() {
                 // Resolve wikilinks relative to file directory for matching
-                let file_dir = ctx.file_path.as_deref()
+                let file_dir = ctx
+                    .file_path
+                    .as_deref()
                     .and_then(|p| std::path::Path::new(p).parent())
                     .and_then(|p| p.to_str())
                     .unwrap_or("");
 
                 for link in &all_links {
                     // Direct match
-                    if link == link_target { return Ok(Value::Bool(true)); }
+                    if link == link_target {
+                        return Ok(Value::Bool(true));
+                    }
                     // Strip .md extension
                     let link_no_ext = link.strip_suffix(".md").unwrap_or(link);
                     let target_no_ext = link_target.strip_suffix(".md").unwrap_or(link_target);
-                    if link_no_ext == target_no_ext { return Ok(Value::Bool(true)); }
+                    if link_no_ext == target_no_ext {
+                        return Ok(Value::Bool(true));
+                    }
                     // Resolve relative to file directory
                     if !link.contains('/') && !file_dir.is_empty() {
                         let resolved = format!("{}/{}", file_dir, link);
@@ -519,19 +592,33 @@ fn eval_file_method(method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Va
                     // Check basename match
                     let link_basename = link.rsplit('/').next().unwrap_or(link);
                     let target_basename = link_target.rsplit('/').next().unwrap_or(link_target);
-                    let link_basename_no_ext = link_basename.strip_suffix(".md").unwrap_or(link_basename);
-                    let target_basename_no_ext = target_basename.strip_suffix(".md").unwrap_or(target_basename);
+                    let link_basename_no_ext =
+                        link_basename.strip_suffix(".md").unwrap_or(link_basename);
+                    let target_basename_no_ext = target_basename
+                        .strip_suffix(".md")
+                        .unwrap_or(target_basename);
                     if link_basename_no_ext == target_basename_no_ext && link_target.contains('/') {
                         // Only match by basename if the target has a path and the resolved path matches
-                        let resolved = if link.contains('/') { link.to_string() } else if !file_dir.is_empty() { format!("{}/{}", file_dir, link) } else { link.to_string() };
+                        let resolved = if link.contains('/') {
+                            link.to_string()
+                        } else if !file_dir.is_empty() {
+                            format!("{}/{}", file_dir, link)
+                        } else {
+                            link.to_string()
+                        };
                         let resolved_no_ext = resolved.strip_suffix(".md").unwrap_or(&resolved);
-                        if resolved_no_ext == target_no_ext { return Ok(Value::Bool(true)); }
+                        if resolved_no_ext == target_no_ext {
+                            return Ok(Value::Bool(true));
+                        }
                     }
                 }
             }
             Ok(Value::Bool(false))
         }
-        _ => Err(EvalError::unknown_function(&format!("Unknown file method: .{}()", method))),
+        _ => Err(EvalError::unknown_function(&format!(
+            "Unknown file method: .{}()",
+            method
+        ))),
     }
 }
 
@@ -552,7 +639,11 @@ fn eval_index(obj_expr: &Expr, idx_expr: &Expr, ctx: &EvalContext) -> Result<Val
     match &obj {
         Value::Array(arr) => {
             if let Some(i) = idx.as_i64() {
-                let i = if i < 0 { (arr.len() as i64 + i) as usize } else { i as usize };
+                let i = if i < 0 {
+                    (arr.len() as i64 + i) as usize
+                } else {
+                    i as usize
+                };
                 Ok(arr.get(i).cloned().unwrap_or(Value::Null))
             } else {
                 Ok(Value::Null)
@@ -567,8 +658,15 @@ fn eval_index(obj_expr: &Expr, idx_expr: &Expr, ctx: &EvalContext) -> Result<Val
         }
         Value::String(s) => {
             if let Some(i) = idx.as_i64() {
-                let i = if i < 0 { (s.len() as i64 + i) as usize } else { i as usize };
-                Ok(s.chars().nth(i).map(|c| Value::String(c.to_string())).unwrap_or(Value::Null))
+                let i = if i < 0 {
+                    (s.len() as i64 + i) as usize
+                } else {
+                    i as usize
+                };
+                Ok(s.chars()
+                    .nth(i)
+                    .map(|c| Value::String(c.to_string()))
+                    .unwrap_or(Value::Null))
             } else {
                 Ok(Value::Null)
             }
@@ -577,7 +675,12 @@ fn eval_index(obj_expr: &Expr, idx_expr: &Expr, ctx: &EvalContext) -> Result<Val
     }
 }
 
-fn eval_binop(left: &Expr, op: &BinOp, right: &Expr, ctx: &EvalContext) -> Result<Value, EvalError> {
+fn eval_binop(
+    left: &Expr,
+    op: &BinOp,
+    right: &Expr,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
     // Short-circuit for logical operators
     match op {
         BinOp::And => {
@@ -608,10 +711,20 @@ fn eval_binop(left: &Expr, op: &BinOp, right: &Expr, ctx: &EvalContext) -> Resul
         BinOp::Mod => eval_arithmetic(&lval, &rval, "%"),
         BinOp::Eq => Ok(Value::Bool(values_equal(&lval, &rval))),
         BinOp::Neq => Ok(Value::Bool(!values_equal(&lval, &rval))),
-        BinOp::Lt => Ok(Value::Bool(compare_values(&lval, &rval) == Some(std::cmp::Ordering::Less))),
-        BinOp::Gt => Ok(Value::Bool(compare_values(&lval, &rval) == Some(std::cmp::Ordering::Greater))),
-        BinOp::Lte => Ok(Value::Bool(matches!(compare_values(&lval, &rval), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)))),
-        BinOp::Gte => Ok(Value::Bool(matches!(compare_values(&lval, &rval), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)))),
+        BinOp::Lt => Ok(Value::Bool(
+            compare_values(&lval, &rval) == Some(std::cmp::Ordering::Less),
+        )),
+        BinOp::Gt => Ok(Value::Bool(
+            compare_values(&lval, &rval) == Some(std::cmp::Ordering::Greater),
+        )),
+        BinOp::Lte => Ok(Value::Bool(matches!(
+            compare_values(&lval, &rval),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ))),
+        BinOp::Gte => Ok(Value::Bool(matches!(
+            compare_values(&lval, &rval),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        ))),
         BinOp::And | BinOp::Or => unreachable!(),
     }
 }
@@ -628,7 +741,10 @@ fn value_to_concat_string(v: &Value) -> Result<String, EvalError> {
         }
         Value::Bool(b) => Ok(b.to_string()),
         Value::Null => Ok("null".to_string()),
-        _ => Err(EvalError::type_error(&format!("Cannot concatenate {}", type_name(v)))),
+        _ => Err(EvalError::type_error(&format!(
+            "Cannot concatenate {}",
+            type_name(v)
+        ))),
     }
 }
 
@@ -642,12 +758,16 @@ fn eval_add(left: &Value, right: &Value, string_concat: bool) -> Result<Value, E
                 }
             }
             // Date + non-duration string is a type error
-            return Err(EvalError::type_error("Cannot add date and non-duration string"));
+            return Err(EvalError::type_error(
+                "Cannot add date and non-duration string",
+            ));
         }
     }
     // Duration + date (commutative)
     if let (Value::String(dur_str), Value::String(date_str)) = (left, right) {
-        if (is_date_string(date_str) || is_datetime_string(date_str)) && parse_duration_ms(dur_str).is_some() {
+        if (is_date_string(date_str) || is_datetime_string(date_str))
+            && parse_duration_ms(dur_str).is_some()
+        {
             if let Some(result) = add_duration_to_date(date_str, dur_str) {
                 return Ok(Value::String(result));
             }
@@ -655,7 +775,11 @@ fn eval_add(left: &Value, right: &Value, string_concat: bool) -> Result<Value, E
     }
     // Array + anything is type_error
     if left.is_array() || right.is_array() {
-        return Err(EvalError::type_error(&format!("Cannot add {} and {}", type_name(left), type_name(right))));
+        return Err(EvalError::type_error(&format!(
+            "Cannot add {} and {}",
+            type_name(left),
+            type_name(right)
+        )));
     }
     // String concatenation: if either side is a string, coerce the other to string
     // Only allowed in formula context (string_concat=true), not in where clauses
@@ -673,7 +797,11 @@ fn eval_add(left: &Value, right: &Value, string_concat: bool) -> Result<Value, E
             return Ok(Value::String(format!("{}{}", ls, rs)));
         }
         // In where context: type mismatch
-        return Err(EvalError::type_error(&format!("Cannot add {} and {}", type_name(left), type_name(right))));
+        return Err(EvalError::type_error(&format!(
+            "Cannot add {} and {}",
+            type_name(left),
+            type_name(right)
+        )));
     }
     eval_arithmetic(left, right, "+")
 }
@@ -685,7 +813,10 @@ fn eval_arithmetic(left: &Value, right: &Value, op: &str) -> Result<Value, EvalE
             if is_date_string(date_str) && parse_duration_ms(dur_str).is_some() {
                 // Negate the duration and add
                 if let Some(_ms) = parse_duration_ms(dur_str) {
-                    let unit_start = dur_str.trim().find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-').unwrap_or(dur_str.len());
+                    let unit_start = dur_str
+                        .trim()
+                        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+                        .unwrap_or(dur_str.len());
                     let unit = &dur_str.trim()[unit_start..];
                     let num_str = &dur_str.trim()[..unit_start];
                     let num: f64 = num_str.parse().unwrap_or(0.0);
@@ -707,27 +838,43 @@ fn eval_arithmetic(left: &Value, right: &Value, op: &str) -> Result<Value, EvalE
     if left.is_null() || right.is_null() {
         return Ok(Value::Null);
     }
-    let ln = as_number(left).ok_or_else(|| EvalError::type_error(&format!("Cannot apply '{}' to {}", op, type_name(left))))?;
-    let rn = as_number(right).ok_or_else(|| EvalError::type_error(&format!("Cannot apply '{}' to {}", op, type_name(right))))?;
+    let ln = as_number(left).ok_or_else(|| {
+        EvalError::type_error(&format!("Cannot apply '{}' to {}", op, type_name(left)))
+    })?;
+    let rn = as_number(right).ok_or_else(|| {
+        EvalError::type_error(&format!("Cannot apply '{}' to {}", op, type_name(right)))
+    })?;
 
     let result = match op {
         "+" => ln + rn,
         "-" => ln - rn,
         "*" => ln * rn,
         "/" => {
-            if rn == 0.0 { return Ok(Value::Null); }
+            if rn == 0.0 {
+                return Ok(Value::Null);
+            }
             ln / rn
         }
         "%" => {
-            if rn == 0.0 { return Ok(Value::Null); }
+            if rn == 0.0 {
+                return Ok(Value::Null);
+            }
             ln % rn
         }
-        _ => return Err(EvalError::invalid_expression(&format!("Unknown op: {}", op))),
+        _ => {
+            return Err(EvalError::invalid_expression(&format!(
+                "Unknown op: {}",
+                op
+            )))
+        }
     };
 
     // Return integer if both inputs were integers and result is integer
-    if result.fract() == 0.0 && result >= i64::MIN as f64 && result <= i64::MAX as f64
-        && left.is_i64() && right.is_i64()
+    if result.fract() == 0.0
+        && result >= i64::MIN as f64
+        && result <= i64::MAX as f64
+        && left.is_i64()
+        && right.is_i64()
     {
         Ok(Value::Number((result as i64).into()))
     } else {
@@ -742,7 +889,8 @@ fn eval_unary(op: &UnaryOp, expr: &Expr, ctx: &EvalContext) -> Result<Value, Eva
     match op {
         UnaryOp::Not => Ok(Value::Bool(!is_truthy(&val))),
         UnaryOp::Neg => {
-            let n = as_number(&val).ok_or_else(|| EvalError::type_error("Cannot negate non-number"))?;
+            let n =
+                as_number(&val).ok_or_else(|| EvalError::type_error("Cannot negate non-number"))?;
             if n.fract() == 0.0 {
                 Ok(Value::Number(((-n) as i64).into()))
             } else {
@@ -773,7 +921,10 @@ fn eval_call(func_expr: &Expr, args: &[Expr], ctx: &EvalContext) -> Result<Value
             if func_name.is_empty() {
                 return Err(EvalError::invalid_expression("ext:: with no function name"));
             }
-            return Err(EvalError::unknown_function(&format!("Unknown extension function: {}()", name)));
+            return Err(EvalError::unknown_function(&format!(
+                "Unknown extension function: {}()",
+                name
+            )));
         }
         return eval_function(name, args, ctx);
     }
@@ -785,11 +936,15 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
     match name {
         "exists" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("exists() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "exists() requires 1 argument",
+                ));
             }
             // exists() checks if a field exists in frontmatter (even if null)
             if let Expr::Ident(ref field) = args[0] {
-                let has = ctx.frontmatter.as_object()
+                let has = ctx
+                    .frontmatter
+                    .as_object()
                     .is_some_and(|m| m.contains_key(field));
                 Ok(Value::Bool(has))
             } else {
@@ -799,7 +954,9 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
         }
         "default" => {
             if args.len() != 2 {
-                return Err(EvalError::wrong_argument_count("default() requires 2 arguments"));
+                return Err(EvalError::wrong_argument_count(
+                    "default() requires 2 arguments",
+                ));
             }
             let val = evaluate(&args[0], ctx)?;
             if val.is_null() {
@@ -810,14 +967,18 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
         }
         "isTruthy" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("isTruthy() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "isTruthy() requires 1 argument",
+                ));
             }
             let val = evaluate(&args[0], ctx)?;
             Ok(Value::Bool(is_truthy(&val)))
         }
         "number" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("number() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "number() requires 1 argument",
+                ));
             }
             let val = evaluate(&args[0], ctx)?;
             match &val {
@@ -828,7 +989,9 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
                         if n.fract() == 0.0 {
                             return Ok(Value::Number((n as i64).into()));
                         } else {
-                            return Ok(serde_json::Number::from_f64(n).map(Value::Number).unwrap_or(Value::Null));
+                            return Ok(serde_json::Number::from_f64(n)
+                                .map(Value::Number)
+                                .unwrap_or(Value::Null));
                         }
                     }
                     // Try parsing as datetime → epoch milliseconds
@@ -845,7 +1008,9 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
         }
         "toString" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("toString() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "toString() requires 1 argument",
+                ));
             }
             let val = evaluate(&args[0], ctx)?;
             Ok(Value::String(value_to_string(&val)))
@@ -863,33 +1028,38 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
         }
         "date" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("date() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "date() requires 1 argument",
+                ));
             }
             let val = evaluate(&args[0], ctx)?;
             // Return the date string as-is
             Ok(val)
         }
-        "today" => {
-            Ok(Value::String(chrono::Local::now().format("%Y-%m-%d").to_string()))
-        }
-        "now" => {
-            Ok(Value::String(chrono::Utc::now().to_rfc3339()))
-        }
+        "today" => Ok(Value::String(
+            chrono::Local::now().format("%Y-%m-%d").to_string(),
+        )),
+        "now" => Ok(Value::String(chrono::Utc::now().to_rfc3339())),
         "abs" => {
             if args.len() != 1 {
                 return Err(EvalError::wrong_argument_count("abs() requires 1 argument"));
             }
             let val = evaluate(&args[0], ctx)?;
-            let n = as_number(&val).ok_or_else(|| EvalError::type_error("abs() requires a number"))?;
+            let n =
+                as_number(&val).ok_or_else(|| EvalError::type_error("abs() requires a number"))?;
             if n.fract() == 0.0 {
                 Ok(Value::Number((n.abs() as i64).into()))
             } else {
-                Ok(serde_json::Number::from_f64(n.abs()).map(Value::Number).unwrap_or(Value::Null))
+                Ok(serde_json::Number::from_f64(n.abs())
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null))
             }
         }
         "min" => {
             if args.len() < 2 {
-                return Err(EvalError::wrong_argument_count("min() requires at least 2 arguments"));
+                return Err(EvalError::wrong_argument_count(
+                    "min() requires at least 2 arguments",
+                ));
             }
             let mut result = evaluate(&args[0], ctx)?;
             for arg in &args[1..] {
@@ -902,7 +1072,9 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
         }
         "max" => {
             if args.len() < 2 {
-                return Err(EvalError::wrong_argument_count("max() requires at least 2 arguments"));
+                return Err(EvalError::wrong_argument_count(
+                    "max() requires at least 2 arguments",
+                ));
             }
             let mut result = evaluate(&args[0], ctx)?;
             for arg in &args[1..] {
@@ -915,38 +1087,52 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
         }
         "round" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("round() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "round() requires 1 argument",
+                ));
             }
             let val = evaluate(&args[0], ctx)?;
-            let n = as_number(&val).ok_or_else(|| EvalError::type_error("round() requires a number"))?;
+            let n = as_number(&val)
+                .ok_or_else(|| EvalError::type_error("round() requires a number"))?;
             Ok(Value::Number((n.round() as i64).into()))
         }
         "floor" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("floor() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "floor() requires 1 argument",
+                ));
             }
             let val = evaluate(&args[0], ctx)?;
-            let n = as_number(&val).ok_or_else(|| EvalError::type_error("floor() requires a number"))?;
+            let n = as_number(&val)
+                .ok_or_else(|| EvalError::type_error("floor() requires a number"))?;
             Ok(Value::Number((n.floor() as i64).into()))
         }
         "ceil" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("ceil() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "ceil() requires 1 argument",
+                ));
             }
             let val = evaluate(&args[0], ctx)?;
-            let n = as_number(&val).ok_or_else(|| EvalError::type_error("ceil() requires a number"))?;
+            let n =
+                as_number(&val).ok_or_else(|| EvalError::type_error("ceil() requires a number"))?;
             Ok(Value::Number((n.ceil() as i64).into()))
         }
         "length" | "upper" | "lower" | "trim" | "trimStart" | "trimEnd" | "isEmpty"
-        | "contains" | "startsWith" | "endsWith" | "replace" | "split" | "slice"
-        | "matches" | "reverse" | "repeat" | "join" | "unique" | "flat" | "sort"
-        | "first" | "last" | "keys" | "values" => {
+        | "contains" | "startsWith" | "endsWith" | "replace" | "split" | "slice" | "matches"
+        | "reverse" | "repeat" | "join" | "unique" | "flat" | "sort" | "first" | "last"
+        | "keys" | "values" => {
             // These are method-only, not free functions
-            Err(EvalError::unknown_function(&format!("{}() is a method, not a free function", name)))
+            Err(EvalError::unknown_function(&format!(
+                "{}() is a method, not a free function",
+                name
+            )))
         }
         "duration" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("duration() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "duration() requires 1 argument",
+                ));
             }
             let val = evaluate(&args[0], ctx)?;
             let s = value_to_string(&val);
@@ -958,7 +1144,9 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
         }
         "datetime" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("datetime() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "datetime() requires 1 argument",
+                ));
             }
             let val = evaluate(&args[0], ctx)?;
             // Return the datetime string as-is (like date())
@@ -966,7 +1154,9 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
         }
         "list" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("list() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "list() requires 1 argument",
+                ));
             }
             let val = evaluate(&args[0], ctx)?;
             match val {
@@ -977,20 +1167,33 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
         "link" => {
             // link("target") creates a link value (returns the string as-is)
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("link() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "link() requires 1 argument",
+                ));
             }
             let val = evaluate(&args[0], ctx)?;
             Ok(val)
         }
-        _ => Err(EvalError::unknown_function(&format!("Unknown function: {}()", name))),
+        _ => Err(EvalError::unknown_function(&format!(
+            "Unknown function: {}()",
+            name
+        ))),
     }
 }
 
-fn eval_method(obj_expr: &Expr, method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, EvalError> {
+fn eval_method(
+    obj_expr: &Expr,
+    method: &str,
+    args: &[Expr],
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
     // Handle ext.name() and ext::name() as extension function calls
     if let Expr::Ident(ref name) = obj_expr {
         if name == "ext" || name.starts_with("ext::") {
-            return Err(EvalError::unknown_function(&format!("Unknown extension function: ext.{}()", method)));
+            return Err(EvalError::unknown_function(&format!(
+                "Unknown extension function: ext.{}()",
+                method
+            )));
         }
     }
 
@@ -1007,7 +1210,11 @@ fn eval_method(obj_expr: &Expr, method: &str, args: &[Expr], ctx: &EvalContext) 
                 "isTruthy" => Ok(Value::Bool(false)),
                 "toString" => Ok(Value::String("null".to_string())),
                 "isType" => {
-                    if args.len() != 1 { return Err(EvalError::wrong_argument_count("isType() requires 1 argument")); }
+                    if args.len() != 1 {
+                        return Err(EvalError::wrong_argument_count(
+                            "isType() requires 1 argument",
+                        ));
+                    }
                     let type_name_val = evaluate(&args[0], ctx)?;
                     Ok(Value::Bool(type_name_val.as_str() == Some("null")))
                 }
@@ -1015,123 +1222,200 @@ fn eval_method(obj_expr: &Expr, method: &str, args: &[Expr], ctx: &EvalContext) 
                 _ => Ok(Value::Null),
             }
         }
-        other => {
-            match method {
-                "isEmpty" => Ok(Value::Bool(other.is_null())),
-                "isType" => {
-                    if args.len() != 1 { return Err(EvalError::wrong_argument_count("isType() requires 1 argument")); }
-                    let type_name_val = evaluate(&args[0], ctx)?;
-                    let type_str = type_name_val.as_str().unwrap_or("");
-                    let result = match other {
-                        Value::Bool(_) => type_str == "boolean",
-                        Value::Number(n) => type_str == "number" || (type_str == "integer" && n.is_i64()),
-                        _ => false,
-                    };
-                    Ok(Value::Bool(result))
+        other => match method {
+            "isEmpty" => Ok(Value::Bool(other.is_null())),
+            "isType" => {
+                if args.len() != 1 {
+                    return Err(EvalError::wrong_argument_count(
+                        "isType() requires 1 argument",
+                    ));
                 }
-                "toString" => Ok(Value::String(value_to_string(other))),
-                "isTruthy" => Ok(Value::Bool(is_truthy(other))),
-                _ => Err(EvalError::unknown_function(&format!("Unknown {} method: .{}()", type_name(other), method))),
+                let type_name_val = evaluate(&args[0], ctx)?;
+                let type_str = type_name_val.as_str().unwrap_or("");
+                let result = match other {
+                    Value::Bool(_) => type_str == "boolean",
+                    Value::Number(n) => {
+                        type_str == "number" || (type_str == "integer" && n.is_i64())
+                    }
+                    _ => false,
+                };
+                Ok(Value::Bool(result))
             }
-        }
+            "toString" => Ok(Value::String(value_to_string(other))),
+            "isTruthy" => Ok(Value::Bool(is_truthy(other))),
+            _ => Err(EvalError::unknown_function(&format!(
+                "Unknown {} method: .{}()",
+                type_name(other),
+                method
+            ))),
+        },
     }
 }
 
-fn eval_string_method(s: &str, method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, EvalError> {
+fn eval_string_method(
+    s: &str,
+    method: &str,
+    args: &[Expr],
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
     match method {
         "length" => {
-            if !args.is_empty() { return Err(EvalError::wrong_argument_count("length() takes no arguments")); }
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count(
+                    "length() takes no arguments",
+                ));
+            }
             Ok(Value::Number(s.len().into()))
         }
         "upper" => {
-            if !args.is_empty() { return Err(EvalError::wrong_argument_count("upper() takes no arguments")); }
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count(
+                    "upper() takes no arguments",
+                ));
+            }
             Ok(Value::String(s.to_uppercase()))
         }
         "lower" => {
-            if !args.is_empty() { return Err(EvalError::wrong_argument_count("lower() takes no arguments")); }
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count(
+                    "lower() takes no arguments",
+                ));
+            }
             Ok(Value::String(s.to_lowercase()))
         }
         "trim" => {
-            if !args.is_empty() { return Err(EvalError::wrong_argument_count("trim() takes no arguments")); }
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count("trim() takes no arguments"));
+            }
             Ok(Value::String(s.trim().to_string()))
         }
         "trimStart" => {
-            if !args.is_empty() { return Err(EvalError::wrong_argument_count("trimStart() takes no arguments")); }
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count(
+                    "trimStart() takes no arguments",
+                ));
+            }
             Ok(Value::String(s.trim_start().to_string()))
         }
         "trimEnd" => {
-            if !args.is_empty() { return Err(EvalError::wrong_argument_count("trimEnd() takes no arguments")); }
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count(
+                    "trimEnd() takes no arguments",
+                ));
+            }
             Ok(Value::String(s.trim_end().to_string()))
         }
         "isEmpty" => {
-            if !args.is_empty() { return Err(EvalError::wrong_argument_count("isEmpty() takes no arguments")); }
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count(
+                    "isEmpty() takes no arguments",
+                ));
+            }
             Ok(Value::Bool(s.is_empty()))
         }
         "contains" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("contains() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "contains() requires 1 argument",
+                ));
             }
             let needle = evaluate(&args[0], ctx)?;
-            let needle_str = match needle.as_str() { Some(s) => s.to_string(), None => value_to_string(&needle) };
+            let needle_str = match needle.as_str() {
+                Some(s) => s.to_string(),
+                None => value_to_string(&needle),
+            };
             Ok(Value::Bool(s.contains(&needle_str)))
         }
         "startsWith" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("startsWith() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "startsWith() requires 1 argument",
+                ));
             }
             let prefix = evaluate(&args[0], ctx)?;
-            let prefix_str = match prefix.as_str() { Some(s) => s.to_string(), None => value_to_string(&prefix) };
+            let prefix_str = match prefix.as_str() {
+                Some(s) => s.to_string(),
+                None => value_to_string(&prefix),
+            };
             Ok(Value::Bool(s.starts_with(&prefix_str)))
         }
         "endsWith" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("endsWith() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "endsWith() requires 1 argument",
+                ));
             }
             let suffix = evaluate(&args[0], ctx)?;
-            let suffix_str = match suffix.as_str() { Some(s) => s.to_string(), None => value_to_string(&suffix) };
+            let suffix_str = match suffix.as_str() {
+                Some(s) => s.to_string(),
+                None => value_to_string(&suffix),
+            };
             Ok(Value::Bool(s.ends_with(&suffix_str)))
         }
         "replace" => {
             if args.len() != 2 {
-                return Err(EvalError::wrong_argument_count("replace() requires 2 arguments"));
+                return Err(EvalError::wrong_argument_count(
+                    "replace() requires 2 arguments",
+                ));
             }
             let from = evaluate(&args[0], ctx)?;
             let to = evaluate(&args[1], ctx)?;
-            let from_str = match from.as_str() { Some(s) => s.to_string(), None => value_to_string(&from) };
-            let to_str = match to.as_str() { Some(s) => s.to_string(), None => value_to_string(&to) };
+            let from_str = match from.as_str() {
+                Some(s) => s.to_string(),
+                None => value_to_string(&from),
+            };
+            let to_str = match to.as_str() {
+                Some(s) => s.to_string(),
+                None => value_to_string(&to),
+            };
             Ok(Value::String(s.replace(&from_str, &to_str)))
         }
         "split" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::wrong_argument_count("split() requires 1-2 arguments"));
+                return Err(EvalError::wrong_argument_count(
+                    "split() requires 1-2 arguments",
+                ));
             }
             let sep = evaluate(&args[0], ctx)?;
-            let sep_str = match sep.as_str() { Some(s) => s.to_string(), None => value_to_string(&sep) };
+            let sep_str = match sep.as_str() {
+                Some(s) => s.to_string(),
+                None => value_to_string(&sep),
+            };
             let parts: Vec<Value> = if args.len() > 1 {
                 let limit = evaluate(&args[1], ctx)?.as_u64().unwrap_or(0) as usize;
-                s.splitn(limit, &sep_str).map(|p| Value::String(p.to_string())).collect()
+                s.splitn(limit, &sep_str)
+                    .map(|p| Value::String(p.to_string()))
+                    .collect()
             } else {
-                s.split(&sep_str).map(|p| Value::String(p.to_string())).collect()
+                s.split(&sep_str)
+                    .map(|p| Value::String(p.to_string()))
+                    .collect()
             };
             Ok(Value::Array(parts))
         }
-        "toString" => {
-            Ok(Value::String(s.to_string()))
-        }
-        "isTruthy" => {
-            Ok(Value::Bool(!s.is_empty()))
-        }
+        "toString" => Ok(Value::String(s.to_string())),
+        "isTruthy" => Ok(Value::Bool(!s.is_empty())),
         "slice" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::wrong_argument_count("slice() requires 1-2 arguments"));
+                return Err(EvalError::wrong_argument_count(
+                    "slice() requires 1-2 arguments",
+                ));
             }
             let start = evaluate(&args[0], ctx)?.as_i64().unwrap_or(0);
             let chars: Vec<char> = s.chars().collect();
             let len = chars.len() as i64;
-            let start = if start < 0 { (len + start).max(0) as usize } else { start.min(len) as usize };
+            let start = if start < 0 {
+                (len + start).max(0) as usize
+            } else {
+                start.min(len) as usize
+            };
             let end = if args.len() > 1 {
                 let e = evaluate(&args[1], ctx)?.as_i64().unwrap_or(len);
-                if e < 0 { (len + e).max(0) as usize } else { e.min(len) as usize }
+                if e < 0 {
+                    (len + e).max(0) as usize
+                } else {
+                    e.min(len) as usize
+                }
             } else {
                 len as usize
             };
@@ -1140,19 +1424,29 @@ fn eval_string_method(s: &str, method: &str, args: &[Expr], ctx: &EvalContext) -
         }
         "matches" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("matches() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "matches() requires 1 argument",
+                ));
             }
             let pattern = evaluate(&args[0], ctx)?;
-            let pat_str = match pattern.as_str() { Some(s) => s.to_string(), None => value_to_string(&pattern) };
+            let pat_str = match pattern.as_str() {
+                Some(s) => s.to_string(),
+                None => value_to_string(&pattern),
+            };
             match fancy_regex::Regex::new(&pat_str) {
                 Ok(re) => Ok(Value::Bool(re.is_match(s).unwrap_or(false))),
-                Err(_) => Err(EvalError::invalid_expression(&format!("Invalid regex: {}", pat_str))),
+                Err(_) => Err(EvalError::invalid_expression(&format!(
+                    "Invalid regex: {}",
+                    pat_str
+                ))),
             }
         }
         "reverse" => Ok(Value::String(s.chars().rev().collect())),
         "repeat" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("repeat() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "repeat() requires 1 argument",
+                ));
             }
             let n = evaluate(&args[0], ctx)?.as_u64().unwrap_or(0);
             Ok(Value::String(s.repeat(n as usize)))
@@ -1160,7 +1454,10 @@ fn eval_string_method(s: &str, method: &str, args: &[Expr], ctx: &EvalContext) -
         "containsAll" => {
             for arg in args {
                 let needle = evaluate(arg, ctx)?;
-                let needle_str = match needle.as_str() { Some(s) => s.to_string(), None => value_to_string(&needle) };
+                let needle_str = match needle.as_str() {
+                    Some(s) => s.to_string(),
+                    None => value_to_string(&needle),
+                };
                 if !s.contains(&needle_str) {
                     return Ok(Value::Bool(false));
                 }
@@ -1170,7 +1467,10 @@ fn eval_string_method(s: &str, method: &str, args: &[Expr], ctx: &EvalContext) -
         "containsAny" => {
             for arg in args {
                 let needle = evaluate(arg, ctx)?;
-                let needle_str = match needle.as_str() { Some(s) => s.to_string(), None => value_to_string(&needle) };
+                let needle_str = match needle.as_str() {
+                    Some(s) => s.to_string(),
+                    None => value_to_string(&needle),
+                };
                 if s.contains(&needle_str) {
                     return Ok(Value::Bool(true));
                 }
@@ -1178,8 +1478,13 @@ fn eval_string_method(s: &str, method: &str, args: &[Expr], ctx: &EvalContext) -
             Ok(Value::Bool(false))
         }
         "title" => {
-            if !args.is_empty() { return Err(EvalError::wrong_argument_count("title() takes no arguments")); }
-            let result = s.split_whitespace()
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count(
+                    "title() takes no arguments",
+                ));
+            }
+            let result = s
+                .split_whitespace()
                 .map(|word| {
                     let mut chars = word.chars();
                     match chars.next() {
@@ -1196,7 +1501,9 @@ fn eval_string_method(s: &str, method: &str, args: &[Expr], ctx: &EvalContext) -
         }
         "isType" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("isType() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "isType() requires 1 argument",
+                ));
             }
             let type_name = evaluate(&args[0], ctx)?;
             let type_str = type_name.as_str().unwrap_or("");
@@ -1214,7 +1521,11 @@ fn eval_string_method(s: &str, method: &str, args: &[Expr], ctx: &EvalContext) -
         }
         "date" => {
             // .date() extracts date portion from datetime string
-            if !args.is_empty() { return Err(EvalError::wrong_argument_count("date() takes no arguments as method")); }
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count(
+                    "date() takes no arguments as method",
+                ));
+            }
             if let Some(date_part) = s.split('T').next() {
                 Ok(Value::String(date_part.to_string()))
             } else {
@@ -1223,12 +1534,19 @@ fn eval_string_method(s: &str, method: &str, args: &[Expr], ctx: &EvalContext) -
         }
         "time" => {
             // .time() extracts time portion from datetime string
-            if !args.is_empty() { return Err(EvalError::wrong_argument_count("time() takes no arguments")); }
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count("time() takes no arguments"));
+            }
             if let Some(time_part) = s.split('T').nth(1) {
                 // Strip timezone suffix
-                let time_clean = time_part.trim_end_matches('Z')
-                    .split('+').next().unwrap_or(time_part)
-                    .split('-').next().unwrap_or(time_part);
+                let time_clean = time_part
+                    .trim_end_matches('Z')
+                    .split('+')
+                    .next()
+                    .unwrap_or(time_part)
+                    .split('-')
+                    .next()
+                    .unwrap_or(time_part);
                 Ok(Value::String(time_clean.to_string()))
             } else {
                 Ok(Value::Null)
@@ -1236,29 +1554,41 @@ fn eval_string_method(s: &str, method: &str, args: &[Expr], ctx: &EvalContext) -
         }
         "format" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("format() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "format() requires 1 argument",
+                ));
             }
             let fmt = evaluate(&args[0], ctx)?;
             let fmt_str = fmt.as_str().unwrap_or("");
             Ok(Value::String(format_date_string(s, fmt_str)))
         }
-        "asFile" => {
-            resolve_as_file(s, ctx)
-        }
-        _ => Err(EvalError::unknown_function(&format!("Unknown string method: .{}()", method))),
+        "asFile" => resolve_as_file(s, ctx),
+        _ => Err(EvalError::unknown_function(&format!(
+            "Unknown string method: .{}()",
+            method
+        ))),
     }
 }
 
-fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, EvalError> {
+fn eval_array_method(
+    arr: &[Value],
+    method: &str,
+    args: &[Expr],
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
     match method {
         "length" => Ok(Value::Number(arr.len().into())),
         "isEmpty" => Ok(Value::Bool(arr.is_empty())),
         "contains" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("contains() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "contains() requires 1 argument",
+                ));
             }
             let needle = evaluate(&args[0], ctx)?;
-            Ok(Value::Bool(arr.iter().any(|item| values_equal(item, &needle))))
+            Ok(Value::Bool(
+                arr.iter().any(|item| values_equal(item, &needle)),
+            ))
         }
         "join" => {
             let sep = if !args.is_empty() {
@@ -1296,14 +1626,24 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
         }
         "slice" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::wrong_argument_count("slice() requires 1-2 arguments"));
+                return Err(EvalError::wrong_argument_count(
+                    "slice() requires 1-2 arguments",
+                ));
             }
             let start = evaluate(&args[0], ctx)?.as_i64().unwrap_or(0);
             let len = arr.len() as i64;
-            let start = if start < 0 { (len + start).max(0) as usize } else { start.min(len) as usize };
+            let start = if start < 0 {
+                (len + start).max(0) as usize
+            } else {
+                start.min(len) as usize
+            };
             let end = if args.len() > 1 {
                 let e = evaluate(&args[1], ctx)?.as_i64().unwrap_or(len);
-                if e < 0 { (len + e).max(0) as usize } else { e.min(len) as usize }
+                if e < 0 {
+                    (len + e).max(0) as usize
+                } else {
+                    e.min(len) as usize
+                }
             } else {
                 len as usize
             };
@@ -1317,9 +1657,15 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
         "first" => Ok(arr.first().cloned().unwrap_or(Value::Null)),
         "last" => Ok(arr.last().cloned().unwrap_or(Value::Null)),
         "isType" => {
-            if args.len() != 1 { return Err(EvalError::wrong_argument_count("isType() requires 1 argument")); }
+            if args.len() != 1 {
+                return Err(EvalError::wrong_argument_count(
+                    "isType() requires 1 argument",
+                ));
+            }
             let type_name = evaluate(&args[0], ctx)?;
-            Ok(Value::Bool(type_name.as_str() == Some("list") || type_name.as_str() == Some("array")))
+            Ok(Value::Bool(
+                type_name.as_str() == Some("list") || type_name.as_str() == Some("array"),
+            ))
         }
         "containsAll" => {
             for arg in args {
@@ -1341,7 +1687,9 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
         }
         "filter" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("filter() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "filter() requires 1 argument",
+                ));
             }
             let mut result = Vec::new();
             for (i, item) in arr.iter().enumerate() {
@@ -1356,7 +1704,9 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
                     raw_frontmatter: ctx.raw_frontmatter.clone(),
                     file_path: ctx.file_path.clone(),
                     body: ctx.body.clone(),
-                    file_size: ctx.file_size, file_mtime: ctx.file_mtime.clone(), file_ctime: ctx.file_ctime.clone(),
+                    file_size: ctx.file_size,
+                    file_mtime: ctx.file_mtime.clone(),
+                    file_ctime: ctx.file_ctime.clone(),
                     this_context: ctx.this_context.clone(),
                     all_files: ctx.all_files.clone(),
                     traversal_depth: ctx.traversal_depth.clone(),
@@ -1389,7 +1739,9 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
                     raw_frontmatter: ctx.raw_frontmatter.clone(),
                     file_path: ctx.file_path.clone(),
                     body: ctx.body.clone(),
-                    file_size: ctx.file_size, file_mtime: ctx.file_mtime.clone(), file_ctime: ctx.file_ctime.clone(),
+                    file_size: ctx.file_size,
+                    file_mtime: ctx.file_mtime.clone(),
+                    file_ctime: ctx.file_ctime.clone(),
                     this_context: ctx.this_context.clone(),
                     all_files: ctx.all_files.clone(),
                     traversal_depth: ctx.traversal_depth.clone(),
@@ -1407,7 +1759,9 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
         }
         "reduce" => {
             if args.len() != 2 {
-                return Err(EvalError::wrong_argument_count("reduce() requires 2 arguments"));
+                return Err(EvalError::wrong_argument_count(
+                    "reduce() requires 2 arguments",
+                ));
             }
             let mut acc = if args.len() > 1 {
                 evaluate(&args[1], ctx)?
@@ -1425,7 +1779,9 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
                     raw_frontmatter: ctx.raw_frontmatter.clone(),
                     file_path: ctx.file_path.clone(),
                     body: ctx.body.clone(),
-                    file_size: ctx.file_size, file_mtime: ctx.file_mtime.clone(), file_ctime: ctx.file_ctime.clone(),
+                    file_size: ctx.file_size,
+                    file_mtime: ctx.file_mtime.clone(),
+                    file_ctime: ctx.file_ctime.clone(),
                     this_context: ctx.this_context.clone(),
                     all_files: ctx.all_files.clone(),
                     traversal_depth: ctx.traversal_depth.clone(),
@@ -1438,11 +1794,19 @@ fn eval_array_method(arr: &[Value], method: &str, args: &[Expr], ctx: &EvalConte
             }
             Ok(acc)
         }
-        _ => Err(EvalError::unknown_function(&format!("Unknown array method: .{}()", method))),
+        _ => Err(EvalError::unknown_function(&format!(
+            "Unknown array method: .{}()",
+            method
+        ))),
     }
 }
 
-fn eval_object_method(map: &serde_json::Map<String, Value>, method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, EvalError> {
+fn eval_object_method(
+    map: &serde_json::Map<String, Value>,
+    method: &str,
+    args: &[Expr],
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
     match method {
         "keys" => {
             let keys: Vec<Value> = map.keys().map(|k| Value::String(k.clone())).collect();
@@ -1455,15 +1819,22 @@ fn eval_object_method(map: &serde_json::Map<String, Value>, method: &str, args: 
         "isEmpty" => Ok(Value::Bool(map.is_empty())),
         "isType" => {
             if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("isType() requires 1 argument"));
+                return Err(EvalError::wrong_argument_count(
+                    "isType() requires 1 argument",
+                ));
             }
             let type_name = evaluate(&args[0], ctx)?;
             let type_str = type_name.as_str().unwrap_or("");
             Ok(Value::Bool(type_str == "object"))
         }
-        "toString" => Ok(Value::String(serde_json::to_string(&Value::Object(map.clone())).unwrap_or_default())),
+        "toString" => Ok(Value::String(
+            serde_json::to_string(&Value::Object(map.clone())).unwrap_or_default(),
+        )),
         "isTruthy" => Ok(Value::Bool(true)),
-        _ => Err(EvalError::unknown_function(&format!("Unknown object method: .{}()", method))),
+        _ => Err(EvalError::unknown_function(&format!(
+            "Unknown object method: .{}()",
+            method
+        ))),
     }
 }
 
@@ -1494,9 +1865,13 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
         (Value::String(a), Value::String(b)) => {
-            if a == b { return true; }
+            if a == b {
+                return true;
+            }
             // Try datetime-aware equality for offset-aware strings
-            if let (Some(da), Some(db)) = (parse_datetime_for_compare(a), parse_datetime_for_compare(b)) {
+            if let (Some(da), Some(db)) =
+                (parse_datetime_for_compare(a), parse_datetime_for_compare(b))
+            {
                 return da == db;
             }
             false
@@ -1507,7 +1882,11 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         // Cross-type numeric equality
         (Value::Number(_), Value::String(s)) | (Value::String(s), Value::Number(_)) => {
             if let Ok(n) = s.parse::<f64>() {
-                let other = if a.is_number() { a.as_f64().unwrap_or(f64::NAN) } else { b.as_f64().unwrap_or(f64::NAN) };
+                let other = if a.is_number() {
+                    a.as_f64().unwrap_or(f64::NAN)
+                } else {
+                    b.as_f64().unwrap_or(f64::NAN)
+                };
                 n == other
             } else {
                 false
@@ -1519,10 +1898,15 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 
 fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
-        (Value::Number(a), Value::Number(b)) => a.as_f64().unwrap_or(0.0).partial_cmp(&b.as_f64().unwrap_or(0.0)),
+        (Value::Number(a), Value::Number(b)) => a
+            .as_f64()
+            .unwrap_or(0.0)
+            .partial_cmp(&b.as_f64().unwrap_or(0.0)),
         (Value::String(a), Value::String(b)) => {
             // Try datetime comparison if both look like ISO dates
-            if let (Some(da), Some(db)) = (parse_datetime_for_compare(a), parse_datetime_for_compare(b)) {
+            if let (Some(da), Some(db)) =
+                (parse_datetime_for_compare(a), parse_datetime_for_compare(b))
+            {
                 return da.partial_cmp(&db);
             }
             Some(a.cmp(b))
@@ -1563,9 +1947,13 @@ fn value_to_string(val: &Value) -> String {
     match val {
         Value::String(s) => s.clone(),
         Value::Number(n) => {
-            if let Some(i) = n.as_i64() { i.to_string() }
-            else if let Some(f) = n.as_f64() { f.to_string() }
-            else { "null".to_string() }
+            if let Some(i) = n.as_i64() {
+                i.to_string()
+            } else if let Some(f) = n.as_f64() {
+                f.to_string()
+            } else {
+                "null".to_string()
+            }
         }
         Value::Bool(b) => b.to_string(),
         Value::Null => "null".to_string(),
@@ -1592,10 +1980,11 @@ fn is_date_string(s: &str) -> bool {
     // Simple check: YYYY-MM-DD format
     if s.len() >= 10 {
         let bytes = s.as_bytes();
-        bytes[4] == b'-' && bytes[7] == b'-' &&
-        bytes[0..4].iter().all(|b| b.is_ascii_digit()) &&
-        bytes[5..7].iter().all(|b| b.is_ascii_digit()) &&
-        bytes[8..10].iter().all(|b| b.is_ascii_digit())
+        bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[0..4].iter().all(|b| b.is_ascii_digit())
+            && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+            && bytes[8..10].iter().all(|b| b.is_ascii_digit())
     } else {
         false
     }
@@ -1624,7 +2013,9 @@ fn eval_date_component(s: &str, component: &str) -> Result<Value, EvalError> {
             "year" => Ok(Value::Number(d.year().into())),
             "month" => Ok(Value::Number(d.month().into())),
             "day" => Ok(Value::Number(d.day().into())),
-            "dayOfWeek" => Ok(Value::Number((d.weekday().num_days_from_sunday() as i64).into())),
+            "dayOfWeek" => Ok(Value::Number(
+                (d.weekday().num_days_from_sunday() as i64).into(),
+            )),
             "hour" | "minute" | "second" => Ok(Value::Number(0.into())),
             _ => Ok(Value::Null),
         };
@@ -1632,7 +2023,10 @@ fn eval_date_component(s: &str, component: &str) -> Result<Value, EvalError> {
     Ok(Value::Null)
 }
 
-fn eval_chrono_component_dt(dt: &chrono::NaiveDateTime, component: &str) -> Result<Value, EvalError> {
+fn eval_chrono_component_dt(
+    dt: &chrono::NaiveDateTime,
+    component: &str,
+) -> Result<Value, EvalError> {
     use chrono::Datelike;
     use chrono::Timelike;
     match component {
@@ -1642,7 +2036,9 @@ fn eval_chrono_component_dt(dt: &chrono::NaiveDateTime, component: &str) -> Resu
         "hour" => Ok(Value::Number(dt.time().hour().into())),
         "minute" => Ok(Value::Number(dt.time().minute().into())),
         "second" => Ok(Value::Number(dt.time().second().into())),
-        "dayOfWeek" => Ok(Value::Number((dt.date().weekday().num_days_from_sunday() as i64).into())),
+        "dayOfWeek" => Ok(Value::Number(
+            (dt.date().weekday().num_days_from_sunday() as i64).into(),
+        )),
         _ => Ok(Value::Null),
     }
 }
@@ -1666,7 +2062,7 @@ fn resolve_as_file(link_str: &str, ctx: &EvalContext) -> Result<Value, EvalError
 
     // Extract the target from wikilink syntax
     let target = if link_str.starts_with("[[") && link_str.ends_with("]]") {
-        let inner = &link_str[2..link_str.len()-2];
+        let inner = &link_str[2..link_str.len() - 2];
         // Strip display text after |
         let inner = inner.split('|').next().unwrap_or(inner);
         // Strip anchor after #
@@ -1737,12 +2133,15 @@ fn resolve_as_file(link_str: &str, ctx: &EvalContext) -> Result<Value, EvalError
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("");
-                map.insert("file".to_string(), serde_json::json!({
-                    "path": path,
-                    "name": name,
-                    "folder": folder,
-                    "basename": basename,
-                }));
+                map.insert(
+                    "file".to_string(),
+                    serde_json::json!({
+                        "path": path,
+                        "name": name,
+                        "folder": folder,
+                        "basename": basename,
+                    }),
+                );
             }
             Ok(result)
         }
@@ -1782,7 +2181,9 @@ fn format_date_string(s: &str, fmt: &str) -> String {
 /// Parse a duration string like "7d", "1w", "24h", "30m", "1M", "1y" into milliseconds.
 fn parse_duration_ms(s: &str) -> Option<i64> {
     let s = s.trim();
-    if s.is_empty() { return None; }
+    if s.is_empty() {
+        return None;
+    }
 
     // Try to parse as "<number><unit>"
     let mut num_end = 0;
@@ -1793,7 +2194,9 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
             break;
         }
     }
-    if num_end == 0 { return None; }
+    if num_end == 0 {
+        return None;
+    }
 
     let num: f64 = s[..num_end].parse().ok()?;
     let unit = s[num_end..].trim_start();
@@ -1806,7 +2209,7 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
         "d" | "day" | "days" => 86_400_000.0,
         "w" | "week" | "weeks" => 604_800_000.0,
         "M" | "month" | "months" => 2_592_000_000.0, // 30 days
-        "y" | "year" | "years" => 31_536_000_000.0, // 365 days
+        "y" | "year" | "years" => 31_536_000_000.0,  // 365 days
         _ => return None,
     };
 
@@ -1826,7 +2229,9 @@ fn add_duration_to_date(date_str: &str, duration_str: &str) -> Option<String> {
             break;
         }
     }
-    if num_end == 0 { return None; }
+    if num_end == 0 {
+        return None;
+    }
     let num: i64 = dur_str[..num_end].parse().ok()?;
     let unit = dur_str[num_end..].trim();
 
@@ -1906,7 +2311,13 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 => if is_leap_year(year) { 29 } else { 28 },
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
         _ => 30,
     }
 }
@@ -2069,13 +2480,19 @@ pub fn extract_tags_from_body(body: &str) -> Vec<String> {
                 let preceded_by_space = i > 0 && chars[i - 1].is_whitespace();
 
                 // Check it's NOT preceded by a quote (URL fragment exclusion)
-                let preceded_by_quote = i > 0 && (chars[i - 1] == '"' || chars[i - 1] == '\'' || chars[i - 1] == '(');
+                let preceded_by_quote =
+                    i > 0 && (chars[i - 1] == '"' || chars[i - 1] == '\'' || chars[i - 1] == '(');
 
                 if (at_start || preceded_by_space) && !preceded_by_quote {
                     // Scan tag characters
                     let tag_start = i + 1;
                     i = tag_start;
-                    while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '-' || chars[i] == '/') {
+                    while i < len
+                        && (chars[i].is_ascii_alphanumeric()
+                            || chars[i] == '_'
+                            || chars[i] == '-'
+                            || chars[i] == '/')
+                    {
                         i += 1;
                     }
                     if i > tag_start {
@@ -2151,8 +2568,12 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
             i += 1;
             let mut bracket_depth = 1;
             while i < len && bracket_depth > 0 {
-                if chars[i] == '[' { bracket_depth += 1; }
-                if chars[i] == ']' { bracket_depth -= 1; }
+                if chars[i] == '[' {
+                    bracket_depth += 1;
+                }
+                if chars[i] == ']' {
+                    bracket_depth -= 1;
+                }
                 i += 1;
             }
             // Check for (path)
@@ -2161,14 +2582,19 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
                 let paren_start = i;
                 let mut paren_depth = 1;
                 while i < len && paren_depth > 0 {
-                    if chars[i] == '(' { paren_depth += 1; }
-                    if chars[i] == ')' { paren_depth -= 1; }
+                    if chars[i] == '(' {
+                        paren_depth += 1;
+                    }
+                    if chars[i] == ')' {
+                        paren_depth -= 1;
+                    }
                     i += 1;
                 }
                 let path: String = chars[paren_start..i - 1].iter().collect();
                 let path = path.trim().to_string();
                 // Skip external URLs
-                if !path.is_empty() && !path.starts_with("http://") && !path.starts_with("https://") {
+                if !path.is_empty() && !path.starts_with("http://") && !path.starts_with("https://")
+                {
                     // Strip anchor
                     let path = path.split('#').next().unwrap_or(&path).to_string();
                     if !path.is_empty() {
@@ -2204,7 +2630,12 @@ pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
             }
             if i < len {
                 let content: String = chars[start..i].iter().collect();
-                let target = content.split('|').next().unwrap_or(&content).trim().to_string();
+                let target = content
+                    .split('|')
+                    .next()
+                    .unwrap_or(&content)
+                    .trim()
+                    .to_string();
                 if !target.is_empty() {
                     embeds.push(target);
                 }
@@ -2214,11 +2645,15 @@ pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
         // Markdown embed: ![alt](path)
         else if i + 1 < len && chars[i] == '!' && chars[i + 1] == '[' {
             i += 2; // skip ![
-            // Find closing ]
+                    // Find closing ]
             let mut bracket_depth = 1;
             while i < len && bracket_depth > 0 {
-                if chars[i] == '[' { bracket_depth += 1; }
-                if chars[i] == ']' { bracket_depth -= 1; }
+                if chars[i] == '[' {
+                    bracket_depth += 1;
+                }
+                if chars[i] == ']' {
+                    bracket_depth -= 1;
+                }
                 i += 1;
             }
             // Check for (path)
@@ -2227,21 +2662,25 @@ pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
                 let paren_start = i;
                 let mut paren_depth = 1;
                 while i < len && paren_depth > 0 {
-                    if chars[i] == '(' { paren_depth += 1; }
-                    if chars[i] == ')' { paren_depth -= 1; }
+                    if chars[i] == '(' {
+                        paren_depth += 1;
+                    }
+                    if chars[i] == ')' {
+                        paren_depth -= 1;
+                    }
                     i += 1;
                 }
                 let path: String = chars[paren_start..i - 1].iter().collect();
                 let path = path.trim().to_string();
-                if !path.is_empty() && !path.starts_with("http://") && !path.starts_with("https://") {
+                if !path.is_empty() && !path.starts_with("http://") && !path.starts_with("https://")
+                {
                     let path = path.split('#').next().unwrap_or(&path).to_string();
                     if !path.is_empty() {
                         embeds.push(path);
                     }
                 }
             }
-        }
-        else {
+        } else {
             i += 1;
         }
     }
@@ -2280,8 +2719,10 @@ pub fn extract_links_from_fm_value(val: &Value, links: &mut Vec<String>) {
                 }
             }
             // If no wikilinks found, check if the string itself is a link path
-            if !found_wikilink && !s.is_empty()
-                && !s.starts_with("http://") && !s.starts_with("https://")
+            if !found_wikilink
+                && !s.is_empty()
+                && !s.starts_with("http://")
+                && !s.starts_with("https://")
                 && (s.contains('.') || s.contains('/'))
             {
                 let path = s.trim().to_string();

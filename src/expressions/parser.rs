@@ -12,16 +12,31 @@ enum Token {
     Ident(String),
 
     // Operators
-    Plus, Minus, Star, Slash, Percent,
-    Eq, Neq, Lt, Gt, Lte, Gte,
-    And, Or, Not,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    Eq,
+    Neq,
+    Lt,
+    Gt,
+    Lte,
+    Gte,
+    And,
+    Or,
+    Not,
     QuestionQuestion, // ??
-    Question, Colon,  // ternary
+    Question,
+    Colon, // ternary
 
     // Delimiters
-    LParen, RParen,
-    LBracket, RBracket,
-    Dot, Comma,
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    Dot,
+    Comma,
 
     Eof,
 }
@@ -33,7 +48,10 @@ struct Lexer {
 
 impl Lexer {
     fn new(input: &str) -> Self {
-        Lexer { chars: input.chars().collect(), pos: 0 }
+        Lexer {
+            chars: input.chars().collect(),
+            pos: 0,
+        }
     }
 
     fn peek(&self) -> Option<char> {
@@ -62,16 +80,46 @@ impl Lexer {
             }
             let c = self.chars[self.pos];
             match c {
-                '+' => { self.advance(); tokens.push(Token::Plus); }
-                '*' => { self.advance(); tokens.push(Token::Star); }
-                '/' => { self.advance(); tokens.push(Token::Slash); }
-                '%' => { self.advance(); tokens.push(Token::Percent); }
-                '(' => { self.advance(); tokens.push(Token::LParen); }
-                ')' => { self.advance(); tokens.push(Token::RParen); }
-                '[' => { self.advance(); tokens.push(Token::LBracket); }
-                ']' => { self.advance(); tokens.push(Token::RBracket); }
-                ',' => { self.advance(); tokens.push(Token::Comma); }
-                ':' => { self.advance(); tokens.push(Token::Colon); }
+                '+' => {
+                    self.advance();
+                    tokens.push(Token::Plus);
+                }
+                '*' => {
+                    self.advance();
+                    tokens.push(Token::Star);
+                }
+                '/' => {
+                    self.advance();
+                    tokens.push(Token::Slash);
+                }
+                '%' => {
+                    self.advance();
+                    tokens.push(Token::Percent);
+                }
+                '(' => {
+                    self.advance();
+                    tokens.push(Token::LParen);
+                }
+                ')' => {
+                    self.advance();
+                    tokens.push(Token::RParen);
+                }
+                '[' => {
+                    self.advance();
+                    tokens.push(Token::LBracket);
+                }
+                ']' => {
+                    self.advance();
+                    tokens.push(Token::RBracket);
+                }
+                ',' => {
+                    self.advance();
+                    tokens.push(Token::Comma);
+                }
+                ':' => {
+                    self.advance();
+                    tokens.push(Token::Colon);
+                }
                 '.' => {
                     self.advance();
                     // Check if next char starts a digit (decimal number like .5)
@@ -158,16 +206,17 @@ impl Lexer {
                     let mut s = String::new();
                     loop {
                         match self.advance() {
-                            Some('\\') => {
-                                match self.advance() {
-                                    Some('n') => s.push('\n'),
-                                    Some('t') => s.push('\t'),
-                                    Some('\\') => s.push('\\'),
-                                    Some(q) if q == quote => s.push(q),
-                                    Some(c) => { s.push('\\'); s.push(c); }
-                                    None => return Err("Unterminated string".to_string()),
+                            Some('\\') => match self.advance() {
+                                Some('n') => s.push('\n'),
+                                Some('t') => s.push('\t'),
+                                Some('\\') => s.push('\\'),
+                                Some(q) if q == quote => s.push(q),
+                                Some(c) => {
+                                    s.push('\\');
+                                    s.push(c);
                                 }
-                            }
+                                None => return Err("Unterminated string".to_string()),
+                            },
                             Some(c) if c == quote => break,
                             Some(c) => s.push(c),
                             None => return Err("Unterminated string".to_string()),
@@ -190,12 +239,17 @@ impl Lexer {
                             num_str.push(self.advance().unwrap());
                         }
                     }
-                    let n: f64 = num_str.parse().map_err(|_| format!("Invalid number: {}", num_str))?;
+                    let n: f64 = num_str
+                        .parse()
+                        .map_err(|_| format!("Invalid number: {}", num_str))?;
                     tokens.push(Token::Number(n));
                 }
                 c if c.is_ascii_alphabetic() || c == '_' => {
                     let mut ident = String::new();
-                    while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    while self
+                        .peek()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
                         ident.push(self.advance().unwrap());
                     }
                     // Handle ext::name syntax
@@ -204,9 +258,12 @@ impl Lexer {
                         self.advance(); // first ':'
                         if self.peek() == Some(':') {
                             self.advance(); // second ':'
-                            // Read the function name after ::
+                                            // Read the function name after ::
                             let mut func_name = String::new();
-                            while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                            while self
+                                .peek()
+                                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                            {
                                 func_name.push(self.advance().unwrap());
                             }
                             if func_name.is_empty() {
@@ -259,19 +316,27 @@ impl Parser {
             return Err("expression_depth_exceeded".to_string());
         }
 
-        let mut parser = Parser { tokens, pos: 0, depth: 0 };
+        let mut parser = Parser {
+            tokens,
+            pos: 0,
+            depth: 0,
+        };
         let expr = parser.parse_ternary()?;
         if parser.peek() != &Token::Eof {
             // If we have trailing tokens but the expression parsed successfully,
             // tolerate extra closing tokens (lenient parsing per spec conformance)
-            let remaining_significant = parser.tokens[parser.pos..].iter()
-                .any(|t| !matches!(t, Token::RParen | Token::Comma | Token::Eof)
-                    || matches!(t, Token::RParen));
+            let remaining_significant = parser.tokens[parser.pos..].iter().any(|t| {
+                !matches!(t, Token::RParen | Token::Comma | Token::Eof)
+                    || matches!(t, Token::RParen)
+            });
             if remaining_significant {
                 // Check if remaining tokens are just extra close-parens and commas
-                let only_trailing = parser.tokens[parser.pos..].iter().all(|t|
-                    matches!(t, Token::RParen | Token::Comma | Token::Eof |
-                             Token::Number(_)));
+                let only_trailing = parser.tokens[parser.pos..].iter().all(|t| {
+                    matches!(
+                        t,
+                        Token::RParen | Token::Comma | Token::Eof | Token::Number(_)
+                    )
+                });
                 if !only_trailing {
                     return Err(format!("Unexpected token: {:?}", parser.peek()));
                 }
@@ -331,7 +396,11 @@ impl Parser {
             self.expect(&Token::Colon)?;
             let else_expr = self.parse_ternary()?;
             self.dec_depth();
-            return Ok(Expr::Conditional(Box::new(expr), Box::new(then_expr), Box::new(else_expr)));
+            return Ok(Expr::Conditional(
+                Box::new(expr),
+                Box::new(then_expr),
+                Box::new(else_expr),
+            ));
         }
         Ok(expr)
     }
@@ -462,10 +531,7 @@ impl Parser {
                         let args = self.parse_args()?;
                         self.expect(&Token::RParen)?;
                         self.dec_depth();
-                        expr = Expr::Call(
-                            Box::new(Expr::Dot(Box::new(expr), name)),
-                            args,
-                        );
+                        expr = Expr::Call(Box::new(Expr::Dot(Box::new(expr), name)), args);
                     } else {
                         expr = Expr::Dot(Box::new(expr), name);
                     }
@@ -493,11 +559,28 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.peek().clone() {
-            Token::Null => { self.advance(); Ok(Expr::Null) }
-            Token::Bool(b) => { self.advance(); Ok(Expr::Bool(b)) }
-            Token::Number(n) => { self.advance(); Ok(Expr::Number(n)) }
-            Token::Str(s) => { let s = s.clone(); self.advance(); Ok(Expr::Str(s)) }
-            Token::Ident(s) => { let s = s.clone(); self.advance(); Ok(Expr::Ident(s)) }
+            Token::Null => {
+                self.advance();
+                Ok(Expr::Null)
+            }
+            Token::Bool(b) => {
+                self.advance();
+                Ok(Expr::Bool(b))
+            }
+            Token::Number(n) => {
+                self.advance();
+                Ok(Expr::Number(n))
+            }
+            Token::Str(s) => {
+                let s = s.clone();
+                self.advance();
+                Ok(Expr::Str(s))
+            }
+            Token::Ident(s) => {
+                let s = s.clone();
+                self.advance();
+                Ok(Expr::Ident(s))
+            }
             Token::LParen => {
                 self.check_depth()?;
                 self.advance();

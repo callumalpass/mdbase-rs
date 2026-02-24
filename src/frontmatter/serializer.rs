@@ -4,8 +4,8 @@ use serde_yaml::Value as YamlValue;
 
 /// Serialize a YAML mapping to a frontmatter string (with --- delimiters).
 pub fn serialize_document(frontmatter: &serde_yaml::Mapping, body: &str) -> String {
-    let yaml_str = serde_yaml::to_string(&YamlValue::Mapping(frontmatter.clone()))
-        .unwrap_or_default();
+    let yaml_str =
+        serde_yaml::to_string(&YamlValue::Mapping(frontmatter.clone())).unwrap_or_default();
     let mut result = String::from("---\n");
     result.push_str(&yaml_str);
     if !yaml_str.ends_with('\n') {

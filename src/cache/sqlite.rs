@@ -6,9 +6,8 @@ use std::path::Path;
 /// Open (or create) the cache database at `<root>/<cache_folder>/cache.db`.
 pub(crate) fn open_cache_db(root: &Path, cache_folder: &str) -> Result<Connection> {
     let db_dir = root.join(cache_folder);
-    std::fs::create_dir_all(&db_dir).map_err(|_e| {
-        rusqlite::Error::InvalidPath(db_dir.join("cache.db"))
-    })?;
+    std::fs::create_dir_all(&db_dir)
+        .map_err(|_e| rusqlite::Error::InvalidPath(db_dir.join("cache.db")))?;
     let db_path = db_dir.join("cache.db");
     let conn = Connection::open(&db_path)?;
     conn.execute_batch(

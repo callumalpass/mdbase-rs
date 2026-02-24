@@ -21,13 +21,7 @@ pub(crate) fn apply_transform(source: &serde_json::Value, transform: &str) -> se
 pub(crate) fn slugify(s: &str) -> String {
     s.to_lowercase()
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c
-            } else {
-                '-'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())
@@ -139,7 +133,8 @@ impl Collection {
             };
 
             if should_generate {
-                let value = self.generate_value(strategy, field_name, type_names, frontmatter, file_path);
+                let value =
+                    self.generate_value(strategy, field_name, type_names, frontmatter, file_path);
                 frontmatter.insert(field_name.clone(), value);
             }
         }
@@ -154,17 +149,11 @@ impl Collection {
         file_path: Option<&str>,
     ) -> serde_json::Value {
         match strategy {
-            GeneratedStrategy::Ulid => {
-                serde_json::Value::String(ulid::Ulid::new().to_string())
-            }
-            GeneratedStrategy::Uuid => {
-                serde_json::Value::String(uuid::Uuid::new_v4().to_string())
-            }
-            GeneratedStrategy::Now | GeneratedStrategy::NowOnWrite => {
-                serde_json::Value::String(
-                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                )
-            }
+            GeneratedStrategy::Ulid => serde_json::Value::String(ulid::Ulid::new().to_string()),
+            GeneratedStrategy::Uuid => serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+            GeneratedStrategy::Now | GeneratedStrategy::NowOnWrite => serde_json::Value::String(
+                chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            ),
             GeneratedStrategy::Sequence(start) => {
                 let type_name = type_names.first().map(|s| s.as_str()).unwrap_or("");
                 let max_val = self.find_max_sequence_value(type_name, field_name);
@@ -193,20 +182,21 @@ impl Collection {
                         Some(path) => {
                             let p = std::path::Path::new(path);
                             match from.as_str() {
-                                "file.name" => p.file_name()
+                                "file.name" => p
+                                    .file_name()
                                     .and_then(|s| s.to_str())
                                     .map(|s| serde_json::Value::String(s.to_string())),
-                                "file.basename" => p.file_stem()
+                                "file.basename" => p
+                                    .file_stem()
                                     .and_then(|s| s.to_str())
                                     .map(|s| serde_json::Value::String(s.to_string())),
-                                "file.ext" => p.extension()
+                                "file.ext" => p
+                                    .extension()
                                     .and_then(|s| s.to_str())
                                     .map(|s| serde_json::Value::String(s.to_string())),
                                 "file.path" => Some(serde_json::Value::String(path.to_string())),
                                 "file.folder" => {
-                                    let folder = p.parent()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("");
+                                    let folder = p.parent().and_then(|s| s.to_str()).unwrap_or("");
                                     Some(serde_json::Value::String(folder.to_string()))
                                 }
                                 _ => None,

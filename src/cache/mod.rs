@@ -32,8 +32,14 @@ impl Collection {
             let _ = std::fs::remove_file(&db_path);
         }
         // Also try to remove WAL and SHM files that SQLite may leave behind
-        let wal_path = self.root.join(&self.settings.cache_folder).join("cache.db-wal");
-        let shm_path = self.root.join(&self.settings.cache_folder).join("cache.db-shm");
+        let wal_path = self
+            .root
+            .join(&self.settings.cache_folder)
+            .join("cache.db-wal");
+        let shm_path = self
+            .root
+            .join(&self.settings.cache_folder)
+            .join("cache.db-shm");
         if wal_path.exists() {
             let _ = std::fs::remove_file(&wal_path);
         }

@@ -40,7 +40,7 @@ pub(crate) fn find_stale(conn: &Connection, root: &Path, files: &[PathBuf]) -> V
 
         match cached_mtime {
             Some(cm) if cm == fs_mtime_ns => {} // up to date
-            _ => stale.push(file_path.clone()),  // missing or different
+            _ => stale.push(file_path.clone()), // missing or different
         }
     }
     stale

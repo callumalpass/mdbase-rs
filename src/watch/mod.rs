@@ -47,7 +47,12 @@ pub fn simulate_watch(
 
     let sim_obj = match sim.as_object() {
         Some(obj) => obj,
-        None => return WatchResult { events, listener_error_event: None },
+        None => {
+            return WatchResult {
+                events,
+                listener_error_event: None,
+            }
+        }
     };
 
     // Check for listener_error_on_event
@@ -58,7 +63,12 @@ pub fn simulate_watch(
     // Open collection to get current state before changes
     let collection = match crate::Collection::open(collection_root) {
         Ok(c) => c,
-        Err(_) => return WatchResult { events, listener_error_event },
+        Err(_) => {
+            return WatchResult {
+                events,
+                listener_error_event,
+            }
+        }
     };
 
     // Process each simulate action
@@ -111,7 +121,10 @@ pub fn simulate_watch(
         }
     }
 
-    WatchResult { events, listener_error_event }
+    WatchResult {
+        events,
+        listener_error_event,
+    }
 }
 
 pub struct WatchResult {
@@ -150,9 +163,14 @@ fn read_effective_frontmatter(
 ) -> Option<(Value, Vec<String>)> {
     let result = collection.read(&json!({"path": rel_path}));
     let frontmatter = result.get("frontmatter").cloned()?;
-    let types: Vec<String> = result.get("types")
+    let types: Vec<String> = result
+        .get("types")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Remove computed fields from frontmatter
@@ -187,17 +205,16 @@ fn read_raw_frontmatter_ordered(
     };
     let doc = crate::frontmatter::parser::parse_document(&content);
     match &doc.frontmatter {
-        Some(serde_yaml::Value::Mapping(m)) => {
-            m.iter()
-                .filter_map(|(k, v)| {
-                    if let serde_yaml::Value::String(key) = k {
-                        Some((key.clone(), v.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        }
+        Some(serde_yaml::Value::Mapping(m)) => m
+            .iter()
+            .filter_map(|(k, v)| {
+                if let serde_yaml::Value::String(key) = k {
+                    Some((key.clone(), v.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect(),
         _ => vec![],
     }
 }
@@ -215,10 +232,9 @@ fn validate_file(
     };
     let result = fresh_collection.validate_op(&json!({"path": rel_path}));
     if let Some(issues) = result.get("issues").and_then(|v| v.as_array()) {
-        let error_issues: Vec<Value> = issues.iter()
-            .filter(|issue| {
-                issue.get("severity").and_then(|s| s.as_str()) == Some("error")
-            })
+        let error_issues: Vec<Value> = issues
+            .iter()
+            .filter(|issue| issue.get("severity").and_then(|s| s.as_str()) == Some("error"))
             .cloned()
             .collect();
         if !error_issues.is_empty() {
@@ -282,8 +298,8 @@ fn process_external_create(
     let mut events = Vec::new();
 
     // Read effective frontmatter
-    let (frontmatter, types) = read_effective_frontmatter(collection_root, path, &fresh)
-        .unwrap_or((json!({}), vec![]));
+    let (frontmatter, types) =
+        read_effective_frontmatter(collection_root, path, &fresh).unwrap_or((json!({}), vec![]));
 
     events.push(json!({
         "event": "file_created",
@@ -328,8 +344,8 @@ fn process_external_modify(
         Err(_) => return None,
     };
 
-    let (frontmatter, types) = read_effective_frontmatter(collection_root, path, &fresh)
-        .unwrap_or((json!({}), vec![]));
+    let (frontmatter, types) =
+        read_effective_frontmatter(collection_root, path, &fresh).unwrap_or((json!({}), vec![]));
 
     // Determine changed_fields by comparing raw frontmatter
     let new_raw_fm = read_raw_frontmatter_ordered(collection_root, path);
@@ -375,11 +391,12 @@ fn process_external_delete(
     }
 
     // Get last known types before deletion
-    let last_known_types: Vec<String> = if let Some((_, types)) = read_effective_frontmatter(collection_root, path, collection) {
-        types
-    } else {
-        vec![]
-    };
+    let last_known_types: Vec<String> =
+        if let Some((_, types)) = read_effective_frontmatter(collection_root, path, collection) {
+            types
+        } else {
+            vec![]
+        };
 
     // Delete the file
     let full_path = collection_root.join(path);
@@ -400,14 +417,18 @@ fn process_external_rename(
 ) -> Option<Vec<Value>> {
     let from = val.get("from")?.as_str()?;
     let to = val.get("to")?.as_str()?;
-    let detection_fails = val.get("detection_fails").and_then(|v| v.as_bool()).unwrap_or(false);
+    let detection_fails = val
+        .get("detection_fails")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Get types before rename
-    let types: Vec<String> = if let Some((_, types)) = read_effective_frontmatter(collection_root, from, collection) {
-        types
-    } else {
-        vec![]
-    };
+    let types: Vec<String> =
+        if let Some((_, types)) = read_effective_frontmatter(collection_root, from, collection) {
+            types
+        } else {
+            vec![]
+        };
 
     // Perform the rename
     let from_path = collection_root.join(from);
@@ -423,8 +444,8 @@ fn process_external_rename(
             Ok(c) => c,
             Err(_) => return None,
         };
-        let (frontmatter, new_types) = read_effective_frontmatter(collection_root, to, &fresh)
-            .unwrap_or((json!({}), vec![]));
+        let (frontmatter, new_types) =
+            read_effective_frontmatter(collection_root, to, &fresh).unwrap_or((json!({}), vec![]));
 
         Some(vec![
             json!({
@@ -465,15 +486,21 @@ fn process_type_change(
     let all_files = collection.build_all_files_data();
     let mut affected_files: Vec<String> = Vec::new();
     for file_data in &all_files {
-        let file_types = collection.determine_types_for_path(&file_data.frontmatter, Some(&file_data.path));
-        if file_types.iter().any(|t| t.to_lowercase() == type_name.to_lowercase()) {
+        let file_types =
+            collection.determine_types_for_path(&file_data.frontmatter, Some(&file_data.path));
+        if file_types
+            .iter()
+            .any(|t| t.to_lowercase() == type_name.to_lowercase())
+        {
             affected_files.push(file_data.path.clone());
         }
     }
     affected_files.sort();
 
     // Apply the type change
-    let type_path = collection_root.join(&collection.settings.types_folder).join(format!("{}.md", type_name));
+    let type_path = collection_root
+        .join(&collection.settings.types_folder)
+        .join(format!("{}.md", type_name));
     let _ = std::fs::write(&type_path, new_definition);
 
     Some(vec![json!({
@@ -484,10 +511,7 @@ fn process_type_change(
     })])
 }
 
-fn process_config_change(
-    collection_root: &Path,
-    val: &Value,
-) -> Option<Vec<Value>> {
+fn process_config_change(collection_root: &Path, val: &Value) -> Option<Vec<Value>> {
     let new_config = val.get("new_config")?.as_str()?;
 
     // Compute hash of old config
@@ -577,8 +601,9 @@ fn process_rapid_changes(
         for path in created.keys() {
             if !deleted.contains(path) {
                 let fresh = crate::Collection::open(collection_root).ok()?;
-                let (frontmatter, types) = read_effective_frontmatter(collection_root, path, &fresh)
-                    .unwrap_or((json!({}), vec![]));
+                let (frontmatter, types) =
+                    read_effective_frontmatter(collection_root, path, &fresh)
+                        .unwrap_or((json!({}), vec![]));
                 events.push(json!({
                     "event": "file_created",
                     "timestamp": now_timestamp(),
@@ -655,8 +680,9 @@ fn process_sequential_changes(
                     Err(_) => continue,
                 };
 
-                let (frontmatter, types) = read_effective_frontmatter(collection_root, path, &fresh)
-                    .unwrap_or((json!({}), vec![]));
+                let (frontmatter, types) =
+                    read_effective_frontmatter(collection_root, path, &fresh)
+                        .unwrap_or((json!({}), vec![]));
 
                 let new_raw_fm = read_raw_frontmatter_ordered(collection_root, path);
                 let changed_fields = compute_changed_fields(&old_raw_fm, &new_raw_fm);
@@ -682,8 +708,9 @@ fn process_sequential_changes(
                     Err(_) => continue,
                 };
 
-                let (frontmatter, types) = read_effective_frontmatter(collection_root, path, &fresh)
-                    .unwrap_or((json!({}), vec![]));
+                let (frontmatter, types) =
+                    read_effective_frontmatter(collection_root, path, &fresh)
+                        .unwrap_or((json!({}), vec![]));
 
                 events.push(json!({
                     "event": "file_created",
@@ -702,9 +729,10 @@ fn process_sequential_changes(
                         continue;
                     }
                 };
-                let last_known_types: Vec<String> = read_effective_frontmatter(collection_root, path, &fresh)
-                    .map(|(_, types)| types)
-                    .unwrap_or_default();
+                let last_known_types: Vec<String> =
+                    read_effective_frontmatter(collection_root, path, &fresh)
+                        .map(|(_, types)| types)
+                        .unwrap_or_default();
 
                 let full_path = collection_root.join(path);
                 let _ = std::fs::remove_file(&full_path);
@@ -730,12 +758,10 @@ fn compute_changed_fields(
     new: &[(String, serde_yaml::Value)],
 ) -> Vec<String> {
     let mut changed = Vec::new();
-    let old_map: std::collections::HashMap<&str, &serde_yaml::Value> = old.iter()
-        .map(|(k, v)| (k.as_str(), v))
-        .collect();
-    let new_map: std::collections::HashMap<&str, &serde_yaml::Value> = new.iter()
-        .map(|(k, v)| (k.as_str(), v))
-        .collect();
+    let old_map: std::collections::HashMap<&str, &serde_yaml::Value> =
+        old.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let new_map: std::collections::HashMap<&str, &serde_yaml::Value> =
+        new.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
     // Check for added or changed fields (in new frontmatter order)
     for (key, new_val) in new {

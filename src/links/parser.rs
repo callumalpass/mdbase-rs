@@ -23,8 +23,12 @@ pub(crate) fn normalize_link_path(target: &str, source_dir: &str) -> String {
     }
 
     // If target contains relative segments (./ or ../), resolve relative to source dir
-    if target.starts_with("./") || target.starts_with("../") || target == "." || target == ".."
-        || target.contains("/./") || target.contains("/../")
+    if target.starts_with("./")
+        || target.starts_with("../")
+        || target == "."
+        || target == ".."
+        || target.contains("/./")
+        || target.contains("/../")
     {
         let combined = if source_dir.is_empty() {
             target.to_string()
@@ -70,23 +74,28 @@ impl Collection {
     pub fn parse_link(&self, input: &serde_json::Value) -> serde_json::Value {
         let value = match input.get("value").and_then(|v| v.as_str()) {
             Some(v) => v,
-            None => return serde_json::json!({"error": {"code": "invalid_input", "message": "parse_link requires 'value' field"}}),
+            None => {
+                return serde_json::json!({"error": {"code": "invalid_input", "message": "parse_link requires 'value' field"}})
+            }
         };
 
         let raw = value.to_string();
 
         // Wikilink: [[target]], [[target|alias]], [[target#anchor]], [[target#anchor|alias]]
         if value.starts_with("[[") && value.ends_with("]]") {
-            let inner = &value[2..value.len()-2];
+            let inner = &value[2..value.len() - 2];
             // Split on | for alias
             let (target_part, alias) = if let Some(pipe_idx) = inner.find('|') {
-                (&inner[..pipe_idx], Some(inner[pipe_idx+1..].to_string()))
+                (&inner[..pipe_idx], Some(inner[pipe_idx + 1..].to_string()))
             } else {
                 (inner, None)
             };
             // Split on # for anchor
             let (target, anchor) = if let Some(hash_idx) = target_part.find('#') {
-                (target_part[..hash_idx].to_string(), Some(target_part[hash_idx+1..].to_string()))
+                (
+                    target_part[..hash_idx].to_string(),
+                    Some(target_part[hash_idx + 1..].to_string()),
+                )
             } else {
                 (target_part.to_string(), None)
             };
@@ -107,9 +116,12 @@ impl Collection {
         if value.starts_with('[') && value.contains("](") && value.ends_with(')') {
             let bracket_end = value.find("](").unwrap();
             let text = &value[1..bracket_end];
-            let path_str = &value[bracket_end+2..value.len()-1];
+            let path_str = &value[bracket_end + 2..value.len() - 1];
             let (path, anchor) = if let Some(hash_idx) = path_str.find('#') {
-                (path_str[..hash_idx].to_string(), Some(path_str[hash_idx+1..].to_string()))
+                (
+                    path_str[..hash_idx].to_string(),
+                    Some(path_str[hash_idx + 1..].to_string()),
+                )
             } else {
                 (path_str.to_string(), None)
             };

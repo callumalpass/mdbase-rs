@@ -75,7 +75,7 @@ pub fn parse_document(content: &str) -> ParsedDocument {
 
     let yaml_str = &rest[..close_pos];
     let body_start = after_open + close_pos + 3; // skip "---"
-    // Skip the newline after closing ---
+                                                 // Skip the newline after closing ---
     let body = if body_start < content.len() {
         let b = &content[body_start..];
         if let Some(stripped) = b.strip_prefix('\n') {
@@ -95,10 +95,12 @@ pub fn parse_document(content: &str) -> ParsedDocument {
         Err(_) => {
             // Return the raw yaml string as an error indicator - caller handles this
             return ParsedDocument {
-                frontmatter: Some(YamlValue::Tagged(Box::new(serde_yaml::value::TaggedValue {
-                    tag: serde_yaml::value::Tag::new("!parse_error"),
-                    value: YamlValue::String(yaml_str.to_string()),
-                }))),
+                frontmatter: Some(YamlValue::Tagged(Box::new(
+                    serde_yaml::value::TaggedValue {
+                        tag: serde_yaml::value::Tag::new("!parse_error"),
+                        value: YamlValue::String(yaml_str.to_string()),
+                    },
+                ))),
                 body,
                 has_frontmatter: true,
             };

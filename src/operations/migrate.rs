@@ -9,10 +9,16 @@ impl Collection {
     pub fn migrate(&self, input: &serde_json::Value) -> serde_json::Value {
         let id = input.get("id").and_then(|v| v.as_str());
         let path = input.get("path").and_then(|v| v.as_str());
-        let dry_run = input.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+        let dry_run = input
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         if (id.is_some() && path.is_some()) || (id.is_none() && path.is_none()) {
-            return op_error(INVALID_REQUEST, "migrate requires exactly one of 'id' or 'path'");
+            return op_error(
+                INVALID_REQUEST,
+                "migrate requires exactly one of 'id' or 'path'",
+            );
         }
 
         let manifest_path = if let Some(p) = path {
@@ -32,7 +38,10 @@ impl Collection {
                         if entry_path.is_dir() {
                             stack.push(entry_path);
                         } else if entry_path.is_file() {
-                            let ext = entry_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            let ext = entry_path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("");
                             if ext != "md" && ext != "yaml" && ext != "yml" {
                                 continue;
                             }
@@ -65,7 +74,12 @@ impl Collection {
 
         let content = match std::fs::read_to_string(&manifest_path) {
             Ok(c) => c,
-            Err(e) => return op_error(INVALID_MIGRATION, &format!("Failed to read manifest: {}", e)),
+            Err(e) => {
+                return op_error(
+                    INVALID_MIGRATION,
+                    &format!("Failed to read manifest: {}", e),
+                )
+            }
         };
         let doc = parse_document(&content);
         let frontmatter = match &doc.frontmatter {
@@ -123,11 +137,8 @@ impl Collection {
                     step_result["status"] = serde_json::Value::String("success".to_string());
                     step_result["result"] = backfill_result;
                 }
-                Some("add_field")
-                | Some("rename_field")
-                | Some("change_type")
-                | Some("rename_type")
-                | Some("move_path") => {
+                Some("add_field") | Some("rename_field") | Some("change_type")
+                | Some("rename_type") | Some("move_path") => {
                     step_result["status"] = serde_json::Value::String("manual".to_string());
                 }
                 Some(_) | None => {

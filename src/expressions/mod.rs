@@ -33,7 +33,9 @@ pub(crate) fn expr_contains_ident(expr: &crate::expressions::ast::Expr, name: &s
             expr_contains_ident(f, name) || args.iter().any(|a| expr_contains_ident(a, name))
         }
         Expr::Conditional(c, t, e) => {
-            expr_contains_ident(c, name) || expr_contains_ident(t, name) || expr_contains_ident(e, name)
+            expr_contains_ident(c, name)
+                || expr_contains_ident(t, name)
+                || expr_contains_ident(e, name)
         }
         _ => false,
     }
@@ -51,9 +53,9 @@ pub(crate) fn is_truthy_value(val: &serde_json::Value) -> bool {
     }
 }
 
-use std::collections::HashMap;
 use crate::expressions::evaluator::{evaluate as eval_expr, EvalContext};
 use crate::Collection;
+use std::collections::HashMap;
 
 impl Collection {
     /// Evaluate computed fields for a read result (§5.12).
@@ -84,7 +86,8 @@ impl Collection {
         }
 
         // Topological sort to determine evaluation order
-        let computed_names: std::collections::HashSet<&str> = computed.iter().map(|(n, _)| n.as_str()).collect();
+        let computed_names: std::collections::HashSet<&str> =
+            computed.iter().map(|(n, _)| n.as_str()).collect();
         let mut deps: HashMap<&str, Vec<&str>> = HashMap::new();
         for (name, expr) in &computed {
             let mut field_deps = Vec::new();
@@ -130,7 +133,9 @@ impl Collection {
                     raw_frontmatter: None,
                     file_path: Some(path.to_string()),
                     body: body.map(String::from),
-                    file_size: None, file_mtime: None, file_ctime: None,
+                    file_size: None,
+                    file_mtime: None,
+                    file_ctime: None,
                     this_context: None,
                     all_files: None,
                     traversal_depth: std::cell::Cell::new(0),
