@@ -10,10 +10,14 @@ pub(crate) fn compute_relative_path(source_dir: &str, target_path: &str) -> Stri
         source_dir.split('/').filter(|s| !s.is_empty()).collect()
     };
 
-    let target_dir = std::path::Path::new(target_path).parent()
-        .map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-    let target_filename = std::path::Path::new(target_path).file_name()
-        .and_then(|s| s.to_str()).unwrap_or(target_path);
+    let target_dir = std::path::Path::new(target_path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let target_filename = std::path::Path::new(target_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(target_path);
 
     let tgt_parts: Vec<&str> = if target_dir.is_empty() {
         Vec::new()
@@ -23,7 +27,10 @@ pub(crate) fn compute_relative_path(source_dir: &str, target_path: &str) -> Stri
 
     // Find common prefix
     let mut common = 0;
-    while common < src_parts.len() && common < tgt_parts.len() && src_parts[common] == tgt_parts[common] {
+    while common < src_parts.len()
+        && common < tgt_parts.len()
+        && src_parts[common] == tgt_parts[common]
+    {
         common += 1;
     }
 
@@ -47,30 +54,87 @@ pub(crate) fn compute_relative_path(source_dir: &str, target_path: &str) -> Stri
 
 // --- impl Collection methods for link resolution ---
 
-use std::path::{Path, PathBuf};
+use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::links::parser::{count_leading_dotdot, normalize_link_path};
-use crate::errors::*;
 use crate::types::schema::FieldDef;
 use crate::Collection;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LinkResolutionIndex {
+    pub known_paths: HashSet<String>,
+    pub basename_lower_to_path: HashMap<String, String>,
+    pub id_lower_to_path: HashMap<String, String>,
+    pub title_lower_to_path: HashMap<String, String>,
+}
 
 impl Collection {
+    pub(crate) fn build_link_resolution_index(
+        &self,
+        all_files: &[crate::expressions::evaluator::ResolvedFileData],
+    ) -> LinkResolutionIndex {
+        let mut index = LinkResolutionIndex::default();
+
+        for file_data in all_files {
+            let path = file_data.path.clone();
+            index.known_paths.insert(path.clone());
+
+            if let Some(basename) = std::path::Path::new(&path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+            {
+                index
+                    .basename_lower_to_path
+                    .entry(basename.to_ascii_lowercase())
+                    .or_insert_with(|| path.clone());
+            }
+
+            if let Some(id) = file_data
+                .frontmatter
+                .get(&self.settings.id_field)
+                .and_then(|v| v.as_str())
+            {
+                index
+                    .id_lower_to_path
+                    .entry(id.to_ascii_lowercase())
+                    .or_insert_with(|| path.clone());
+            }
+
+            if let Some(title) = file_data.frontmatter.get("title").and_then(|v| v.as_str()) {
+                index
+                    .title_lower_to_path
+                    .entry(title.to_ascii_lowercase())
+                    .or_insert_with(|| path.clone());
+            }
+        }
+
+        index
+    }
+
     /// Resolve a link field to a target file path.
     pub fn resolve_link(&self, input: &serde_json::Value) -> serde_json::Value {
         let source_path = match input.get("path").and_then(|v| v.as_str()) {
             Some(v) => v,
-            None => return serde_json::json!({"error": {"code": "invalid_input", "message": "resolve_link requires 'path' field"}}),
+            None => {
+                return serde_json::json!({"error": {"code": "invalid_input", "message": "resolve_link requires 'path' field"}})
+            }
         };
         let field_name = match input.get("field").and_then(|v| v.as_str()) {
             Some(v) => v,
-            None => return serde_json::json!({"error": {"code": "invalid_input", "message": "resolve_link requires 'field' field"}}),
+            None => {
+                return serde_json::json!({"error": {"code": "invalid_input", "message": "resolve_link requires 'field' field"}})
+            }
         };
 
         // Read the source file to get the field value
         let read_result = self.read(&serde_json::json!({"path": source_path}));
         let fm = match read_result.get("frontmatter") {
             Some(fm) => fm,
-            None => return serde_json::json!({"error": {"code": "file_not_found", "message": format!("Cannot read {}", source_path)}}),
+            None => {
+                return serde_json::json!({"error": {"code": "file_not_found", "message": format!("Cannot read {}", source_path)}})
+            }
         };
 
         let field_val = match fm.get(field_name).and_then(|v| v.as_str()) {
@@ -80,20 +144,29 @@ impl Collection {
 
         // Parse the link value
         let parse_result = self.parse_link(&serde_json::json!({"value": field_val}));
-        let target = match parse_result.get("link").and_then(|l| l.get("target")).and_then(|t| t.as_str()) {
+        let target = match parse_result
+            .get("link")
+            .and_then(|l| l.get("target"))
+            .and_then(|t| t.as_str())
+        {
             Some(t) => t.to_string(),
             None => return serde_json::json!({"resolved_path": serde_json::Value::Null}),
         };
-        let is_relative = parse_result.get("link")
+        let is_relative = parse_result
+            .get("link")
             .and_then(|l| l.get("is_relative"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let format = parse_result.get("link")
+        let format = parse_result
+            .get("link")
             .and_then(|l| l.get("format"))
             .and_then(|v| v.as_str())
             .unwrap_or("wikilink");
 
-        let source_dir = Path::new(source_path).parent().and_then(|p| p.to_str()).unwrap_or("");
+        let source_dir = Path::new(source_path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
 
         // Determine field type constraints
         let target_type = self.get_field_target_type(source_path, field_name);
@@ -177,8 +250,12 @@ impl Collection {
         for seg in base.split('/') {
             match seg {
                 "." => {}
-                ".." => { segments.pop(); }
-                s if !s.is_empty() => { segments.push(s); }
+                ".." => {
+                    segments.pop();
+                }
+                s if !s.is_empty() => {
+                    segments.push(s);
+                }
                 _ => {}
             }
         }
@@ -186,15 +263,26 @@ impl Collection {
     }
 
     /// Resolve a simple name (no path separators) via id_field, then filename.
-    pub(crate) fn resolve_simple_name(&self, name: &str, source_dir: &str, target_type: Option<&str>) -> Option<String> {
+    pub(crate) fn resolve_simple_name(
+        &self,
+        name: &str,
+        source_dir: &str,
+        target_type: Option<&str>,
+    ) -> Option<String> {
         let files = self.scan_collection_files();
-        let id_field_name = if self.settings.id_field.is_empty() { "id" } else { &self.settings.id_field };
+        let id_field_name = if self.settings.id_field.is_empty() {
+            "id"
+        } else {
+            &self.settings.id_field
+        };
 
         let mut id_matches: Vec<String> = Vec::new();
         let mut filename_matches: Vec<String> = Vec::new();
 
         for file_path in &files {
-            let rel_path = file_path.strip_prefix(&self.root).ok()
+            let rel_path = file_path
+                .strip_prefix(&self.root)
+                .ok()
                 .and_then(|p| p.to_str())
                 .unwrap_or("")
                 .to_string();
@@ -214,7 +302,10 @@ impl Collection {
             // Check target type constraint
             if let Some(constraint_type) = target_type {
                 let file_types = self.determine_types_for_path(&fm, Some(&rel_path));
-                if !file_types.iter().any(|t| t.to_lowercase() == constraint_type.to_lowercase()) {
+                if !file_types
+                    .iter()
+                    .any(|t| t.to_lowercase() == constraint_type.to_lowercase())
+                {
                     continue;
                 }
             }
@@ -227,14 +318,21 @@ impl Collection {
             }
 
             // Check filename match
-            let basename = Path::new(&rel_path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let basename = Path::new(&rel_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
             if basename == name {
                 filename_matches.push(rel_path.clone());
             }
         }
 
         // Prefer id matches over filename matches
-        let candidates = if !id_matches.is_empty() { id_matches } else { filename_matches };
+        let candidates = if !id_matches.is_empty() {
+            id_matches
+        } else {
+            filename_matches
+        };
 
         if candidates.is_empty() {
             return None;
@@ -249,7 +347,11 @@ impl Collection {
             let a_same = Path::new(a).parent().and_then(|p| p.to_str()).unwrap_or("") == source_dir;
             let b_same = Path::new(b).parent().and_then(|p| p.to_str()).unwrap_or("") == source_dir;
             if a_same != b_same {
-                return if a_same { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+                return if a_same {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
             }
             let a_depth = a.matches('/').count();
             let b_depth = b.matches('/').count();
@@ -262,7 +364,11 @@ impl Collection {
     }
 
     /// Get the target type constraint for a field.
-    pub(crate) fn get_field_target_type(&self, source_path: &str, field_name: &str) -> Option<String> {
+    pub(crate) fn get_field_target_type(
+        &self,
+        source_path: &str,
+        field_name: &str,
+    ) -> Option<String> {
         // Read source file to get its type, then look up the field definition
         let read_result = self.read(&serde_json::json!({"path": source_path}));
         let fm = read_result.get("frontmatter")?;
@@ -278,17 +384,31 @@ impl Collection {
     }
 
     /// Resolve a link target string to a file path.
-    pub(crate) fn resolve_link_target(&self, target: &str, source_path: &str, known_paths: &[&str]) -> Option<String> {
+    pub(crate) fn resolve_link_target(
+        &self,
+        target: &str,
+        source_path: &str,
+        resolution_index: &LinkResolutionIndex,
+    ) -> Option<String> {
         // Strip wikilink syntax
         let target = if target.starts_with("[[") && target.ends_with("]]") {
-            let inner = &target[2..target.len()-2];
-            inner.split('|').next().unwrap_or(inner).split('#').next().unwrap_or(inner).trim()
+            let inner = &target[2..target.len() - 2];
+            inner
+                .split('|')
+                .next()
+                .unwrap_or(inner)
+                .split('#')
+                .next()
+                .unwrap_or(inner)
+                .trim()
         } else {
             // Strip anchor from markdown links
             target.split('#').next().unwrap_or(target).trim()
         };
 
-        if target.is_empty() { return None; }
+        if target.is_empty() {
+            return None;
+        }
 
         // Handle relative paths (./foo, ../foo)
         let resolved_target = if target.starts_with("./") || target.starts_with("../") {
@@ -300,9 +420,13 @@ impl Collection {
             let mut components = Vec::new();
             for c in joined.components() {
                 match c {
-                    std::path::Component::ParentDir => { components.pop(); }
+                    std::path::Component::ParentDir => {
+                        components.pop();
+                    }
                     std::path::Component::CurDir => {}
-                    _ => { components.push(c); }
+                    _ => {
+                        components.push(c);
+                    }
                 }
             }
             let normalized: PathBuf = components.iter().collect();
@@ -312,56 +436,29 @@ impl Collection {
         };
 
         // Exact path match
-        if known_paths.contains(&resolved_target.as_str()) {
+        if resolution_index.known_paths.contains(&resolved_target) {
             return Some(resolved_target.clone());
         }
 
         // With .md extension
         if !resolved_target.ends_with(".md") && !resolved_target.ends_with(".mdx") {
             let with_md = format!("{}.md", resolved_target);
-            if known_paths.contains(&with_md.as_str()) {
+            if resolution_index.known_paths.contains(&with_md) {
                 return Some(with_md);
             }
         }
 
         // Basename match (for wikilinks without path)
         if !resolved_target.contains('/') {
-            let target_lower = resolved_target.to_lowercase();
-            for path in known_paths {
-                let basename = std::path::Path::new(path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
-                if basename == resolved_target || basename.to_lowercase() == target_lower {
-                    return Some(path.to_string());
-                }
+            let target_lower = resolved_target.to_ascii_lowercase();
+            if let Some(path) = resolution_index.basename_lower_to_path.get(&target_lower) {
+                return Some(path.clone());
             }
-            // Also try matching against ID field and title in frontmatter
-            let files = self.scan_collection_files();
-            for fp in &files {
-                let rp = fp.strip_prefix(&self.root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default()
-                    .replace('\\', "/");
-                if !known_paths.contains(&rp.as_str()) { continue; }
-                if let Ok(content) = std::fs::read_to_string(fp) {
-                    let doc = parse_document(&content);
-                    if let Some(serde_yaml::Value::Mapping(m)) = &doc.frontmatter {
-                        let fm = yaml_mapping_to_json(m);
-                        // Check ID field
-                        if let Some(id) = fm.get(&self.settings.id_field).and_then(|v| v.as_str()) {
-                            if id == resolved_target || id.to_lowercase() == target_lower {
-                                return Some(rp);
-                            }
-                        }
-                        // Check title field
-                        if let Some(title) = fm.get("title").and_then(|v| v.as_str()) {
-                            if title == resolved_target || title.to_lowercase() == target_lower {
-                                return Some(rp);
-                            }
-                        }
-                    }
-                }
+            if let Some(path) = resolution_index.id_lower_to_path.get(&target_lower) {
+                return Some(path.clone());
+            }
+            if let Some(path) = resolution_index.title_lower_to_path.get(&target_lower) {
+                return Some(path.clone());
             }
         }
 
@@ -370,7 +467,12 @@ impl Collection {
 
     /// Check link fields with validate_exists: true.
     /// Verifies that wiki-link targets actually exist in the collection.
-    pub(crate) fn check_link_exists(&self, frontmatter: &serde_json::Value, type_names: &[String], path: &str) -> Vec<Issue> {
+    pub(crate) fn check_link_exists(
+        &self,
+        frontmatter: &serde_json::Value,
+        type_names: &[String],
+        path: &str,
+    ) -> Vec<Issue> {
         let mut issues = Vec::new();
 
         for type_name in type_names {
@@ -385,7 +487,11 @@ impl Collection {
                     Some(field_def)
                 } else if field_def.field_type == "list" {
                     field_def.items.as_ref().and_then(|item| {
-                        if item.field_type == "link" { Some(item.as_ref()) } else { None }
+                        if item.field_type == "link" {
+                            Some(item.as_ref())
+                        } else {
+                            None
+                        }
                     })
                 } else {
                     None
@@ -407,13 +513,12 @@ impl Collection {
                 } else if let Some(arr) = value.as_array() {
                     arr.iter().filter_map(|v| v.as_str()).collect()
                 } else {
-                    continue
+                    continue;
                 };
 
                 for link_str in link_values {
-                    let link_issues = self.validate_single_link(
-                        link_str, field_name, link_field, type_name, path,
-                    );
+                    let link_issues = self
+                        .validate_single_link(link_str, field_name, link_field, type_name, path);
                     issues.extend(link_issues);
                 }
             }
@@ -435,7 +540,7 @@ impl Collection {
 
         // Extract target from [[...]] wiki-link syntax
         let target = if link_str.starts_with("[[") && link_str.ends_with("]]") {
-            &link_str[2..link_str.len()-2]
+            &link_str[2..link_str.len() - 2]
         } else {
             link_str
         };
@@ -448,7 +553,9 @@ impl Collection {
         }
 
         // Normalize path (resolve ./ and ../)
-        let source_dir = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(""));
+        let source_dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new(""));
         let source_dir_str = source_dir.to_string_lossy();
         let normalized = normalize_link_path(target, &source_dir_str);
 
@@ -457,11 +564,17 @@ impl Collection {
         // If the target has >= 2 leading ../ segments AND those segments would reach or
         // exceed the collection root boundary, flag as path_traversal.
         let leading_dotdot_count = count_leading_dotdot(target);
-        let source_depth = if source_dir_str.is_empty() { 0 } else {
+        let source_depth = if source_dir_str.is_empty() {
+            0
+        } else {
             source_dir_str.split('/').filter(|s| !s.is_empty()).count()
         };
         let reaches_root = leading_dotdot_count >= source_depth && leading_dotdot_count >= 2;
-        if reaches_root || normalized.starts_with("../") || normalized.starts_with("..\\") || normalized == ".." {
+        if reaches_root
+            || normalized.starts_with("../")
+            || normalized.starts_with("..\\")
+            || normalized == ".."
+        {
             issues.push(Issue {
                 code: "path_traversal".to_string(),
                 message: format!("Link target '{}' escapes collection root", target),
@@ -484,7 +597,10 @@ impl Collection {
             if matches.is_empty() {
                 issues.push(Issue {
                     code: "link_not_found".to_string(),
-                    message: format!("Link target '{}' not found for field '{}'", target, field_name),
+                    message: format!(
+                        "Link target '{}' not found for field '{}'",
+                        target, field_name
+                    ),
                     path: Some(path.to_string()),
                     field: Some(field_name.to_string()),
                     severity: Severity::Error,
@@ -497,7 +613,10 @@ impl Collection {
             } else if matches.len() > 1 {
                 issues.push(Issue {
                     code: "ambiguous_link".to_string(),
-                    message: format!("Link '{}' matches multiple files for field '{}'", target, field_name),
+                    message: format!(
+                        "Link '{}' matches multiple files for field '{}'",
+                        target, field_name
+                    ),
                     path: Some(path.to_string()),
                     field: Some(field_name.to_string()),
                     severity: Severity::Error,
@@ -555,7 +674,10 @@ impl Collection {
             } else if matches.len() > 1 {
                 issues.push(Issue {
                     code: "ambiguous_link".to_string(),
-                    message: format!("Link '{}' matches multiple files for field '{}'", target, field_name),
+                    message: format!(
+                        "Link '{}' matches multiple files for field '{}'",
+                        target, field_name
+                    ),
                     path: Some(path.to_string()),
                     field: Some(field_name.to_string()),
                     severity: Severity::Error,
@@ -583,11 +705,12 @@ impl Collection {
             };
 
             // Check exact path match (with .md extension)
-            let normalized_with_ext = if !normalized.ends_with(".md") && !normalized.ends_with(".mdx") {
-                format!("{}.md", normalized)
-            } else {
-                normalized.to_string()
-            };
+            let normalized_with_ext =
+                if !normalized.ends_with(".md") && !normalized.ends_with(".mdx") {
+                    format!("{}.md", normalized)
+                } else {
+                    normalized.to_string()
+                };
             if rel_path == normalized_with_ext || rel_path == normalized {
                 matches.push(rel_path);
                 continue;
@@ -611,11 +734,12 @@ impl Collection {
                     let doc = parse_document(&content);
                     if let Some(serde_yaml::Value::Mapping(m)) = &doc.frontmatter {
                         let json = yaml_mapping_to_json(m);
-                        if let Some(id_val) = json.get(&self.settings.id_field).and_then(|v| v.as_str()) {
-                            if id_val == original
-                                && !matches.contains(&rel_path) {
-                                    matches.push(rel_path);
-                                }
+                        if let Some(id_val) =
+                            json.get(&self.settings.id_field).and_then(|v| v.as_str())
+                        {
+                            if id_val == original && !matches.contains(&rel_path) {
+                                matches.push(rel_path);
+                            }
                         }
                     }
                 }

@@ -3,13 +3,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rusqlite::Connection;
 
-use crate::Collection;
 use crate::cache::{indexer, sqlite, staleness};
 use crate::expressions::evaluator::ResolvedFileData;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
+use crate::Collection;
 
 /// Common intermediate representation that both the cache path and disk-fallback
 /// path produce. The query loop reads from these instead of touching disk.
@@ -26,9 +27,34 @@ pub(crate) struct FileRecord {
 
 type QueryData = (
     Vec<FileRecord>,
-    Arc<Vec<ResolvedFileData>>,
-    Arc<HashMap<String, Vec<String>>>,
+    Option<Arc<Vec<ResolvedFileData>>>,
+    Option<Arc<HashMap<String, Vec<String>>>>,
 );
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LoadQueryPerf {
+    pub total_ms: f64,
+    pub try_open_cache_ms: f64,
+    pub refresh_cache_ms: f64,
+    pub scan_files_ms: f64,
+    pub load_records_ms: f64,
+    pub build_all_files_ms: f64,
+    pub build_backlinks_ms: f64,
+    pub backlinks_frontmatter_extract_ms: f64,
+    pub backlinks_body_links_extract_ms: f64,
+    pub backlinks_body_embeds_extract_ms: f64,
+    pub backlinks_resolve_targets_ms: f64,
+    pub backlinks_files_processed: usize,
+    pub backlinks_targets_scanned: usize,
+    pub backlinks_resolve_calls: usize,
+    pub file_records: usize,
+    pub cache_used: bool,
+    pub built_link_graph: bool,
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
 
 /// Convert nanoseconds-since-epoch to ISO 8601 string.
 fn ns_to_iso(ns: i64) -> String {
@@ -121,8 +147,8 @@ impl Collection {
                 Err(_) => continue,
             };
 
-            let raw_frontmatter: serde_json::Value = serde_json::from_str(&fm_json_str)
-                .unwrap_or(serde_json::json!({}));
+            let raw_frontmatter: serde_json::Value =
+                serde_json::from_str(&fm_json_str).unwrap_or(serde_json::json!({}));
 
             let effective_frontmatter: serde_json::Value = eff_json_str
                 .and_then(|s| serde_json::from_str(&s).ok())
@@ -130,7 +156,11 @@ impl Collection {
 
             let type_names = types_map.get(&path).cloned().unwrap_or_default();
 
-            let file_mtime_iso = if mtime_ns != 0 { Some(ns_to_iso(mtime_ns)) } else { None };
+            let file_mtime_iso = if mtime_ns != 0 {
+                Some(ns_to_iso(mtime_ns))
+            } else {
+                None
+            };
             let file_ctime_iso = ctime_ns.map(ns_to_iso);
 
             records.push(FileRecord {
@@ -194,18 +224,14 @@ impl Collection {
 
             let metadata = std::fs::metadata(file_path).ok();
             let file_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-            let file_mtime_iso = metadata.as_ref()
-                .and_then(|m| m.modified().ok())
-                .map(|t| {
-                    let dt: chrono::DateTime<chrono::Utc> = t.into();
-                    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-                });
-            let file_ctime_iso = metadata.as_ref()
-                .and_then(|m| m.created().ok())
-                .map(|t| {
-                    let dt: chrono::DateTime<chrono::Utc> = t.into();
-                    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-                });
+            let file_mtime_iso = metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            });
+            let file_ctime_iso = metadata.as_ref().and_then(|m| m.created().ok()).map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            });
 
             records.push(FileRecord {
                 rel_path,
@@ -224,30 +250,91 @@ impl Collection {
 
     /// Load all query data: tries cache first, falls back to disk.
     /// Returns (file_records, all_files_data arc, backlinks_index arc).
-    pub(crate) fn load_query_data(
+    #[allow(dead_code)]
+    pub(crate) fn load_query_data(&self) -> QueryData {
+        self.load_query_data_profiled(false, true).0
+    }
+
+    /// Load query data with optional detailed timing.
+    pub(crate) fn load_query_data_profiled(
         &self,
-    ) -> QueryData {
-        let file_records = if let Some(conn) = self.try_open_cache() {
+        profile: bool,
+        include_link_graph: bool,
+    ) -> (QueryData, Option<LoadQueryPerf>) {
+        let total_start = Instant::now();
+        let mut perf = LoadQueryPerf::default();
+        perf.built_link_graph = include_link_graph;
+
+        let try_open_start = Instant::now();
+        let conn = self.try_open_cache();
+        perf.try_open_cache_ms = elapsed_ms(try_open_start);
+
+        let file_records = if let Some(conn) = conn {
+            perf.cache_used = true;
+
+            let refresh_start = Instant::now();
             self.refresh_cache(&conn);
-            self.load_file_records_from_cache(&conn)
+            perf.refresh_cache_ms = elapsed_ms(refresh_start);
+
+            let load_start = Instant::now();
+            let records = self.load_file_records_from_cache(&conn);
+            perf.load_records_ms = elapsed_ms(load_start);
+            records
         } else {
+            perf.cache_used = false;
+
+            let scan_start = Instant::now();
             let files = self.scan_collection_files();
-            self.load_file_records_from_disk(&files)
+            perf.scan_files_ms = elapsed_ms(scan_start);
+
+            let load_start = Instant::now();
+            let records = self.load_file_records_from_disk(&files);
+            perf.load_records_ms = elapsed_ms(load_start);
+            records
         };
 
-        // Build all_files_data and backlinks index from the loaded records
-        let all_files_data: Vec<ResolvedFileData> = file_records.iter()
-            .map(|r| ResolvedFileData {
-                path: r.rel_path.clone(),
-                frontmatter: r.effective_frontmatter.clone(),
-                body: r.body.clone(),
-            })
-            .collect();
+        perf.file_records = file_records.len();
 
-        let all_files_arc = Arc::new(all_files_data);
-        let backlinks_index = self.build_backlinks_index(&all_files_arc);
-        let backlinks_arc = Arc::new(backlinks_index);
+        let (all_files_arc, backlinks_arc) = if include_link_graph {
+            // Build all_files_data and backlinks index from the loaded records
+            let all_files_start = Instant::now();
+            let all_files_data: Vec<ResolvedFileData> = file_records
+                .iter()
+                .map(|r| ResolvedFileData {
+                    path: r.rel_path.clone(),
+                    frontmatter: r.effective_frontmatter.clone(),
+                    body: r.body.clone(),
+                })
+                .collect();
+            perf.build_all_files_ms = elapsed_ms(all_files_start);
 
-        (file_records, all_files_arc, backlinks_arc)
+            let backlinks_start = Instant::now();
+            let all_files_arc = Arc::new(all_files_data);
+            let (backlinks_index, backlinks_perf) =
+                self.build_backlinks_index_profiled(&all_files_arc, profile);
+            let backlinks_arc = Arc::new(backlinks_index);
+            perf.build_backlinks_ms = elapsed_ms(backlinks_start);
+            if let Some(bp) = backlinks_perf {
+                perf.backlinks_frontmatter_extract_ms = bp.frontmatter_extract_ms;
+                perf.backlinks_body_links_extract_ms = bp.body_links_extract_ms;
+                perf.backlinks_body_embeds_extract_ms = bp.body_embeds_extract_ms;
+                perf.backlinks_resolve_targets_ms = bp.resolve_targets_ms;
+                perf.backlinks_files_processed = bp.files_processed;
+                perf.backlinks_targets_scanned = bp.targets_scanned;
+                perf.backlinks_resolve_calls = bp.resolve_calls;
+            }
+            (Some(all_files_arc), Some(backlinks_arc))
+        } else {
+            (None, None)
+        };
+
+        perf.total_ms = elapsed_ms(total_start);
+
+        let data = (file_records, all_files_arc, backlinks_arc);
+        if profile {
+            (data, Some(perf))
+        } else {
+            (data, None)
+        }
     }
 }
