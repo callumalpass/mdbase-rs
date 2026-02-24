@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck disable=SC2034
+MDB_CMD=()
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    die "missing dependency: $1"
+  fi
+}
+
+run_mdb() {
+  NO_COLOR=1 "${MDB_CMD[@]}" "$@"
+}
+
+align_tsv() {
+  awk -F'\t' '
+    {
+      n = split($0, a, FS)
+      nf[NR] = n
+      for (i = 1; i <= n; i++) {
+        rows[NR, i] = a[i]
+        if (length(a[i]) > w[i]) {
+          w[i] = length(a[i])
+        }
+      }
+      row_count = NR
+    }
+    END {
+      for (r = 1; r <= row_count; r++) {
+        out = ""
+        for (i = 1; i <= nf[r]; i++) {
+          cell = rows[r, i]
+          if (i < nf[r]) {
+            out = out sprintf("%-*s  ", w[i], cell)
+          } else {
+            out = out cell
+          }
+        }
+        print out
+      }
+    }
+  '
+}
+
+pick_editor() {
+  if [[ -n "${VISUAL:-}" ]]; then
+    printf '%s\n' "$VISUAL"
+    return 0
+  fi
+
+  if [[ -n "${EDITOR:-}" ]]; then
+    printf '%s\n' "$EDITOR"
+    return 0
+  fi
+
+  for candidate in nvim vim vi nano code; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+open_in_editor() {
+  local file="$1"
+  local editor
+  editor="$(pick_editor)" || die "no editor configured (set VISUAL or EDITOR)"
+  # Allow editor commands with flags, e.g. "code -w"
+  # shellcheck disable=SC2086
+  $editor "$file"
+}
+
+discover_types() {
+  local types_folder="_types"
+
+  if [[ ! -d "$types_folder" ]]; then
+    return 0
+  fi
+
+  find "$types_folder" -maxdepth 1 -type f -name '*.md' -print \
+    | sed -E 's#.*/##' \
+    | sed -E 's/\.md$//' \
+    | sed '/^$/d' \
+    | sort -fu
+}
+
+type_count() {
+  local type_name="$1"
+  local q
+
+  if [[ "$type_name" == "untype" ]]; then
+    q="$(run_mdb query --where "type == null")"
+  else
+    q="$(run_mdb query --types "$type_name")"
+  fi
+
+  jq -r '.meta.total_count // (.results | length)' <<<"$q"
+}
+
+pick_type() {
+  local selected aligned_visible
+  local -a discovered=() key_lines=() visible_lines=()
+
+  mapfile -t discovered < <(discover_types)
+
+  key_lines+=("__HEADER__")
+  visible_lines+=($'type\tcount')
+
+  key_lines+=("untype")
+  visible_lines+=("untype"$'\t'"$(type_count untype)")
+
+  local t
+  for t in "${discovered[@]}"; do
+    [[ "$t" == "untype" ]] && continue
+    key_lines+=("$t")
+    visible_lines+=("$t"$'\t'"$(type_count "$t")")
+  done
+
+  aligned_visible="$(printf '%s\n' "${visible_lines[@]}" | align_tsv)"
+
+  selected="$(
+    paste \
+      <(printf '%s\n' "${key_lines[@]}") \
+      <(printf '%s\n' "$aligned_visible") \
+    | fzf \
+      --delimiter=$'\t' \
+      --header-lines=1 \
+      --with-nth=2 \
+      --height=95% \
+      --layout=reverse \
+      --border \
+      --prompt='type > '
+  )" || return 1
+
+  printf '%s\n' "${selected%%$'\t'*}"
+}
+
+select_fields() {
+  local selected_type="$1"
+  local results_json="$2"
+  local max_fields="${MDB_FZF_MAX_FIELDS:-5}"
+  local types_folder="_types"
+
+  [[ "$max_fields" =~ ^[1-9][0-9]*$ ]] || max_fields=5
+
+  local -a all_keys=() freq_keys=() required_keys=() chosen=()
+  local -a display_candidates=(display_name displayName title name label)
+  local -a priority_candidates=(status state priority due due_date date created updated tags rating)
+  local -A has_key seen
+
+  mapfile -t all_keys < <(
+    jq -r '[.results[].frontmatter // {} | keys[]] | unique[]?' <<<"$results_json"
+  )
+
+  local key
+  for key in "${all_keys[@]}"; do
+    has_key["$key"]=1
+  done
+
+  mapfile -t freq_keys < <(
+    jq -r '
+      [.results[].frontmatter // {} | to_entries[] | .key]
+      | group_by(.)
+      | map({ key: .[0], count: length })
+      | sort_by(-.count, .key)
+      | .[].key
+    ' <<<"$results_json"
+  )
+
+  if [[ "$selected_type" != "untype" ]]; then
+    local type_file="$types_folder/$selected_type.md"
+    if [[ -f "$type_file" ]]; then
+      local type_json
+      if type_json="$(run_mdb read "$type_file" 2>/dev/null)"; then
+        mapfile -t required_keys < <(
+          jq -r '
+            .frontmatter.fields // {}
+            | to_entries[]
+            | select(.value.required == true)
+            | .key
+          ' <<<"$type_json"
+        )
+      fi
+    fi
+  fi
+
+  add_field() {
+    local field="$1"
+    [[ -n "$field" ]] || return 0
+    [[ "${has_key[$field]:-0}" == "1" ]] || return 0
+    [[ -z "${seen[$field]:-}" ]] || return 0
+    if (( ${#chosen[@]} >= max_fields )); then
+      return 0
+    fi
+    chosen+=("$field")
+    seen["$field"]=1
+  }
+
+  local field
+  for field in "${display_candidates[@]}"; do
+    if [[ "${has_key[$field]:-0}" == "1" ]]; then
+      add_field "$field"
+      break
+    fi
+  done
+  for field in "${required_keys[@]}"; do
+    add_field "$field"
+  done
+  for field in "${priority_candidates[@]}"; do
+    add_field "$field"
+  done
+  for field in "${freq_keys[@]}"; do
+    add_field "$field"
+  done
+
+  printf '%s\n' "${chosen[@]}"
+}
+
+pick_note() {
+  local selected_type="$1"
+  local results_json="$2"
+  local fields_json="$3"
+  local header selected rows aligned_visible
+  local -a key_lines=() visible_lines=()
+
+  rows="$(
+    jq -r --argjson fields "$fields_json" '
+      def fmt:
+        (if . == null then ""
+         elif type == "array" then (map(if . == null then "" else tostring end) | join(", "))
+         elif type == "object" then tojson
+         else tostring
+         end)
+        | gsub("[\\t\\r\\n]+"; " ");
+      .results[] as $row
+      | [ $row.path ] + ($fields | map(($row.frontmatter[.] // null | fmt)))
+      | @tsv
+    ' <<<"$results_json"
+  )"
+
+  header="path"
+  while IFS= read -r field; do
+    [[ -n "$field" ]] || continue
+    header+=$'\t'"$field"
+  done < <(jq -r '.[]' <<<"$fields_json")
+
+  key_lines+=("__HEADER__")
+  visible_lines+=("$header")
+  if [[ -n "$rows" ]]; then
+    while IFS= read -r row; do
+      [[ -n "$row" ]] || continue
+      key_lines+=("${row%%$'\t'*}")
+      visible_lines+=("$row")
+    done <<<"$rows"
+  fi
+
+  aligned_visible="$(printf '%s\n' "${visible_lines[@]}" | align_tsv)"
+
+  selected="$(
+    paste \
+      <(printf '%s\n' "${key_lines[@]}") \
+      <(printf '%s\n' "$aligned_visible") \
+    | fzf \
+      --delimiter=$'\t' \
+      --header-lines=1 \
+      --with-nth=2 \
+      --height=98% \
+      --layout=reverse \
+      --border \
+      --prompt="${selected_type} > " \
+      --preview='sed -n "1,220p" {1}' \
+      --preview-window='right,65%,wrap' \
+      --bind='ctrl-/:toggle-preview'
+  )" || return 1
+
+  printf '%s\n' "${selected%%$'\t'*}"
+}
+
+main() {
+  require_cmd jq
+  require_cmd fzf
+
+  local script_dir
+  script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+  if [[ -n "${MDB_FZF_MDB_BIN:-}" ]]; then
+    MDB_CMD=("$MDB_FZF_MDB_BIN")
+  elif command -v mdb >/dev/null 2>&1; then
+    MDB_CMD=("mdb")
+  elif [[ -x "$script_dir/target/debug/mdb" ]]; then
+    MDB_CMD=("$script_dir/target/debug/mdb")
+  else
+    die "mdb command not found (build or install mdbase-rs first)"
+  fi
+
+  local selected_type results_json result_count fields_json selected_path
+
+  selected_type="$(pick_type)" || exit 0
+
+  if [[ "$selected_type" == "untype" ]]; then
+    results_json="$(run_mdb query --where "type == null")"
+  else
+    results_json="$(run_mdb query --types "$selected_type")"
+  fi
+
+  result_count="$(jq -r '.results | length' <<<"$results_json")"
+  if [[ "$result_count" == "0" ]]; then
+    printf 'No files found for type "%s"\n' "$selected_type" >&2
+    exit 0
+  fi
+
+  fields_json="$({
+    select_fields "$selected_type" "$results_json" | jq -R . | jq -s .
+  })"
+
+  selected_path="$(pick_note "$selected_type" "$results_json" "$fields_json")" || exit 0
+  open_in_editor "$selected_path"
+}
+
+main "$@"
