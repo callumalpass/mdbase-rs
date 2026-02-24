@@ -25,27 +25,42 @@ fn traversal_paths_are_rejected_for_core_operations() {
 
     write_file(&col_root.join("mdbase.yaml"), "spec_version: 0.2.0\n");
     write_file(&col_root.join("inside.md"), "---\na: 1\n---\ninside\n");
-    write_file(&outside_root.join("secret.md"), "---\nleak: true\n---\nout\n");
+    write_file(
+        &outside_root.join("secret.md"),
+        "---\nleak: true\n---\nout\n",
+    );
 
     let collection = open_collection(&col_root);
 
     let read_res = collection.read(&serde_json::json!({ "path": "../outside/secret.md" }));
-    assert_eq!(read_res.pointer("/error/code").and_then(|v| v.as_str()), Some("invalid_path"));
+    assert_eq!(
+        read_res.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("invalid_path")
+    );
 
     let update_res = collection.update(&serde_json::json!({
         "path": "../outside/secret.md",
         "fields": { "x": 1 }
     }));
-    assert_eq!(update_res.pointer("/error/code").and_then(|v| v.as_str()), Some("invalid_path"));
+    assert_eq!(
+        update_res.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("invalid_path")
+    );
 
     let delete_res = collection.delete(&serde_json::json!({ "path": "../outside/secret.md" }));
-    assert_eq!(delete_res.pointer("/error/code").and_then(|v| v.as_str()), Some("invalid_path"));
+    assert_eq!(
+        delete_res.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("invalid_path")
+    );
 
     let rename_res = collection.rename(&serde_json::json!({
         "from": "inside.md",
         "to": "../outside/pwn.md"
     }));
-    assert_eq!(rename_res.pointer("/error/code").and_then(|v| v.as_str()), Some("invalid_path"));
+    assert_eq!(
+        rename_res.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("invalid_path")
+    );
     assert!(col_root.join("inside.md").exists());
     assert!(!outside_root.join("pwn.md").exists());
 }
@@ -73,7 +88,11 @@ fn cli_update_refs_flag_is_honored() {
     assert!(status.success());
 
     let ref_content = fs::read_to_string(root.join("r.md")).expect("read r.md");
-    assert!(ref_content.contains("[[b]]"), "reference not updated: {}", ref_content);
+    assert!(
+        ref_content.contains("[[b]]"),
+        "reference not updated: {}",
+        ref_content
+    );
 }
 
 #[test]
@@ -137,5 +156,8 @@ fn rename_reports_ref_update_io_failures() {
     assert!(result.get("references_updated").is_none());
     assert!(result.pointer("/partial_updates/failed").is_some());
     let ref_content = fs::read_to_string(&ref_path).expect("read ref");
-    assert!(ref_content.contains("[[target]]"), "ref should be unchanged");
+    assert!(
+        ref_content.contains("[[target]]"),
+        "ref should be unchanged"
+    );
 }

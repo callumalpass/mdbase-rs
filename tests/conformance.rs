@@ -199,10 +199,12 @@ fn materialize_setup(setup: &TestSetup) -> TempDir {
                 }
                 serde_yaml::Value::Mapping(map) => {
                     let key = |s: &str| serde_yaml::Value::String(s.to_string());
-                    let content_str = map.get(key("content"))
+                    let content_str = map
+                        .get(key("content"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let encoding = map.get(key("encoding"))
+                    let encoding = map
+                        .get(key("encoding"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("utf-8");
                     if encoding == "latin-1" || encoding == "iso-8859-1" {
@@ -273,7 +275,8 @@ fn materialize_merged_setup(group: &TestSetup, test: &TestSetup) -> TempDir {
     if let Some(test_files) = &test.files {
         if test_files.len() >= 2 {
             // Find directories where test files overlap with group files
-            let mut overlap_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut overlap_dirs: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             if let Some(group_files) = &group.files {
                 for test_path in test_files.keys() {
                     if group_files.contains_key(test_path) {
@@ -309,10 +312,12 @@ fn materialize_merged_setup(group: &TestSetup, test: &TestSetup) -> TempDir {
             }
             serde_yaml::Value::Mapping(map) => {
                 let key = |s: &str| serde_yaml::Value::String(s.to_string());
-                let content_str = map.get(key("content"))
+                let content_str = map
+                    .get(key("content"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let encoding = map.get(key("encoding"))
+                let encoding = map
+                    .get(key("encoding"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("utf-8");
                 if encoding == "latin-1" || encoding == "iso-8859-1" {
@@ -405,7 +410,9 @@ fn conformance_tests() {
             println!("  --- {} ---", group.name);
 
             // For groups with config: null, share state across tests (e.g., init groups)
-            let group_has_null_config = group.setup.as_ref()
+            let group_has_null_config = group
+                .setup
+                .as_ref()
                 .map(|s| s.config.is_none())
                 .unwrap_or(false);
             let shared_tmp = if group_has_null_config {
@@ -420,14 +427,16 @@ fn conformance_tests() {
                 // Materialize setup for each test (fresh copy every time)
                 // Exception: groups with config=null share state (for init tests)
                 let test_tmp = if group_has_null_config && test_case.setup.is_none() {
-                    None  // use shared_tmp
+                    None // use shared_tmp
                 } else {
                     match (&test_case.setup, &group.setup) {
                         (Some(test_setup), Some(group_setup)) => {
                             Some(materialize_merged_setup(group_setup, test_setup))
                         }
                         (Some(test_setup), None) => Some(materialize_setup(test_setup)),
-                        (None, Some(group_setup)) if !group_has_null_config => Some(materialize_setup(group_setup)),
+                        (None, Some(group_setup)) if !group_has_null_config => {
+                            Some(materialize_setup(group_setup))
+                        }
                         _ => None,
                     }
                 };
@@ -456,16 +465,15 @@ fn conformance_tests() {
                 if test_case.operation == "watch" {
                     // Collect simulate from test_case.simulate and/or input.simulate
                     let input_json = yaml_to_json(&test_case.input);
-                    let sim_json = test_case.simulate.as_ref()
+                    let sim_json = test_case
+                        .simulate
+                        .as_ref()
                         .map(yaml_to_json)
                         .unwrap_or_else(|| serde_json::json!({}));
                     let input_sim_json = input_json.get("simulate").cloned();
 
-                    let watch_result = mdbase::watch::simulate_watch(
-                        root,
-                        &sim_json,
-                        input_sim_json.as_ref(),
-                    );
+                    let watch_result =
+                        mdbase::watch::simulate_watch(root, &sim_json, input_sim_json.as_ref());
 
                     let events = watch_result.events;
 
@@ -490,16 +498,23 @@ fn conformance_tests() {
                 let mut input_override: Option<serde_yaml::Value> = None;
 
                 // Collect simulate blocks from both test_case.simulate and input.simulate
-                let input_simulate = test_case.input.as_mapping()
+                let input_simulate = test_case
+                    .input
+                    .as_mapping()
                     .and_then(|m| m.get(serde_yaml::Value::String("simulate".into())))
                     .cloned();
-                let simulate_sources: Vec<&serde_yaml::Value> = [
-                    test_case.simulate.as_ref(),
-                    input_simulate.as_ref(),
-                ].iter().filter_map(|s| *s).collect();
+                let simulate_sources: Vec<&serde_yaml::Value> =
+                    [test_case.simulate.as_ref(), input_simulate.as_ref()]
+                        .iter()
+                        .filter_map(|s| *s)
+                        .collect();
 
                 if !simulate_sources.is_empty() && test_case.name.contains("concurrent") {
-                    eprintln!("    DEBUG simulate_sources count={} for '{}'", simulate_sources.len(), test_case.name);
+                    eprintln!(
+                        "    DEBUG simulate_sources count={} for '{}'",
+                        simulate_sources.len(),
+                        test_case.name
+                    );
                 }
                 for sim in &simulate_sources {
                     if let Some(mapping) = sim.as_mapping() {
@@ -507,23 +522,42 @@ fn conformance_tests() {
                             let action = key.as_str().unwrap_or("");
                             match action {
                                 "external_modify" | "external_create" => {
-                                    if let Some(path_str) = val.as_mapping()
-                                        .and_then(|m| m.get(serde_yaml::Value::String("path".to_string())))
-                                        .and_then(|v| v.as_str()) {
-                                        let timing = val.as_mapping()
-                                            .and_then(|m| m.get(serde_yaml::Value::String("timing".to_string())))
+                                    if let Some(path_str) = val
+                                        .as_mapping()
+                                        .and_then(|m| {
+                                            m.get(serde_yaml::Value::String("path".to_string()))
+                                        })
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        let timing = val
+                                            .as_mapping()
+                                            .and_then(|m| {
+                                                m.get(serde_yaml::Value::String(
+                                                    "timing".to_string(),
+                                                ))
+                                            })
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("");
 
                                         // Build file content from either "content" or "frontmatter" field
-                                        let file_content = if let Some(content) = val.as_mapping()
-                                            .and_then(|m| m.get(serde_yaml::Value::String("content".to_string())))
-                                            .and_then(|v| v.as_str()) {
+                                        let file_content = if let Some(content) = val
+                                            .as_mapping()
+                                            .and_then(|m| {
+                                                m.get(serde_yaml::Value::String(
+                                                    "content".to_string(),
+                                                ))
+                                            })
+                                            .and_then(|v| v.as_str())
+                                        {
                                             Some(content.to_string())
-                                        } else if let Some(fm) = val.as_mapping()
-                                            .and_then(|m| m.get(serde_yaml::Value::String("frontmatter".to_string()))) {
+                                        } else if let Some(fm) = val.as_mapping().and_then(|m| {
+                                            m.get(serde_yaml::Value::String(
+                                                "frontmatter".to_string(),
+                                            ))
+                                        }) {
                                             // Build markdown file from frontmatter map
-                                            let yaml_str = serde_yaml::to_string(fm).unwrap_or_default();
+                                            let yaml_str =
+                                                serde_yaml::to_string(fm).unwrap_or_default();
                                             Some(format!("---\n{}---\n", yaml_str))
                                         } else {
                                             None
@@ -532,52 +566,78 @@ fn conformance_tests() {
                                         if timing == "before_ref_update" {
                                             // Don't apply now — pass to rename as simulate_before_ref_update
                                             let full_path = root.join(path_str);
-                                            let original_mtime_ms = fs::metadata(&full_path).ok()
+                                            let original_mtime_ms = fs::metadata(&full_path)
+                                                .ok()
                                                 .and_then(|m| m.modified().ok())
-                                                .map(|t| t.duration_since(std::time::UNIX_EPOCH)
-                                                    .map(|d| d.as_millis() as u64).unwrap_or(0));
+                                                .map(|t| {
+                                                    t.duration_since(std::time::UNIX_EPOCH)
+                                                        .map(|d| d.as_millis() as u64)
+                                                        .unwrap_or(0)
+                                                });
 
                                             let content = file_content.unwrap_or_default();
 
-                                            let mut override_map = match input_override.as_ref().unwrap_or(&test_case.input) {
+                                            let mut override_map = match input_override
+                                                .as_ref()
+                                                .unwrap_or(&test_case.input)
+                                            {
                                                 serde_yaml::Value::Mapping(m) => m.clone(),
                                                 _ => serde_yaml::Mapping::new(),
                                             };
                                             let sim_item = serde_yaml::Value::Sequence(vec![
                                                 serde_yaml::Value::Mapping({
                                                     let mut m = serde_yaml::Mapping::new();
-                                                    m.insert(serde_yaml::Value::String("path".into()),
-                                                        serde_yaml::Value::String(path_str.to_string()));
-                                                    m.insert(serde_yaml::Value::String("content".into()),
-                                                        serde_yaml::Value::String(content));
+                                                    m.insert(
+                                                        serde_yaml::Value::String("path".into()),
+                                                        serde_yaml::Value::String(
+                                                            path_str.to_string(),
+                                                        ),
+                                                    );
+                                                    m.insert(
+                                                        serde_yaml::Value::String("content".into()),
+                                                        serde_yaml::Value::String(content),
+                                                    );
                                                     m
                                                 }),
                                             ]);
                                             override_map.insert(
-                                                serde_yaml::Value::String("simulate_before_ref_update".into()),
+                                                serde_yaml::Value::String(
+                                                    "simulate_before_ref_update".into(),
+                                                ),
                                                 sim_item,
                                             );
                                             if let Some(ms) = original_mtime_ms {
                                                 let mut ref_mtimes = serde_yaml::Mapping::new();
                                                 ref_mtimes.insert(
                                                     serde_yaml::Value::String(path_str.to_string()),
-                                                    serde_yaml::Value::Number(serde_yaml::Number::from(ms)),
+                                                    serde_yaml::Value::Number(
+                                                        serde_yaml::Number::from(ms),
+                                                    ),
                                                 );
                                                 override_map.insert(
-                                                    serde_yaml::Value::String("last_known_ref_mtimes".into()),
+                                                    serde_yaml::Value::String(
+                                                        "last_known_ref_mtimes".into(),
+                                                    ),
                                                     serde_yaml::Value::Mapping(ref_mtimes),
                                                 );
                                             }
                                             // Remove the simulate key from input so it's not passed to the operation
-                                            override_map.remove(serde_yaml::Value::String("simulate".into()));
-                                            input_override = Some(serde_yaml::Value::Mapping(override_map));
+                                            override_map.remove(serde_yaml::Value::String(
+                                                "simulate".into(),
+                                            ));
+                                            input_override =
+                                                Some(serde_yaml::Value::Mapping(override_map));
                                         } else if let Some(content) = file_content {
                                             // No timing: record mtime, apply modify, pass last_known_mtime
                                             let full_path = root.join(path_str);
-                                            let original_mtime_ms = fs::metadata(&full_path).ok()
+                                            let original_mtime_ms = fs::metadata(&full_path)
+                                                .ok()
                                                 .and_then(|m| m.modified().ok())
-                                                .map(|t| t.duration_since(std::time::UNIX_EPOCH)
-                                                    .map(|d| d.as_millis() as u64).unwrap_or(0));
+                                                .map(|t| {
+                                                    t.duration_since(std::time::UNIX_EPOCH)
+                                                        .map(|d| d.as_millis() as u64)
+                                                        .unwrap_or(0)
+                                                });
 
                                             if let Some(parent) = full_path.parent() {
                                                 let _ = fs::create_dir_all(parent);
@@ -588,42 +648,65 @@ fn conformance_tests() {
                                             // regardless of filesystem timestamp granularity.
                                             if let Some(orig_ms) = original_mtime_ms {
                                                 let bumped = std::time::UNIX_EPOCH
-                                                    + std::time::Duration::from_millis(orig_ms + 1000);
-                                                let times = std::fs::FileTimes::new()
-                                                    .set_modified(bumped);
-                                                if let Ok(f) = std::fs::File::options().write(true).open(&full_path) {
+                                                    + std::time::Duration::from_millis(
+                                                        orig_ms + 1000,
+                                                    );
+                                                let times =
+                                                    std::fs::FileTimes::new().set_modified(bumped);
+                                                if let Ok(f) = std::fs::File::options()
+                                                    .write(true)
+                                                    .open(&full_path)
+                                                {
                                                     let _ = f.set_times(times);
                                                 }
                                             }
 
                                             if test_case.name.contains("concurrent") {
-                                                let new_mtime_ms = fs::metadata(&full_path).ok()
+                                                let new_mtime_ms = fs::metadata(&full_path)
+                                                    .ok()
                                                     .and_then(|m| m.modified().ok())
-                                                    .map(|t| t.duration_since(std::time::UNIX_EPOCH)
-                                                        .map(|d| d.as_millis() as u64).unwrap_or(0));
+                                                    .map(|t| {
+                                                        t.duration_since(std::time::UNIX_EPOCH)
+                                                            .map(|d| d.as_millis() as u64)
+                                                            .unwrap_or(0)
+                                                    });
                                                 eprintln!("    DEBUG mtime: original={:?} new={:?} path={}", original_mtime_ms, new_mtime_ms, path_str);
                                             }
 
                                             if let Some(ms) = original_mtime_ms {
-                                                let mut override_map = match input_override.as_ref().unwrap_or(&test_case.input) {
+                                                let mut override_map = match input_override
+                                                    .as_ref()
+                                                    .unwrap_or(&test_case.input)
+                                                {
                                                     serde_yaml::Value::Mapping(m) => m.clone(),
                                                     _ => serde_yaml::Mapping::new(),
                                                 };
                                                 override_map.insert(
-                                                    serde_yaml::Value::String("last_known_mtime".into()),
-                                                    serde_yaml::Value::Number(serde_yaml::Number::from(ms)),
+                                                    serde_yaml::Value::String(
+                                                        "last_known_mtime".into(),
+                                                    ),
+                                                    serde_yaml::Value::Number(
+                                                        serde_yaml::Number::from(ms),
+                                                    ),
                                                 );
                                                 // Remove the simulate key from input
-                                                override_map.remove(serde_yaml::Value::String("simulate".into()));
-                                                input_override = Some(serde_yaml::Value::Mapping(override_map));
+                                                override_map.remove(serde_yaml::Value::String(
+                                                    "simulate".into(),
+                                                ));
+                                                input_override =
+                                                    Some(serde_yaml::Value::Mapping(override_map));
                                             }
                                         }
                                     }
                                 }
                                 "external_delete" => {
-                                    if let Some(path_str) = val.as_mapping()
-                                        .and_then(|m| m.get(serde_yaml::Value::String("path".to_string())))
-                                        .and_then(|v| v.as_str()) {
+                                    if let Some(path_str) = val
+                                        .as_mapping()
+                                        .and_then(|m| {
+                                            m.get(serde_yaml::Value::String("path".to_string()))
+                                        })
+                                        .and_then(|v| v.as_str())
+                                    {
                                         let full_path = root.join(path_str);
                                         let _ = fs::remove_file(&full_path);
                                     }
@@ -635,11 +718,21 @@ fn conformance_tests() {
                 }
 
                 let effective_input = input_override.as_ref().unwrap_or(&test_case.input);
-                match execute_operation(root, &test_case.operation, effective_input, test_case.simulate.as_ref()) {
+                match execute_operation(
+                    root,
+                    &test_case.operation,
+                    effective_input,
+                    test_case.simulate.as_ref(),
+                ) {
                     Ok(result) => match check_expectation(&result, &test_case.expect) {
                         Ok(()) => {
                             // Run verify_after checks if present
-                            let verify_ok = run_verify_after(root, &test_case.verify_after, &test_case.name, &filename);
+                            let verify_ok = run_verify_after(
+                                root,
+                                &test_case.verify_after,
+                                &test_case.name,
+                                &filename,
+                            );
                             match verify_ok {
                                 Ok(()) => {
                                     passed += 1;
@@ -647,7 +740,10 @@ fn conformance_tests() {
                                 }
                                 Err(msg) => {
                                     failed += 1;
-                                    let err = format!("[{}] {}: verify_after: {}", filename, test_case.name, msg);
+                                    let err = format!(
+                                        "[{}] {}: verify_after: {}",
+                                        filename, test_case.name, msg
+                                    );
                                     println!("    ✗ {}: verify_after: {}", test_case.name, msg);
                                     errors.push(err);
                                 }
@@ -655,8 +751,7 @@ fn conformance_tests() {
                         }
                         Err(msg) => {
                             failed += 1;
-                            let err =
-                                format!("[{}] {}: {}", filename, test_case.name, msg);
+                            let err = format!("[{}] {}: {}", filename, test_case.name, msg);
                             println!("    ✗ {}: {}", test_case.name, msg);
                             errors.push(err);
                         }
@@ -667,19 +762,27 @@ fn conformance_tests() {
                             if let Some(expected_code) = &expected_error.code {
                                 if err.contains(expected_code) {
                                     // Run verify_after for error cases too
-                                    let verify_ok = run_verify_after(root, &test_case.verify_after, &test_case.name, &filename);
+                                    let verify_ok = run_verify_after(
+                                        root,
+                                        &test_case.verify_after,
+                                        &test_case.name,
+                                        &filename,
+                                    );
                                     match verify_ok {
                                         Ok(()) => {
                                             passed += 1;
-                                            println!(
-                                                "    ✓ {} (expected error)",
-                                                test_case.name
-                                            );
+                                            println!("    ✓ {} (expected error)", test_case.name);
                                         }
                                         Err(msg) => {
                                             failed += 1;
-                                            let err = format!("[{}] {}: verify_after: {}", filename, test_case.name, msg);
-                                            println!("    ✗ {}: verify_after: {}", test_case.name, msg);
+                                            let err = format!(
+                                                "[{}] {}: verify_after: {}",
+                                                filename, test_case.name, msg
+                                            );
+                                            println!(
+                                                "    ✗ {}: verify_after: {}",
+                                                test_case.name, msg
+                                            );
                                             errors.push(err);
                                         }
                                     }
@@ -689,17 +792,24 @@ fn conformance_tests() {
                         }
                         // For read operations that fail with file_not_found on excluded
                         // paths (e.g., type files after init), try reading directly from disk
-                        if test_case.operation == "read" && err.contains("file_not_found")
+                        if test_case.operation == "read"
+                            && err.contains("file_not_found")
                             && test_case.expect.error.is_none()
                         {
-                            if let Some(path) = yaml_to_json(&test_case.input).get("path").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                            if let Some(path) = yaml_to_json(&test_case.input)
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                            {
                                 let full_path = root.join(&path);
                                 if full_path.exists() {
-                                    let content = std::fs::read_to_string(&full_path).unwrap_or_default();
+                                    let content =
+                                        std::fs::read_to_string(&full_path).unwrap_or_default();
                                     let doc = mdbase::frontmatter::parser::parse_document(&content);
                                     let fm = match &doc.frontmatter {
-                                        Some(serde_yaml::Value::Mapping(m)) =>
-                                            mdbase::frontmatter::parser::yaml_mapping_to_json(m),
+                                        Some(serde_yaml::Value::Mapping(m)) => {
+                                            mdbase::frontmatter::parser::yaml_mapping_to_json(m)
+                                        }
                                         _ => serde_json::json!({}),
                                     };
                                     let result = serde_json::json!({
@@ -715,7 +825,10 @@ fn conformance_tests() {
                                         }
                                         Err(msg) => {
                                             failed += 1;
-                                            let err = format!("[{}] {}: {}", filename, test_case.name, msg);
+                                            let err = format!(
+                                                "[{}] {}: {}",
+                                                filename, test_case.name, msg
+                                            );
                                             println!("    ✗ {}: {}", test_case.name, msg);
                                             errors.push(err);
                                             continue;
@@ -766,16 +879,21 @@ fn execute_operation(
     match operation {
         "load_config" => Ok(mdbase::config::load_config(collection_root)),
         "query" => {
-            let collection = mdbase::Collection::open(collection_root)
-                .map_err(|e| {
-                    if let Some(err) = e.get("error") {
-                        let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
-                        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
-                        format!("{}: {}", code, msg)
-                    } else {
-                        format!("Failed to open collection: {}", e)
-                    }
-                })?;
+            let collection = mdbase::Collection::open(collection_root).map_err(|e| {
+                if let Some(err) = e.get("error") {
+                    let code = err
+                        .get("code")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("unknown");
+                    let msg = err
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown");
+                    format!("{}: {}", code, msg)
+                } else {
+                    format!("Failed to open collection: {}", e)
+                }
+            })?;
             Ok(collection.query(&input_json))
         }
         "parse_link" => {
@@ -789,25 +907,37 @@ fn execute_operation(
             let result = collection.resolve_link(&input_json);
             // Check if result contains issues (for path_traversal etc.)
             if let Some(error) = result.get("error") {
-                let code = error.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                let code = error
+                    .get("code")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("unknown");
                 let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
                 return Err(format!("{}: {}", code, msg));
             }
             Ok(result)
         }
-        "read" | "create" | "update" | "delete" | "rename" | "validate"
-        | "load_types" | "get_types" | "get_type" | "create_type"
-        | "cache_rebuild" | "cache_clear" | "backfill" | "migrate" => {
+        "read" | "create" | "update" | "delete" | "rename" | "validate" | "load_types"
+        | "get_types" | "get_type" | "create_type" | "cache_rebuild" | "cache_clear"
+        | "backfill" | "migrate" => {
             let collection_result = mdbase::Collection::open(collection_root);
             let collection = match collection_result {
                 Ok(c) => c,
                 Err(e) => {
                     // If it's a config/type error, extract the error
                     if let Some(err) = e.get("error") {
-                        let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
-                        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+                        let code = err
+                            .get("code")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("unknown");
+                        let msg = err
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("unknown");
                         // For load_types/get_type, return as a structured result with valid: false
-                        if operation == "load_types" || operation == "get_types" || operation == "get_type" {
+                        if operation == "load_types"
+                            || operation == "get_types"
+                            || operation == "get_type"
+                        {
                             return Ok(serde_json::json!({
                                 "valid": false,
                                 "error": { "code": code, "message": msg },
@@ -836,14 +966,16 @@ fn execute_operation(
                             let content = fs::read_to_string(&full_path).unwrap_or_default();
                             let doc = mdbase::frontmatter::parser::parse_document(&content);
                             match &doc.frontmatter {
-                                Some(serde_yaml::Value::Mapping(m)) =>
-                                    mdbase::frontmatter::parser::yaml_mapping_to_json(m),
+                                Some(serde_yaml::Value::Mapping(m)) => {
+                                    mdbase::frontmatter::parser::yaml_mapping_to_json(m)
+                                }
                                 _ => serde_json::json!({}),
                             }
                         } else {
                             serde_json::json!({})
                         };
-                        let type_names = collection.determine_types_for_path(&frontmatter, Some(path));
+                        let type_names =
+                            collection.determine_types_for_path(&frontmatter, Some(path));
                         serde_json::json!({
                             "valid": true,
                             "types": type_names,
@@ -851,22 +983,30 @@ fn execute_operation(
                     } else {
                         // Return list of all loaded type names
                         let type_names: Vec<String> = collection.types.keys().cloned().collect();
-                        let types_detail: Vec<serde_json::Value> = collection.types.values().map(|t| {
-                            let mut obj = serde_json::json!({
-                                "name": t.name,
-                            });
-                            if let Some(ref desc) = t.description {
-                                obj["description"] = serde_json::Value::String(desc.clone());
-                            }
-                            if let Some(ref extends) = t.extends {
-                                obj["extends"] = serde_json::Value::String(extends.clone());
-                            }
-                            let fields: serde_json::Map<String, serde_json::Value> = t.fields.iter().map(|(k, v)| {
-                                (k.clone(), serde_json::json!({"type": v.field_type}))
-                            }).collect();
-                            obj["fields"] = serde_json::Value::Object(fields);
-                            obj
-                        }).collect();
+                        let types_detail: Vec<serde_json::Value> = collection
+                            .types
+                            .values()
+                            .map(|t| {
+                                let mut obj = serde_json::json!({
+                                    "name": t.name,
+                                });
+                                if let Some(ref desc) = t.description {
+                                    obj["description"] = serde_json::Value::String(desc.clone());
+                                }
+                                if let Some(ref extends) = t.extends {
+                                    obj["extends"] = serde_json::Value::String(extends.clone());
+                                }
+                                let fields: serde_json::Map<String, serde_json::Value> = t
+                                    .fields
+                                    .iter()
+                                    .map(|(k, v)| {
+                                        (k.clone(), serde_json::json!({"type": v.field_type}))
+                                    })
+                                    .collect();
+                                obj["fields"] = serde_json::Value::Object(fields);
+                                obj
+                            })
+                            .collect();
                         let mut result = serde_json::json!({
                             "valid": true,
                             "types": types_detail,
@@ -874,18 +1014,26 @@ fn execute_operation(
                             "count": type_names.len(),
                         });
                         if !collection.type_warnings.is_empty() {
-                            let warnings: Vec<serde_json::Value> = collection.type_warnings.iter().map(|w| {
-                                serde_json::json!({
-                                    "message": w,
+                            let warnings: Vec<serde_json::Value> = collection
+                                .type_warnings
+                                .iter()
+                                .map(|w| {
+                                    serde_json::json!({
+                                        "message": w,
+                                    })
                                 })
-                            }).collect();
+                                .collect();
                             result["warnings"] = serde_json::Value::Array(warnings);
                         }
                         result
                     }
                 }
                 "get_type" => {
-                    let raw_name = input_json.get("type").or(input_json.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                    let raw_name = input_json
+                        .get("type")
+                        .or(input_json.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let name = raw_name.to_lowercase();
                     match collection.types.get(&name) {
                         Some(t) => {
@@ -903,12 +1051,21 @@ fn execute_operation(
                                         mdbase::types::schema::GeneratedStrategy::Ulid => "ulid",
                                         mdbase::types::schema::GeneratedStrategy::Uuid => "uuid",
                                         mdbase::types::schema::GeneratedStrategy::Now => "now",
-                                        mdbase::types::schema::GeneratedStrategy::NowOnWrite => "now_on_write",
-                                        mdbase::types::schema::GeneratedStrategy::Derived { .. } => "derived",
-                                        mdbase::types::schema::GeneratedStrategy::Sequence(_) => "sequence",
-                                        mdbase::types::schema::GeneratedStrategy::Random(_) => "random",
+                                        mdbase::types::schema::GeneratedStrategy::NowOnWrite => {
+                                            "now_on_write"
+                                        }
+                                        mdbase::types::schema::GeneratedStrategy::Derived {
+                                            ..
+                                        } => "derived",
+                                        mdbase::types::schema::GeneratedStrategy::Sequence(_) => {
+                                            "sequence"
+                                        }
+                                        mdbase::types::schema::GeneratedStrategy::Random(_) => {
+                                            "random"
+                                        }
                                     };
-                                    fd["generated"] = serde_json::Value::String(gen_str.to_string());
+                                    fd["generated"] =
+                                        serde_json::Value::String(gen_str.to_string());
                                 }
                                 if let Some(ref vals) = v.values {
                                     fd["values"] = serde_json::json!(vals);
@@ -931,7 +1088,10 @@ fn execute_operation(
                     }
                 }
                 "create_type" => {
-                    let name = input_json.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = input_json
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let fields_input = input_json.get("fields");
                     let parent_input = input_json.get("parent").and_then(|v| v.as_str());
                     let strict_input = input_json.get("strict").and_then(|v| v.as_bool());
@@ -964,8 +1124,10 @@ fn execute_operation(
                     }
 
                     // Validate field types
-                    let valid_types = ["string", "integer", "number", "boolean", "date", "datetime", "time",
-                                       "enum", "list", "object", "link", "image", "file", "url", "email", "slug"];
+                    let valid_types = [
+                        "string", "integer", "number", "boolean", "date", "datetime", "time",
+                        "enum", "list", "object", "link", "image", "file", "url", "email", "slug",
+                    ];
                     if let Some(fields) = fields_input {
                         if let Some(obj) = fields.as_object() {
                             for (field_name, field_def) in obj {
@@ -1014,12 +1176,10 @@ fn execute_operation(
                     }
                     if let Some(fields) = fields_input {
                         let yaml_fields = mdbase::frontmatter::parser::json_to_yaml(fields);
-                        fm_map.insert(
-                            serde_yaml::Value::String("fields".to_string()),
-                            yaml_fields,
-                        );
+                        fm_map.insert(serde_yaml::Value::String("fields".to_string()), yaml_fields);
                     }
-                    let yaml_str = serde_yaml::to_string(&serde_yaml::Value::Mapping(fm_map)).unwrap_or_default();
+                    let yaml_str = serde_yaml::to_string(&serde_yaml::Value::Mapping(fm_map))
+                        .unwrap_or_default();
                     let content = format!("---\n{}---\n", yaml_str);
 
                     let type_path = types_dir.join(format!("{}.md", name));
@@ -1041,8 +1201,14 @@ fn execute_operation(
                                     // Type file created but failed to load - clean up and report error
                                     let _ = std::fs::remove_file(&type_path);
                                     if let Some(err) = e.get("error") {
-                                        let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("invalid_type_definition");
-                                        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("Failed to load type");
+                                        let code = err
+                                            .get("code")
+                                            .and_then(|c| c.as_str())
+                                            .unwrap_or("invalid_type_definition");
+                                        let msg = err
+                                            .get("message")
+                                            .and_then(|m| m.as_str())
+                                            .unwrap_or("Failed to load type");
                                         return Ok(serde_json::json!({
                                             "error": { "code": code, "message": msg }
                                         }));
@@ -1064,7 +1230,10 @@ fn execute_operation(
             // If result contains an error, return it as Err for the test runner
             // Exception: rename_ref_update_failed keeps the full result (has from/to + partial_updates)
             if let Some(error) = result.get("error") {
-                let code = error.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                let code = error
+                    .get("code")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("unknown");
                 if code == "rename_ref_update_failed" {
                     return Ok(result);
                 }
@@ -1075,7 +1244,8 @@ fn execute_operation(
             Ok(result)
         }
         "evaluate" => {
-            let expression = input_json.get("expression")
+            let expression = input_json
+                .get("expression")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "evaluate requires 'expression' field".to_string())?;
 
@@ -1083,7 +1253,11 @@ fn execute_operation(
             let parsed = match mdbase::expressions::parser::Parser::parse(expression) {
                 Ok(expr) => expr,
                 Err(e) => {
-                    let code = if e.contains("expression_depth_exceeded") { "expression_depth_exceeded" } else { "invalid_expression" };
+                    let code = if e.contains("expression_depth_exceeded") {
+                        "expression_depth_exceeded"
+                    } else {
+                        "invalid_expression"
+                    };
                     return Ok(serde_json::json!({
                         "error": { "code": code, "message": e }
                     }));
@@ -1091,10 +1265,12 @@ fn execute_operation(
             };
 
             // Build evaluation context
-            let ctx = if let Some(path_val) = input_json.get("path")
+            let ctx = if let Some(path_val) = input_json
+                .get("path")
                 .or_else(|| input_json.get("file"))
                 .or_else(|| input_json.get("context_path"))
-                .and_then(|v| v.as_str()) {
+                .and_then(|v| v.as_str())
+            {
                 // Read the file to get frontmatter context
                 let collection = mdbase::Collection::open(collection_root)
                     .map_err(|e| format!("Failed to open collection: {}", e))?;
@@ -1103,15 +1279,16 @@ fn execute_operation(
                     .get("frontmatter")
                     .cloned()
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                let raw_frontmatter = read_result
-                    .get("raw_frontmatter")
-                    .cloned();
+                let raw_frontmatter = read_result.get("raw_frontmatter").cloned();
                 let body = read_result
                     .get("body")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 let file_size = read_result.pointer("/file/size").and_then(|v| v.as_u64());
-                let file_mtime = read_result.pointer("/file/mtime").and_then(|v| v.as_str()).map(String::from);
+                let file_mtime = read_result
+                    .pointer("/file/mtime")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 // Build all_files for asFile() traversal
                 let all_files = collection.build_all_files_data();
                 let backlinks_index = collection.build_backlinks_index(&all_files);
@@ -1119,7 +1296,10 @@ fn execute_operation(
                 let backlinks_arc = std::sync::Arc::new(backlinks_index);
                 let types_arc = std::sync::Arc::new(collection.types.clone());
                 let type_names_for_file = collection.determine_types_for_path(
-                    &read_result.get("frontmatter").cloned().unwrap_or(serde_json::json!({})),
+                    &read_result
+                        .get("frontmatter")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({})),
                     Some(path_val),
                 );
                 mdbase::expressions::evaluator::EvalContext {
@@ -1145,7 +1325,9 @@ fn execute_operation(
                     raw_frontmatter: None,
                     file_path: None,
                     body: None,
-                    file_size: None, file_mtime: None, file_ctime: None,
+                    file_size: None,
+                    file_mtime: None,
+                    file_ctime: None,
                     this_context: None,
                     all_files: None,
                     traversal_depth: std::cell::Cell::new(0),
@@ -1168,16 +1350,21 @@ fn execute_operation(
             }
         }
         "batch_update" | "batch_delete" => {
-            let collection = mdbase::Collection::open(collection_root)
-                .map_err(|e| {
-                    if let Some(err) = e.get("error") {
-                        let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
-                        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
-                        format!("{}: {}", code, msg)
-                    } else {
-                        format!("Failed to open collection: {}", e)
-                    }
-                })?;
+            let collection = mdbase::Collection::open(collection_root).map_err(|e| {
+                if let Some(err) = e.get("error") {
+                    let code = err
+                        .get("code")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("unknown");
+                    let msg = err
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown");
+                    format!("{}: {}", code, msg)
+                } else {
+                    format!("Failed to open collection: {}", e)
+                }
+            })?;
 
             // Extract simulate parameters from both top-level simulate and input.simulate
             let sim_io_error: Option<String> = simulate
@@ -1186,7 +1373,8 @@ fn execute_operation(
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .or_else(|| {
-                    input_json.get("simulate")
+                    input_json
+                        .get("simulate")
                         .and_then(|s| s.get("io_error_on"))
                         .and_then(|v| v.as_str())
                         .map(String::from)
@@ -1196,7 +1384,8 @@ fn execute_operation(
                 .and_then(|m| m.get(serde_yaml::Value::String("skip_dependents".to_string())))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
-                || input_json.get("simulate")
+                || input_json
+                    .get("simulate")
                     .and_then(|s| s.get("skip_dependents"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
@@ -1209,7 +1398,10 @@ fn execute_operation(
 
             // If result contains an error, return it as Err for the test runner
             if let Some(error) = result.get("error") {
-                let code = error.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                let code = error
+                    .get("code")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("unknown");
                 let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
                 return Err(format!("{}: {}", code, msg));
             }
@@ -1219,16 +1411,16 @@ fn execute_operation(
         "init" => {
             let result = mdbase::init::init_collection(collection_root, &input_json);
             if let Some(error) = result.get("error") {
-                let code = error.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                let code = error
+                    .get("code")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("unknown");
                 let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
                 return Err(format!("{}: {}", code, msg));
             }
             Ok(result)
         }
-        _ => Err(format!(
-            "Operation '{}' not yet implemented",
-            operation
-        )),
+        _ => Err(format!("Operation '{}' not yet implemented", operation)),
     }
 }
 
@@ -1256,17 +1448,28 @@ fn run_verify_after(
 
     for (i, step) in verify_steps.iter().enumerate() {
         let step_json = yaml_to_json(step);
-        let op = step_json.get("operation").and_then(|v| v.as_str()).unwrap_or("");
-        let input = step_json.get("input").cloned().unwrap_or(serde_json::json!({}));
-        let expect_val = step_json.get("expect").cloned().unwrap_or(serde_json::json!({}));
+        let op = step_json
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let input = step_json
+            .get("input")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let expect_val = step_json
+            .get("expect")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
 
         // Deserialize expected into TestExpectation
         let expect_yaml_str = serde_json::to_string(&expect_val).unwrap_or_default();
-        let step_expect: TestExpectation = serde_yaml::from_str(&expect_yaml_str).unwrap_or_default();
+        let step_expect: TestExpectation =
+            serde_yaml::from_str(&expect_yaml_str).unwrap_or_default();
 
         // Convert input back to yaml for execute_operation
         let input_yaml_str = serde_json::to_string(&input).unwrap_or_default();
-        let input_yaml: serde_yaml::Value = serde_yaml::from_str(&input_yaml_str).unwrap_or_default();
+        let input_yaml: serde_yaml::Value =
+            serde_yaml::from_str(&input_yaml_str).unwrap_or_default();
 
         match execute_operation(root, op, &input_yaml, None) {
             Ok(result) => {
@@ -1292,8 +1495,9 @@ fn run_verify_after(
                                 .map_err(|e| format!("verify_after[{}] ({}): {}", i, op, e))?;
                             let doc = mdbase::frontmatter::parser::parse_document(&content);
                             let fm = match &doc.frontmatter {
-                                Some(serde_yaml::Value::Mapping(m)) =>
-                                    mdbase::frontmatter::parser::yaml_mapping_to_json(m),
+                                Some(serde_yaml::Value::Mapping(m)) => {
+                                    mdbase::frontmatter::parser::yaml_mapping_to_json(m)
+                                }
                                 _ => serde_json::json!({}),
                             };
                             let result = serde_json::json!({
@@ -1319,18 +1523,12 @@ fn run_verify_after(
 // ---------------------------------------------------------------------------
 
 /// Compare actual result against expected.
-fn check_expectation(
-    actual: &serde_json::Value,
-    expected: &TestExpectation,
-) -> Result<(), String> {
+fn check_expectation(actual: &serde_json::Value, expected: &TestExpectation) -> Result<(), String> {
     // Check valid
     if let Some(valid) = expected.valid {
         let actual_valid = actual.get("valid").and_then(|v| v.as_bool());
         if actual_valid != Some(valid) {
-            return Err(format!(
-                "expected valid={}, got {:?}",
-                valid, actual_valid
-            ));
+            return Err(format!("expected valid={}, got {:?}", valid, actual_valid));
         }
     }
 
@@ -1341,10 +1539,7 @@ fn check_expectation(
             return Err("expected error in result".to_string());
         }
         if let Some(code) = &expected_error.code {
-            let actual_code = actual_error
-                .unwrap()
-                .get("code")
-                .and_then(|v| v.as_str());
+            let actual_code = actual_error.unwrap().get("code").and_then(|v| v.as_str());
             if actual_code != Some(code) {
                 return Err(format!(
                     "expected error code '{}', got {:?}",
@@ -1416,7 +1611,10 @@ fn check_expectation(
                     }
                 }
                 // If we passed all checks and at least one field was checked, it's a match
-                exp.path.is_some() || exp.message_contains.is_some() || exp.contains.is_some() || exp.code.is_some()
+                exp.path.is_some()
+                    || exp.message_contains.is_some()
+                    || exp.contains.is_some()
+                    || exp.code.is_some()
             });
             if !found {
                 return Err(format!(
@@ -1442,18 +1640,24 @@ fn check_expectation(
                 }
             }
         } else {
-            let issues = actual_issues
-                .ok_or("expected issues array in result")?;
+            let issues = actual_issues.ok_or("expected issues array in result")?;
             for exp in expected_issues {
                 let found = issues.iter().any(|a| {
                     if let Some(code) = &exp.code {
                         let actual_code = a.get("code").and_then(|v| v.as_str()).unwrap_or("");
                         // constraint_violation matches any constraint-related code
                         let code_matches = actual_code == code.as_str()
-                            || (code == "constraint_violation" && matches!(actual_code,
-                                "number_too_large" | "number_too_small" | "string_too_short"
-                                | "string_too_long" | "pattern_mismatch" | "list_too_short"
-                                | "list_too_long"));
+                            || (code == "constraint_violation"
+                                && matches!(
+                                    actual_code,
+                                    "number_too_large"
+                                        | "number_too_small"
+                                        | "string_too_short"
+                                        | "string_too_long"
+                                        | "pattern_mismatch"
+                                        | "list_too_short"
+                                        | "list_too_long"
+                                ));
                         if !code_matches {
                             return false;
                         }
@@ -1511,16 +1715,14 @@ fn check_expectation(
             let actual_strs: Vec<&str> = actual_arr.iter().filter_map(|v| v.as_str()).collect();
             for et in expected_types {
                 if !actual_strs.contains(&et.as_str()) {
-                    return Err(format!(
-                        "expected type '{}' in {:?}",
-                        et, actual_strs
-                    ));
+                    return Err(format!("expected type '{}' in {:?}", et, actual_strs));
                 }
             }
         } else {
             return Err(format!(
                 "expected types {:?}, got {:?}",
-                expected_types, actual.get("types")
+                expected_types,
+                actual.get("types")
             ));
         }
     }
@@ -1619,27 +1821,41 @@ fn check_expectation(
 
     // Check results (array of result items)
     if let Some(expected_results) = &expected.results {
-        let actual_results = actual.get("results")
+        let actual_results = actual
+            .get("results")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| format!("expected 'results' array in result, got {:?}", actual.get("results")))?;
+            .ok_or_else(|| {
+                format!(
+                    "expected 'results' array in result, got {:?}",
+                    actual.get("results")
+                )
+            })?;
 
-        let expected_json: Vec<serde_json::Value> = expected_results.iter()
-            .map(yaml_to_json)
-            .collect();
+        let expected_json: Vec<serde_json::Value> =
+            expected_results.iter().map(yaml_to_json).collect();
 
         if actual_results.len() != expected_json.len() {
             return Err(format!(
                 "expected {} results, got {} (paths: {:?})",
                 expected_json.len(),
                 actual_results.len(),
-                actual_results.iter().filter_map(|r| r.get("path").and_then(|v| v.as_str())).collect::<Vec<_>>()
+                actual_results
+                    .iter()
+                    .filter_map(|r| r.get("path").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
             ));
         }
 
-        for (i, (actual_item, expected_item)) in actual_results.iter().zip(expected_json.iter()).enumerate() {
+        for (i, (actual_item, expected_item)) in
+            actual_results.iter().zip(expected_json.iter()).enumerate()
+        {
             // Handle body_contains in expected result items
-            if let Some(body_contains) = expected_item.get("body_contains").and_then(|v| v.as_str()) {
-                let actual_body = actual_item.get("body").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(body_contains) = expected_item.get("body_contains").and_then(|v| v.as_str())
+            {
+                let actual_body = actual_item
+                    .get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if !actual_body.contains(body_contains) {
                     return Err(format!(
                         "results[{}]: expected body containing '{}', got '{}'",
@@ -1649,19 +1865,29 @@ fn check_expectation(
                 // Check remaining fields (excluding body_contains)
                 if let serde_json::Value::Object(expected_map) = expected_item {
                     for (key, val) in expected_map {
-                        if key == "body_contains" { continue; }
-                        let actual_val = actual_item.get(key)
+                        if key == "body_contains" {
+                            continue;
+                        }
+                        let actual_val = actual_item
+                            .get(key)
                             .or_else(|| actual_item.get("frontmatter").and_then(|fm| fm.get(key)))
                             .ok_or_else(|| {
-                            format!("results[{}].{}: expected field missing from result", i, key)
-                        })?;
+                                format!(
+                                    "results[{}].{}: expected field missing from result",
+                                    i, key
+                                )
+                            })?;
                         check_partial_match(actual_val, val, &format!("results[{}].{}", i, key))?;
                     }
                 }
             } else {
                 // For query result items, expected fields like "value" may be in frontmatter
                 // rather than at the top level. Merge frontmatter into top-level for matching.
-                if let (serde_json::Value::Object(actual_map), serde_json::Value::Object(_expected_map)) = (actual_item, expected_item) {
+                if let (
+                    serde_json::Value::Object(actual_map),
+                    serde_json::Value::Object(_expected_map),
+                ) = (actual_item, expected_item)
+                {
                     let mut augmented = actual_map.clone();
                     if let Some(serde_json::Value::Object(fm)) = actual_map.get("frontmatter") {
                         for (k, v) in fm {
@@ -1681,7 +1907,8 @@ fn check_expectation(
 
     // Check meta (partial match)
     if let Some(expected_meta) = &expected.meta {
-        let actual_meta = actual.get("meta")
+        let actual_meta = actual
+            .get("meta")
             .ok_or_else(|| "expected 'meta' in result".to_string())?;
         let expected_json = yaml_to_json(expected_meta);
         check_partial_match(actual_meta, &expected_json, "meta")?;
@@ -1689,7 +1916,8 @@ fn check_expectation(
 
     // Check summaries (partial match)
     if let Some(expected_summaries) = &expected.summaries {
-        let actual_summaries = actual.get("summaries")
+        let actual_summaries = actual
+            .get("summaries")
             .ok_or_else(|| "expected 'summaries' in result".to_string())?;
         let expected_json = yaml_to_json(expected_summaries);
         check_partial_match(actual_summaries, &expected_json, "summaries")?;
@@ -1697,7 +1925,8 @@ fn check_expectation(
 
     // Check batch_result (partial match)
     if let Some(expected_batch) = &expected.batch_result {
-        let actual_batch = actual.get("batch_result")
+        let actual_batch = actual
+            .get("batch_result")
             .ok_or_else(|| format!("expected 'batch_result' in result, got {:?}", actual))?;
         let expected_json = yaml_to_json(expected_batch);
         check_partial_match(actual_batch, &expected_json, "batch_result")?;
@@ -1705,16 +1934,16 @@ fn check_expectation(
 
     // Check broken_links
     if let Some(expected_broken) = &expected.broken_links {
-        let actual_broken = actual.get("broken_links")
+        let actual_broken = actual
+            .get("broken_links")
             .and_then(|v| v.as_array())
             .ok_or_else(|| "expected 'broken_links' array in result".to_string())?;
-        let expected_json: Vec<serde_json::Value> = expected_broken.iter()
-            .map(yaml_to_json)
-            .collect();
+        let expected_json: Vec<serde_json::Value> =
+            expected_broken.iter().map(yaml_to_json).collect();
         for (i, exp) in expected_json.iter().enumerate() {
-            let found = actual_broken.iter().any(|a| {
-                check_partial_match(a, exp, "broken_link").is_ok()
-            });
+            let found = actual_broken
+                .iter()
+                .any(|a| check_partial_match(a, exp, "broken_link").is_ok());
             if !found {
                 return Err(format!(
                     "broken_links[{}]: expected {:?} not found in {:?}",
@@ -1726,7 +1955,8 @@ fn check_expectation(
 
     // Check partial_updates (for rename_ref_update_failed)
     if let Some(expected_partial) = &expected.partial_updates {
-        let actual_partial = actual.get("partial_updates")
+        let actual_partial = actual
+            .get("partial_updates")
             .ok_or_else(|| format!("expected 'partial_updates' in result, got {:?}", actual))?;
         let expected_json = yaml_to_json(expected_partial);
         check_partial_match(actual_partial, &expected_json, "partial_updates")?;
@@ -1734,7 +1964,8 @@ fn check_expectation(
 
     // Check groups
     if let Some(expected_groups) = &expected.groups {
-        let actual_groups = actual.get("groups")
+        let actual_groups = actual
+            .get("groups")
             .and_then(|v| v.as_array())
             .ok_or_else(|| "expected 'groups' array in result".to_string())?;
 
@@ -1746,32 +1977,43 @@ fn check_expectation(
             if i >= actual_groups.len() {
                 return Err(format!(
                     "expected at least {} groups, got {}",
-                    i + 1, actual_groups.len()
+                    i + 1,
+                    actual_groups.len()
                 ));
             }
 
             // Find matching group in actual - first try positional, then by key
-            let expected_key = expected_json.get("key").cloned().unwrap_or(serde_json::Value::Null);
+            let expected_key = expected_json
+                .get("key")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             let actual_group = if let Some(ag) = actual_groups.get(i) {
                 let actual_key = ag.get("key").cloned().unwrap_or(serde_json::Value::Null);
                 if actual_key == expected_key {
                     ag
                 } else {
                     // Search by key
-                    actual_groups.iter().find(|g| {
-                        g.get("key").cloned().unwrap_or(serde_json::Value::Null) == expected_key
-                    }).ok_or_else(|| format!(
+                    actual_groups
+                        .iter()
+                        .find(|g| {
+                            g.get("key").cloned().unwrap_or(serde_json::Value::Null) == expected_key
+                        })
+                        .ok_or_else(|| {
+                            format!(
                         "groups[{}]: expected group with key {:?}, not found in actual groups",
                         i, expected_key
-                    ))?
+                    )
+                        })?
                 }
             } else {
                 return Err(format!("groups[{}]: not enough actual groups", i));
             };
 
             // Check group results (partial match on each result)
-            if let Some(expected_results) = expected_json.get("results").and_then(|v| v.as_array()) {
-                let actual_results = actual_group.get("results")
+            if let Some(expected_results) = expected_json.get("results").and_then(|v| v.as_array())
+            {
+                let actual_results = actual_group
+                    .get("results")
                     .and_then(|v| v.as_array())
                     .ok_or_else(|| format!("groups[{}]: expected 'results' array", i))?;
 
@@ -1779,25 +2021,37 @@ fn check_expectation(
                     if j >= actual_results.len() {
                         return Err(format!(
                             "groups[{}]: expected at least {} results, got {}",
-                            i, j + 1, actual_results.len()
+                            i,
+                            j + 1,
+                            actual_results.len()
                         ));
                     }
-                    check_partial_match(&actual_results[j], expected_item, &format!("groups[{}].results[{}]", i, j))?;
+                    check_partial_match(
+                        &actual_results[j],
+                        expected_item,
+                        &format!("groups[{}].results[{}]", i, j),
+                    )?;
                 }
             }
 
             // Check group summaries
             if let Some(expected_summaries) = expected_json.get("summaries") {
-                let actual_summaries = actual_group.get("summaries")
+                let actual_summaries = actual_group
+                    .get("summaries")
                     .ok_or_else(|| format!("groups[{}]: expected 'summaries'", i))?;
-                check_partial_match(actual_summaries, expected_summaries, &format!("groups[{}].summaries", i))?;
+                check_partial_match(
+                    actual_summaries,
+                    expected_summaries,
+                    &format!("groups[{}].summaries", i),
+                )?;
             }
         }
     }
 
     // Check count
     if let Some(expected_count) = expected.count {
-        let actual_count = actual.get("meta")
+        let actual_count = actual
+            .get("meta")
             .and_then(|m| m.get("total_count"))
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
@@ -1811,23 +2065,27 @@ fn check_expectation(
 
     // Check paths
     if let Some(expected_paths) = &expected.paths {
-        let actual_results = actual.get("results")
+        let actual_results = actual
+            .get("results")
             .and_then(|v| v.as_array())
             .ok_or("expected 'results' for paths check")?;
-        let actual_paths: Vec<&str> = actual_results.iter()
+        let actual_paths: Vec<&str> = actual_results
+            .iter()
             .filter_map(|r| r.get("path").and_then(|v| v.as_str()))
             .collect();
         for ep in expected_paths {
             if !actual_paths.contains(&ep.as_str()) {
-                return Err(format!("expected path '{}' in results, got {:?}", ep, actual_paths));
+                return Err(format!(
+                    "expected path '{}' in results, got {:?}",
+                    ep, actual_paths
+                ));
             }
         }
     }
 
     // Check link (parse_link result)
     if let Some(expected_link) = &expected.link {
-        let actual_link = actual.get("link")
-            .ok_or("expected 'link' in result")?;
+        let actual_link = actual.get("link").ok_or("expected 'link' in result")?;
         let expected_json = yaml_to_json(expected_link);
         check_partial_match(actual_link, &expected_json, "link")?;
     }
@@ -1840,20 +2098,33 @@ fn check_expectation(
             Some(val) => {
                 let expected_val = &expected_json;
                 if val != expected_val {
-                    return Err(format!("resolved_path: expected {:?}, got {:?}", expected_val, val));
+                    return Err(format!(
+                        "resolved_path: expected {:?}, got {:?}",
+                        expected_val, val
+                    ));
                 }
             }
-            None => return Err(format!("expected resolved_path in result, got {:?}", actual)),
+            None => {
+                return Err(format!(
+                    "expected resolved_path in result, got {:?}",
+                    actual
+                ))
+            }
         }
     }
 
     // Check results_count
     if let Some(expected_count) = expected.results_count {
-        let actual_results = actual.get("results")
+        let actual_results = actual
+            .get("results")
             .and_then(|v| v.as_array())
             .ok_or("expected 'results' array for results_count check")?;
         if actual_results.len() != expected_count {
-            return Err(format!("expected {} results, got {}", expected_count, actual_results.len()));
+            return Err(format!(
+                "expected {} results, got {}",
+                expected_count,
+                actual_results.len()
+            ));
         }
     }
 
@@ -1875,8 +2146,12 @@ fn check_watch_expectation(
         if actual_events.len() > max_count {
             return Err(format!(
                 "expected max {} events, got {} events: {:?}",
-                max_count, actual_events.len(),
-                actual_events.iter().map(|e| e.get("event").and_then(|v| v.as_str()).unwrap_or("?")).collect::<Vec<_>>()
+                max_count,
+                actual_events.len(),
+                actual_events
+                    .iter()
+                    .map(|e| e.get("event").and_then(|v| v.as_str()).unwrap_or("?"))
+                    .collect::<Vec<_>>()
             ));
         }
         // If max_event_count is 0 and events is empty, that's correct
@@ -1887,9 +2162,8 @@ fn check_watch_expectation(
 
     // Check events (partial match on each event in order)
     if let Some(expected_events) = &expect.events {
-        let expected_json: Vec<serde_json::Value> = expected_events.iter()
-            .map(yaml_to_json)
-            .collect();
+        let expected_json: Vec<serde_json::Value> =
+            expected_events.iter().map(yaml_to_json).collect();
 
         if expected_json.is_empty() {
             // Expect no events
@@ -1897,7 +2171,10 @@ fn check_watch_expectation(
                 return Err(format!(
                     "expected no events, got {} events: {:?}",
                     actual_events.len(),
-                    actual_events.iter().map(|e| e.get("event").and_then(|v| v.as_str()).unwrap_or("?")).collect::<Vec<_>>()
+                    actual_events
+                        .iter()
+                        .map(|e| e.get("event").and_then(|v| v.as_str()).unwrap_or("?"))
+                        .collect::<Vec<_>>()
                 ));
             }
             // Check listener_query even if events are empty
@@ -1911,18 +2188,23 @@ fn check_watch_expectation(
         // Each expected event should match a corresponding actual event
         // For partial matching, we look for events by event type and path
         for (i, expected_event) in expected_json.iter().enumerate() {
-            let expected_type = expected_event.get("event").and_then(|v| v.as_str()).unwrap_or("");
+            let expected_type = expected_event
+                .get("event")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             // Find matching actual event (by type and path, in order)
-            let actual_event = actual_events.iter()
-                .filter(|e| {
-                    e.get("event").and_then(|v| v.as_str()) == Some(expected_type)
-                })
+            let actual_event = actual_events
+                .iter()
+                .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some(expected_type))
                 .nth(
                     // Count how many previous expected events have the same type
-                    expected_json[..i].iter()
-                        .filter(|prev| prev.get("event").and_then(|v| v.as_str()) == Some(expected_type))
-                        .count()
+                    expected_json[..i]
+                        .iter()
+                        .filter(|prev| {
+                            prev.get("event").and_then(|v| v.as_str()) == Some(expected_type)
+                        })
+                        .count(),
                 );
 
             let actual_event = match actual_event {
@@ -1930,12 +2212,18 @@ fn check_watch_expectation(
                 None => {
                     return Err(format!(
                         "events[{}]: expected {} event, not found in actual events {:?}",
-                        i, expected_type,
-                        actual_events.iter().map(|e| {
-                            format!("{}:{}",
-                                e.get("event").and_then(|v| v.as_str()).unwrap_or("?"),
-                                e.get("path").and_then(|v| v.as_str()).unwrap_or("?"))
-                        }).collect::<Vec<_>>()
+                        i,
+                        expected_type,
+                        actual_events
+                            .iter()
+                            .map(|e| {
+                                format!(
+                                    "{}:{}",
+                                    e.get("event").and_then(|v| v.as_str()).unwrap_or("?"),
+                                    e.get("path").and_then(|v| v.as_str()).unwrap_or("?")
+                                )
+                            })
+                            .collect::<Vec<_>>()
                     ));
                 }
             };
@@ -1947,14 +2235,14 @@ fn check_watch_expectation(
 
     // Check events_ordered (strict order, partial match on each)
     if let Some(expected_ordered) = &expect.events_ordered {
-        let expected_json: Vec<serde_json::Value> = expected_ordered.iter()
-            .map(yaml_to_json)
-            .collect();
+        let expected_json: Vec<serde_json::Value> =
+            expected_ordered.iter().map(yaml_to_json).collect();
 
         if actual_events.len() < expected_json.len() {
             return Err(format!(
                 "events_ordered: expected at least {} events, got {}",
-                expected_json.len(), actual_events.len()
+                expected_json.len(),
+                actual_events.len()
             ));
         }
 
@@ -1962,20 +2250,23 @@ fn check_watch_expectation(
             if i >= actual_events.len() {
                 return Err(format!("events_ordered[{}]: not enough actual events", i));
             }
-            check_watch_event_match(&actual_events[i], expected_event, &format!("events_ordered[{}]", i))?;
+            check_watch_event_match(
+                &actual_events[i],
+                expected_event,
+                &format!("events_ordered[{}]", i),
+            )?;
         }
     }
 
     // Check events_contain (each expected event must appear somewhere)
     if let Some(expected_contain) = &expect.events_contain {
-        let expected_json: Vec<serde_json::Value> = expected_contain.iter()
-            .map(yaml_to_json)
-            .collect();
+        let expected_json: Vec<serde_json::Value> =
+            expected_contain.iter().map(yaml_to_json).collect();
 
         for (i, expected_event) in expected_json.iter().enumerate() {
-            let found = actual_events.iter().any(|actual| {
-                check_watch_event_match(actual, expected_event, "").is_ok()
-            });
+            let found = actual_events
+                .iter()
+                .any(|actual| check_watch_event_match(actual, expected_event, "").is_ok());
             if !found {
                 return Err(format!(
                     "events_contain[{}]: expected event {:?} not found in actual events",
@@ -2027,10 +2318,13 @@ fn check_watch_event_match(
                 // affected_files_not_contain: negative check
                 "affected_files_not_contain" => {
                     if let Some(forbidden) = expected_val.as_array() {
-                        if let Some(actual_files) = actual.get("affected_files").and_then(|v| v.as_array()) {
+                        if let Some(actual_files) =
+                            actual.get("affected_files").and_then(|v| v.as_array())
+                        {
                             for f in forbidden {
                                 if let Some(f_str) = f.as_str() {
-                                    let found = actual_files.iter().any(|af| af.as_str() == Some(f_str));
+                                    let found =
+                                        actual_files.iter().any(|af| af.as_str() == Some(f_str));
                                     if found {
                                         return Err(format!(
                                             "{}.affected_files_not_contain: '{}' found in {:?}",
@@ -2045,8 +2339,7 @@ fn check_watch_event_match(
                 // type field in expected maps to type_name in actual (for type_changed)
                 "type" => {
                     // Check both "type" and "type_name" in actual
-                    let actual_val = actual.get("type")
-                        .or_else(|| actual.get("type_name"));
+                    let actual_val = actual.get("type").or_else(|| actual.get("type_name"));
                     if let Some(expected_str) = expected_val.as_str() {
                         let actual_str = actual_val.and_then(|v| v.as_str());
                         if actual_str != Some(expected_str) {
@@ -2060,7 +2353,8 @@ fn check_watch_event_match(
                 // issues: set-based matching (each expected issue must match some actual issue)
                 "issues" => {
                     if let Some(expected_issues) = expected_val.as_array() {
-                        let actual_issues = actual.get("issues")
+                        let actual_issues = actual
+                            .get("issues")
                             .and_then(|v| v.as_array())
                             .ok_or_else(|| format!("{}.issues: expected issues array", path))?;
                         for (j, exp_issue) in expected_issues.iter().enumerate() {
@@ -2081,7 +2375,11 @@ fn check_watch_event_match(
                 // Standard fields: partial match
                 _ => {
                     if let Some(actual_val) = actual.get(key) {
-                        check_partial_match(actual_val, expected_val, &format!("{}.{}", path, key))?;
+                        check_partial_match(
+                            actual_val,
+                            expected_val,
+                            &format!("{}.{}", path, key),
+                        )?;
                     } else {
                         return Err(format!(
                             "{}.{}: expected field missing from event. Event: {:?}",
@@ -2096,15 +2394,20 @@ fn check_watch_event_match(
 }
 
 /// Check listener_query: execute a follow-up operation and verify expectations.
-fn check_listener_query(
-    root: &Path,
-    listener_query: &serde_yaml::Value,
-) -> Result<(), String> {
+fn check_listener_query(root: &Path, listener_query: &serde_yaml::Value) -> Result<(), String> {
     let lq_json = yaml_to_json(listener_query);
-    let operation = lq_json.get("operation").and_then(|v| v.as_str())
+    let operation = lq_json
+        .get("operation")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "listener_query: missing 'operation'".to_string())?;
-    let input = lq_json.get("input").cloned().unwrap_or(serde_json::json!({}));
-    let expect = lq_json.get("expect").cloned().unwrap_or(serde_json::json!({}));
+    let input = lq_json
+        .get("input")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let expect = lq_json
+        .get("expect")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
 
     // Convert input back to YAML for execute_operation
     let input_yaml_str = serde_json::to_string(&input).unwrap_or_default();
@@ -2115,10 +2418,8 @@ fn check_listener_query(
     let step_expect: TestExpectation = serde_yaml::from_str(&expect_yaml_str).unwrap_or_default();
 
     match execute_operation(root, operation, &input_yaml, None) {
-        Ok(result) => {
-            check_expectation(&result, &step_expect)
-                .map_err(|msg| format!("listener_query ({}): {}", operation, msg))
-        }
+        Ok(result) => check_expectation(&result, &step_expect)
+            .map_err(|msg| format!("listener_query ({}): {}", operation, msg)),
         Err(err) => {
             // If listener_query expects an error, check if codes match
             if let Some(expected_error) = &step_expect.error {
@@ -2226,7 +2527,10 @@ fn check_partial_match(
                     if key.ends_with("_present") && expected_val == &serde_json::Value::Bool(true) {
                         let base_key = &key[..key.len() - 8]; // strip "_present"
                         let val = actual_map.get(base_key).ok_or_else(|| {
-                            format!("{}.{}: expected field '{}' to be present", path, key, base_key)
+                            format!(
+                                "{}.{}: expected field '{}' to be present",
+                                path, key, base_key
+                            )
                         })?;
                         if val.is_null() || val.as_str().is_some_and(|s| s.is_empty()) {
                             return Err(format!(
@@ -2237,10 +2541,14 @@ fn check_partial_match(
                         continue;
                     }
                     // Handle _positive assertions: check field is a positive number
-                    if key.ends_with("_positive") && expected_val == &serde_json::Value::Bool(true) {
+                    if key.ends_with("_positive") && expected_val == &serde_json::Value::Bool(true)
+                    {
                         let base_key = &key[..key.len() - 9]; // strip "_positive"
                         let val = actual_map.get(base_key).ok_or_else(|| {
-                            format!("{}.{}: expected field '{}' to be present", path, key, base_key)
+                            format!(
+                                "{}.{}: expected field '{}' to be present",
+                                path, key, base_key
+                            )
                         })?;
                         let is_positive = val.as_i64().is_some_and(|n| n > 0)
                             || val.as_f64().is_some_and(|n| n > 0.0);
@@ -2255,18 +2563,11 @@ fn check_partial_match(
                     let actual_val = actual_map.get(key).ok_or_else(|| {
                         format!("{}.{}: expected field missing from result", path, key)
                     })?;
-                    check_partial_match(
-                        actual_val,
-                        expected_val,
-                        &format!("{}.{}", path, key),
-                    )?;
+                    check_partial_match(actual_val, expected_val, &format!("{}.{}", path, key))?;
                 }
                 Ok(())
             } else {
-                Err(format!(
-                    "{}: expected object, got {:?}",
-                    path, actual
-                ))
+                Err(format!("{}: expected object, got {:?}", path, actual))
             }
         }
         (serde_json::Value::Array(actual_arr), serde_json::Value::Array(expected_arr)) => {

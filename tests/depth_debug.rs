@@ -1,5 +1,5 @@
-use mdbase::expressions::parser::Parser;
 use mdbase::expressions::evaluator::{evaluate, EvalContext};
+use mdbase::expressions::parser::Parser;
 
 #[test]
 fn test_depth_65() {
@@ -7,7 +7,7 @@ fn test_depth_65() {
     for _ in 0..65 {
         expr = format!("if(true, {}, 0)", expr);
     }
-    
+
     eprintln!("=== Parsing 65-level ({} chars) ===", expr.len());
     match Parser::parse(&expr) {
         Ok(parsed) => {
@@ -28,7 +28,7 @@ fn test_depth_64() {
     for _ in 0..64 {
         expr = format!("if(true, {}, 0)", expr);
     }
-    
+
     eprintln!("=== Parsing 64-level ({} chars) ===", expr.len());
     match Parser::parse(&expr) {
         Ok(parsed) => {
