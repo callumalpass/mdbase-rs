@@ -176,10 +176,10 @@ select_fields() {
 
   [[ "$max_fields" =~ ^[1-9][0-9]*$ ]] || max_fields=5
 
-  local -a all_keys=() freq_keys=() required_keys=() chosen=()
+  local -a all_keys=() freq_keys=() required_keys=() schema_keys=() chosen=()
   local -a display_candidates=(display_name displayName title name label)
   local -a priority_candidates=(status state priority due due_date date created updated tags rating)
-  local -A has_key seen
+  local -A has_key seen schema_has
 
   mapfile -t all_keys < <(
     jq -r '[.results[].frontmatter // {} | keys[]] | unique[]?' <<<"$results_json"
@@ -205,6 +205,12 @@ select_fields() {
     if [[ -f "$type_file" ]]; then
       local type_json
       if type_json="$(run_mdb read "$type_file" 2>/dev/null)"; then
+        mapfile -t schema_keys < <(
+          jq -r '
+            .frontmatter.fields // {}
+            | keys[]
+          ' <<<"$type_json"
+        )
         mapfile -t required_keys < <(
           jq -r '
             .frontmatter.fields // {}
@@ -217,11 +223,25 @@ select_fields() {
     fi
   fi
 
+  for key in "${schema_keys[@]}"; do
+    schema_has["$key"]=1
+  done
+
   add_field() {
     local field="$1"
     [[ -n "$field" ]] || return 0
-    [[ "${has_key[$field]:-0}" == "1" ]] || return 0
     [[ -z "${seen[$field]:-}" ]] || return 0
+
+    if [[ "$selected_type" == "untype" ]]; then
+      [[ "${has_key[$field]:-0}" == "1" ]] || return 0
+    else
+      if (( ${#schema_keys[@]} > 0 )); then
+        [[ "${schema_has[$field]:-0}" == "1" ]] || return 0
+      else
+        [[ "${has_key[$field]:-0}" == "1" ]] || return 0
+      fi
+    fi
+
     if (( ${#chosen[@]} >= max_fields )); then
       return 0
     fi
@@ -230,25 +250,41 @@ select_fields() {
   }
 
   local field
-  for field in "${display_candidates[@]}"; do
-    if [[ "${has_key[$field]:-0}" == "1" ]]; then
+
+  # For typed selections, columns are determined by the selected type schema.
+  if [[ "$selected_type" != "untype" ]] && (( ${#schema_keys[@]} > 0 )); then
+    for field in "${display_candidates[@]}"; do
+      if [[ "${schema_has[$field]:-0}" == "1" ]]; then
+        add_field "$field"
+        break
+      fi
+    done
+    for field in "${required_keys[@]}"; do
       add_field "$field"
-      break
-    fi
-  done
-  for field in "${required_keys[@]}"; do
-    add_field "$field"
-  done
-  for field in "${priority_candidates[@]}"; do
-    add_field "$field"
-  done
-  for field in "${freq_keys[@]}"; do
-    add_field "$field"
-  done
+    done
+    for field in "${schema_keys[@]}"; do
+      add_field "$field"
+    done
+  else
+    for field in "${display_candidates[@]}"; do
+      if [[ "${has_key[$field]:-0}" == "1" ]]; then
+        add_field "$field"
+        break
+      fi
+    done
+    for field in "${required_keys[@]}"; do
+      add_field "$field"
+    done
+    for field in "${priority_candidates[@]}"; do
+      add_field "$field"
+    done
+    for field in "${freq_keys[@]}"; do
+      add_field "$field"
+    done
+  fi
 
   printf '%s\n' "${chosen[@]}"
 }
-
 pick_note() {
   local selected_type="$1"
   local results_json="$2"
