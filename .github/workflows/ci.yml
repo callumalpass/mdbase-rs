@@ -18,6 +18,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Checkout mdbase spec
+        uses: actions/checkout@v4
+        with:
+          repository: callumalpass/mdbase-spec
+          path: mdbase-spec
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -28,5 +33,8 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-targets --all-features
+        env:
+          MDBASE_SPEC_REPO_DIR: ${{ github.workspace }}/mdbase-spec
+          MDBASE_SPEC_TESTS_DIR: ${{ github.workspace }}/mdbase-spec/tests
       - name: Verify crate package
         run: cargo package

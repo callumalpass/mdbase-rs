@@ -25,7 +25,20 @@ use tempfile::TempDir;
 
 /// Path to the spec's test files.
 fn spec_tests_dir() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME not set");
+    if let Some(path) = std::env::var_os("MDBASE_SPEC_TESTS_DIR") {
+        return PathBuf::from(path);
+    }
+
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            Some(home.into_os_string())
+        })
+        .expect("home directory not set; provide MDBASE_SPEC_TESTS_DIR");
     PathBuf::from(home).join("projects/mdbase-spec/tests")
 }
 
