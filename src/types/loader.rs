@@ -147,13 +147,11 @@ pub fn load_types_with_warnings(
                             ));
                         }
                     }
-                    GeneratedStrategy::Sequence(_) => {
-                        if field_def.field_type != "integer" {
-                            return Err(format!(
-                                "Type '{}' field '{}': sequence generation requires integer type",
-                                type_def.name, field_name
-                            ));
-                        }
+                    GeneratedStrategy::Sequence(_) if field_def.field_type != "integer" => {
+                        return Err(format!(
+                            "Type '{}' field '{}': sequence generation requires integer type",
+                            type_def.name, field_name
+                        ));
                     }
                     _ => {}
                 }
