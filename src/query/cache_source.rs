@@ -267,8 +267,10 @@ impl Collection {
         include_link_graph: bool,
     ) -> (QueryData, Option<LoadQueryPerf>) {
         let total_start = Instant::now();
-        let mut perf = LoadQueryPerf::default();
-        perf.built_link_graph = include_link_graph;
+        let mut perf = LoadQueryPerf {
+            built_link_graph: include_link_graph,
+            ..LoadQueryPerf::default()
+        };
 
         let try_open_start = Instant::now();
         let conn = self.try_open_cache();

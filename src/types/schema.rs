@@ -45,6 +45,8 @@ pub enum GeneratedStrategy {
 #[derive(Debug, Clone)]
 pub struct TypeDef {
     pub name: String,
+    pub kind: Option<String>,
+    pub version: Option<u64>,
     pub description: Option<String>,
     pub extends: Option<String>,
     pub strict: Option<StrictMode>,
@@ -53,6 +55,9 @@ pub struct TypeDef {
     pub display_name_key: Option<String>,
     pub fields: HashMap<String, FieldDef>,
     pub match_rules: Option<MatchRules>,
+    pub json_schema: Option<serde_json::Value>,
+    pub read_defaults: HashMap<String, serde_json::Value>,
+    pub source_path: Option<String>,
 }
 
 /// Strictness mode for unknown fields.
@@ -67,6 +72,7 @@ pub enum StrictMode {
 #[derive(Debug, Clone)]
 pub struct MatchRules {
     pub path_glob: Option<String>,
+    pub path_globs: Option<Vec<String>>,
     pub fields_present: Option<Vec<String>>,
     pub where_clause: Option<serde_json::Value>,
 }

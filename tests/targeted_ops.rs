@@ -319,10 +319,7 @@ fn query_types_works_when_cache_file_types_rows_are_missing() {
         &tmp.path().join("_types/person.md"),
         "---\nname: person\nmatch:\n  where:\n    tags:\n      contains: person\nfields:\n  tags:\n    type: list\n    items:\n      type: string\n---\n",
     );
-    write_file(
-        &tmp.path().join("alice.md"),
-        "---\ntags: [person]\n---\n",
-    );
+    write_file(&tmp.path().join("alice.md"), "---\ntags: [person]\n---\n");
 
     let collection = open_collection(tmp.path());
     let rebuild = collection.cache_rebuild();

@@ -482,8 +482,12 @@ impl Collection {
             };
 
             for (field_name, field_def) in &type_def.fields {
-                // Determine the effective link field def (could be the field itself or list items)
-                let link_field = if field_def.field_type == "link" {
+                // v0.3 collection.links annotates a JSON Schema string or array; v0.2
+                // represents links directly in the field type.
+                let link_field = if field_def.validate_exists.is_some()
+                    || field_def.target.is_some()
+                    || field_def.field_type == "link"
+                {
                     Some(field_def)
                 } else if field_def.field_type == "list" {
                     field_def.items.as_ref().and_then(|item| {

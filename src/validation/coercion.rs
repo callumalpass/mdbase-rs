@@ -70,6 +70,11 @@ impl Collection {
 
         for type_name in type_names {
             if let Some(type_def) = self.types.get(type_name) {
+                for (field_name, default) in &type_def.read_defaults {
+                    if !obj.contains_key(field_name) {
+                        obj.insert(field_name.clone(), default.clone());
+                    }
+                }
                 for (field_name, field_def) in &type_def.fields {
                     if let Some(default) = &field_def.default {
                         if !obj.contains_key(field_name) {
@@ -96,6 +101,9 @@ impl Collection {
         frontmatter: &serde_json::Value,
         type_names: &[String],
     ) -> serde_json::Value {
+        if self.spec_profile == crate::SpecProfile::V03 {
+            return frontmatter.clone();
+        }
         let mut result = frontmatter.clone();
         let obj = match result.as_object_mut() {
             Some(o) => o,

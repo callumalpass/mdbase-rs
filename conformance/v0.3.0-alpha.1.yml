@@ -1,0 +1,78 @@
+kind: mdbase.conformance
+status: verified
+implementation:
+  id: mdbase-rs
+  name: mdbase Rust implementation
+  version: 0.3.0-alpha.1
+  language: Rust
+  target: crate
+  url: https://github.com/callumalpass/mdbase-rs
+spec_version: 0.3.0
+profiles:
+  - core_read
+  - collection_semantics
+json_schema:
+  dialect: https://json-schema.org/draft/2020-12/schema
+  keywords:
+    - type
+    - required
+    - properties
+    - additionalProperties
+    - items
+    - enum
+    - const
+    - oneOf
+    - anyOf
+    - allOf
+    - if
+    - then
+    - else
+    - minimum
+    - maximum
+    - exclusiveMinimum
+    - exclusiveMaximum
+    - multipleOf
+    - minLength
+    - maxLength
+    - pattern
+    - minItems
+    - maxItems
+    - uniqueItems
+    - $defs
+    - $ref
+    - title
+    - description
+    - default
+    - examples
+  formats:
+    - date
+    - date-time
+    - time
+  remote_refs: false
+compatibility:
+  v0_2_read: true
+  v0_2_migrate: false
+limits:
+  external_schema_refs: false
+  schema_ref_roots:
+    - collection_root
+    - ancestor_pack_schemas/v0.3
+  operation_surface: v03_operations
+evidence:
+  - kind: conformance_suite
+    command: MDBASE_REQUIRE_V03_CONFORMANCE=1 cargo test
+    result: pass
+    verified_at: "2026-07-16T22:27:44+10:00"
+    artifact: tests/v03_conformance.rs
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: test_suite
+    command: cargo clippy --all-targets --all-features -- -D warnings
+    result: pass
+    verified_at: "2026-07-16T22:27:44+10:00"
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: package_smoke
+    command: cargo package --allow-dirty
+    result: pass
+    verified_at: "2026-07-16T22:27:44+10:00"
+    artifact: target/package/mdbase-0.3.0-alpha.1.crate
+    environment: Linux x86_64, Rust 1.94.0

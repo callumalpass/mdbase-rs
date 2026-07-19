@@ -14,8 +14,8 @@ impl Collection {
             Ok(parsed) => parsed,
             Err(err) => return err,
         };
-        if let Err(msg) = ensure_safe_relative_path(&input.path) {
-            return op_error(INVALID_PATH, msg);
+        if let Err(error) = ensure_safe_relative_path(&input.path, self.spec_profile) {
+            return error;
         }
 
         // Check exclusions
@@ -118,7 +118,15 @@ impl Collection {
                 issues: Vec::new(),
             }
         } else {
-            self.validate(&effective, &type_names, &input.path)
+            self.validate(
+                if self.spec_profile == crate::SpecProfile::V03 {
+                    &raw_frontmatter
+                } else {
+                    &effective
+                },
+                &type_names,
+                &input.path,
+            )
         };
         let issues_json: Vec<serde_json::Value> =
             validation.issues.iter().map(issue_to_json).collect();

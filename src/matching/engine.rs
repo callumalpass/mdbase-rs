@@ -12,6 +12,14 @@ pub fn matches_rules(rules: &MatchRules, rel_path: &str, frontmatter: &serde_jso
             return false;
         }
     }
+    if let Some(ref path_globs) = rules.path_globs {
+        if !path_globs
+            .iter()
+            .any(|path_glob| matches_path_glob(rel_path, path_glob))
+        {
+            return false;
+        }
+    }
 
     if let Some(ref fields_present) = rules.fields_present {
         if !check_fields_present(frontmatter, fields_present) {
@@ -26,7 +34,10 @@ pub fn matches_rules(rules: &MatchRules, rel_path: &str, frontmatter: &serde_jso
     }
 
     // At least one condition must be specified
-    rules.path_glob.is_some() || rules.fields_present.is_some() || rules.where_clause.is_some()
+    rules.path_glob.is_some()
+        || rules.path_globs.is_some()
+        || rules.fields_present.is_some()
+        || rules.where_clause.is_some()
 }
 
 /// Check if a relative path matches a glob pattern.

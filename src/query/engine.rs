@@ -84,15 +84,12 @@ impl Collection {
         let query_total_start = Instant::now();
         let mut perf_validate_where_ms = 0.0;
         let mut perf_validate_formulas_ms = 0.0;
-        let perf_load_query_data_ms: f64;
-        let perf_loop_total_ms: f64;
         let mut perf_computed_fields_ms = 0.0;
         let mut perf_formula_order_ms = 0.0;
         let mut perf_formula_eval_ms = 0.0;
         let mut perf_where_eval_ms = 0.0;
         let mut perf_body_extract_ms = 0.0;
         let mut perf_entry_build_ms = 0.0;
-        let perf_sort_ms: f64;
         let mut perf_groupby_ms = 0.0;
         let mut perf_pagination_ms = 0.0;
         let mut perf_summaries_ms = 0.0;
@@ -228,7 +225,7 @@ impl Collection {
         let load_start = Instant::now();
         let ((file_records, all_files_arc, backlinks_arc), load_query_perf) =
             self.load_query_data_profiled(profile_query, needs_link_graph);
-        perf_load_query_data_ms = elapsed_ms(load_start);
+        let perf_load_query_data_ms = elapsed_ms(load_start);
 
         let mut candidates: Vec<serde_json::Value> = Vec::new();
 
@@ -419,7 +416,7 @@ impl Collection {
             candidates.push(entry);
             perf_entry_build_ms += elapsed_ms(entry_build_start);
         }
-        perf_loop_total_ms = elapsed_ms(loop_start);
+        let perf_loop_total_ms = elapsed_ms(loop_start);
 
         // Sort
         let sort_start = Instant::now();
@@ -459,7 +456,7 @@ impl Collection {
                 ap.cmp(bp)
             });
         }
-        perf_sort_ms = elapsed_ms(sort_start);
+        let perf_sort_ms = elapsed_ms(sort_start);
 
         // GroupBy handling
         if let Some(gb) = group_by {

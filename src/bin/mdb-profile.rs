@@ -11,50 +11,60 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const TASK_TYPE_DEF: &str = r#"---
+kind: mdbase.type
 name: task
+version: 1
 description: Synthetic task type for profiling
-strict: false
-fields:
-  title:
-    type: string
-    required: true
-  status:
-    type: enum
-    values: [open, in-progress, done]
-    default: open
-  priority:
-    type: integer
-    min: 1
-    max: 5
-    default: 3
-  points:
-    type: integer
-    min: 0
-    max: 13
-    default: 1
-  project:
-    type: link
-  id:
-    type: string
-  tags:
-    type: list
-    items:
-      type: string
+match:
+  path_glob: ["tasks/*.md", "scratch/*.md"]
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [type, title]
+    additionalProperties: false
+    properties:
+      type: { const: task }
+      id: { type: string }
+      title: { type: string, minLength: 1 }
+      status: { enum: [open, in-progress, done] }
+      priority: { type: integer, minimum: 1, maximum: 5 }
+      points: { type: integer, minimum: 0, maximum: 13 }
+      project: { type: string }
+      tags:
+        type: array
+        items: { type: string }
+collection:
+  read_defaults:
+    status: open
+    priority: 3
+    points: 1
+  links:
+    project:
+      target_type: project
+      validate_exists: true
 ---
 
 # Task
 "#;
 
 const PROJECT_TYPE_DEF: &str = r#"---
+kind: mdbase.type
 name: project
+version: 1
 description: Synthetic project type for profiling
-strict: false
-fields:
-  title:
-    type: string
-    required: true
-  id:
-    type: string
+match:
+  path_glob: "projects/*.md"
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [type, id, title]
+    additionalProperties: false
+    properties:
+      type: { const: project }
+      id: { type: string }
+      title: { type: string, minLength: 1 }
 ---
 
 # Project
@@ -335,13 +345,11 @@ fn build_fixture(root: &Path, args: &Args) -> Result<FixtureData, String> {
     fs::create_dir_all(root.join("_types"))
         .map_err(|e| format!("Failed to create _types folder in {}: {e}", root.display()))?;
 
-    let config = r#"spec_version: "0.2.0"
+    let config = r#"spec_version: "0.3.0"
 name: "Profiler"
 settings:
   types_folder: "_types"
-  default_validation: "error"
-  default_strict: false
-  rename_update_refs: true
+  validation: "error"
   exclude:
     - "_types"
 "#;

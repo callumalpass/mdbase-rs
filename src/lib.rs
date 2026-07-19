@@ -17,6 +17,7 @@ pub mod matching;
 pub mod operations;
 pub mod query;
 pub mod types;
+pub mod v03;
 pub mod validation;
 pub mod watch;
 
@@ -49,6 +50,12 @@ pub struct Settings {
     pub cache_folder: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecProfile {
+    V02,
+    V03,
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -75,6 +82,7 @@ impl Default for Settings {
 /// A loaded mdbase collection.
 pub struct Collection {
     pub root: PathBuf,
+    pub spec_profile: SpecProfile,
     pub settings: Settings,
     pub types: HashMap<String, TypeDef>,
     pub type_warnings: Vec<String>,
@@ -90,6 +98,10 @@ impl Collection {
 
         let config = &config_result["config"];
         let settings_json = &config["settings"];
+        let spec_profile = match config["spec_profile"].as_str() {
+            Some("v0.3") => SpecProfile::V03,
+            _ => SpecProfile::V02,
+        };
 
         let settings = Settings {
             extensions: settings_json["extensions"]
@@ -194,6 +206,7 @@ impl Collection {
 
         Ok(Collection {
             root: root.to_path_buf(),
+            spec_profile,
             settings,
             types,
             type_warnings,

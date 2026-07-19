@@ -1,7 +1,22 @@
 [package]
 name = "mdbase"
-version = "0.1.0"
+version = "0.3.0-alpha.1"
 edition = "2021"
+description = "Rust implementation of the mdbase specification"
+license = "MIT"
+repository = "https://github.com/callumalpass/mdbase-rs"
+homepage = "https://github.com/callumalpass/mdbase-rs"
+include = [
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/conformance/**",
+    "/LICENSE",
+    "/schemas/v0.3/**",
+    "/scripts/**",
+    "/src/**",
+    "/tests/**",
+]
 
 [[bin]]
 name = "mdb"
@@ -12,6 +27,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
+sha2 = "0.10"
 glob = "0.3"
 regex = "1"
 fancy-regex = "0.14"
@@ -21,6 +37,8 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
+jsonschema = { version = "0.18", features = ["draft202012"] }
+walkdir = "2"
 
 [dev-dependencies]
 insta = "1"

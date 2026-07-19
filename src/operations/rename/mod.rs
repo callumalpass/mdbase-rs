@@ -25,11 +25,11 @@ impl Collection {
             simulate_before_ref_update,
             last_known_ref_mtimes,
         } = input;
-        if let Err(msg) = ensure_safe_relative_path(&from) {
-            return op_error(INVALID_PATH, msg);
+        if let Err(error) = ensure_safe_relative_path(&from, self.spec_profile) {
+            return error;
         }
-        if let Err(msg) = ensure_safe_relative_path(&to) {
-            return op_error(INVALID_PATH, msg);
+        if let Err(error) = ensure_safe_relative_path(&to, self.spec_profile) {
+            return error;
         }
 
         let from_path = self.root.join(&from);

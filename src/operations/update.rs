@@ -20,8 +20,8 @@ impl Collection {
             body: new_body,
             last_known_mtime,
         } = input;
-        if let Err(msg) = ensure_safe_relative_path(&path) {
-            return op_error(INVALID_PATH, msg);
+        if let Err(error) = ensure_safe_relative_path(&path, self.spec_profile) {
+            return error;
         }
 
         let new_body = new_body.as_deref();

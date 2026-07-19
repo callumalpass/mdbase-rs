@@ -52,6 +52,23 @@ fn load_config_internal(collection_root: &Path, allow_future_minor: bool) -> ser
         Ok(v) => v,
         Err(e) => return e,
     };
+    let spec_profile = if crate::v03::is_supported_spec_version(&spec_version)
+        || is_future_v03_compatible(&spec_version, allow_future_minor)
+    {
+        "v0.3"
+    } else {
+        "v0.2"
+    };
+
+    if spec_profile == "v0.3" {
+        let config_value = crate::frontmatter::parser::yaml_to_json(&yaml);
+        if let Some(diagnostic) = crate::v03::validate_config(&config_value, "mdbase.yaml")
+            .into_iter()
+            .find(|diagnostic| diagnostic.severity == "error")
+        {
+            return error_json(&diagnostic.code, &diagnostic.message);
+        }
+    }
 
     // Optional top-level fields
     let name = map
@@ -70,10 +87,10 @@ fn load_config_internal(collection_root: &Path, allow_future_minor: bool) -> ser
     };
 
     // Unknown top-level keys
-    let known_top = ["spec_version", "name", "description", "settings"];
+    let known_top = ["spec_version", "name", "description", "settings", "runtime"];
     for (key, _) in map {
         if let serde_yaml::Value::String(k) = key {
-            if !known_top.contains(&k.as_str()) {
+            if !known_top.contains(&k.as_str()) && !k.starts_with("x-") {
                 warnings.push(format!("Unknown top-level key: {}", k));
             }
         }
@@ -82,6 +99,7 @@ fn load_config_internal(collection_root: &Path, allow_future_minor: bool) -> ser
     // Build result
     let mut config = serde_json::json!({
         "spec_version": spec_version,
+        "spec_profile": spec_profile,
         "settings": settings,
     });
     if let Some(n) = name {
@@ -89,6 +107,9 @@ fn load_config_internal(collection_root: &Path, allow_future_minor: bool) -> ser
     }
     if let Some(d) = description {
         config["description"] = serde_json::Value::String(d);
+    }
+    if let Some(runtime) = map.get(ykey("runtime")) {
+        config["runtime"] = crate::frontmatter::parser::yaml_to_json(runtime);
     }
 
     let mut result = serde_json::json!({
@@ -139,69 +160,69 @@ fn validate_version(
     warnings: &mut Vec<String>,
     allow_future_minor: bool,
 ) -> Result<String, serde_json::Value> {
-    let parts: Vec<&str> = version.split('.').collect();
-    let supported_major = 0u32;
-    let supported_minor = 2u32;
-    let supported_patch = 1u32;
-
-    let (major, minor, mut patch) = match parts.len() {
-        2 => {
-            let major = parts[0]
-                .parse::<u32>()
-                .map_err(|_| error_json("invalid_config", "Invalid spec_version format"))?;
-            let minor = parts[1]
-                .parse::<u32>()
-                .map_err(|_| error_json("invalid_config", "Invalid spec_version format"))?;
+    if crate::v03::is_supported_spec_version(version) {
+        if version != crate::v03::SPEC_VERSION {
             warnings.push(format!(
-                "spec_version '{}' interpreted as major.minor alias",
-                version
+                "spec_version '{}' is a compatible v0.3 prerelease; new collections use '{}'",
+                version,
+                crate::v03::SPEC_VERSION
             ));
-            (major, minor, 0u32)
         }
-        3 => {
-            let major = parts[0]
-                .parse::<u32>()
-                .map_err(|_| error_json("invalid_config", "Invalid spec_version format"))?;
-            let minor = parts[1]
-                .parse::<u32>()
-                .map_err(|_| error_json("invalid_config", "Invalid spec_version format"))?;
-            let patch = parts[2]
-                .parse::<u32>()
-                .map_err(|_| error_json("invalid_config", "Invalid spec_version format"))?;
-            (major, minor, patch)
-        }
-        _ => return Err(error_json("invalid_config", "Invalid spec_version format")),
-    };
+        return Ok(version.to_string());
+    }
+    if version == "0.2" {
+        warnings.push("spec_version '0.2' interpreted as major.minor alias".to_string());
+        return Ok("0.2.1".to_string());
+    }
 
-    if major != supported_major {
-        return Err(error_json(
-            "unsupported_version",
-            &format!(
-                "Unsupported spec version: {}. This implementation supports 0.2.x",
-                version
-            ),
+    let expression = regex::Regex::new(r"^(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z0-9.-]+))?$")
+        .expect("valid spec version expression");
+    let captures = expression
+        .captures(version)
+        .ok_or_else(|| error_json("invalid_config", "Invalid spec_version format"))?;
+    let major = captures[1]
+        .parse::<u32>()
+        .map_err(|_| error_json("invalid_config", "Invalid spec_version format"))?;
+    let minor = captures[2]
+        .parse::<u32>()
+        .map_err(|_| error_json("invalid_config", "Invalid spec_version format"))?;
+    let prerelease = captures.get(4).map(|value| value.as_str());
+
+    if major == 0 && minor == 2 && prerelease.is_none() {
+        return Ok(version.to_string());
+    }
+    if allow_future_minor && major == 0 && minor > 3 && prerelease.is_none() {
+        warnings.push(format!(
+            "spec_version '{}' is newer than supported v0.3; attempting with the v0.3 profile",
+            version
         ));
-    }
-    if minor != supported_minor {
-        if allow_future_minor && minor > supported_minor {
-            // Allow forward minor versions when opening a collection
-        } else {
-            return Err(error_json(
-                "unsupported_version",
-                &format!(
-                    "Unsupported spec version: {}. This implementation supports 0.2.x",
-                    version
-                ),
-            ));
-        }
+        return Ok(version.to_string());
     }
 
-    // Canonicalize 0.2 alias to the current default patch release.
-    if parts.len() == 2 && major == supported_major && minor == supported_minor {
-        patch = supported_patch;
-    }
+    Err(error_json(
+        "unsupported_version",
+        &format!(
+            "Unsupported spec version: {} (supported: {}; legacy adapter: 0.2.x)",
+            version,
+            crate::v03::SPEC_VERSION
+        ),
+    ))
+}
 
-    Ok(format!("{}.{}.{}", major, minor, patch))
+fn is_future_v03_compatible(version: &str, allow_future_minor: bool) -> bool {
+    if !allow_future_minor {
+        return false;
+    }
+    let expression =
+        regex::Regex::new(r"^(\d+)\.(\d+)\.(\d+)$").expect("valid spec version expression");
+    let Some(captures) = expression.captures(version) else {
+        return false;
+    };
+    captures.get(1).is_some_and(|value| value.as_str() == "0")
+        && captures
+            .get(2)
+            .and_then(|value| value.as_str().parse::<u32>().ok())
+            .is_some_and(|minor| minor > 3)
 }
 
 fn parse_settings(
@@ -214,7 +235,25 @@ fn parse_settings(
         Some(_) => return Err(error_json("invalid_config", "settings must be a mapping")),
     };
 
-    // extensions
+    // v0.2 extensions or the complete v0.3 record_extensions set.
+    let record_extensions = match get_setting(settings_map, "record_extensions") {
+        Some(serde_yaml::Value::Sequence(seq)) => Some(
+            seq.iter()
+                .map(|item| {
+                    item.as_str().map(String::from).ok_or_else(|| {
+                        error_json("invalid_config", "record_extensions items must be strings")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Some(serde_yaml::Value::Null) | None => None,
+        Some(_) => {
+            return Err(error_json(
+                "invalid_config",
+                "settings.record_extensions must be a list",
+            ))
+        }
+    };
     let raw_extensions = match get_setting(settings_map, "extensions") {
         Some(serde_yaml::Value::Sequence(seq)) => {
             let mut exts = Vec::new();
@@ -242,13 +281,16 @@ fn parse_settings(
 
     // Normalize extensions: strip leading dots, warn about "md"
     let mut extensions = Vec::new();
-    for ext in &raw_extensions {
+    for ext in record_extensions.as_ref().unwrap_or(&raw_extensions) {
         let stripped = ext.strip_prefix('.').unwrap_or(ext);
         if stripped == "md" {
-            warnings.push(format!(
-                "'{}' in extensions is redundant (md is always included)",
-                ext
-            ));
+            if record_extensions.is_none() {
+                warnings.push(format!(
+                    "'{}' in extensions is redundant (md is always included)",
+                    ext
+                ));
+            }
+            continue;
         }
         extensions.push(stripped.to_string());
     }
@@ -340,7 +382,9 @@ fn parse_settings(
     };
 
     // default_validation (check both settings and top level)
-    let default_validation = match get_setting_or_top(settings_map, top_map, "default_validation") {
+    let validation_value = get_setting_or_top(settings_map, top_map, "default_validation")
+        .or_else(|| get_setting(settings_map, "validation"));
+    let default_validation = match validation_value {
         Some(serde_yaml::Value::String(s)) => match s.as_str() {
             "off" | "warn" | "error" => s.clone(),
             _ => {
@@ -468,6 +512,7 @@ fn parse_settings(
     if let Some(smap) = settings_map {
         let known = [
             "extensions",
+            "record_extensions",
             "exclude",
             "include_subfolders",
             "types_folder",
@@ -475,6 +520,7 @@ fn parse_settings(
             "explicit_type_keys",
             "write_defaults",
             "default_validation",
+            "validation",
             "default_strict",
             "timezone",
             "id_field",
@@ -494,6 +540,7 @@ fn parse_settings(
 
     Ok(serde_json::json!({
         "extensions": extensions,
+        "record_extensions": std::iter::once("md".to_string()).chain(extensions.iter().cloned()).collect::<Vec<_>>(),
         "exclude": exclude,
         "include_subfolders": include_subfolders,
         "types_folder": types_folder,

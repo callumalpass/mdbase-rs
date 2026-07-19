@@ -1,0 +1,727 @@
+//! mdbase v0.3 schema loading and canonical diagnostics.
+
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use jsonschema::error::{ValidationError, ValidationErrorKind};
+use jsonschema::{Draft, JSONSchema};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use walkdir::{DirEntry, WalkDir};
+
+use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_to_json};
+use crate::{Collection, SpecProfile};
+
+mod operations;
+
+pub use operations::{OperationResult, Operations};
+
+pub const SPEC_VERSION: &str = "0.3.0";
+pub const PRERELEASE_SPEC_VERSIONS: &[&str] = &["0.3.0-alpha.1"];
+pub const RUNTIME_PROFILE_VERSION: &str = "0.1.0";
+
+pub fn is_supported_spec_version(version: &str) -> bool {
+    version == SPEC_VERSION || PRERELEASE_SPEC_VERSIONS.contains(&version)
+}
+
+const CONFIG_SCHEMA_ID: &str = "https://mdbase.dev/schemas/v0.3/config.schema.json";
+const TYPE_FILE_SCHEMA_ID: &str = "https://mdbase.dev/schemas/v0.3/type-file.schema.json";
+
+const CONFIG_SCHEMA: &str = include_str!("../../schemas/v0.3/config.schema.json");
+const DIAGNOSTIC_SCHEMA: &str = include_str!("../../schemas/v0.3/diagnostic.schema.json");
+const OPERATION_RESULT_SCHEMA: &str =
+    include_str!("../../schemas/v0.3/operation-result.schema.json");
+const QUERY_RESULT_SCHEMA: &str = include_str!("../../schemas/v0.3/query-result.schema.json");
+const TYPE_FILE_SCHEMA: &str = include_str!("../../schemas/v0.3/type-file.schema.json");
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Diagnostic {
+    pub severity: String,
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+impl Diagnostic {
+    pub fn error(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        path: Option<String>,
+    ) -> Self {
+        Self {
+            severity: "error".to_string(),
+            code: code.into(),
+            message: message.into(),
+            path,
+            field: None,
+            type_name: None,
+            schema_location: None,
+            details: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeFile {
+    pub path: String,
+    pub name: String,
+    pub version: Option<u64>,
+    pub frontmatter: Value,
+    pub schema: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectionReport {
+    pub valid: bool,
+    pub config: Option<Value>,
+    pub types: Vec<TypeFile>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+pub fn validate_canonical_schemas() -> Result<(), String> {
+    for (name, source) in [
+        ("config", CONFIG_SCHEMA),
+        ("diagnostic", DIAGNOSTIC_SCHEMA),
+        ("operation-result", OPERATION_RESULT_SCHEMA),
+        ("query-result", QUERY_RESULT_SCHEMA),
+        ("type-file", TYPE_FILE_SCHEMA),
+    ] {
+        let schema: Value = serde_json::from_str(source)
+            .map_err(|error| format!("{name} schema is not valid JSON: {error}"))?;
+        compile_schema(&schema)
+            .map_err(|error| format!("{name} schema is not valid JSON Schema 2020-12: {error}"))?;
+    }
+    Ok(())
+}
+
+pub fn validate_config(value: &Value, path: &str) -> Vec<Diagnostic> {
+    let mut canonical = value.clone();
+    if canonical.get("spec_version").and_then(Value::as_str) != Some(SPEC_VERSION)
+        && canonical
+            .get("spec_version")
+            .and_then(Value::as_str)
+            .is_some_and(is_supported_spec_version)
+    {
+        canonical["spec_version"] = Value::String(SPEC_VERSION.to_string());
+    }
+    validate_canonical_value(CONFIG_SCHEMA, &canonical, path, CONFIG_SCHEMA_ID, None)
+}
+
+pub fn validate_type_file(value: &Value, path: &str) -> Vec<Diagnostic> {
+    let type_name = value.get("name").and_then(Value::as_str);
+    validate_canonical_value(
+        TYPE_FILE_SCHEMA,
+        value,
+        path,
+        TYPE_FILE_SCHEMA_ID,
+        type_name,
+    )
+}
+
+pub fn validate_record(type_file: &TypeFile, value: &Value, path: &str) -> Vec<Diagnostic> {
+    validate_value(
+        &type_file.schema,
+        value,
+        path,
+        "embedded://type/schema",
+        Some(&type_file.name),
+    )
+}
+
+pub fn validate_schema_instance(
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    type_name: Option<&str>,
+) -> Vec<Diagnostic> {
+    validate_value(schema, value, path, "embedded://type/schema", type_name)
+}
+
+pub fn inspect_collection(root: &Path) -> CollectionReport {
+    let mut diagnostics = Vec::new();
+    let mut config = None;
+    let mut types = Vec::new();
+    let config_path = root.join("mdbase.yaml");
+    let config_label = "mdbase.yaml";
+
+    match read_yaml_document(&config_path, config_label) {
+        Ok(value) => {
+            diagnostics.extend(validate_config(&value, config_label));
+            config = Some(value);
+        }
+        Err(diagnostic) => diagnostics.push(*diagnostic),
+    }
+
+    let types_folder = config
+        .as_ref()
+        .and_then(|value| value.pointer("/settings/types_folder"))
+        .and_then(Value::as_str)
+        .unwrap_or("_types");
+    let types_root = root.join(types_folder);
+    let mut names = HashSet::new();
+
+    if types_root.exists() {
+        let walker = WalkDir::new(&types_root)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(should_descend);
+        for entry in walker {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    diagnostics.push(Diagnostic::error(
+                        "invalid_type_definition",
+                        error.to_string(),
+                        None,
+                    ));
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("md")
+            {
+                continue;
+            }
+            let relative = relative_path(root, entry.path());
+            match fs::read_to_string(entry.path()) {
+                Ok(text) => match parse_type_file(&text, entry.path(), root, &relative) {
+                    Ok(type_file) => {
+                        if !names.insert(type_file.name.to_ascii_lowercase()) {
+                            diagnostics.push(Diagnostic::error(
+                                "duplicate_type",
+                                format!("Type '{}' is defined more than once.", type_file.name),
+                                Some(relative),
+                            ));
+                        } else {
+                            types.push(type_file);
+                        }
+                    }
+                    Err(mut type_diagnostics) => diagnostics.append(&mut type_diagnostics),
+                },
+                Err(error) => diagnostics.push(Diagnostic::error(
+                    "invalid_type_definition",
+                    format!("Failed to read type file: {error}"),
+                    Some(relative),
+                )),
+            }
+        }
+    }
+
+    diagnostics.sort_by(|left, right| {
+        (
+            left.path.as_deref().unwrap_or(""),
+            left.code.as_str(),
+            left.field.as_deref().unwrap_or(""),
+            left.message.as_str(),
+        )
+            .cmp(&(
+                right.path.as_deref().unwrap_or(""),
+                right.code.as_str(),
+                right.field.as_deref().unwrap_or(""),
+                right.message.as_str(),
+            ))
+    });
+    let valid = !diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == "error");
+
+    CollectionReport {
+        valid,
+        config,
+        types,
+        diagnostics,
+    }
+}
+
+pub fn parse_type_file(
+    text: &str,
+    absolute_path: &Path,
+    collection_root: &Path,
+    relative_path: &str,
+) -> Result<TypeFile, Vec<Diagnostic>> {
+    let document = parse_document(text);
+    let yaml = match document.frontmatter {
+        Some(value) if is_parse_error(&value) => {
+            return Err(vec![Diagnostic::error(
+                "invalid_frontmatter",
+                "Failed to parse YAML frontmatter.",
+                Some(relative_path.to_string()),
+            )]);
+        }
+        Some(value) => value,
+        None => {
+            return Err(vec![Diagnostic::error(
+                "invalid_type_definition",
+                "Type file has no frontmatter.",
+                Some(relative_path.to_string()),
+            )]);
+        }
+    };
+    if !yaml.is_mapping() {
+        return Err(vec![Diagnostic::error(
+            "invalid_frontmatter",
+            "Type file frontmatter must be a mapping.",
+            Some(relative_path.to_string()),
+        )]);
+    }
+    let frontmatter = yaml_to_json(&yaml);
+    let mut diagnostics = validate_type_file(&frontmatter, relative_path);
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == "error")
+    {
+        return Err(diagnostics);
+    }
+
+    let name = frontmatter
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let version = frontmatter.get("version").and_then(Value::as_u64);
+    let schema_wrapper = frontmatter.get("schema").and_then(Value::as_object);
+    let schema = if let Some(value) = schema_wrapper.and_then(|wrapper| wrapper.get("value")) {
+        value.clone()
+    } else if let Some(reference) = schema_wrapper
+        .and_then(|wrapper| wrapper.get("ref"))
+        .and_then(Value::as_str)
+    {
+        match resolve_schema_ref(reference, absolute_path, collection_root) {
+            Ok(value) => value,
+            Err(diagnostic) => {
+                diagnostics.push(*diagnostic);
+                return Err(diagnostics);
+            }
+        }
+    } else {
+        return Err(vec![Diagnostic::error(
+            "invalid_type_definition",
+            "Type file must define schema.value or schema.ref.",
+            Some(relative_path.to_string()),
+        )]);
+    };
+
+    if let Some((code, reference)) = unsupported_schema_reference(&schema) {
+        diagnostics.push(Diagnostic::error(
+            code,
+            if code == "schema_ref_forbidden" {
+                format!("Type '{name}' contains forbidden JSON Schema reference '{reference}'.")
+            } else {
+                format!(
+                    "Type '{name}' requires the optional external_schema_refs feature for '{reference}'."
+                )
+            },
+            Some(relative_path.to_string()),
+        ));
+        return Err(diagnostics);
+    }
+
+    if let Err(error) = compile_schema(&schema) {
+        diagnostics.push(Diagnostic {
+            severity: "error".to_string(),
+            code: "invalid_embedded_schema".to_string(),
+            message: error,
+            path: Some(relative_path.to_string()),
+            field: Some("schema".to_string()),
+            type_name: Some(name.clone()),
+            schema_location: None,
+            details: None,
+        });
+        return Err(diagnostics);
+    }
+
+    Ok(TypeFile {
+        path: relative_path.to_string(),
+        name,
+        version,
+        frontmatter,
+        schema,
+    })
+}
+
+fn read_yaml_document(path: &Path, relative_path: &str) -> Result<Value, Box<Diagnostic>> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        Box::new(Diagnostic::error(
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "missing_config"
+            } else {
+                "invalid_config"
+            },
+            format!("Failed to read {relative_path}: {error}"),
+            Some(relative_path.to_string()),
+        ))
+    })?;
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|error| {
+        Box::new(Diagnostic::error(
+            "invalid_config",
+            format!("Failed to parse {relative_path}: {error}"),
+            Some(relative_path.to_string()),
+        ))
+    })?;
+    let value = yaml_to_json(&yaml);
+    if !value.is_object() {
+        return Err(Box::new(Diagnostic::error(
+            "invalid_config",
+            "Configuration must be a mapping.",
+            Some(relative_path.to_string()),
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_canonical_value(
+    schema_source: &str,
+    value: &Value,
+    path: &str,
+    schema_id: &str,
+    type_name: Option<&str>,
+) -> Vec<Diagnostic> {
+    let schema: Value = match serde_json::from_str(schema_source) {
+        Ok(schema) => schema,
+        Err(error) => {
+            return vec![Diagnostic::error(
+                "invalid_schema",
+                error.to_string(),
+                Some(path.to_string()),
+            )]
+        }
+    };
+    validate_value(&schema, value, path, schema_id, type_name)
+}
+
+fn validate_value(
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    schema_id: &str,
+    type_name: Option<&str>,
+) -> Vec<Diagnostic> {
+    if let Some((code, reference)) = unsupported_schema_reference(schema) {
+        return vec![Diagnostic::error(
+            code,
+            if code == "schema_ref_forbidden" {
+                format!("Forbidden JSON Schema reference: {reference}")
+            } else {
+                format!("The optional external_schema_refs feature is required for: {reference}")
+            },
+            Some(path.to_string()),
+        )];
+    }
+    let compiled = match compile_schema(schema) {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            return vec![Diagnostic::error(
+                "invalid_schema",
+                error,
+                Some(path.to_string()),
+            )]
+        }
+    };
+    let diagnostics = match compiled.validate(value) {
+        Ok(()) => Vec::new(),
+        Err(errors) => errors
+            .map(|error| validation_diagnostic(error, path, schema_id, type_name))
+            .collect(),
+    };
+    diagnostics
+}
+
+fn validation_diagnostic(
+    error: ValidationError<'_>,
+    path: &str,
+    schema_id: &str,
+    type_name: Option<&str>,
+) -> Diagnostic {
+    let field = diagnostic_field(&error);
+    Diagnostic {
+        severity: "error".to_string(),
+        code: diagnostic_code(&error.kind).to_string(),
+        message: error.to_string(),
+        path: Some(path.to_string()),
+        field,
+        type_name: type_name.map(str::to_string),
+        schema_location: Some(format!("{schema_id}#{}", error.schema_path)),
+        details: Some(serde_json::json!({
+            "instance_path": error.instance_path.to_string(),
+            "schema_path": error.schema_path.to_string(),
+        })),
+    }
+}
+
+fn diagnostic_code(kind: &ValidationErrorKind) -> &'static str {
+    match kind {
+        ValidationErrorKind::Required { .. } => "schema_required",
+        ValidationErrorKind::AdditionalProperties { .. } => "schema_additional_properties",
+        ValidationErrorKind::UnevaluatedProperties { .. } => "schema_unevaluated_properties",
+        ValidationErrorKind::Type { .. } => "schema_type",
+        ValidationErrorKind::Constant { .. } => "schema_const",
+        ValidationErrorKind::Enum { .. } => "schema_enum",
+        ValidationErrorKind::Pattern { .. } => "schema_pattern",
+        ValidationErrorKind::MinLength { .. } => "schema_min_length",
+        ValidationErrorKind::MaxLength { .. } => "schema_max_length",
+        ValidationErrorKind::Minimum { .. } => "schema_minimum",
+        ValidationErrorKind::Maximum { .. } => "schema_maximum",
+        ValidationErrorKind::MultipleOf { .. } => "schema_multiple_of",
+        ValidationErrorKind::ExclusiveMinimum { .. } => "schema_exclusive_minimum",
+        ValidationErrorKind::ExclusiveMaximum { .. } => "schema_exclusive_maximum",
+        ValidationErrorKind::MinItems { .. } => "schema_min_items",
+        ValidationErrorKind::MaxItems { .. } => "schema_max_items",
+        ValidationErrorKind::UniqueItems => "schema_unique_items",
+        ValidationErrorKind::OneOfMultipleValid | ValidationErrorKind::OneOfNotValid => {
+            "schema_one_of"
+        }
+        ValidationErrorKind::AnyOf => "schema_any_of",
+        ValidationErrorKind::Not { .. } => "schema_not",
+        ValidationErrorKind::Format { .. } => "format_invalid",
+        _ => "schema_invalid",
+    }
+}
+
+fn diagnostic_field(error: &ValidationError<'_>) -> Option<String> {
+    match &error.kind {
+        ValidationErrorKind::Required { property } => property.as_str().map(str::to_string),
+        ValidationErrorKind::AdditionalProperties { unexpected }
+        | ValidationErrorKind::UnevaluatedProperties { unexpected } => unexpected.first().cloned(),
+        _ => error
+            .instance_path
+            .to_string()
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .map(decode_pointer_segment),
+    }
+}
+
+fn decode_pointer_segment(segment: &str) -> String {
+    segment.replace("~1", "/").replace("~0", "~")
+}
+
+fn compile_schema(schema: &Value) -> Result<JSONSchema, String> {
+    JSONSchema::options()
+        .with_draft(Draft::Draft202012)
+        .should_validate_formats(true)
+        .compile(schema)
+        .map_err(|error| error.to_string())
+}
+
+fn resolve_schema_ref(
+    reference: &str,
+    type_file_path: &Path,
+    collection_root: &Path,
+) -> Result<Value, Box<Diagnostic>> {
+    if is_forbidden_reference(reference) {
+        return Err(Box::new(Diagnostic::error(
+            "schema_ref_forbidden",
+            format!("Only local schema refs are supported: {reference}"),
+            Some(relative_path(collection_root, type_file_path)),
+        )));
+    }
+    let (path_reference, fragment) = reference
+        .split_once('#')
+        .map_or((reference, None), |(path, fragment)| (path, Some(fragment)));
+    if path_reference.is_empty() {
+        return Err(Box::new(Diagnostic::error(
+            "schema_ref_unresolved",
+            "Type wrapper schema.ref must name a local JSON file.",
+            Some(relative_path(collection_root, type_file_path)),
+        )));
+    }
+    let Some(parent) = type_file_path.parent() else {
+        return Err(Box::new(Diagnostic::error(
+            "schema_ref_unresolved",
+            format!("Cannot resolve schema ref: {reference}"),
+            Some(relative_path(collection_root, type_file_path)),
+        )));
+    };
+    let candidate = parent.join(path_reference);
+    let canonical = candidate.canonicalize().map_err(|error| {
+        Box::new(Diagnostic::error(
+            "schema_ref_unresolved",
+            format!("Cannot resolve schema ref {reference}: {error}"),
+            Some(relative_path(collection_root, type_file_path)),
+        ))
+    })?;
+    if !is_allowed_schema_path(&canonical, collection_root) {
+        return Err(Box::new(Diagnostic::error(
+            "schema_ref_forbidden",
+            format!(
+                "Schema ref escapes the collection and allowed package schema roots: {reference}"
+            ),
+            Some(relative_path(collection_root, type_file_path)),
+        )));
+    }
+    let text = fs::read_to_string(&canonical).map_err(|error| {
+        Box::new(Diagnostic::error(
+            "schema_ref_unresolved",
+            format!("Cannot read schema ref {reference}: {error}"),
+            Some(relative_path(collection_root, type_file_path)),
+        ))
+    })?;
+    let document: Value = serde_json::from_str(&text).map_err(|error| {
+        Box::new(Diagnostic::error(
+            "invalid_embedded_schema",
+            format!("Referenced schema is not valid JSON: {error}"),
+            Some(relative_path(collection_root, type_file_path)),
+        ))
+    })?;
+    let selected = match fragment {
+        None | Some("") => &document,
+        Some(pointer) if pointer.starts_with('/') => {
+            document.pointer(pointer).ok_or_else(|| {
+                Box::new(Diagnostic::error(
+                    "schema_ref_unresolved",
+                    format!("Schema ref points to a missing JSON Pointer target: {reference}"),
+                    Some(relative_path(collection_root, type_file_path)),
+                ))
+            })?
+        }
+        Some(_) => {
+            return Err(Box::new(Diagnostic::error(
+                "schema_ref_unresolved",
+                format!("Schema ref fragment must be a JSON Pointer: {reference}"),
+                Some(relative_path(collection_root, type_file_path)),
+            )))
+        }
+    };
+    if !selected.is_object() {
+        return Err(Box::new(Diagnostic::error(
+            "invalid_embedded_schema",
+            format!("Schema ref must resolve to a JSON Schema object: {reference}"),
+            Some(relative_path(collection_root, type_file_path)),
+        )));
+    }
+    Ok(selected.clone())
+}
+
+fn unsupported_schema_reference(schema: &Value) -> Option<(&'static str, &str)> {
+    match schema {
+        Value::Array(values) => values.iter().find_map(unsupported_schema_reference),
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                if !reference.starts_with('#') {
+                    let code = if is_forbidden_reference(reference) {
+                        "schema_ref_forbidden"
+                    } else {
+                        "unsupported_profile"
+                    };
+                    return Some((code, reference));
+                }
+            }
+            object.values().find_map(unsupported_schema_reference)
+        }
+        _ => None,
+    }
+}
+
+fn is_forbidden_reference(reference: &str) -> bool {
+    let has_scheme = reference.split_once(':').is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme.chars().enumerate().all(|(index, character)| {
+                if index == 0 {
+                    character.is_ascii_alphabetic()
+                } else {
+                    character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+                }
+            })
+    });
+    has_scheme || Path::new(reference).is_absolute() || reference.starts_with("//")
+}
+
+fn is_allowed_schema_path(candidate: &Path, collection_root: &Path) -> bool {
+    if let Ok(root) = collection_root.canonicalize() {
+        if candidate.starts_with(root) {
+            return true;
+        }
+    }
+    let mut current = Some(collection_root);
+    while let Some(directory) = current {
+        let schema_root = directory.join("schemas/v0.3");
+        if let Ok(schema_root) = schema_root.canonicalize() {
+            if candidate.starts_with(schema_root) {
+                return true;
+            }
+        }
+        current = directory.parent();
+    }
+    false
+}
+
+fn should_descend(entry: &DirEntry) -> bool {
+    if !entry.file_type().is_dir() {
+        return true;
+    }
+    !matches!(
+        entry.file_name().to_str(),
+        Some(".git" | ".mdbase" | "node_modules")
+    )
+}
+
+fn relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+pub fn schema_path(name: &str) -> Option<PathBuf> {
+    match name {
+        "config" => Some(PathBuf::from("schemas/v0.3/config.schema.json")),
+        "diagnostic" => Some(PathBuf::from("schemas/v0.3/diagnostic.schema.json")),
+        "operation-result" => Some(PathBuf::from("schemas/v0.3/operation-result.schema.json")),
+        "query-result" => Some(PathBuf::from("schemas/v0.3/query-result.schema.json")),
+        "type-file" => Some(PathBuf::from("schemas/v0.3/type-file.schema.json")),
+        _ => None,
+    }
+}
+
+impl Collection {
+    pub fn v03_operations(&self) -> Result<Operations<'_>, Box<Diagnostic>> {
+        Operations::new(self)
+    }
+
+    pub fn validate_v03_frontmatter(
+        &self,
+        frontmatter: &Value,
+        path: &str,
+    ) -> Option<Vec<Diagnostic>> {
+        if self.spec_profile != SpecProfile::V03 {
+            return None;
+        }
+        let type_names = self.determine_types_for_path(frontmatter, Some(path));
+        let mut diagnostics = Vec::new();
+        for type_name in type_names {
+            let Some(type_definition) = self.types.get(&type_name) else {
+                diagnostics.push(Diagnostic {
+                    severity: "error".to_string(),
+                    code: "unknown_type".to_string(),
+                    message: format!("Unknown type '{type_name}'."),
+                    path: Some(path.to_string()),
+                    field: None,
+                    type_name: Some(type_name),
+                    schema_location: None,
+                    details: None,
+                });
+                continue;
+            };
+            let Some(schema) = &type_definition.json_schema else {
+                continue;
+            };
+            diagnostics.extend(validate_schema_instance(
+                schema,
+                frontmatter,
+                path,
+                Some(&type_name),
+            ));
+        }
+        Some(diagnostics)
+    }
+}

@@ -90,7 +90,7 @@ pub fn load_types_with_warnings(
         let content = std::fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read type file {:?}: {}", path, e))?;
 
-        let type_def = parse_type_file(&content, &path)?;
+        let type_def = parse_type_file(&content, &path, collection_root)?;
 
         // Validate type name
         validate_type_name(&type_def.name)?;
@@ -231,7 +231,7 @@ fn collect_type_files(
 }
 
 /// Parse a single type definition file.
-fn parse_type_file(content: &str, path: &Path) -> Result<TypeDef, String> {
+fn parse_type_file(content: &str, path: &Path, collection_root: &Path) -> Result<TypeDef, String> {
     let doc = parse_document(content);
 
     let yaml = match &doc.frontmatter {
@@ -253,6 +253,23 @@ fn parse_type_file(content: &str, path: &Path) -> Result<TypeDef, String> {
     };
 
     let ykey = |s: &str| serde_yaml::Value::String(s.to_string());
+
+    if mapping.get(ykey("kind")).and_then(|value| value.as_str()) == Some("mdbase.type") {
+        let relative_path = path
+            .strip_prefix(collection_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let type_file = crate::v03::parse_type_file(content, path, collection_root, &relative_path)
+            .map_err(|diagnostics| {
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| diagnostic.message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })?;
+        return v03_type_definition(type_file);
+    }
 
     let name = mapping
         .get(ykey("name"))
@@ -308,6 +325,8 @@ fn parse_type_file(content: &str, path: &Path) -> Result<TypeDef, String> {
 
     Ok(TypeDef {
         name,
+        kind: None,
+        version: None,
         description,
         extends,
         strict,
@@ -316,7 +335,254 @@ fn parse_type_file(content: &str, path: &Path) -> Result<TypeDef, String> {
         display_name_key,
         fields,
         match_rules,
+        json_schema: None,
+        read_defaults: HashMap::new(),
+        source_path: path
+            .strip_prefix(collection_root)
+            .ok()
+            .map(|value| value.to_string_lossy().replace('\\', "/")),
     })
+}
+
+fn v03_type_definition(type_file: crate::v03::TypeFile) -> Result<TypeDef, String> {
+    let frontmatter = type_file
+        .frontmatter
+        .as_object()
+        .ok_or_else(|| "v0.3 type file frontmatter must be an object".to_string())?;
+    let schema_object = type_file.schema.as_object().ok_or_else(|| {
+        format!(
+            "Type '{}' embedded schema must be an object",
+            type_file.name
+        )
+    })?;
+    let required: std::collections::HashSet<String> = schema_object
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(String::from)
+        .collect();
+    let mut fields = HashMap::new();
+    if let Some(properties) = schema_object
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (name, schema) in properties {
+            let mut field = field_from_json_schema(schema)?;
+            field.required = required.contains(name);
+            fields.insert(name.clone(), field);
+        }
+    }
+
+    let mut match_rules = frontmatter.get("match").map(parse_v03_match_rules);
+    if match_rules.as_ref().is_some_and(|rules| {
+        rules.path_glob.is_none()
+            && rules.path_globs.is_none()
+            && rules.fields_present.is_none()
+            && rules.where_clause.is_none()
+    }) {
+        match_rules = None;
+    }
+    let collection = frontmatter
+        .get("collection")
+        .and_then(serde_json::Value::as_object);
+    let read_defaults = collection
+        .and_then(|value| value.get("read_defaults"))
+        .and_then(serde_json::Value::as_object)
+        .map(|value| {
+            value
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let display_name_key = collection
+        .and_then(|value| value.get("display"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|value| value.get("name_field"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+    let path_pattern = collection
+        .and_then(|value| value.get("path"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|value| value.get("pattern"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+
+    if let Some(unique_rules) = collection
+        .and_then(|value| value.get("unique"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for rule in unique_rules {
+            if let Some(field_name) = rule.get("field").and_then(serde_json::Value::as_str) {
+                if let Some(field) = fields.get_mut(field_name) {
+                    field.unique = true;
+                }
+            }
+        }
+    }
+    if let Some(link_rules) = collection
+        .and_then(|value| value.get("links"))
+        .and_then(serde_json::Value::as_object)
+    {
+        for (field_name, rule) in link_rules {
+            let Some(field) = fields.get_mut(field_name) else {
+                continue;
+            };
+            field.validate_exists = rule
+                .get("validate_exists")
+                .and_then(serde_json::Value::as_bool);
+            field.target = rule
+                .get("target_type")
+                .and_then(serde_json::Value::as_str)
+                .filter(|target| *target != "any")
+                .map(String::from);
+        }
+    }
+
+    Ok(TypeDef {
+        name: type_file.name,
+        kind: Some("mdbase.type".to_string()),
+        version: type_file.version,
+        description: frontmatter
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        extends: None,
+        strict: match schema_object.get("additionalProperties") {
+            Some(serde_json::Value::Bool(false)) => Some(StrictMode::Error),
+            _ => Some(StrictMode::Off),
+        },
+        filename_pattern: None,
+        path_pattern,
+        display_name_key,
+        fields,
+        match_rules,
+        json_schema: Some(type_file.schema),
+        read_defaults,
+        source_path: Some(type_file.path),
+    })
+}
+
+fn field_from_json_schema(schema: &serde_json::Value) -> Result<FieldDef, String> {
+    let Some(object) = schema.as_object() else {
+        return Ok(FieldDef::default());
+    };
+    let field_type = match object.get("type") {
+        Some(serde_json::Value::String(value)) => match value.as_str() {
+            "array" => "list".to_string(),
+            value => value.to_string(),
+        },
+        _ if object.contains_key("enum") || object.contains_key("const") => "enum".to_string(),
+        _ => "any".to_string(),
+    };
+    let mut field = FieldDef {
+        field_type,
+        description: object
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        deprecated: object
+            .get("deprecated")
+            .and_then(serde_json::Value::as_bool)
+            .filter(|value| *value)
+            .map(|_| "deprecated".to_string()),
+        min: object
+            .get("minimum")
+            .or_else(|| object.get("exclusiveMinimum"))
+            .and_then(serde_json::Value::as_f64),
+        max: object
+            .get("maximum")
+            .or_else(|| object.get("exclusiveMaximum"))
+            .and_then(serde_json::Value::as_f64),
+        min_length: object
+            .get("minLength")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize),
+        max_length: object
+            .get("maxLength")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize),
+        pattern: object
+            .get("pattern")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        min_items: object
+            .get("minItems")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize),
+        max_items: object
+            .get("maxItems")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize),
+        list_unique: object
+            .get("uniqueItems")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        values: object
+            .get("enum")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(String::from)
+                    .collect()
+            }),
+        ..FieldDef::default()
+    };
+    if field.values.is_none() {
+        field.values = object
+            .get("const")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| vec![value.to_string()]);
+    }
+    field.items = object
+        .get("items")
+        .map(field_from_json_schema)
+        .transpose()?
+        .map(Box::new);
+    field.fields = object
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map(|properties| {
+            properties
+                .iter()
+                .map(|(name, schema)| Ok((name.clone(), field_from_json_schema(schema)?)))
+                .collect::<Result<HashMap<_, _>, String>>()
+        })
+        .transpose()?;
+    Ok(field)
+}
+
+fn parse_v03_match_rules(value: &serde_json::Value) -> MatchRules {
+    let path_glob_value = value.get("path_glob");
+    MatchRules {
+        path_glob: path_glob_value
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        path_globs: path_glob_value
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(String::from)
+                    .collect()
+            }),
+        fields_present: value
+            .get("fields_present")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(String::from)
+                    .collect()
+            }),
+        where_clause: value.get("where").cloned(),
+    }
 }
 
 /// Parse a fields mapping from YAML.
@@ -556,6 +822,7 @@ fn parse_match_rules(value: &serde_yaml::Value) -> MatchRules {
         None => {
             return MatchRules {
                 path_glob: None,
+                path_globs: None,
                 fields_present: None,
                 where_clause: None,
             }
@@ -581,6 +848,7 @@ fn parse_match_rules(value: &serde_yaml::Value) -> MatchRules {
 
     MatchRules {
         path_glob,
+        path_globs: None,
         fields_present,
         where_clause,
     }

@@ -52,6 +52,32 @@ pub fn validate_frontmatter_full_multi(
     explicit_type_keys: Option<&[String]>,
     union_fields: Option<&std::collections::HashSet<String>>,
 ) -> ValidationResult {
+    if let Some(schema) = &type_def.json_schema {
+        let issues =
+            crate::v03::validate_schema_instance(schema, frontmatter, path, Some(&type_def.name))
+                .into_iter()
+                .map(|diagnostic| Issue {
+                    code: diagnostic.code,
+                    message: diagnostic.message,
+                    path: diagnostic.path,
+                    field: diagnostic.field,
+                    severity: match diagnostic.severity.as_str() {
+                        "warning" => Severity::Warning,
+                        "info" => Severity::Info,
+                        _ => Severity::Error,
+                    },
+                    expected: None,
+                    actual: diagnostic.details,
+                    type_name: diagnostic.type_name,
+                    line: None,
+                    column: None,
+                })
+                .collect::<Vec<_>>();
+        return ValidationResult {
+            valid: !issues.iter().any(|issue| issue.severity == Severity::Error),
+            issues,
+        };
+    }
     let mut issues = Vec::new();
     let obj = match frontmatter.as_object() {
         Some(o) => o,
@@ -436,6 +462,11 @@ impl Collection {
             let type_names = self.determine_types_for_path(&raw_frontmatter, Some(path));
             let effective = self.apply_defaults(&raw_frontmatter, &type_names);
             let effective = self.coerce_types(&effective, &type_names);
+            let validation_frontmatter = if self.spec_profile == crate::SpecProfile::V03 {
+                &raw_frontmatter
+            } else {
+                &effective
+            };
 
             let mut all_issues = Vec::new();
 
@@ -488,7 +519,7 @@ impl Collection {
             for type_name in &type_names {
                 if let Some(type_def) = self.types.get(type_name) {
                     let result = validate_frontmatter_full_multi(
-                        &effective,
+                        validation_frontmatter,
                         type_def,
                         path,
                         Some(&config_strict),

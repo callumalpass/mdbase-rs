@@ -68,8 +68,8 @@ impl Collection {
                 if p.is_empty() {
                     return op_error(PATH_REQUIRED, "path must not be empty");
                 }
-                if let Err(msg) = ensure_safe_relative_path(p) {
-                    return op_error(INVALID_PATH, msg);
+                if let Err(error) = ensure_safe_relative_path(p, self.spec_profile) {
+                    return error;
                 }
                 p.to_string()
             }
@@ -103,8 +103,8 @@ impl Collection {
         if path.is_empty() {
             return op_error(PATH_REQUIRED, "path must not be empty");
         }
-        if let Err(msg) = ensure_safe_relative_path(&path) {
-            return op_error(INVALID_PATH, msg);
+        if let Err(error) = ensure_safe_relative_path(&path, self.spec_profile) {
+            return error;
         }
 
         // Check existence

@@ -12,8 +12,8 @@ impl Collection {
             Ok(parsed) => parsed,
             Err(err) => return err,
         };
-        if let Err(msg) = ensure_safe_relative_path(&input.path) {
-            return op_error(INVALID_PATH, msg);
+        if let Err(error) = ensure_safe_relative_path(&input.path, self.spec_profile) {
+            return error;
         }
         let path = input.path;
         let check_backlinks = input.check_backlinks;
