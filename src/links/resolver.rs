@@ -1,5 +1,26 @@
 //! Link resolution algorithm (§8.4).
 
+fn normalize_collection_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn collection_parent(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{collection_parent, normalize_collection_path};
+
+    #[test]
+    fn collection_paths_are_platform_independent() {
+        let path = normalize_collection_path(r"projects\active\note.md");
+
+        assert_eq!(path, "projects/active/note.md");
+        assert_eq!(collection_parent(&path), "projects/active");
+    }
+}
+
 /// Compute a relative path from source_dir to target_path.
 /// E.g., from "docs" to "archive/detail.md" -> "../archive/detail.md"
 /// E.g., from "notes" to "notes/new-target.md" -> "./new-target.md"
@@ -190,7 +211,8 @@ impl Collection {
         } else {
             // Simple name - try id_field, then filename
             self.resolve_simple_name(&target, source_dir, target_type.as_deref())
-        };
+        }
+        .map(|path| normalize_collection_path(&path));
 
         // Check for path traversal
         if let Some(ref path) = resolved {
@@ -284,8 +306,8 @@ impl Collection {
                 .strip_prefix(&self.root)
                 .ok()
                 .and_then(|p| p.to_str())
-                .unwrap_or("")
-                .to_string();
+                .map(normalize_collection_path)
+                .unwrap_or_default();
 
             // Read file content once
             let content = match std::fs::read_to_string(file_path) {
@@ -344,8 +366,8 @@ impl Collection {
         // Tiebreaker: same directory > shortest path > alphabetical
         let mut sorted = candidates;
         sorted.sort_by(|a, b| {
-            let a_same = Path::new(a).parent().and_then(|p| p.to_str()).unwrap_or("") == source_dir;
-            let b_same = Path::new(b).parent().and_then(|p| p.to_str()).unwrap_or("") == source_dir;
+            let a_same = collection_parent(a) == source_dir;
+            let b_same = collection_parent(b) == source_dir;
             if a_same != b_same {
                 return if a_same {
                     std::cmp::Ordering::Less
