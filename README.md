@@ -9,7 +9,7 @@ Rust implementation of the [mdbase spec](https://mdbase.dev), with:
 - SQLite cache support
 - Watch event simulation for conformance testing
 
-The `0.3.0-alpha.1` crate dual-loads legacy v0.2 collections and v0.3 type
+The `0.3.0-rc.1` crate dual-loads legacy v0.2 collections and v0.3 type
 wrappers. v0.3 records are validated against their embedded JSON Schema
 2020-12 schemas and report canonical structured diagnostics. The canonical
 config, type-file, diagnostic, operation-result, and query-result schemas are

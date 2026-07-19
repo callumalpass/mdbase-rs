@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## Unreleased
+## 0.3.0-rc.1 - 2026-07-19
 
 ### Added
 - v0.3 config and `mdbase.type` wrapper loading alongside the v0.2 adapter.

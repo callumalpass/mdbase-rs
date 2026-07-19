@@ -1,6 +1,6 @@
 [package]
 name = "mdbase"
-version = "0.3.0-alpha.1"
+version = "0.3.0-rc.1"
 edition = "2021"
 description = "Rust implementation of the mdbase specification"
 license = "MIT"
