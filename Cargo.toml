@@ -39,6 +39,7 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 jsonschema = { version = "0.18", features = ["draft202012"] }
 walkdir = "2"
+notify = "8"
 
 [dev-dependencies]
 insta = "1"

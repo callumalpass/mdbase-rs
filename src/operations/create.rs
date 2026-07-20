@@ -17,6 +17,7 @@ impl Collection {
         let frontmatter_input = input.frontmatter;
         let body = input.body.as_str();
         let path_input = input.path.as_deref();
+        let if_revision = input.if_revision.as_deref();
 
         // Determine type names
         let mut type_names: Vec<String> = Vec::new();
@@ -111,6 +112,12 @@ impl Collection {
         let full_path = self.root.join(&path);
         if full_path.exists() {
             return op_error(PATH_CONFLICT, &format!("File already exists: {}", path));
+        }
+        if if_revision.is_some() {
+            return op_error(
+                CONCURRENT_MODIFICATION,
+                &format!("File '{}' no longer matches the requested revision", path),
+            );
         }
 
         // Apply defaults for effective frontmatter (for validation and output)

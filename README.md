@@ -7,7 +7,7 @@ Rust implementation of the [mdbase spec](https://mdbase.dev), with:
 - Link parsing/resolution/traversal
 - CRUD, batch, backfill, and migrate operations
 - SQLite cache support
-- Watch event simulation for conformance testing
+- Debounced filesystem watching with normalized collection events
 
 The `0.3.0-rc.1` crate dual-loads legacy v0.2 collections and v0.3 type
 wrappers. v0.3 records are validated against their embedded JSON Schema
@@ -34,9 +34,15 @@ assert!(read.result["revision"].as_str().is_some());
 The existing `Collection` operation methods retain their legacy native result
 shape for v0.2 consumers. The v0.3 facade returns `{ valid, result,
 diagnostics }`, canonicalizes diagnostics, reports persisted mutation state,
-and emits opaque `sha256:` revisions. The verified, evidence-scoped claim for
+and emits opaque `sha256:` revisions. Mutations enforce optional
+`if_revision` preconditions, and queries use the same envelope. The verified, evidence-scoped claim for
 `core_read` and `collection_semantics` is published under `conformance/`;
 unlisted profiles are not claimed.
+
+`mdbase::watch::CollectionWatcher` observes real filesystem changes, debounces
+atomic-save sequences, and emits final-state record, type, and configuration
+events. The legacy v0.2 conformance adapter retains a deterministic simulation
+path for fixture-driven watch tests.
 
 ## Packages
 

@@ -2,7 +2,7 @@
 
 use crate::api::operations::{DeleteInput, DeleteOutput};
 use crate::errors::*;
-use crate::operations::ensure_safe_relative_path;
+use crate::operations::{ensure_revision, ensure_safe_relative_path};
 use crate::Collection;
 
 impl Collection {
@@ -21,6 +21,9 @@ impl Collection {
         let full_path = self.root.join(&path);
         if !full_path.exists() {
             return op_error(FILE_NOT_FOUND, &format!("File not found: {}", path));
+        }
+        if let Err(error) = ensure_revision(&full_path, &path, input.if_revision.as_deref()) {
+            return error;
         }
 
         // Concurrent modification detection
@@ -55,6 +58,9 @@ impl Collection {
             }
         }
 
+        if let Err(error) = ensure_revision(&full_path, &path, input.if_revision.as_deref()) {
+            return error;
+        }
         if let Err(e) = std::fs::remove_file(&full_path) {
             return op_error("io_error", &format!("Failed to delete: {}", e));
         }

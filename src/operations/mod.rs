@@ -11,7 +11,7 @@ pub mod update;
 
 use std::path::Path;
 
-use crate::errors::{op_error, INVALID_PATH, PATH_TRAVERSAL};
+use crate::errors::{op_error, CONCURRENT_MODIFICATION, INVALID_PATH, PATH_TRAVERSAL};
 use crate::SpecProfile;
 
 /// Validate that a user-supplied path is relative to the collection root.
@@ -37,6 +37,35 @@ pub(crate) fn ensure_safe_relative_path(
             INVALID_PATH
         };
         return Err(op_error(code, "Path contains path traversal"));
+    }
+    Ok(())
+}
+
+/// Verify an opaque revision token against the current raw file contents.
+///
+/// Call this immediately before a mutation. Callers that perform work between
+/// this check and the write must retain their existing mtime/file-identity
+/// guard as a second check against changes during the operation.
+pub(crate) fn ensure_revision(
+    path: &Path,
+    display_path: &str,
+    expected: Option<&str>,
+) -> Result<(), serde_json::Value> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let bytes = std::fs::read(path).map_err(|_| {
+        op_error(
+            CONCURRENT_MODIFICATION,
+            &format!("File '{display_path}' no longer matches the requested revision"),
+        )
+    })?;
+    let actual = crate::v03::revision(&bytes);
+    if actual != expected {
+        return Err(op_error(
+            CONCURRENT_MODIFICATION,
+            &format!("File '{display_path}' was modified externally"),
+        ));
     }
     Ok(())
 }

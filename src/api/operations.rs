@@ -25,6 +25,7 @@ pub struct CreateInput {
     pub frontmatter: serde_json::Value,
     pub body: String,
     pub path: Option<String>,
+    pub if_revision: Option<String>,
 }
 
 impl CreateInput {
@@ -47,12 +48,17 @@ impl CreateInput {
             .get("path")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let if_revision = input
+            .get("if_revision")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         Self {
             type_name,
             frontmatter,
             body,
             path,
+            if_revision,
         }
     }
 }
@@ -63,6 +69,7 @@ pub struct UpdateInput {
     pub fields: serde_json::Value,
     pub body: Option<String>,
     pub last_known_mtime: Option<u64>,
+    pub if_revision: Option<String>,
 }
 
 impl UpdateInput {
@@ -81,12 +88,17 @@ impl UpdateInput {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let last_known_mtime = input.get("last_known_mtime").and_then(|v| v.as_u64());
+        let if_revision = input
+            .get("if_revision")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         Ok(Self {
             path: path.to_string(),
             fields,
             body,
             last_known_mtime,
+            if_revision,
         })
     }
 }
@@ -96,6 +108,7 @@ pub struct DeleteInput {
     pub path: String,
     pub check_backlinks: bool,
     pub last_known_mtime: Option<u64>,
+    pub if_revision: Option<String>,
 }
 
 impl DeleteInput {
@@ -109,11 +122,16 @@ impl DeleteInput {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let last_known_mtime = input.get("last_known_mtime").and_then(|v| v.as_u64());
+        let if_revision = input
+            .get("if_revision")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         Ok(Self {
             path: path.to_string(),
             check_backlinks,
             last_known_mtime,
+            if_revision,
         })
     }
 }
@@ -130,6 +148,7 @@ pub struct RenameInput {
     pub to: String,
     pub update_refs: Option<bool>,
     pub last_known_mtime: Option<u64>,
+    pub if_revision: Option<String>,
     pub simulate_before_ref_update: Vec<SimulatedRefWrite>,
     pub last_known_ref_mtimes: HashMap<String, u64>,
 }
@@ -179,6 +198,10 @@ impl RenameInput {
             to: to.to_string(),
             update_refs: input.get("update_refs").and_then(|v| v.as_bool()),
             last_known_mtime: input.get("last_known_mtime").and_then(|v| v.as_u64()),
+            if_revision: input
+                .get("if_revision")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             simulate_before_ref_update,
             last_known_ref_mtimes,
         })

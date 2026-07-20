@@ -403,3 +403,93 @@ fn v03_operation_facade_returns_canonical_envelopes_and_revisions() {
         .iter()
         .any(|diagnostic| diagnostic.code == "path_traversal"));
 }
+
+#[test]
+fn v03_mutations_enforce_opaque_revision_preconditions() {
+    let directory = v03_collection();
+    write(
+        directory.path(),
+        "tasks/conditional.md",
+        "---\ntype: task\ntitle: Original\n---\nBody\n",
+    );
+
+    let collection = Collection::open(directory.path()).expect("open v0.3 collection");
+    let operations = collection.v03_operations().expect("v0.3 operations");
+    let read = operations.read(&serde_json::json!({"path": "tasks/conditional.md"}));
+    let original_revision = read.result["revision"]
+        .as_str()
+        .expect("read revision")
+        .to_string();
+
+    let updated = operations.update(&serde_json::json!({
+        "path": "tasks/conditional.md",
+        "fields": {"title": "Updated"},
+        "if_revision": original_revision,
+    }));
+    assert!(updated.valid, "{:#?}", updated.diagnostics);
+    let updated_revision = updated.result["revision"]
+        .as_str()
+        .expect("updated revision")
+        .to_string();
+    assert_ne!(updated_revision, original_revision);
+
+    write(
+        directory.path(),
+        "tasks/conditional.md",
+        "---\ntype: task\ntitle: External\n---\nBody\n",
+    );
+
+    for conflict in [
+        operations.update(&serde_json::json!({
+            "path": "tasks/conditional.md",
+            "fields": {"title": "Lost update"},
+            "if_revision": updated_revision,
+        })),
+        operations.delete(&serde_json::json!({
+            "path": "tasks/conditional.md",
+            "if_revision": updated_revision,
+        })),
+        operations.rename(&serde_json::json!({
+            "from": "tasks/conditional.md",
+            "to": "tasks/renamed.md",
+            "if_revision": updated_revision,
+        })),
+    ] {
+        assert!(!conflict.valid);
+        assert!(conflict
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "concurrent_modification"));
+    }
+
+    let persisted = fs::read_to_string(directory.path().join("tasks/conditional.md"))
+        .expect("conflicting writes preserve current file");
+    assert!(persisted.contains("title: External"));
+    assert!(!directory.path().join("tasks/renamed.md").exists());
+
+    let invalid_token = operations.update(&serde_json::json!({
+        "path": "tasks/conditional.md",
+        "fields": {"title": "Unsafe"},
+        "if_revision": 42,
+    }));
+    assert!(!invalid_token.valid);
+    assert_eq!(invalid_token.diagnostics[0].code, "invalid_request");
+}
+
+#[test]
+fn v03_query_uses_the_canonical_operation_envelope() {
+    let directory = v03_collection();
+    write(
+        directory.path(),
+        "tasks/query.md",
+        "---\ntype: task\ntitle: Query me\n---\n",
+    );
+    let collection = Collection::open(directory.path()).expect("open v0.3 collection");
+    let query = collection
+        .v03_operations()
+        .expect("v0.3 operations")
+        .query(&serde_json::json!({"types": ["task"]}));
+
+    assert!(query.valid, "{:#?}", query.diagnostics);
+    assert_eq!(query.result["results"][0]["path"], "tasks/query.md");
+}

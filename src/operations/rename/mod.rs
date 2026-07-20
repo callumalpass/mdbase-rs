@@ -7,7 +7,7 @@ mod link_rewrite;
 use crate::api::operations::RenameInput;
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
-use crate::operations::ensure_safe_relative_path;
+use crate::operations::{ensure_revision, ensure_safe_relative_path};
 use crate::Collection;
 
 impl Collection {
@@ -22,6 +22,7 @@ impl Collection {
             to,
             update_refs,
             last_known_mtime,
+            if_revision,
             simulate_before_ref_update,
             last_known_ref_mtimes,
         } = input;
@@ -41,6 +42,10 @@ impl Collection {
 
         if to_path.exists() {
             return op_error(PATH_CONFLICT, &format!("Target already exists: {}", to));
+        }
+
+        if let Err(error) = ensure_revision(&from_path, &from, if_revision.as_deref()) {
+            return error;
         }
 
         // Create parent dirs
@@ -81,6 +86,9 @@ impl Collection {
                 }
             });
 
+        if let Err(error) = ensure_revision(&from_path, &from, if_revision.as_deref()) {
+            return error;
+        }
         if let Err(e) = std::fs::rename(&from_path, &to_path) {
             let error_str = e.to_string();
             if error_str.contains("NUL") || error_str.contains("null") {

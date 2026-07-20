@@ -8,6 +8,7 @@ use jsonschema::error::{ValidationError, ValidationErrorKind};
 use jsonschema::{Draft, JSONSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_to_json};
@@ -20,6 +21,10 @@ pub use operations::{OperationResult, Operations};
 pub const SPEC_VERSION: &str = "0.3.0";
 pub const PRERELEASE_SPEC_VERSIONS: &[&str] = &["0.3.0-alpha.1"];
 pub const RUNTIME_PROFILE_VERSION: &str = "0.1.0";
+
+pub(crate) fn revision(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
 
 pub fn is_supported_spec_version(version: &str) -> bool {
     version == SPEC_VERSION || PRERELEASE_SPEC_VERSIONS.contains(&version)

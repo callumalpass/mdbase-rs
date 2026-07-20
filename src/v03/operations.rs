@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 
 use super::Diagnostic;
 use crate::{Collection, SpecProfile};
@@ -36,19 +35,35 @@ impl<'a> Operations<'a> {
         self.normalize("validate", input, self.collection.validate_op(input))
     }
 
+    pub fn query(&self, input: &Value) -> OperationResult {
+        self.normalize("query", input, self.collection.query(input))
+    }
+
     pub fn create(&self, input: &Value) -> OperationResult {
+        if let Some(result) = invalid_revision_input(input) {
+            return result;
+        }
         self.normalize("create", input, self.collection.create(input))
     }
 
     pub fn update(&self, input: &Value) -> OperationResult {
+        if let Some(result) = invalid_revision_input(input) {
+            return result;
+        }
         self.normalize("update", input, self.collection.update(input))
     }
 
     pub fn delete(&self, input: &Value) -> OperationResult {
+        if let Some(result) = invalid_revision_input(input) {
+            return result;
+        }
         self.normalize("delete", input, self.collection.delete(input))
     }
 
     pub fn rename(&self, input: &Value) -> OperationResult {
+        if let Some(result) = invalid_revision_input(input) {
+            return result;
+        }
         self.normalize("rename", input, self.collection.rename(input))
     }
 
@@ -113,7 +128,10 @@ impl<'a> Operations<'a> {
         let full_path = self.collection.root.join(path);
         match std::fs::read(&full_path) {
             Ok(bytes) => {
-                result.insert("revision".to_string(), Value::String(revision(&bytes)));
+                result.insert(
+                    "revision".to_string(),
+                    Value::String(super::revision(&bytes)),
+                );
             }
             Err(error) => {
                 diagnostics.push(Diagnostic::error(
@@ -136,6 +154,25 @@ impl<'a> Operations<'a> {
         }
         result.insert("path".to_string(), Value::String(path.to_string()));
     }
+}
+
+fn invalid_revision_input(input: &Value) -> Option<OperationResult> {
+    let revision = input.get("if_revision")?;
+    if revision.is_string() {
+        return None;
+    }
+    Some(OperationResult {
+        valid: false,
+        result: serde_json::json!({}),
+        diagnostics: vec![Diagnostic::error(
+            "invalid_request",
+            "if_revision must be an opaque string token.",
+            input
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        )],
+    })
 }
 
 fn persisted_path(operation: &str, input: &Value, result: &Map<String, Value>) -> Option<String> {
@@ -238,8 +275,4 @@ fn deduplicate_diagnostics(diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
         }
     }
     result
-}
-
-fn revision(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
 }
