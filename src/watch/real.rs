@@ -1,6 +1,9 @@
 use super::WatchEvent;
 use crate::Collection;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    event::{MetadataKind, ModifyKind},
+    Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -142,7 +145,10 @@ fn watch_loop(
         }
 
         match raw_rx.recv_timeout(tick) {
-            Ok(Ok(_)) => deadline = Some(Instant::now() + debounce),
+            Ok(Ok(event)) if invalidates_snapshot(&event) => {
+                deadline = Some(Instant::now() + debounce)
+            }
+            Ok(Ok(_)) => {}
             Ok(Err(error)) => {
                 sequence += 1;
                 if events
@@ -191,6 +197,18 @@ fn watch_loop(
             }
         }
     }
+}
+
+/// Return whether a filesystem event could change the collection snapshot.
+///
+/// Loading a snapshot opens every visible collection file. Some watcher
+/// backends report those reads as access events, so treating every event as an
+/// invalidation makes the snapshot loader continuously trigger itself.
+fn invalidates_snapshot(event: &Event) -> bool {
+    !matches!(
+        event.kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
+    )
 }
 
 fn watch_error_event(sequence: u64, message: String) -> WatchEvent {
@@ -462,7 +480,31 @@ fn collection_error(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, RemoveKind};
     use std::fs;
+
+    #[test]
+    fn non_mutating_filesystem_events_do_not_invalidate_the_snapshot() {
+        for kind in [
+            EventKind::Access(AccessKind::Any),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)),
+        ] {
+            assert!(!invalidates_snapshot(&Event::new(kind)), "{kind:?}");
+        }
+
+        for kind in [
+            EventKind::Any,
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Other,
+        ] {
+            assert!(invalidates_snapshot(&Event::new(kind)), "{kind:?}");
+        }
+    }
 
     #[test]
     fn real_watcher_debounces_to_the_final_record_state() {
