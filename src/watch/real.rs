@@ -33,7 +33,7 @@ pub struct CollectionWatcher {
 }
 
 enum Command {
-    Rescan,
+    Rescan(mpsc::SyncSender<()>),
     Stop,
 }
 
@@ -80,9 +80,11 @@ impl CollectionWatcher {
     /// Request a snapshot comparison without waiting for an OS notification.
     /// This is useful after an in-process mutation and for deterministic hosts.
     pub fn rescan(&self) -> Result<(), WatchError> {
+        let (ready, receiver) = mpsc::sync_channel(0);
         self.commands
-            .send(Command::Rescan)
-            .map_err(|_| WatchError::Stopped)
+            .send(Command::Rescan(ready))
+            .map_err(|_| WatchError::Stopped)?;
+        receiver.recv().map_err(|_| WatchError::Stopped)
     }
 }
 
@@ -125,13 +127,17 @@ fn watch_loop(
     // Compare once after the OS watch is installed. This closes the small gap
     // between the caller's initial snapshot and watcher registration.
     let mut deadline: Option<Instant> = Some(Instant::now());
+    let mut pending_rescans = Vec::new();
     let mut sequence = 0_u64;
 
     loop {
         while let Ok(command) = commands.try_recv() {
             match command {
                 Command::Stop => return,
-                Command::Rescan => deadline = Some(Instant::now()),
+                Command::Rescan(ready) => {
+                    deadline = Some(Instant::now());
+                    pending_rescans.push(ready);
+                }
             }
         }
 
@@ -179,6 +185,9 @@ fn watch_loop(
                         return;
                     }
                 }
+            }
+            for ready in pending_rescans.drain(..) {
+                let _ = ready.send(());
             }
         }
     }
@@ -330,6 +339,7 @@ impl Snapshot {
                         "after": current.effective_frontmatter,
                         "previous_revision": previous.revision,
                         "revision": current.revision,
+                        "previous_types": previous.types,
                         "types": current.types,
                     }),
                 ));
@@ -376,6 +386,7 @@ impl Snapshot {
                         "changed_fields": changed_fields(previous, current),
                         "previous_revision": previous.revision,
                         "revision": current.revision,
+                        "previous_types": previous.types,
                         "types": current.types,
                     }),
                 ));
@@ -477,5 +488,26 @@ mod tests {
             .recv_timeout(Duration::from_millis(250))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn explicit_rescan_returns_after_changes_are_available() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(60)).unwrap();
+
+        fs::write(directory.path().join("note.md"), "---\ntitle: Ready\n---\n").unwrap();
+        watcher.rescan().unwrap();
+
+        let event = watcher
+            .recv_timeout(Duration::ZERO)
+            .unwrap()
+            .expect("rescan must queue the record event before returning");
+        assert_eq!(event.event_type, "mdbase.record.created");
+        assert_eq!(event.payload["path"], "note.md");
     }
 }
