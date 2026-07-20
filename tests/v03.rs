@@ -59,6 +59,22 @@ fn canonical_v03_schemas_compile() {
 }
 
 #[test]
+fn v03_allows_disabling_explicit_type_keys() {
+    let directory = tempfile::tempdir().expect("temp collection");
+    write(
+        directory.path(),
+        "mdbase.yaml",
+        r#"spec_version: "0.3.0"
+settings:
+  explicit_type_keys: []
+"#,
+    );
+
+    let collection = Collection::open(directory.path()).expect("open collection");
+    assert!(collection.settings.explicit_type_keys.is_empty());
+}
+
+#[test]
 fn init_defaults_to_a_minimal_v03_collection() {
     let directory = tempfile::tempdir().expect("temp collection");
     let result = mdbase::init::init_collection(
