@@ -1,18 +1,23 @@
 //! File system watching (§15).
 //!
-//! Provides watch event types and simulation for conformance testing.
-//! In a real implementation, this would use `notify` or similar for FS events.
-//! For conformance tests, we simulate watch events by processing explicit
-//! filesystem changes and generating the appropriate event payloads.
+//! Provides a real, debounced collection change stream and the deterministic
+//! simulation adapter used by the legacy conformance runner.
 
+mod real;
+
+pub use real::{CollectionWatcher, WatchError};
+
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 
 /// A watch event as defined in §15.2.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WatchEvent {
     pub event_type: String,
+    pub sequence: u64,
+    pub occurred_at: String,
     pub payload: Value,
 }
 
