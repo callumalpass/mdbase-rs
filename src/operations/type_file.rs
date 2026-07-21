@@ -56,8 +56,16 @@ impl Collection {
                 Some(path),
             ));
         }
-        if let Err(error) = atomic_write(&full_path, document.as_bytes(), None) {
-            return failed(io_diagnostic(&path, error));
+        if let Err(error) = atomic_create(&full_path, document.as_bytes()) {
+            return failed(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Diagnostic::error(
+                    "path_conflict",
+                    format!("A type definition already exists at '{path}'."),
+                    Some(path.clone()),
+                )
+            } else {
+                io_diagnostic(&path, error)
+            });
         }
         match Collection::open(&self.root) {
             Ok(reloaded) => reloaded.type_file_result(&path),
@@ -259,6 +267,18 @@ fn atomic_write(
         .map_err(|error| error.error)
 }
 
+fn atomic_create(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
+
 fn failed(diagnostic: Diagnostic) -> OperationResult {
     failed_many(vec![diagnostic])
 }
@@ -306,6 +326,8 @@ fn legacy_failure(error: Value, path: Option<&str>) -> OperationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     fn collection() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
@@ -380,5 +402,44 @@ mod tests {
         assert!(!invalid.valid);
         let reloaded = Collection::open(directory.path()).unwrap();
         assert!(reloaded.read_type_file(&json!({"name": "note"})).valid);
+    }
+
+    #[test]
+    fn concurrent_type_creates_never_replace_the_winner() {
+        let directory = collection();
+        let collection = Arc::new(Collection::open(directory.path()).unwrap());
+        let barrier = Arc::new(Barrier::new(9));
+        let handles = (0..8)
+            .map(|index| {
+                let collection = collection.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    collection.create_type_file(&json!({
+                        "path": "_types/shared.md",
+                        "document": type_document("shared", &format!("Writer {index}")),
+                    }))
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.valid).count(), 1);
+        assert!(results.iter().filter(|result| !result.valid).all(|result| {
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "path_conflict")
+        }));
+        let persisted = fs::read_to_string(directory.path().join("_types/shared.md")).unwrap();
+        let winning_document = results.iter().find(|result| result.valid).unwrap().result
+            ["document"]
+            .as_str()
+            .unwrap();
+        assert_eq!(persisted, winning_document);
     }
 }
