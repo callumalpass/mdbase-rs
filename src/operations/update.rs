@@ -4,7 +4,7 @@ use crate::api::operations::{UpdateInput, UpdateOutput};
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::frontmatter::serializer;
-use crate::operations::ensure_safe_relative_path;
+use crate::operations::{ensure_revision, ensure_safe_relative_path};
 use crate::Collection;
 
 impl Collection {
@@ -19,6 +19,7 @@ impl Collection {
             fields,
             body: new_body,
             last_known_mtime,
+            if_revision,
         } = input;
         if let Err(error) = ensure_safe_relative_path(&path, self.spec_profile) {
             return error;
@@ -55,6 +56,9 @@ impl Collection {
             Ok(c) => c,
             Err(e) => return op_error(FILE_NOT_FOUND, &format!("Failed to read: {}", e)),
         };
+        if let Err(error) = ensure_revision(&full_path, &path, if_revision.as_deref()) {
+            return error;
+        }
 
         let doc = parse_document(&content);
 

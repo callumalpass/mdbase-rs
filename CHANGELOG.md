@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Added
+- A real debounced `CollectionWatcher` backed by filesystem notifications and
+  final-state collection snapshot diffs.
+- A provider-neutral runtime boundary with a serialized filesystem provider for
+  long-running hosts such as mdbase Connect.
+- Opaque `if_revision` preconditions for create, update, delete, and rename.
+
+### Changed
+- v0.3 queries now return the canonical operation envelope.
+- Watch events use stable sequence numbers, timestamps, revisions, and changed
+  frontmatter field metadata.
+
 ## 0.3.0-rc.1 - 2026-07-19
 
 ### Added
