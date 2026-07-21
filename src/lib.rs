@@ -17,6 +17,7 @@ pub mod matching;
 pub mod operations;
 pub mod query;
 pub mod runtime;
+pub mod runtime_contracts;
 pub mod types;
 pub mod v03;
 pub mod validation;
