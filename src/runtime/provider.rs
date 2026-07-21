@@ -98,52 +98,68 @@ impl FilesystemProvider {
         options: &LoadOptions,
     ) -> Result<RuntimeLoadResult, ProviderError> {
         let started = Instant::now();
+        let mut timings = OperationTimings::default();
         let queue_started = Instant::now();
         let _guard = match self.lock() {
             Ok(guard) => guard,
             Err(error) => {
-                self.report_error("runtime_contracts.load", "queue", &error);
-                return Err(error);
+                timings.queue = queue_started.elapsed();
+                return Err(self.finish_provider_error(
+                    "runtime_contracts.load",
+                    "queue",
+                    started,
+                    timings,
+                    error,
+                ));
             }
         };
-        let queue = queue_started.elapsed();
+        timings.queue = queue_started.elapsed();
         let open_started = Instant::now();
         let collection = match open_collection(&self.root) {
             Ok(collection) => collection,
             Err(error) => {
-                self.report_error("runtime_contracts.load", "open", &error);
-                return Err(error);
+                timings.open = open_started.elapsed();
+                return Err(self.finish_provider_error(
+                    "runtime_contracts.load",
+                    "open",
+                    started,
+                    timings,
+                    error,
+                ));
             }
         };
-        let open = open_started.elapsed();
+        timings.open = open_started.elapsed();
         let execute_started = Instant::now();
         let engine = match self.runtime_contracts.get_or_init(RuntimeContracts::new) {
             Ok(engine) => engine,
             Err(message) => {
+                timings.execute = execute_started.elapsed();
                 let error = ProviderError::RuntimeContracts(message.clone());
-                self.report_error("runtime_contracts.load", "execute", &error);
-                return Err(error);
+                return Err(self.finish_provider_error(
+                    "runtime_contracts.load",
+                    "execute",
+                    started,
+                    timings,
+                    error,
+                ));
             }
         };
         let result = engine.load(&collection, implicit_sources, options);
-        let execute = execute_started.elapsed();
-        self.observer.on_performance(&OperationPerformance {
-            operation: "runtime_contracts.load".to_string(),
-            queue_us: micros(queue),
-            open_us: micros(open),
-            execute_us: micros(execute),
-            synchronize_us: 0,
-            total_us: micros(started.elapsed()),
-            valid: result.valid(),
-            diagnostic_count: result.preflight.diagnostics.len(),
-            diagnostic_codes: diagnostic_codes(
+        timings.execute = execute_started.elapsed();
+        self.observe_performance(
+            "runtime_contracts.load",
+            started,
+            timings,
+            result.valid(),
+            result.preflight.diagnostics.len(),
+            diagnostic_codes(
                 result
                     .preflight
                     .diagnostics
                     .iter()
                     .map(|diagnostic| diagnostic.code.as_str()),
             ),
-        });
+        );
         if !result.valid() {
             self.report_diagnostic_error(
                 "runtime_contracts.load",
@@ -164,55 +180,77 @@ impl FilesystemProvider {
         post: impl FnOnce(&OperationResult) -> Result<(), ProviderError>,
     ) -> Result<OperationResult, ProviderError> {
         let started = Instant::now();
+        let mut timings = OperationTimings::default();
         let queue_started = Instant::now();
         let _guard = match self.lock() {
             Ok(guard) => guard,
             Err(error) => {
-                self.report_error(request.operation.as_str(), "queue", &error);
-                return Err(error);
+                timings.queue = queue_started.elapsed();
+                return Err(self.finish_provider_error(
+                    request.operation.as_str(),
+                    "queue",
+                    started,
+                    timings,
+                    error,
+                ));
             }
         };
-        let queue = queue_started.elapsed();
+        timings.queue = queue_started.elapsed();
         let open_started = Instant::now();
         let collection = match open_collection(&self.root) {
             Ok(collection) => collection,
             Err(error) => {
-                self.report_error(request.operation.as_str(), "open", &error);
-                return Err(error);
+                timings.open = open_started.elapsed();
+                return Err(self.finish_provider_error(
+                    request.operation.as_str(),
+                    "open",
+                    started,
+                    timings,
+                    error,
+                ));
             }
         };
-        let open = open_started.elapsed();
+        timings.open = open_started.elapsed();
         let execute_started = Instant::now();
         let result = match execute_collection(&collection, request) {
             Ok(result) => result,
             Err(error) => {
-                self.report_error(request.operation.as_str(), "execute", &error);
-                return Err(error);
+                timings.execute = execute_started.elapsed();
+                return Err(self.finish_provider_error(
+                    request.operation.as_str(),
+                    "execute",
+                    started,
+                    timings,
+                    error,
+                ));
             }
         };
-        let execute = execute_started.elapsed();
+        timings.execute = execute_started.elapsed();
         let synchronize_started = Instant::now();
         if let Err(error) = post(&result) {
-            self.report_error(request.operation.as_str(), "synchronize", &error);
-            return Err(error);
+            timings.synchronize = synchronize_started.elapsed();
+            return Err(self.finish_provider_error(
+                request.operation.as_str(),
+                "synchronize",
+                started,
+                timings,
+                error,
+            ));
         }
-        let synchronize = synchronize_started.elapsed();
-        self.observer.on_performance(&OperationPerformance {
-            operation: request.operation.as_str().to_string(),
-            queue_us: micros(queue),
-            open_us: micros(open),
-            execute_us: micros(execute),
-            synchronize_us: micros(synchronize),
-            total_us: micros(started.elapsed()),
-            valid: result.valid,
-            diagnostic_count: result.diagnostics.len(),
-            diagnostic_codes: diagnostic_codes(
+        timings.synchronize = synchronize_started.elapsed();
+        self.observe_performance(
+            request.operation.as_str(),
+            started,
+            timings,
+            result.valid,
+            result.diagnostics.len(),
+            diagnostic_codes(
                 result
                     .diagnostics
                     .iter()
                     .map(|diagnostic| diagnostic.code.as_str()),
             ),
-        });
+        );
         if !result.valid {
             self.report_diagnostic_error(
                 request.operation.as_str(),
@@ -242,6 +280,48 @@ impl FilesystemProvider {
         );
     }
 
+    fn observe_performance(
+        &self,
+        operation: &str,
+        started: Instant,
+        timings: OperationTimings,
+        valid: bool,
+        diagnostic_count: usize,
+        diagnostic_codes: Vec<String>,
+    ) {
+        self.observer.on_performance(&OperationPerformance {
+            operation: operation.to_string(),
+            queue_us: micros(timings.queue),
+            open_us: micros(timings.open),
+            execute_us: micros(timings.execute),
+            synchronize_us: micros(timings.synchronize),
+            total_us: micros(started.elapsed()),
+            valid,
+            diagnostic_count,
+            diagnostic_codes,
+        });
+    }
+
+    fn finish_provider_error(
+        &self,
+        operation: &str,
+        stage: &str,
+        started: Instant,
+        timings: OperationTimings,
+        error: ProviderError,
+    ) -> ProviderError {
+        self.observe_performance(
+            operation,
+            started,
+            timings,
+            false,
+            1,
+            vec![error.code().to_string()],
+        );
+        self.report_error(operation, stage, &error);
+        error
+    }
+
     fn report_diagnostic_error(&self, operation: &str, diagnostic: Option<(&str, &str)>) {
         let Some((code, message)) = diagnostic else {
             return;
@@ -255,6 +335,14 @@ impl FilesystemProvider {
             message,
         );
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OperationTimings {
+    queue: Duration,
+    open: Duration,
+    execute: Duration,
+    synchronize: Duration,
 }
 
 impl CollectionProvider for FilesystemProvider {

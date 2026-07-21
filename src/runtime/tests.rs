@@ -194,6 +194,51 @@ fn observer_reports_payload_free_performance_and_opt_in_errors() {
 }
 
 #[test]
+fn observer_reports_performance_when_provider_execution_fails_early() {
+    let directory = collection();
+    let observer = Arc::new(RecordingObserver::default());
+    let provider = FilesystemProvider::open_observed(
+        directory.path(),
+        observer.clone(),
+        ObserverOptions {
+            errors: ErrorReporting::Codes,
+        },
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("mdbase.yaml"),
+        "spec_version: 99.0.0\n",
+    )
+    .unwrap();
+
+    let error = provider
+        .execute(&OperationRequest::new(
+            OperationKind::Read,
+            json!({"path": "private-name.md"}),
+        ))
+        .expect_err("reopening invalid configuration must fail");
+
+    let performance = observer.performance.lock().unwrap();
+    assert_eq!(performance.len(), 1);
+    assert_eq!(performance[0].operation, "read");
+    assert!(!performance[0].valid);
+    assert_eq!(performance[0].diagnostic_count, 1);
+    assert_eq!(performance[0].diagnostic_codes, [error.code()]);
+    assert_eq!(performance[0].execute_us, 0);
+    assert_eq!(performance[0].synchronize_us, 0);
+    assert!(!serde_json::to_string(&*performance)
+        .unwrap()
+        .contains("private-name.md"));
+    drop(performance);
+
+    let errors = observer.errors.lock().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].stage, "open");
+    assert_eq!(errors[0].code, error.code());
+    assert!(errors[0].message.is_none());
+}
+
+#[test]
 fn provider_loads_runtime_contracts_inside_its_authority_gate() {
     let directory = collection();
     fs::write(
