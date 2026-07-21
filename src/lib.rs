@@ -93,14 +93,6 @@ pub struct Collection {
 impl Collection {
     /// Open a collection from a root directory.
     pub fn open(root: &Path) -> Result<Self, serde_json::Value> {
-        if std::fs::symlink_metadata(root.join("mdbase.yaml"))
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(crate::errors::op_error(
-                crate::errors::INVALID_CONFIG,
-                "mdbase.yaml must not be a symbolic link",
-            ));
-        }
         let config_result = config::load_config_for_open(root);
         if config_result.get("valid") != Some(&serde_json::Value::Bool(true)) {
             return Err(config_result);

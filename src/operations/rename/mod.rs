@@ -41,6 +41,16 @@ impl Collection {
         if let Err(error) = ensure_no_symlink_components(&self.root, &to, self.spec_profile) {
             return error;
         }
+        for simulated in &simulate_before_ref_update {
+            if let Err(error) = ensure_safe_relative_path(&simulated.path, self.spec_profile) {
+                return error;
+            }
+            if let Err(error) =
+                ensure_no_symlink_components(&self.root, &simulated.path, self.spec_profile)
+            {
+                return error;
+            }
+        }
 
         let from_path = self.root.join(&from);
         let to_path = self.root.join(&to);

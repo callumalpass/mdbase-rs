@@ -108,6 +108,24 @@ fn symlinks_cannot_escape_the_collection_boundary() {
             "to": "renamed.md",
             "update_refs": false
         })),
+        collection.rename(&serde_json::json!({
+            "from": "link.md",
+            "to": "renamed-link.md",
+            "simulate_before_ref_update": [{
+                "path": "escape/simulated.md",
+                "content": "must not be written"
+            }]
+        })),
+        collection.batch_update(
+            &serde_json::json!({
+                "updates": [{
+                    "path": "escape/secret.md",
+                    "fields": {"compromised": true}
+                }]
+            }),
+            None,
+            false,
+        ),
     ] {
         assert_eq!(
             result
@@ -123,6 +141,8 @@ fn symlinks_cannot_escape_the_collection_boundary() {
     }
 
     assert!(!outside.join("created.md").exists());
+    assert!(!outside.join("simulated.md").exists());
+    assert!(root.join("link.md").exists());
     assert_eq!(
         fs::read_to_string(outside.join("secret.md")).expect("external file remains readable"),
         "---\nsecret: never-return-this\n---\noutside\n"
@@ -169,6 +189,12 @@ fn collection_metadata_never_loads_through_symlinks() {
         .expect("config link must fail");
     assert_eq!(
         config_error
+            .pointer("/error/code")
+            .and_then(|value| value.as_str()),
+        Some("invalid_config")
+    );
+    assert_eq!(
+        mdbase::config::load_config(&linked_config_root)
             .pointer("/error/code")
             .and_then(|value| value.as_str()),
         Some("invalid_config")
