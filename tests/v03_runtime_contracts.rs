@@ -209,6 +209,96 @@ fn rejects_a_provider_source_atomically_when_its_listing_is_false() {
 }
 
 #[test]
+fn explicit_provider_listings_validate_ownership_but_capability_catalogs_stay_optional() {
+    let runtime = RuntimeContracts::new().unwrap();
+    let documents = vec![
+        json!({
+            "type": "provider",
+            "id": "owner",
+            "version": 1,
+            "provider_version": "1.0.0",
+            "name": "Owner",
+            "contracts": {
+                "events": ["wrong.owner"],
+                "actions": [],
+                "capabilities": ["virtual.capability"]
+            }
+        }),
+        event("wrong.owner", "someone-else"),
+        action("unadvertised.action", "owner", &[]),
+    ]
+    .into_iter()
+    .map(ContractDocument::virtual_contract)
+    .collect();
+    let registry = runtime.compose(
+        vec![ContractSource::collection(documents)],
+        &ComposeOptions::default(),
+    );
+    let report = runtime.preflight(&registry);
+
+    assert!(registry.capabilities.is_empty());
+    assert!(registry.capability_ids.contains("virtual.capability"));
+    assert_eq!(
+        report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "provider_contract_mismatch")
+            .count(),
+        2
+    );
+    assert!(!report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "unresolved_provider_capability"
+            && diagnostic.id.as_deref() == Some("virtual.capability")
+    }));
+}
+
+#[test]
+fn contract_validation_is_strict_and_never_resolves_external_schemas() {
+    let runtime = RuntimeContracts::new().unwrap();
+    let allowed_extension = ContractDocument::virtual_contract(json!({
+        "type": "event",
+        "id": "extended.event",
+        "version": 1,
+        "provider": "source",
+        "name": "Extended",
+        "schemas": {"dialect": "json-schema-2020-12", "payload": {"type": "object"}},
+        "x-host": {"safe": true}
+    }));
+    assert!(runtime.validate_contract(&allowed_extension).valid);
+
+    let unknown_key = ContractDocument::virtual_contract(json!({
+        "type": "event",
+        "id": "bad.event",
+        "version": 1,
+        "provider": "source",
+        "name": "Bad",
+        "schemas": {"dialect": "json-schema-2020-12", "payload": {"type": "object"}},
+        "typoed": true
+    }));
+    assert_code(
+        &runtime.validate_contract(&unknown_key).diagnostics,
+        "schema_additional_properties",
+    );
+
+    let remote_schema = ContractDocument::virtual_contract(json!({
+        "type": "action",
+        "id": "remote.action",
+        "version": 1,
+        "provider": "source",
+        "name": "Remote",
+        "schemas": {
+            "dialect": "json-schema-2020-12",
+            "input": {"$ref": "https://attacker.invalid/schema.json"},
+            "output": null
+        }
+    }));
+    assert_code(
+        &runtime.validate_contract(&remote_schema).diagnostics,
+        "invalid_embedded_schema",
+    );
+}
+
+#[test]
 fn workflow_preflight_reports_references_versions_duplicates_policy_and_executor() {
     let runtime = RuntimeContracts::new().unwrap();
     let documents = vec![

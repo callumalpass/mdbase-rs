@@ -351,16 +351,61 @@ fn validate_provider_listings(registry: &RuntimeRegistry) -> Vec<RuntimeDiagnost
         for (list, contracts) in [
             ("events", &registry.events),
             ("actions", &registry.actions),
-            ("capabilities", &registry.capabilities),
             ("workflows", &registry.workflows),
         ] {
             for id in strings(provider.contract.pointer(&format!("/contracts/{list}"))) {
-                if !contracts.contains_key(id) {
-                    diagnostics.push(unresolved(
+                match contracts.get(id) {
+                    None => diagnostics.push(unresolved(
                         &format!("unresolved_provider_{}", list.trim_end_matches('s')),
                         id,
                         Some(provider_id),
-                    ));
+                    )),
+                    Some(contract)
+                        if matches!(list, "events" | "actions")
+                            && contract.contract.get("provider").and_then(Value::as_str)
+                                != Some(provider_id.as_str()) =>
+                    {
+                        diagnostics.push(
+                            RuntimeDiagnostic::error(
+                                "provider_contract_mismatch",
+                                format!(
+                                    "Provider {provider_id} advertises {id}, but the contract names another provider."
+                                ),
+                            )
+                            .for_id(id),
+                        );
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        for capability in strings(provider.contract.pointer("/contracts/capabilities")) {
+            if !registry.capability_ids.contains(capability) {
+                diagnostics.push(unresolved(
+                    "unresolved_provider_capability",
+                    capability,
+                    Some(provider_id),
+                ));
+            }
+        }
+
+        for (kind, contracts) in [("event", &registry.events), ("action", &registry.actions)] {
+            let advertised = provider.contract.pointer(&format!("/contracts/{kind}s"));
+            let advertised = strings(advertised).collect::<BTreeSet<_>>();
+            for (id, contract) in contracts {
+                if contract.contract.get("provider").and_then(Value::as_str)
+                    == Some(provider_id.as_str())
+                    && !advertised.contains(id.as_str())
+                {
+                    diagnostics.push(
+                        RuntimeDiagnostic::error(
+                            "provider_contract_mismatch",
+                            format!(
+                                "Provider {provider_id} does not advertise its {kind} contract {id}."
+                            ),
+                        )
+                        .for_id(id),
+                    );
                 }
             }
         }
