@@ -118,7 +118,7 @@ fn add_document(
     let Some(kind) = document.kind().filter(|kind| kind.is_registry_contract()) else {
         return;
     };
-    let validation = validators.validate_contract(&document);
+    let (validation, embedded) = validators.prepare_contract(&document);
     if !validation.valid {
         registry.diagnostics.extend(validation.diagnostics);
         return;
@@ -160,11 +160,6 @@ fn add_document(
         return;
     }
 
-    let (embedded, diagnostics) = validators.compile_embedded(&document);
-    if !diagnostics.is_empty() {
-        registry.diagnostics.extend(diagnostics);
-        return;
-    }
     install_compiled_schemas(registry, &id, embedded);
     add_effective_capabilities(registry, &document.frontmatter);
     map_mut(registry, kind).insert(

@@ -61,12 +61,22 @@ impl CanonicalValidators {
     }
 
     pub fn validate_contract(&self, document: &ContractDocument) -> ValidationResult {
+        self.prepare_contract(document).0
+    }
+
+    pub fn prepare_contract(
+        &self,
+        document: &ContractDocument,
+    ) -> (ValidationResult, EmbeddedSchemas) {
         let Some(kind) = document.kind() else {
-            return ValidationResult::new(vec![RuntimeDiagnostic::error(
-                "invalid_contract_type",
-                "Runtime contract type is missing or unknown.",
-            )
-            .at_path(&document.path)]);
+            return (
+                ValidationResult::new(vec![RuntimeDiagnostic::error(
+                    "invalid_contract_type",
+                    "Runtime contract type is missing or unknown.",
+                )
+                .at_path(&document.path)]),
+                EmbeddedSchemas::default(),
+            );
         };
         let mut diagnostics = self
             .contracts
@@ -79,10 +89,14 @@ impl CanonicalValidators {
                 )
                 .at_path(&document.path)]
             });
-        if kind.is_registry_contract() {
-            diagnostics.extend(self.compile_embedded(document).1);
-        }
-        ValidationResult::new(diagnostics)
+        let embedded = if kind.is_registry_contract() {
+            let (embedded, embedded_diagnostics) = self.compile_embedded(document);
+            diagnostics.extend(embedded_diagnostics);
+            embedded
+        } else {
+            EmbeddedSchemas::default()
+        };
+        (ValidationResult::new(diagnostics), embedded)
     }
 
     pub fn compile_embedded(
