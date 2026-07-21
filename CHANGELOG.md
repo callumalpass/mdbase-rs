@@ -7,6 +7,8 @@ All notable changes to this project are documented in this file.
 ### Added
 - A real debounced `CollectionWatcher` backed by filesystem notifications and
   final-state collection snapshot diffs.
+- A provider-neutral runtime boundary with a serialized filesystem provider for
+  long-running hosts such as mdbase Connect.
 - Opaque `if_revision` preconditions for create, update, delete, and rename.
 
 ### Changed
