@@ -7,6 +7,7 @@ pub mod delete;
 pub mod migrate;
 pub mod read;
 pub mod rename;
+pub mod type_file;
 pub mod update;
 
 use std::path::Path;

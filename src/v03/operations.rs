@@ -67,6 +67,18 @@ impl<'a> Operations<'a> {
         self.normalize("rename", input, self.collection.rename(input))
     }
 
+    pub fn read_type(&self, input: &Value) -> OperationResult {
+        self.collection.read_type_file(input)
+    }
+
+    pub fn create_type(&self, input: &Value) -> OperationResult {
+        self.collection.create_type_file(input)
+    }
+
+    pub fn update_type(&self, input: &Value) -> OperationResult {
+        self.collection.update_type_file(input)
+    }
+
     fn normalize(&self, operation: &str, input: &Value, legacy: Value) -> OperationResult {
         let path = input
             .get("path")
