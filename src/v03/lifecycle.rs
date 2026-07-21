@@ -2,12 +2,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Map, Value};
 
-use super::{cel::enrich_record_bindings, Diagnostic};
-use crate::expressions::evaluator::{evaluate, EvalContext, NoteNamespaceSource};
-use crate::expressions::parser::Parser;
+use super::{
+    cel::{compile, enrich_record_bindings, evaluate_compiled, operation_clock},
+    Diagnostic,
+};
+use crate::expressions::evaluator::{EvalContext, EvaluationClock, NoteNamespaceSource};
 use crate::generated::slugify;
 use crate::Collection;
 
@@ -53,9 +54,15 @@ impl Collection {
         old: Option<&Map<String, Value>>,
         path: &str,
     ) -> Result<Map<String, Value>, Vec<Diagnostic>> {
-        let now = Utc::now();
-        let now_value = Value::String(now.to_rfc3339_opts(SecondsFormat::Secs, true));
-        let today_value = Value::String(now.format("%Y-%m-%d").to_string());
+        let clock = operation_clock(self.settings.timezone.as_deref()).map_err(|error| {
+            vec![Diagnostic::error(
+                error.code,
+                error.message,
+                Some(path.to_string()),
+            )]
+        })?;
+        let now_value = Value::String(clock.now().to_string());
+        let today_value = Value::String(clock.today().to_string());
         let mut assignments: HashMap<String, AppliedAssignment> = HashMap::new();
         let mut ordered_types = type_names.to_vec();
         ordered_types.sort();
@@ -84,7 +91,7 @@ impl Collection {
 
             for (action_index, action) in actions.into_iter().enumerate() {
                 if let Some(source) = action.get("if").and_then(Value::as_str) {
-                    match evaluate_guard(source, &draft, old, &known_fields, path, event) {
+                    match evaluate_guard(source, &draft, old, &known_fields, path, event, &clock) {
                         Ok(true) => {}
                         Ok(false) => continue,
                         Err(message) => {
@@ -163,9 +170,10 @@ fn evaluate_guard(
     known_fields: &BTreeSet<String>,
     path: &str,
     event: LifecycleEvent,
+    clock: &EvaluationClock,
 ) -> Result<bool, String> {
-    let expression = Parser::parse(source)
-        .map_err(|error| format!("Lifecycle guard did not compile: {error}"))?;
+    let expression = compile(source)
+        .map_err(|error| format!("Lifecycle guard did not compile: {}", error.message))?;
     let draft_value = Value::Object(draft.clone());
     let old_value = old.cloned().map(Value::Object).unwrap_or(Value::Null);
     let mut bindings = enrich_record_bindings(&draft_value, &draft_value, known_fields.iter())
@@ -184,7 +192,7 @@ fn evaluate_guard(
     context.note_namespace_source = NoteNamespaceSource::Effective;
     context.string_concat = false;
 
-    let result = evaluate(&expression, &context)
+    let result = evaluate_compiled(&expression, &context, clock)
         .map_err(|error| format!("Lifecycle guard evaluation failed: {}", error.message))?;
     Ok(result == Value::Bool(true))
 }
@@ -273,6 +281,7 @@ mod tests {
             serde_json::from_value::<Map<String, Value>>(json!({"status": "done"})).unwrap();
         let old = serde_json::from_value::<Map<String, Value>>(json!({"status": "open"})).unwrap();
         let known = BTreeSet::from(["status".to_string(), "missing".to_string()]);
+        let clock = EvaluationClock::capture(Some("UTC")).unwrap();
         assert!(evaluate_guard(
             "note.status == 'done' && record.status == 'done' && !present.raw.missing && old.status == 'open' && operation.name == 'update'",
             &draft,
@@ -280,6 +289,7 @@ mod tests {
             &known,
             "task.md",
             LifecycleEvent::Update,
+            &clock,
         )
         .unwrap());
     }

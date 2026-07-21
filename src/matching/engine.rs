@@ -5,11 +5,27 @@ use crate::types::schema::MatchRules;
 /// Check if a file matches the given match rules.
 /// `rel_path` is the file path relative to the collection root (forward slashes).
 /// `frontmatter` is the parsed frontmatter JSON object.
-pub fn matches_rules(rules: &MatchRules, rel_path: &str, frontmatter: &serde_json::Value) -> bool {
+pub fn matches_rules(
+    rules: &MatchRules,
+    rel_path: &str,
+    frontmatter: &serde_json::Value,
+    timezone: Option<&str>,
+) -> bool {
+    matches_rules_checked(rules, rel_path, frontmatter, timezone).unwrap_or(false)
+}
+
+/// Check match rules while preserving CEL evaluation failures for v0.3
+/// callers that must surface per-record diagnostics.
+pub(crate) fn matches_rules_checked(
+    rules: &MatchRules,
+    rel_path: &str,
+    frontmatter: &serde_json::Value,
+    timezone: Option<&str>,
+) -> Result<bool, crate::v03::cel::CelFailure> {
     // All conditions in a match rule are AND'd together
     if let Some(ref path_glob) = rules.path_glob {
         if !matches_path_glob(rel_path, path_glob) {
-            return false;
+            return Ok(false);
         }
     }
     if let Some(ref path_globs) = rules.path_globs {
@@ -17,34 +33,34 @@ pub fn matches_rules(rules: &MatchRules, rel_path: &str, frontmatter: &serde_jso
             .iter()
             .any(|path_glob| matches_path_glob(rel_path, path_glob))
         {
-            return false;
+            return Ok(false);
         }
     }
 
     if let Some(ref fields_present) = rules.fields_present {
         if !check_fields_present(frontmatter, fields_present) {
-            return false;
+            return Ok(false);
         }
     }
 
     if let Some(ref where_clause) = rules.where_clause {
         if !evaluate_where(frontmatter, where_clause) {
-            return false;
+            return Ok(false);
         }
     }
     if let Some(ref expression) = rules.match_expr {
-        if crate::v03::cel::evaluate_match_expression(expression, frontmatter, rel_path) != Ok(true)
+        if !crate::v03::cel::evaluate_match_expression(expression, frontmatter, rel_path, timezone)?
         {
-            return false;
+            return Ok(false);
         }
     }
 
     // At least one condition must be specified
-    rules.path_glob.is_some()
+    Ok(rules.path_glob.is_some()
         || rules.path_globs.is_some()
         || rules.fields_present.is_some()
         || rules.where_clause.is_some()
-        || rules.match_expr.is_some()
+        || rules.match_expr.is_some())
 }
 
 /// Check if a relative path matches a glob pattern.
@@ -500,6 +516,15 @@ impl Collection {
         frontmatter: &serde_json::Value,
         rel_path: Option<&str>,
     ) -> Vec<String> {
+        self.determine_types_for_path_checked(frontmatter, rel_path)
+            .0
+    }
+
+    pub(crate) fn determine_types_for_path_checked(
+        &self,
+        frontmatter: &serde_json::Value,
+        rel_path: Option<&str>,
+    ) -> (Vec<String>, Vec<(String, crate::v03::cel::CelFailure)>) {
         let mut types = Vec::new();
         let mut has_explicit = false;
 
@@ -529,20 +554,30 @@ impl Collection {
 
         // If explicit types found, stop here (§6.6)
         if has_explicit {
-            return types;
+            return (types, Vec::new());
         }
 
         // Evaluate match rules from all types
+        let mut failures = Vec::new();
         if let Some(path) = rel_path {
-            for (type_name, type_def) in &self.types {
+            let mut definitions = self.types.iter().collect::<Vec<_>>();
+            definitions.sort_by_key(|(type_name, _)| type_name.as_str());
+            for (type_name, type_def) in definitions {
                 if let Some(ref rules) = type_def.match_rules {
-                    if matches_rules(rules, path, frontmatter) && !types.contains(type_name) {
-                        types.push(type_name.clone());
+                    match matches_rules_checked(
+                        rules,
+                        path,
+                        frontmatter,
+                        self.settings.timezone.as_deref(),
+                    ) {
+                        Ok(true) if !types.contains(type_name) => types.push(type_name.clone()),
+                        Ok(_) => {}
+                        Err(failure) => failures.push((type_name.clone(), failure)),
                     }
                 }
             }
         }
 
-        types
+        (types, failures)
     }
 }

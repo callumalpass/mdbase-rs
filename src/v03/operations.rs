@@ -29,7 +29,46 @@ impl<'a> Operations<'a> {
     }
 
     pub fn read(&self, input: &Value) -> OperationResult {
-        self.normalize("read", input, self.collection.read(input))
+        let mut result = self.normalize("read", input, self.collection.read(input));
+        self.attach_match_diagnostics(&mut result);
+        result
+    }
+
+    /// Resolve explicit or inferred type membership for one record.
+    pub fn get_types(&self, input: &Value) -> OperationResult {
+        let Some(path) = input.get("path").and_then(Value::as_str) else {
+            return failed_result(vec![Diagnostic::error(
+                "invalid_request",
+                "Type matching requires path.",
+                None,
+            )]);
+        };
+        let read = self.collection.read(&serde_json::json!({"path": path}));
+        if let Some(error) = read.get("error") {
+            return failed_result(vec![Diagnostic::error(
+                error
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("operation_failed"),
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Record could not be read."),
+                Some(path.to_string()),
+            )]);
+        }
+        let raw = read
+            .get("raw_frontmatter")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let (types, failures) = self
+            .collection
+            .determine_types_for_path_checked(&raw, Some(path));
+        OperationResult {
+            valid: true,
+            result: serde_json::json!({"types": types}),
+            diagnostics: match_failure_diagnostics(path, failures),
+        }
     }
 
     pub fn validate(&self, input: &Value) -> OperationResult {
@@ -275,6 +314,46 @@ impl<'a> Operations<'a> {
         );
         Ok(Value::Object(normalized))
     }
+
+    fn attach_match_diagnostics(&self, result: &mut OperationResult) {
+        let Some(path) = result.result.get("path").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(raw) = result.result.get("raw_frontmatter") else {
+            return;
+        };
+        let (_, failures) = self
+            .collection
+            .determine_types_for_path_checked(raw, Some(path));
+        result
+            .diagnostics
+            .extend(match_failure_diagnostics(path, failures));
+    }
+}
+
+fn match_failure_diagnostics(
+    path: &str,
+    failures: Vec<(String, super::cel::CelFailure)>,
+) -> Vec<Diagnostic> {
+    failures
+        .into_iter()
+        .map(|(type_name, failure)| Diagnostic {
+            severity: "warning".to_string(),
+            code: "expression_evaluation_error".to_string(),
+            message: format!(
+                "Type '{type_name}' match expression failed: {}",
+                failure.message
+            ),
+            path: Some(path.to_string()),
+            field: Some("match.expr".to_string()),
+            type_name: Some(type_name),
+            schema_location: None,
+            details: Some(serde_json::json!({
+                "context": "match",
+                "evaluator_code": failure.code,
+            })),
+        })
+        .collect()
 }
 
 fn create_type_membership(

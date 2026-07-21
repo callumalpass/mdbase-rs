@@ -379,10 +379,10 @@ fn v03_type_definition(type_file: crate::v03::TypeFile) -> Result<TypeDef, Strin
         .as_ref()
         .and_then(|rules| rules.match_expr.as_deref())
     {
-        crate::expressions::parser::Parser::parse(expression).map_err(|error| {
+        crate::v03::cel::compile(expression).map_err(|error| {
             format!(
-                "Type '{}' has an invalid CEL match expression: {error}",
-                type_file.name
+                "Type '{}' has an invalid CEL match expression: {}",
+                type_file.name, error.message,
             )
         })?;
     }
@@ -500,9 +500,10 @@ fn validate_v03_lifecycle_expressions(
             let Some(expression) = action.get("if").and_then(serde_json::Value::as_str) else {
                 continue;
             };
-            crate::expressions::parser::Parser::parse(expression).map_err(|error| {
+            crate::v03::cel::compile(expression).map_err(|error| {
                 format!(
-                    "Type '{type_name}' has an invalid lifecycle guard at lifecycle.{event}[{index}]: {error}"
+                    "Type '{type_name}' has an invalid lifecycle guard at lifecycle.{event}[{index}]: {}",
+                    error.message,
                 )
             })?;
         }

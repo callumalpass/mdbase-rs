@@ -128,7 +128,7 @@ impl Collection {
         for tn in &type_names {
             if let Some(type_def) = self.types.get(tn) {
                 if let Some(ref rules) = type_def.match_rules {
-                    if !matches_rules(rules, &path, &effective) {
+                    if !matches_rules(rules, &path, &effective, self.settings.timezone.as_deref()) {
                         return op_error(
                             "match_failed",
                             &format!(

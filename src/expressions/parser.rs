@@ -296,12 +296,22 @@ pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     depth: u32,
+    max_depth: u32,
 }
 
 const MAX_PARSE_DEPTH: u32 = 64;
 
 impl Parser {
     pub fn parse(input: &str) -> Result<Expr, String> {
+        Self::parse_with_max_depth(input, MAX_PARSE_DEPTH)
+    }
+
+    /// Parse an expression with an explicit nesting limit.
+    ///
+    /// The legacy expression profile retains its historical 64-level limit,
+    /// while newer profiles can select a higher portable minimum without
+    /// changing legacy behavior.
+    pub fn parse_with_max_depth(input: &str, max_depth: u32) -> Result<Expr, String> {
         if input.trim().is_empty() {
             return Err("Empty expression".to_string());
         }
@@ -312,7 +322,7 @@ impl Parser {
         // Per §11.18, if total close-paren count exceeds the depth limit,
         // report expression_depth_exceeded before attempting a full parse.
         let close_paren_count = tokens.iter().filter(|t| matches!(t, Token::RParen)).count() as u32;
-        if close_paren_count > MAX_PARSE_DEPTH {
+        if close_paren_count > max_depth {
             return Err("expression_depth_exceeded".to_string());
         }
 
@@ -320,6 +330,7 @@ impl Parser {
             tokens,
             pos: 0,
             depth: 0,
+            max_depth,
         };
         let expr = parser.parse_ternary()?;
         if parser.peek() != &Token::Eof {
@@ -347,7 +358,7 @@ impl Parser {
 
     fn check_depth(&mut self) -> Result<(), String> {
         self.depth += 1;
-        if self.depth > MAX_PARSE_DEPTH {
+        if self.depth > self.max_depth {
             return Err("expression_depth_exceeded".to_string());
         }
         Ok(())

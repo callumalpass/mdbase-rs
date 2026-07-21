@@ -6,9 +6,67 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use super::{Diagnostic, OperationResult};
-use crate::expressions::evaluator::{evaluate, EvalContext, NoteNamespaceSource};
+use crate::expressions::ast::Expr;
+use crate::expressions::evaluator::{
+    evaluate_with_limits, EvalContext, EvaluationClock, NoteNamespaceSource,
+};
 use crate::expressions::parser::Parser;
 use crate::Collection;
+
+pub(crate) const MAX_SOURCE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_AST_DEPTH: u32 = 128;
+pub(crate) const MAX_EVALUATION_STEPS: u64 = 1_000_000;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct CelFailure {
+    pub code: String,
+    pub message: String,
+}
+
+pub(crate) fn compile(source: &str) -> Result<Expr, CelFailure> {
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err(CelFailure {
+            code: "expression_source_limit_exceeded".to_string(),
+            message: format!(
+                "CEL source is {} bytes; the configured limit is {MAX_SOURCE_BYTES} bytes.",
+                source.len()
+            ),
+        });
+    }
+    Parser::parse_with_max_depth(source, MAX_AST_DEPTH).map_err(|message| CelFailure {
+        code: if message == "expression_depth_exceeded" {
+            "expression_depth_exceeded".to_string()
+        } else {
+            "expression_compile_error".to_string()
+        },
+        message,
+    })
+}
+
+pub(crate) fn operation_clock(timezone: Option<&str>) -> Result<EvaluationClock, CelFailure> {
+    EvaluationClock::capture(timezone).map_err(|message| CelFailure {
+        code: "invalid_timezone".to_string(),
+        message,
+    })
+}
+
+pub(crate) fn evaluate_compiled(
+    expression: &Expr,
+    context: &EvalContext,
+    clock: &EvaluationClock,
+) -> Result<Value, CelFailure> {
+    evaluate_with_limits(
+        expression,
+        context,
+        MAX_AST_DEPTH,
+        MAX_EVALUATION_STEPS,
+        clock,
+    )
+    .map_err(|error| CelFailure {
+        code: error.code,
+        message: error.message,
+    })
+}
 
 pub(crate) fn evaluate_record(collection: &Collection, input: &Value) -> OperationResult {
     let Some(path) = input.get("path").and_then(Value::as_str) else {
@@ -71,7 +129,11 @@ pub(crate) fn evaluate_record(collection: &Collection, input: &Value) -> Operati
     context.types = Some(Arc::new(collection.types.clone()));
     context.note_namespace_source = NoteNamespaceSource::Effective;
     context.string_concat = false;
-    evaluate_source(source, &context, Some(path))
+    let clock = match operation_clock(collection.settings.timezone.as_deref()) {
+        Ok(clock) => clock,
+        Err(error) => return failed(&error.code, error.message, Some(path.to_string())),
+    };
+    evaluate_source(source, &context, &clock, Some(path))
 }
 
 pub(crate) fn evaluate_bindings(input: &Value) -> OperationResult {
@@ -85,7 +147,11 @@ pub(crate) fn evaluate_bindings(input: &Value) -> OperationResult {
     let mut context = EvalContext::empty();
     context.frontmatter = input.get("bindings").cloned().unwrap_or_else(|| json!({}));
     context.string_concat = false;
-    evaluate_source(source, &context, None)
+    let clock = match operation_clock(input.get("timezone").and_then(Value::as_str)) {
+        Ok(clock) => clock,
+        Err(error) => return failed(&error.code, error.message, None),
+    };
+    evaluate_source(source, &context, &clock, None)
 }
 
 pub(crate) fn evaluate_workflow_template(input: &Value) -> OperationResult {
@@ -99,8 +165,12 @@ pub(crate) fn evaluate_workflow_template(input: &Value) -> OperationResult {
     let mut context = EvalContext::empty();
     context.frontmatter = input.get("bindings").cloned().unwrap_or_else(|| json!({}));
     context.string_concat = false;
+    let clock = match operation_clock(input.get("timezone").and_then(Value::as_str)) {
+        Ok(clock) => clock,
+        Err(error) => return failed(&error.code, error.message, None),
+    };
     let mut diagnostics = Vec::new();
-    let value = evaluate_template_value(template, &context, &mut diagnostics);
+    let value = evaluate_template_value(template, &context, &clock, &mut diagnostics);
     let valid = !diagnostics
         .iter()
         .any(|diagnostic: &Diagnostic| diagnostic.severity == "error");
@@ -115,8 +185,9 @@ pub(crate) fn evaluate_match_expression(
     source: &str,
     raw: &Value,
     path: &str,
-) -> Result<bool, String> {
-    let parsed = Parser::parse(source)?;
+    timezone: Option<&str>,
+) -> Result<bool, CelFailure> {
+    let parsed = compile(source)?;
     let mut context = EvalContext::empty();
     let known = raw.as_object().into_iter().flat_map(|object| object.keys());
     context.frontmatter = enrich_record_bindings(raw, raw, known);
@@ -124,7 +195,8 @@ pub(crate) fn evaluate_match_expression(
     context.note_namespace_source = NoteNamespaceSource::Effective;
     context.file_path = Some(path.to_string());
     context.string_concat = false;
-    let value = evaluate(&parsed, &context).map_err(|error| error.message)?;
+    let clock = operation_clock(timezone)?;
+    let value = evaluate_compiled(&parsed, &context, &clock)?;
     Ok(value == Value::Bool(true))
 }
 
@@ -188,18 +260,23 @@ fn known_fields(collection: &Collection, type_names: &[String]) -> BTreeSet<Stri
         .collect()
 }
 
-fn evaluate_source(source: &str, context: &EvalContext, path: Option<&str>) -> OperationResult {
-    let expression = match Parser::parse(source) {
+fn evaluate_source(
+    source: &str,
+    context: &EvalContext,
+    clock: &EvaluationClock,
+    path: Option<&str>,
+) -> OperationResult {
+    let expression = match compile(source) {
         Ok(expression) => expression,
         Err(error) => {
             return failed(
-                "expression_compile_error",
-                format!("CEL expression did not compile: {error}"),
+                &error.code,
+                format!("CEL expression did not compile: {}", error.message),
                 path.map(String::from),
             )
         }
     };
-    match evaluate(&expression, context) {
+    match evaluate_compiled(&expression, context, clock) {
         Ok(value) => OperationResult {
             valid: true,
             result: json!({"value": value}),
@@ -225,6 +302,7 @@ fn evaluate_source(source: &str, context: &EvalContext, path: Option<&str>) -> O
 fn evaluate_template_value(
     value: &Value,
     context: &EvalContext,
+    clock: &EvaluationClock,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Value {
     match value {
@@ -237,7 +315,7 @@ fn evaluate_template_value(
                 ));
                 return Value::Null;
             };
-            let result = evaluate_source(source, context, None);
+            let result = evaluate_source(source, context, clock, None);
             diagnostics.extend(result.diagnostics);
             result.result.get("value").cloned().unwrap_or(Value::Null)
         }
@@ -247,7 +325,7 @@ fn evaluate_template_value(
                 .map(|(key, value)| {
                     (
                         key.clone(),
-                        evaluate_template_value(value, context, diagnostics),
+                        evaluate_template_value(value, context, clock, diagnostics),
                     )
                 })
                 .collect(),
@@ -255,7 +333,7 @@ fn evaluate_template_value(
         Value::Array(values) => Value::Array(
             values
                 .iter()
-                .map(|value| evaluate_template_value(value, context, diagnostics))
+                .map(|value| evaluate_template_value(value, context, clock, diagnostics))
                 .collect(),
         ),
         value => value.clone(),
@@ -273,6 +351,7 @@ fn failed(code: &str, message: impl Into<String>, path: Option<String>) -> Opera
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expressions::evaluator::evaluate;
 
     #[test]
     fn presence_maps_include_known_missing_fields() {

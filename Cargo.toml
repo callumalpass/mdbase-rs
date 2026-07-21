@@ -32,6 +32,7 @@ glob = "0.3"
 regex = "1"
 fancy-regex = "0.14"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 ulid = "1"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
