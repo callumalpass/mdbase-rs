@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Query {
@@ -30,6 +30,17 @@ pub(crate) struct Query {
     pub frontmatter: FrontmatterMode,
     #[serde(flatten)]
     pub _extensions: BTreeMap<String, Value>,
+}
+
+pub(super) struct Candidate {
+    pub path: String,
+    pub types: Vec<String>,
+    pub raw: Value,
+    pub effective: Value,
+    pub body: String,
+    pub file: Value,
+    pub projections: Map<String, Value>,
+    pub values: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
