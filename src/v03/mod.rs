@@ -14,6 +14,8 @@ use walkdir::{DirEntry, WalkDir};
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_to_json};
 use crate::{Collection, SpecProfile};
 
+pub(crate) mod cel;
+mod lifecycle;
 mod operations;
 
 pub use operations::{OperationResult, Operations};
@@ -37,8 +39,10 @@ const CONFIG_SCHEMA: &str = include_str!("../../schemas/v0.3/config.schema.json"
 const DIAGNOSTIC_SCHEMA: &str = include_str!("../../schemas/v0.3/diagnostic.schema.json");
 const OPERATION_RESULT_SCHEMA: &str =
     include_str!("../../schemas/v0.3/operation-result.schema.json");
+const QUERY_SCHEMA: &str = include_str!("../../schemas/v0.3/query.schema.json");
 const QUERY_RESULT_SCHEMA: &str = include_str!("../../schemas/v0.3/query-result.schema.json");
 const TYPE_FILE_SCHEMA: &str = include_str!("../../schemas/v0.3/type-file.schema.json");
+const VIEW_SCHEMA: &str = include_str!("../../schemas/v0.3/view.schema.json");
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Diagnostic {
@@ -98,8 +102,10 @@ pub fn validate_canonical_schemas() -> Result<(), String> {
         ("config", CONFIG_SCHEMA),
         ("diagnostic", DIAGNOSTIC_SCHEMA),
         ("operation-result", OPERATION_RESULT_SCHEMA),
+        ("query", QUERY_SCHEMA),
         ("query-result", QUERY_RESULT_SCHEMA),
         ("type-file", TYPE_FILE_SCHEMA),
+        ("view", VIEW_SCHEMA),
     ] {
         let schema: Value = serde_json::from_str(source)
             .map_err(|error| format!("{name} schema is not valid JSON: {error}"))?;
@@ -682,8 +688,10 @@ pub fn schema_path(name: &str) -> Option<PathBuf> {
         "config" => Some(PathBuf::from("schemas/v0.3/config.schema.json")),
         "diagnostic" => Some(PathBuf::from("schemas/v0.3/diagnostic.schema.json")),
         "operation-result" => Some(PathBuf::from("schemas/v0.3/operation-result.schema.json")),
+        "query" => Some(PathBuf::from("schemas/v0.3/query.schema.json")),
         "query-result" => Some(PathBuf::from("schemas/v0.3/query-result.schema.json")),
         "type-file" => Some(PathBuf::from("schemas/v0.3/type-file.schema.json")),
+        "view" => Some(PathBuf::from("schemas/v0.3/view.schema.json")),
         _ => None,
     }
 }

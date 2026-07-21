@@ -32,12 +32,19 @@ pub fn matches_rules(rules: &MatchRules, rel_path: &str, frontmatter: &serde_jso
             return false;
         }
     }
+    if let Some(ref expression) = rules.match_expr {
+        if crate::v03::cel::evaluate_match_expression(expression, frontmatter, rel_path) != Ok(true)
+        {
+            return false;
+        }
+    }
 
     // At least one condition must be specified
     rules.path_glob.is_some()
         || rules.path_globs.is_some()
         || rules.fields_present.is_some()
         || rules.where_clause.is_some()
+        || rules.match_expr.is_some()
 }
 
 /// Check if a relative path matches a glob pattern.

@@ -57,6 +57,17 @@ pub struct ResolvedFileData {
     pub body: String,
 }
 
+/// Selects which frontmatter view backs the `note` namespace.
+///
+/// The legacy expression profile exposes persisted frontmatter through
+/// `note`; the v0.3 CEL host defines `note` as an alias for `record`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NoteNamespaceSource {
+    #[default]
+    Raw,
+    Effective,
+}
+
 /// Context for expression evaluation.
 #[derive(Clone)]
 pub struct EvalContext {
@@ -80,6 +91,7 @@ pub struct EvalContext {
     /// Types map for display_name_key lookup.
     pub types:
         Option<std::sync::Arc<std::collections::HashMap<String, crate::types::schema::TypeDef>>>,
+    pub note_namespace_source: NoteNamespaceSource,
     /// Whether string + number should concatenate (true in formulas) or return type error (false in where clauses).
     pub string_concat: bool,
 }
@@ -100,6 +112,7 @@ impl EvalContext {
             backlinks_index: None,
             type_names: None,
             types: None,
+            note_namespace_source: NoteNamespaceSource::Raw,
             string_concat: true,
         }
     }
@@ -192,6 +205,10 @@ fn eval_dot(obj_expr: &Expr, field: &str, ctx: &EvalContext) -> Result<Value, Ev
         }
         // note.* namespace accesses raw frontmatter (pre-defaults)
         if name == "note" {
+            if ctx.note_namespace_source == NoteNamespaceSource::Effective {
+                let note = ctx.frontmatter.get("note").unwrap_or(&Value::Null);
+                return Ok(note.get(field).cloned().unwrap_or(Value::Null));
+            }
             let fm = ctx.raw_frontmatter.as_ref().unwrap_or(&ctx.frontmatter);
             return Ok(fm.get(field).cloned().unwrap_or(Value::Null));
         }
@@ -628,7 +645,12 @@ fn eval_index(obj_expr: &Expr, idx_expr: &Expr, ctx: &EvalContext) -> Result<Val
         if name == "note" {
             let idx = evaluate(idx_expr, ctx)?;
             if let Some(key) = idx.as_str() {
-                return Ok(ctx.frontmatter.get(key).cloned().unwrap_or(Value::Null));
+                if ctx.note_namespace_source == NoteNamespaceSource::Effective {
+                    let note = ctx.frontmatter.get("note").unwrap_or(&Value::Null);
+                    return Ok(note.get(key).cloned().unwrap_or(Value::Null));
+                }
+                let fm = ctx.raw_frontmatter.as_ref().unwrap_or(&ctx.frontmatter);
+                return Ok(fm.get(key).cloned().unwrap_or(Value::Null));
             }
         }
     }
@@ -1713,6 +1735,7 @@ fn eval_array_method(
                     backlinks_index: ctx.backlinks_index.clone(),
                     type_names: ctx.type_names.clone(),
                     types: ctx.types.clone(),
+                    note_namespace_source: ctx.note_namespace_source,
                     string_concat: ctx.string_concat,
                 };
                 if let Ok(val) = evaluate(&args[0], &item_ctx) {
@@ -1748,6 +1771,7 @@ fn eval_array_method(
                     backlinks_index: ctx.backlinks_index.clone(),
                     type_names: ctx.type_names.clone(),
                     types: ctx.types.clone(),
+                    note_namespace_source: ctx.note_namespace_source,
                     string_concat: ctx.string_concat,
                 };
                 match evaluate(&args[0], &item_ctx) {
@@ -1788,6 +1812,7 @@ fn eval_array_method(
                     backlinks_index: ctx.backlinks_index.clone(),
                     type_names: ctx.type_names.clone(),
                     types: ctx.types.clone(),
+                    note_namespace_source: ctx.note_namespace_source,
                     string_concat: ctx.string_concat,
                 };
                 acc = evaluate(&args[0], &item_ctx)?;

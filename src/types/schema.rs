@@ -57,6 +57,10 @@ pub struct TypeDef {
     pub match_rules: Option<MatchRules>,
     pub json_schema: Option<serde_json::Value>,
     pub read_defaults: HashMap<String, serde_json::Value>,
+    /// Raw v0.3 lifecycle policy. It remains data here so the v0.3 operation
+    /// facade can apply the canonical mutation pipeline without leaking the
+    /// policy into legacy v0.2 generated-field behavior.
+    pub lifecycle: Option<serde_json::Value>,
     pub source_path: Option<String>,
 }
 
@@ -75,6 +79,8 @@ pub struct MatchRules {
     pub path_globs: Option<Vec<String>>,
     pub fields_present: Option<Vec<String>>,
     pub where_clause: Option<serde_json::Value>,
+    /// Portable v0.3 CEL match expression source.
+    pub match_expr: Option<String>,
 }
 
 impl Default for FieldDef {

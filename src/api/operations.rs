@@ -81,6 +81,7 @@ impl UpdateInput {
         let fields = input
             .get("fields")
             .or_else(|| input.get("frontmatter"))
+            .or_else(|| input.get("patch"))
             .cloned()
             .unwrap_or(serde_json::json!({}));
         let body = input

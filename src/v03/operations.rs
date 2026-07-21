@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::lifecycle::LifecycleEvent;
 use super::Diagnostic;
 use crate::{Collection, SpecProfile};
 
@@ -36,21 +37,58 @@ impl<'a> Operations<'a> {
     }
 
     pub fn query(&self, input: &Value) -> OperationResult {
-        self.normalize("query", input, self.collection.query(input))
+        let mut result = self.normalize("query", input, self.collection.query(input));
+        if input.get("include_body").and_then(Value::as_bool) != Some(true) {
+            if let Some(records) = result
+                .result
+                .get_mut("results")
+                .and_then(Value::as_array_mut)
+            {
+                for record in records {
+                    if let Some(object) = record.as_object_mut() {
+                        object.remove("body");
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Evaluate a portable expression against either a record or explicit
+    /// workflow bindings.
+    pub fn evaluate_cel(&self, input: &Value) -> OperationResult {
+        if input.get("path").is_some() {
+            super::cel::evaluate_record(self.collection, input)
+        } else {
+            super::cel::evaluate_bindings(input)
+        }
+    }
+
+    /// Recursively evaluate only `{ "$expr": "..." }` workflow values.
+    pub fn evaluate_workflow_input(&self, input: &Value) -> OperationResult {
+        super::cel::evaluate_workflow_template(input)
     }
 
     pub fn create(&self, input: &Value) -> OperationResult {
         if let Some(result) = invalid_revision_input(input) {
             return result;
         }
-        self.normalize("create", input, self.collection.create(input))
+        let input = match self.prepare_create(input) {
+            Ok(input) => input,
+            Err(diagnostics) => return failed_result(diagnostics),
+        };
+        self.normalize("create", &input, self.collection.create(&input))
     }
 
     pub fn update(&self, input: &Value) -> OperationResult {
         if let Some(result) = invalid_revision_input(input) {
             return result;
         }
-        self.normalize("update", input, self.collection.update(input))
+        let input = match self.prepare_update(input) {
+            Ok(input) => input,
+            Err(diagnostics) => return failed_result(diagnostics),
+        };
+        self.normalize("update", &input, self.collection.update(&input))
     }
 
     pub fn delete(&self, input: &Value) -> OperationResult {
@@ -65,6 +103,18 @@ impl<'a> Operations<'a> {
             return result;
         }
         self.normalize("rename", input, self.collection.rename(input))
+    }
+
+    pub fn read_type(&self, input: &Value) -> OperationResult {
+        self.collection.read_type_file(input)
+    }
+
+    pub fn create_type(&self, input: &Value) -> OperationResult {
+        self.collection.create_type_file(input)
+    }
+
+    pub fn update_type(&self, input: &Value) -> OperationResult {
+        self.collection.update_type_file(input)
     }
 
     fn normalize(&self, operation: &str, input: &Value, legacy: Value) -> OperationResult {
@@ -153,6 +203,157 @@ impl<'a> Operations<'a> {
             result.insert("types".to_string(), types.clone());
         }
         result.insert("path".to_string(), Value::String(path.to_string()));
+    }
+
+    fn prepare_create(&self, input: &Value) -> Result<Value, Vec<Diagnostic>> {
+        let mut normalized = input.as_object().cloned().unwrap_or_default();
+        let mut draft = input
+            .get("frontmatter")
+            .or_else(|| input.get("fields"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(type_name) = input.get("type").and_then(Value::as_str) {
+            draft
+                .entry("type".to_string())
+                .or_insert_with(|| Value::String(type_name.to_string()));
+        }
+        let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+        let type_names = create_type_membership(self.collection, input, &draft, path);
+        let lifecycle_draft = self.collection.apply_v03_lifecycle(
+            LifecycleEvent::Create,
+            &type_names,
+            draft,
+            None,
+            path,
+        )?;
+        ensure_membership_unchanged(self.collection, &type_names, &lifecycle_draft, path)?;
+        normalized.insert("frontmatter".to_string(), Value::Object(lifecycle_draft));
+        Ok(Value::Object(normalized))
+    }
+
+    fn prepare_update(&self, input: &Value) -> Result<Value, Vec<Diagnostic>> {
+        let Some(path) = input.get("path").and_then(Value::as_str) else {
+            return Ok(input.clone());
+        };
+        let read = self.collection.read(&serde_json::json!({"path": path}));
+        if read.get("error").is_some() {
+            return Ok(input.clone());
+        }
+        let old = read
+            .get("raw_frontmatter")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let patch = input
+            .get("patch")
+            .or_else(|| input.get("fields"))
+            .or_else(|| input.get("frontmatter"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut draft = old.clone();
+        apply_patch(&mut draft, &patch, &self.collection.settings.write_nulls);
+        let type_names = self
+            .collection
+            .determine_types_for_path(&Value::Object(draft.clone()), Some(path));
+        let lifecycle_draft = self.collection.apply_v03_lifecycle(
+            LifecycleEvent::Update,
+            &type_names,
+            draft,
+            Some(&old),
+            path,
+        )?;
+        ensure_membership_unchanged(self.collection, &type_names, &lifecycle_draft, path)?;
+
+        let mut normalized = input.as_object().cloned().unwrap_or_default();
+        normalized.remove("patch");
+        normalized.remove("frontmatter");
+        normalized.insert(
+            "fields".to_string(),
+            Value::Object(diff_frontmatter(&old, &lifecycle_draft)),
+        );
+        Ok(Value::Object(normalized))
+    }
+}
+
+fn create_type_membership(
+    collection: &Collection,
+    input: &Value,
+    draft: &Map<String, Value>,
+    path: &str,
+) -> Vec<String> {
+    let mut type_names = Vec::new();
+    if let Some(type_name) = input.get("type").and_then(Value::as_str) {
+        type_names.push(type_name.to_lowercase());
+    }
+    for type_name in collection.determine_types_for_path(&Value::Object(draft.clone()), Some(path))
+    {
+        if !type_names.contains(&type_name) {
+            type_names.push(type_name);
+        }
+    }
+    type_names
+}
+
+fn ensure_membership_unchanged(
+    collection: &Collection,
+    before: &[String],
+    draft: &Map<String, Value>,
+    path: &str,
+) -> Result<(), Vec<Diagnostic>> {
+    let after = collection.determine_types_for_path(&Value::Object(draft.clone()), Some(path));
+    let mut before_sorted = before.to_vec();
+    let mut after_sorted = after;
+    before_sorted.sort();
+    before_sorted.dedup();
+    after_sorted.sort();
+    after_sorted.dedup();
+    if before_sorted == after_sorted {
+        return Ok(());
+    }
+    let mut diagnostic = Diagnostic::error(
+        "type_membership_changed",
+        "Lifecycle policy changed the record's matched type membership.",
+        Some(path.to_string()),
+    );
+    diagnostic.details = Some(serde_json::json!({
+        "before": before_sorted,
+        "after": after_sorted,
+    }));
+    Err(vec![diagnostic])
+}
+
+fn apply_patch(draft: &mut Map<String, Value>, patch: &Map<String, Value>, write_nulls: &str) {
+    for (field, value) in patch {
+        if value.is_null() && write_nulls == "omit" {
+            draft.remove(field);
+        } else {
+            draft.insert(field.clone(), value.clone());
+        }
+    }
+}
+
+fn diff_frontmatter(before: &Map<String, Value>, after: &Map<String, Value>) -> Map<String, Value> {
+    let mut fields = Map::new();
+    for (field, value) in after {
+        if before.get(field) != Some(value) {
+            fields.insert(field.clone(), value.clone());
+        }
+    }
+    for field in before.keys() {
+        if !after.contains_key(field) {
+            fields.insert(field.clone(), Value::Null);
+        }
+    }
+    fields
+}
+
+fn failed_result(diagnostics: Vec<Diagnostic>) -> OperationResult {
+    OperationResult {
+        valid: false,
+        result: serde_json::json!({}),
+        diagnostics,
     }
 }
 

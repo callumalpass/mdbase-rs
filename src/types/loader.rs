@@ -335,6 +335,7 @@ fn parse_type_file(content: &str, path: &Path, collection_root: &Path) -> Result
         match_rules,
         json_schema: None,
         read_defaults: HashMap::new(),
+        lifecycle: None,
         source_path: path
             .strip_prefix(collection_root)
             .ok()
@@ -374,11 +375,24 @@ fn v03_type_definition(type_file: crate::v03::TypeFile) -> Result<TypeDef, Strin
     }
 
     let mut match_rules = frontmatter.get("match").map(parse_v03_match_rules);
+    if let Some(expression) = match_rules
+        .as_ref()
+        .and_then(|rules| rules.match_expr.as_deref())
+    {
+        crate::expressions::parser::Parser::parse(expression).map_err(|error| {
+            format!(
+                "Type '{}' has an invalid CEL match expression: {error}",
+                type_file.name
+            )
+        })?;
+    }
+    validate_v03_lifecycle_expressions(frontmatter, &type_file.name)?;
     if match_rules.as_ref().is_some_and(|rules| {
         rules.path_glob.is_none()
             && rules.path_globs.is_none()
             && rules.fields_present.is_none()
             && rules.where_clause.is_none()
+            && rules.match_expr.is_none()
     }) {
         match_rules = None;
     }
@@ -459,8 +473,41 @@ fn v03_type_definition(type_file: crate::v03::TypeFile) -> Result<TypeDef, Strin
         match_rules,
         json_schema: Some(type_file.schema),
         read_defaults,
+        lifecycle: frontmatter.get("lifecycle").cloned(),
         source_path: Some(type_file.path),
     })
+}
+
+fn validate_v03_lifecycle_expressions(
+    frontmatter: &serde_json::Map<String, serde_json::Value>,
+    type_name: &str,
+) -> Result<(), String> {
+    let Some(lifecycle) = frontmatter
+        .get("lifecycle")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(());
+    };
+    for event in ["on_create", "on_update"] {
+        let Some(policy) = lifecycle.get(event) else {
+            continue;
+        };
+        let actions: Vec<&serde_json::Value> = match policy {
+            serde_json::Value::Array(actions) => actions.iter().collect(),
+            action => vec![action],
+        };
+        for (index, action) in actions.into_iter().enumerate() {
+            let Some(expression) = action.get("if").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            crate::expressions::parser::Parser::parse(expression).map_err(|error| {
+                format!(
+                    "Type '{type_name}' has an invalid lifecycle guard at lifecycle.{event}[{index}]: {error}"
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn field_from_json_schema(schema: &serde_json::Value) -> Result<FieldDef, String> {
@@ -580,6 +627,10 @@ fn parse_v03_match_rules(value: &serde_json::Value) -> MatchRules {
                     .collect()
             }),
         where_clause: value.get("where").cloned(),
+        match_expr: value
+            .pointer("/expr/$expr")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
     }
 }
 
@@ -823,6 +874,7 @@ fn parse_match_rules(value: &serde_yaml::Value) -> MatchRules {
                 path_globs: None,
                 fields_present: None,
                 where_clause: None,
+                match_expr: None,
             }
         }
     };
@@ -849,5 +901,6 @@ fn parse_match_rules(value: &serde_yaml::Value) -> MatchRules {
         path_globs: None,
         fields_present,
         where_clause,
+        match_expr: None,
     }
 }

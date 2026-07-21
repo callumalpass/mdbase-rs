@@ -8,6 +8,8 @@ All notable changes to this project are documented in this file.
 - A real debounced `CollectionWatcher` backed by filesystem notifications and
   final-state collection snapshot diffs.
 - Opaque `if_revision` preconditions for create, update, delete, and rename.
+- Canonical v0.3 query and view schemas, including ordinary Markdown view-record
+  validation through the existing type-file pipeline.
 
 ### Changed
 - v0.3 queries now return the canonical operation envelope.

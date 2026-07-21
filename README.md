@@ -12,9 +12,14 @@ Rust implementation of the [mdbase spec](https://mdbase.dev), with:
 The `0.3.0-rc.1` crate dual-loads legacy v0.2 collections and v0.3 type
 wrappers. v0.3 records are validated against their embedded JSON Schema
 2020-12 schemas and report canonical structured diagnostics. The canonical
-config, type-file, diagnostic, operation-result, and query-result schemas are
-vendored under `schemas/v0.3/` and refreshed with
+config, type-file, diagnostic, operation-result, query, query-result, and view
+schemas are vendored under `schemas/v0.3/` and refreshed with
 `scripts/sync-v03-schemas.sh`.
+
+The canonical `view` schema is handled through the normal v0.3 type-file and
+record-validation pipeline. This crate does not advertise the optional
+`view_records` execution feature or the Query profile; those remain outside its
+verified claim until their shared fixtures are implemented.
 
 `mdb init` creates a minimal stable `0.3.0` collection by default. Supplying an
 explicit v0.2 version retains the legacy initializer and generated meta type.

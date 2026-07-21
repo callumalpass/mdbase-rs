@@ -16,6 +16,7 @@ pub mod links;
 pub mod matching;
 pub mod operations;
 pub mod query;
+pub mod runtime;
 pub mod types;
 pub mod v03;
 pub mod validation;
@@ -139,7 +140,11 @@ impl Collection {
                         .collect()
                 })
                 .unwrap_or_else(|| vec!["type".into(), "types".into()]),
-            write_defaults: settings_json["write_defaults"].as_bool().unwrap_or(true),
+            write_defaults: if spec_profile == SpecProfile::V03 {
+                false
+            } else {
+                settings_json["write_defaults"].as_bool().unwrap_or(true)
+            },
             default_validation: settings_json["default_validation"]
                 .as_str()
                 .unwrap_or("warn")
@@ -153,10 +158,14 @@ impl Collection {
             id_field_explicit: settings_json["id_field_explicit"]
                 .as_bool()
                 .unwrap_or(false),
-            write_nulls: settings_json["write_nulls"]
-                .as_str()
-                .unwrap_or("omit")
-                .to_string(),
+            write_nulls: if spec_profile == SpecProfile::V03 {
+                "explicit".to_string()
+            } else {
+                settings_json["write_nulls"]
+                    .as_str()
+                    .unwrap_or("omit")
+                    .to_string()
+            },
             write_empty_lists: settings_json["write_empty_lists"].as_bool().unwrap_or(true),
             rename_update_refs: settings_json["rename_update_refs"]
                 .as_bool()

@@ -22,11 +22,20 @@ struct Group {
 
 #[derive(Debug, Deserialize)]
 struct Setup {
+    #[serde(default = "default_config")]
     config: String,
     #[serde(default)]
     types: HashMap<String, String>,
     #[serde(default)]
     files: HashMap<String, String>,
+    #[serde(default)]
+    event: Option<serde_yaml::Value>,
+    #[serde(default)]
+    steps: Option<serde_yaml::Value>,
+}
+
+fn default_config() -> String {
+    "spec_version: \"0.3.0\"\n".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,11 +48,12 @@ struct Case {
     expect: serde_yaml::Value,
 }
 
-fn fixture_path() -> PathBuf {
+fn fixture_path(relative_path: &str) -> PathBuf {
     std::env::var_os("MDBASE_SPEC_REPO_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../mdbase-spec"))
-        .join("tests/v0.3/core/core-collection.yaml")
+        .join("tests/v0.3")
+        .join(relative_path)
 }
 
 fn materialize(setup: &Setup) -> TempDir {
@@ -73,7 +83,7 @@ fn yaml_to_json(value: &serde_yaml::Value) -> Value {
     serde_json::to_value(value).expect("convert fixture YAML to JSON")
 }
 
-fn execute(collection: &Collection, case: &Case, expected: &Value) -> Value {
+fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value) -> Value {
     let input = yaml_to_json(&case.input);
     let operations = collection
         .v03_operations()
@@ -115,6 +125,43 @@ fn execute(collection: &Collection, case: &Case, expected: &Value) -> Value {
             }
             result
         }
+        "query" => {
+            let mut result = flatten_envelope(operations.query(&input));
+            let body_returned = result
+                .get("results")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|record| record.get("body").is_some());
+            result["body_returned"] = Value::Bool(body_returned);
+            result
+        }
+        "evaluate_cel" => {
+            let mut input = input;
+            if input.get("context").and_then(Value::as_str) == Some("workflow") {
+                let mut bindings = Map::new();
+                if let Some(event) = &setup.event {
+                    bindings.insert("event".to_string(), yaml_to_json(event));
+                }
+                if let Some(steps) = &setup.steps {
+                    bindings.insert("steps".to_string(), yaml_to_json(steps));
+                }
+                input["bindings"] = Value::Object(bindings);
+            }
+            flatten_envelope(operations.evaluate_cel(&input))
+        }
+        "evaluate_workflow_input" => {
+            let mut input = input;
+            let mut bindings = Map::new();
+            if let Some(event) = &setup.event {
+                bindings.insert("event".to_string(), yaml_to_json(event));
+            }
+            if let Some(steps) = &setup.steps {
+                bindings.insert("steps".to_string(), yaml_to_json(steps));
+            }
+            input["bindings"] = Value::Object(bindings);
+            flatten_envelope(operations.evaluate_workflow_input(&input))
+        }
         "get_types" => {
             let path = input
                 .get("path")
@@ -151,18 +198,51 @@ fn execute(collection: &Collection, case: &Case, expected: &Value) -> Value {
         }
         "create" => {
             let mut result = flatten_envelope(operations.create(&input));
-            if result.get("valid") == Some(&Value::Bool(false)) {
-                if let Some(first) = result
-                    .get("diagnostics")
-                    .and_then(Value::as_array)
-                    .and_then(|items| items.first())
-                {
-                    result["error"] = first.clone();
-                }
+            expose_operation_issues(&mut result);
+            result
+        }
+        "update" => {
+            let path = input
+                .get("path")
+                .and_then(Value::as_str)
+                .expect("update requires input.path");
+            let before = operations.read(&serde_json::json!({"path": path}));
+            let before = before
+                .result
+                .get("raw_frontmatter")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut result = flatten_envelope(operations.update(&input));
+            expose_operation_issues(&mut result);
+            if let Some(after) = result.get("frontmatter").and_then(Value::as_object) {
+                let mut changed = before
+                    .keys()
+                    .chain(after.keys())
+                    .filter(|field| before.get(*field) != after.get(*field))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                changed.sort();
+                changed.dedup();
+                result["frontmatter_changed"] =
+                    Value::Array(changed.into_iter().map(Value::String).collect());
             }
             result
         }
         operation => panic!("unsupported v0.3 fixture operation: {operation}"),
+    }
+}
+
+fn expose_operation_issues(result: &mut Value) {
+    result["issues"] = result["diagnostics"].clone();
+    if result.get("valid") == Some(&Value::Bool(false)) {
+        if let Some(first) = result
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+        {
+            result["error"] = first.clone();
+        }
     }
 }
 
@@ -202,6 +282,21 @@ fn assert_expectation(actual: &Value, expected: &Value, case_name: &str) {
                     );
                 }
             }
+            "frontmatter_contains" => {
+                let frontmatter = actual
+                    .get("frontmatter")
+                    .and_then(Value::as_object)
+                    .unwrap_or_else(|| panic!("{case_name}: missing frontmatter"));
+                for (field, constraint) in expected_value
+                    .as_object()
+                    .expect("frontmatter_contains must be an object")
+                {
+                    let value = frontmatter.get(field).unwrap_or_else(|| {
+                        panic!("{case_name}: frontmatter is missing {field}: {actual:#}")
+                    });
+                    assert_value_constraint(value, constraint, case_name, field);
+                }
+            }
             _ => {
                 let actual_value = actual
                     .get(key)
@@ -210,6 +305,34 @@ fn assert_expectation(actual: &Value, expected: &Value, case_name: &str) {
             }
         }
     }
+}
+
+fn assert_value_constraint(actual: &Value, expected: &Value, case_name: &str, path: &str) {
+    if let Some(pattern) = expected.get("matches").and_then(Value::as_str) {
+        let value = actual
+            .as_str()
+            .unwrap_or_else(|| panic!("{case_name}: {path} is not a string: {actual}"));
+        let pattern = regex::Regex::new(pattern).expect("fixture regex must compile");
+        assert!(
+            pattern.is_match(value),
+            "{case_name}: {path} does not match {}: {actual}",
+            pattern.as_str()
+        );
+        return;
+    }
+    if let Some(format) = expected.get("format").and_then(Value::as_str) {
+        let value = actual
+            .as_str()
+            .unwrap_or_else(|| panic!("{case_name}: {path} is not a string: {actual}"));
+        let valid = match format {
+            "date" => chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok(),
+            "date-time" => chrono::DateTime::parse_from_rfc3339(value).is_ok(),
+            other => panic!("unsupported fixture format constraint: {other}"),
+        };
+        assert!(valid, "{case_name}: {path} is not {format}: {actual}");
+        return;
+    }
+    assert_subset(actual, expected, case_name, path);
 }
 
 fn assert_array_contains(
@@ -254,21 +377,35 @@ fn is_subset(actual: &Value, expected: &Value) -> bool {
 
 #[test]
 fn shared_v03_core_collection_fixture_passes() {
-    let path = fixture_path();
+    run_suite("core/core-collection.yaml", "core_collection");
+}
+
+#[test]
+fn shared_v03_lifecycle_fixture_passes() {
+    run_suite("lifecycle/lifecycle.yaml", "lifecycle");
+}
+
+#[test]
+fn shared_v03_cel_fixture_passes() {
+    run_suite("cel/cel-profile.yaml", "cel");
+}
+
+fn run_suite(relative_path: &str, fixture_set: &str) {
+    let path = fixture_path(relative_path);
     if !path.exists() && std::env::var_os("MDBASE_REQUIRE_V03_CONFORMANCE").is_none() {
         return;
     }
     let fixture = fs::read_to_string(path).expect("read shared v0.3 fixture");
     let suite: Suite = serde_yaml::from_str(&fixture).expect("parse shared v0.3 fixture");
-    assert_eq!(suite.fixture_set, "core_collection");
+    assert_eq!(suite.fixture_set, fixture_set);
 
     for group in suite.groups {
-        let directory = materialize(&group.setup);
-        let collection = Collection::open(directory.path())
-            .unwrap_or_else(|error| panic!("{}: open collection: {error:#}", group.name));
         for case in group.tests {
+            let directory = materialize(&group.setup);
+            let collection = Collection::open(directory.path())
+                .unwrap_or_else(|error| panic!("{}: open collection: {error:#}", group.name));
             let expected = yaml_to_json(&case.expect);
-            let actual = execute(&collection, &case, &expected);
+            let actual = execute(&collection, &group.setup, &case, &expected);
             assert_expectation(&actual, &expected, &case.name);
         }
     }
