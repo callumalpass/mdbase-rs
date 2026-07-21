@@ -1,6 +1,7 @@
 use std::fs;
 use std::time::Duration;
 
+use mdbase::runtime_contracts::{ContractDocument, ContractSource, LoadOptions};
 use mdbase::watch::{CollectionWatcher, WatchKind};
 use mdbase::Collection;
 use serde_json::json;
@@ -137,6 +138,86 @@ fn portable_watcher_tracks_resources_and_honors_collection_scope() {
     watcher.rescan().unwrap();
     assert!(watcher
         .recv_portable_timeout(Duration::from_millis(100))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn runtime_aware_watcher_reports_effective_registry_recomposition() {
+    let root = setup();
+    let provider = ContractDocument::virtual_contract(json!({
+        "type": "provider",
+        "id": "local",
+        "version": 1,
+        "provider_version": "1.0.0",
+        "name": "Local test provider",
+        "contracts": {"events": ["local.changed"]}
+    }));
+    let watcher = CollectionWatcher::open_with_runtime_contracts(
+        root.path(),
+        Duration::from_millis(25),
+        vec![ContractSource::built_in(vec![provider])],
+        LoadOptions::default(),
+    )
+    .unwrap();
+
+    let event = json!({
+        "type": "event",
+        "id": "local.changed",
+        "version": 1,
+        "provider": "local",
+        "name": "Local change",
+        "schemas": {
+            "dialect": "json-schema-2020-12",
+            "payload": {"type": "object"}
+        }
+    });
+    fs::write(
+        root.path().join("local-event.md"),
+        format!("---\n{}---\n", serde_yaml::to_string(&event).unwrap()),
+    )
+    .unwrap();
+    watcher.rescan().unwrap();
+
+    let events = (0..2)
+        .map(|_| {
+            watcher
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .expect("record and registry notifications")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events[0].event_type, "mdbase.record.created");
+    let changed = &events[1];
+    assert_eq!(changed.event_type, "mdbase.runtime.registry.changed");
+    assert_eq!(changed.payload["identity"], "effective_registry");
+    assert_eq!(
+        changed.payload["valid"], true,
+        "unexpected runtime state: {}",
+        changed.payload
+    );
+    assert!(changed.payload["revision"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert!(changed.payload.get("path").is_none());
+    assert!(!changed
+        .payload
+        .to_string()
+        .contains(root.path().to_string_lossy().as_ref()));
+
+    let portable = changed.clone().into_portable();
+    assert_eq!(portable.kind, WatchKind::RuntimeRegistryChanged);
+    assert_eq!(portable.subject.as_deref(), Some("effective_registry"));
+    assert!(portable.path.is_none());
+
+    // A normal record changes the collection snapshot but leaves the runtime
+    // registry alone, so no spurious registry notification is emitted.
+    fs::write(root.path().join("ordinary.md"), "---\ntitle: Note\n---\n").unwrap();
+    watcher.rescan().unwrap();
+    assert_eq!(watcher.recv().unwrap().event_type, "mdbase.record.created");
+    assert!(watcher
+        .recv_timeout(Duration::from_millis(100))
         .unwrap()
         .is_none());
 }

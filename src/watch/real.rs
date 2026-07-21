@@ -1,4 +1,5 @@
 use super::{PortableWatchEvent, WatchEvent};
+use crate::runtime_contracts::{ContractSource, LoadOptions, RuntimeContracts};
 use crate::Collection;
 use notify::{
     event::{MetadataKind, ModifyKind},
@@ -42,14 +43,44 @@ enum Command {
 
 impl CollectionWatcher {
     pub fn open(root: impl AsRef<Path>, debounce: Duration) -> Result<Self, WatchError> {
-        let root = root.as_ref().to_path_buf();
-        let initial = Snapshot::load(&root)?;
+        Self::open_internal(root.as_ref(), debounce, None)
+    }
+
+    /// Open a watcher that also recomposes the effective Runtime Contracts
+    /// registry and emits `mdbase.runtime.registry.changed` after its inputs
+    /// change. Virtual built-in/provider/pack sources stay in memory and are
+    /// never materialized into the collection.
+    pub fn open_with_runtime_contracts(
+        root: impl AsRef<Path>,
+        debounce: Duration,
+        implicit_sources: Vec<ContractSource>,
+        options: LoadOptions,
+    ) -> Result<Self, WatchError> {
+        let runtime = RuntimeSnapshotter {
+            engine: RuntimeContracts::new().map_err(WatchError::Collection)?,
+            implicit_sources,
+            options,
+        };
+        Self::open_internal(root.as_ref(), debounce, Some(runtime))
+    }
+
+    fn open_internal(
+        root: &Path,
+        debounce: Duration,
+        runtime: Option<RuntimeSnapshotter>,
+    ) -> Result<Self, WatchError> {
+        let root = root.to_path_buf();
+        let initial = Snapshot::load(&root, runtime.as_ref())?;
         let (events_tx, events) = mpsc::channel();
         let (commands, command_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("mdbase-watch".to_string())
-            .spawn(move || watch_loop(root, debounce, initial, command_rx, events_tx, ready_tx))
+            .spawn(move || {
+                watch_loop(
+                    root, debounce, initial, runtime, command_rx, events_tx, ready_tx,
+                )
+            })
             .map_err(|error| WatchError::Collection(error.to_string()))?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -118,6 +149,7 @@ fn watch_loop(
     root: PathBuf,
     debounce: Duration,
     mut snapshot: Snapshot,
+    runtime: Option<RuntimeSnapshotter>,
     commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<WatchEvent>,
     ready: mpsc::SyncSender<Result<(), notify::Error>>,
@@ -178,7 +210,7 @@ fn watch_loop(
 
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             deadline = None;
-            match Snapshot::load(&root) {
+            match Snapshot::load(&root, runtime.as_ref()) {
                 Ok(next) => {
                     for event in snapshot.diff(&next) {
                         sequence += 1;
@@ -249,6 +281,20 @@ struct Snapshot {
     config_revision: String,
     types: BTreeMap<String, String>,
     records: BTreeMap<String, RecordState>,
+    runtime: Option<RuntimeRegistryState>,
+}
+
+struct RuntimeSnapshotter {
+    engine: RuntimeContracts,
+    implicit_sources: Vec<ContractSource>,
+    options: LoadOptions,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RuntimeRegistryState {
+    revision: String,
+    valid: bool,
+    diagnostic_codes: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -260,7 +306,7 @@ struct RecordState {
 }
 
 impl Snapshot {
-    fn load(root: &Path) -> Result<Self, WatchError> {
+    fn load(root: &Path, runtime: Option<&RuntimeSnapshotter>) -> Result<Self, WatchError> {
         let collection = Collection::open(root)
             .map_err(|error| WatchError::Collection(collection_error(&error)))?;
         let config_revision = file_revision(&root.join("mdbase.yaml"))?;
@@ -297,10 +343,32 @@ impl Snapshot {
                 },
             );
         }
+        let runtime = runtime.map(|snapshotter| {
+            let loaded = snapshotter.engine.load(
+                &collection,
+                snapshotter.implicit_sources.clone(),
+                &snapshotter.options,
+            );
+            let mut diagnostic_codes = loaded
+                .registry
+                .diagnostics
+                .iter()
+                .chain(loaded.preflight.diagnostics.iter())
+                .map(|diagnostic| diagnostic.code.clone())
+                .collect::<Vec<_>>();
+            diagnostic_codes.sort();
+            diagnostic_codes.dedup();
+            RuntimeRegistryState {
+                revision: loaded.registry.revision(),
+                valid: loaded.valid(),
+                diagnostic_codes,
+            }
+        });
         Ok(Self {
             config_revision,
             types,
             records,
+            runtime,
         })
     }
 
@@ -420,6 +488,20 @@ impl Snapshot {
                         "revision": current.revision,
                         "previous_types": previous.types,
                         "types": current.types,
+                    }),
+                ));
+            }
+        }
+        if self.runtime != next.runtime {
+            if let Some(current) = &next.runtime {
+                events.push(PendingEvent::new(
+                    "mdbase.runtime.registry.changed",
+                    json!({
+                        "identity": "effective_registry",
+                        "previous_revision": self.runtime.as_ref().map(|state| &state.revision),
+                        "revision": current.revision,
+                        "valid": current.valid,
+                        "diagnostic_codes": current.diagnostic_codes,
                     }),
                 ));
             }

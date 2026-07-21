@@ -277,7 +277,7 @@ impl RuntimePackage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContractEntry {
     pub contract: Value,
     pub origins: Vec<ContractOrigin>,

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use jsonschema::JSONSchema;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::model::{
     ComposeOptions, ContractDocument, ContractEntry, ContractKind, ContractOrigin, ContractSource,
@@ -69,6 +70,29 @@ impl RuntimeRegistry {
             .then(|| self.policies.get(&self.selected_policy_ids[0]))
             .flatten()
             .filter(|entry| entry.contract.get("enabled") != Some(&Value::Bool(false)))
+    }
+
+    /// Stable identity of the effective registry, excluding compiled caches.
+    ///
+    /// This is suitable for invalidation and Watch profile notifications. It
+    /// includes provenance and diagnostics because either can affect host
+    /// preflight decisions, but exposes neither collection paths nor contract
+    /// payloads to event consumers.
+    pub fn revision(&self) -> String {
+        let state = serde_json::json!({
+            "providers": self.providers,
+            "actions": self.actions,
+            "events": self.events,
+            "capabilities": self.capabilities,
+            "policies": self.policies,
+            "workflows": self.workflows,
+            "provider_ids": self.provider_ids,
+            "capability_ids": self.capability_ids,
+            "selected_policy_ids": self.selected_policy_ids,
+            "diagnostics": self.diagnostics,
+        });
+        let digest = Sha256::digest(canonical_json(&state).as_bytes());
+        format!("sha256:{digest:x}")
     }
 }
 
