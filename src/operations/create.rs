@@ -6,7 +6,7 @@ use crate::frontmatter;
 use crate::frontmatter::serializer;
 use crate::generated::derive_path;
 use crate::matching::engine::matches_rules;
-use crate::operations::{atomic_create, ensure_safe_relative_path};
+use crate::operations::{atomic_create, ensure_no_symlink_components, ensure_safe_relative_path};
 use crate::Collection;
 
 impl Collection {
@@ -105,6 +105,9 @@ impl Collection {
             return op_error(PATH_REQUIRED, "path must not be empty");
         }
         if let Err(error) = ensure_safe_relative_path(&path, self.spec_profile) {
+            return error;
+        }
+        if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
             return error;
         }
 
@@ -216,6 +219,9 @@ impl Collection {
             frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
         let content = serializer::serialize_document(&yaml_mapping, body);
 
+        if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
+            return error;
+        }
         if let Err(e) = atomic_create(&full_path, content.as_bytes()) {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 return op_error(PATH_CONFLICT, &format!("File already exists: {path}"));

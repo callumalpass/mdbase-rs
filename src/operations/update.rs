@@ -4,7 +4,9 @@ use crate::api::operations::{UpdateInput, UpdateOutput};
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::frontmatter::serializer;
-use crate::operations::{atomic_write, ensure_revision, ensure_safe_relative_path};
+use crate::operations::{
+    atomic_write, ensure_no_symlink_components, ensure_revision, ensure_safe_relative_path,
+};
 use crate::Collection;
 
 impl Collection {
@@ -22,6 +24,9 @@ impl Collection {
             if_revision,
         } = input;
         if let Err(error) = ensure_safe_relative_path(&path, self.spec_profile) {
+            return error;
+        }
+        if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
             return error;
         }
 
@@ -143,6 +148,9 @@ impl Collection {
         };
         let output = serializer::serialize_document(&write_mapping, body);
 
+        if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
+            return error;
+        }
         if let Err(e) = atomic_write(&full_path, output.as_bytes()) {
             return op_error("io_error", &format!("Failed to write: {}", e));
         }

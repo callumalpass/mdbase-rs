@@ -65,6 +65,132 @@ fn traversal_paths_are_rejected_for_core_operations() {
     assert!(!outside_root.join("pwn.md").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn symlinks_cannot_escape_the_collection_boundary() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().join("collection");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&root).expect("create collection");
+    fs::create_dir_all(&outside).expect("create outside folder");
+    write_file(&root.join("mdbase.yaml"), "spec_version: 0.3.0\n");
+    write_file(
+        &outside.join("secret.md"),
+        "---\nsecret: never-return-this\n---\noutside\n",
+    );
+    symlink(&outside, root.join("escape")).expect("create directory symlink");
+    symlink(outside.join("secret.md"), root.join("secret.md")).expect("create file symlink");
+
+    let collection = open_collection(&root);
+    for result in [
+        collection.read(&serde_json::json!({ "path": "secret.md" })),
+        collection.update(&serde_json::json!({
+            "path": "secret.md",
+            "fields": { "compromised": true }
+        })),
+        collection.delete(&serde_json::json!({ "path": "secret.md" })),
+        collection.create(&serde_json::json!({
+            "path": "escape/created.md",
+            "frontmatter": {},
+            "body": "must stay contained"
+        })),
+        collection.rename(&serde_json::json!({
+            "from": "secret.md",
+            "to": "renamed.md",
+            "update_refs": false
+        })),
+    ] {
+        assert_eq!(
+            result
+                .pointer("/error/code")
+                .and_then(|value| value.as_str()),
+            Some("path_traversal"),
+            "unexpected result: {result}"
+        );
+        assert!(
+            !result.to_string().contains("never-return-this"),
+            "operation leaked the external payload: {result}"
+        );
+    }
+
+    assert!(!outside.join("created.md").exists());
+    assert_eq!(
+        fs::read_to_string(outside.join("secret.md")).expect("external file remains readable"),
+        "---\nsecret: never-return-this\n---\noutside\n"
+    );
+}
+
+#[test]
+fn concurrent_renames_never_replace_the_winner() {
+    use std::sync::{Arc, Barrier};
+
+    const WRITERS: usize = 12;
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path();
+    write_file(&root.join("mdbase.yaml"), "spec_version: 0.3.0\n");
+    for index in 0..WRITERS {
+        write_file(
+            &root.join(format!("source-{index}.md")),
+            &format!("---\nwriter: {index}\n---\nwriter-{index}\n"),
+        );
+    }
+
+    let barrier = Arc::new(Barrier::new(WRITERS));
+    let handles = (0..WRITERS)
+        .map(|index| {
+            let root = root.to_path_buf();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let collection = open_collection(&root);
+                barrier.wait();
+                (
+                    index,
+                    collection.rename(&serde_json::json!({
+                        "from": format!("source-{index}.md"),
+                        "to": "winner.md",
+                        "update_refs": false
+                    })),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("rename worker"))
+        .collect::<Vec<_>>();
+    let successes = results
+        .iter()
+        .filter(|(_, result)| result.get("error").is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(successes.len(), 1, "results: {results:?}");
+
+    for (_, result) in &results {
+        if result.get("error").is_some() {
+            assert_eq!(
+                result
+                    .pointer("/error/code")
+                    .and_then(|value| value.as_str()),
+                Some("path_conflict"),
+                "unexpected loser result: {result}"
+            );
+        }
+    }
+
+    let winner_index = successes[0].0;
+    let winner = fs::read_to_string(root.join("winner.md")).expect("winner exists");
+    assert!(winner.contains(&format!("writer-{winner_index}")));
+    for index in 0..WRITERS {
+        assert_eq!(
+            root.join(format!("source-{index}.md")).exists(),
+            index != winner_index,
+            "only the winning source should move"
+        );
+    }
+}
+
 #[test]
 fn cli_update_refs_flag_is_honored() {
     let tmp = TempDir::new().expect("tempdir");

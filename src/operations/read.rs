@@ -3,7 +3,7 @@
 use crate::api::operations::ReadInput;
 use crate::errors::*;
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to_json};
-use crate::operations::ensure_safe_relative_path;
+use crate::operations::{ensure_no_symlink_components, ensure_safe_relative_path};
 use crate::Collection;
 use std::path::Path;
 
@@ -15,6 +15,10 @@ impl Collection {
             Err(err) => return err,
         };
         if let Err(error) = ensure_safe_relative_path(&input.path, self.spec_profile) {
+            return error;
+        }
+        if let Err(error) = ensure_no_symlink_components(&self.root, &input.path, self.spec_profile)
+        {
             return error;
         }
 

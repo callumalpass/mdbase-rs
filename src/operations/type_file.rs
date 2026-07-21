@@ -7,7 +7,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 use tempfile::NamedTempFile;
 
-use crate::operations::{ensure_revision, ensure_safe_relative_path};
+use crate::operations::{ensure_no_symlink_components, ensure_revision, ensure_safe_relative_path};
 use crate::v03::{self, Diagnostic, OperationResult};
 use crate::Collection;
 
@@ -160,6 +160,8 @@ impl Collection {
 
     fn validate_type_path(&self, path: &str) -> Result<(), Box<Diagnostic>> {
         ensure_safe_relative_path(path, self.spec_profile)
+            .map_err(|error| Box::new(open_diagnostic(error, path)))?;
+        ensure_no_symlink_components(&self.root, path, self.spec_profile)
             .map_err(|error| Box::new(open_diagnostic(error, path)))?;
         let prefix = format!("{}/", self.settings.types_folder.trim_end_matches('/'));
         if !path.starts_with(&prefix)

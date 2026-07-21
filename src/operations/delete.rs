@@ -2,7 +2,7 @@
 
 use crate::api::operations::{DeleteInput, DeleteOutput};
 use crate::errors::*;
-use crate::operations::{ensure_revision, ensure_safe_relative_path};
+use crate::operations::{ensure_no_symlink_components, ensure_revision, ensure_safe_relative_path};
 use crate::Collection;
 
 impl Collection {
@@ -13,6 +13,10 @@ impl Collection {
             Err(err) => return err,
         };
         if let Err(error) = ensure_safe_relative_path(&input.path, self.spec_profile) {
+            return error;
+        }
+        if let Err(error) = ensure_no_symlink_components(&self.root, &input.path, self.spec_profile)
+        {
             return error;
         }
         let path = input.path;
@@ -59,6 +63,9 @@ impl Collection {
         }
 
         if let Err(error) = ensure_revision(&full_path, &path, input.if_revision.as_deref()) {
+            return error;
+        }
+        if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
             return error;
         }
         if let Err(e) = std::fs::remove_file(&full_path) {
