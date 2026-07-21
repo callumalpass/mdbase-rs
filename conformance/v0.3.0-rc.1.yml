@@ -88,13 +88,13 @@ evidence:
   - kind: conformance_suite
     command: MDBASE_REQUIRE_V03_CONFORMANCE=1 cargo test --test v03_conformance
     result: pass
-    verified_at: "2026-07-22T00:46:33+10:00"
+    verified_at: "2026-07-22T01:34:25+10:00"
     artifact: tests/v03_conformance.rs
     environment: Linux x86_64, Rust 1.94.0
   - kind: test_suite
-    command: cargo test --workspace
+    command: MDBASE_REQUIRE_V03_CONFORMANCE=1 cargo test --workspace --all-features
     result: pass
-    verified_at: "2026-07-22T00:46:33+10:00"
+    verified_at: "2026-07-22T01:34:25+10:00"
     artifact: tests/v03_*_profiles.rs and tests/v03_lifecycle.rs
     environment: Linux x86_64, Rust 1.94.0
   - kind: conformance_suite
@@ -104,13 +104,13 @@ evidence:
     artifact: tests/v03_runtime_conformance.rs
     environment: Linux x86_64, Rust 1.94.0
   - kind: test_suite
-    command: cargo clippy --all-targets --all-features -- -D warnings
+    command: cargo clippy --workspace --all-targets --all-features -- -D warnings
     result: pass
-    verified_at: "2026-07-22T00:46:33+10:00"
+    verified_at: "2026-07-22T01:34:25+10:00"
     environment: Linux x86_64, Rust 1.94.0
   - kind: package_smoke
     command: cargo package --allow-dirty
     result: pass
-    verified_at: "2026-07-22T00:46:33+10:00"
+    verified_at: "2026-07-22T01:34:25+10:00"
     artifact: target/package/mdbase-0.3.0-rc.1.crate
     environment: Linux x86_64, Rust 1.94.0
