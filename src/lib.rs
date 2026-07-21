@@ -93,6 +93,14 @@ pub struct Collection {
 impl Collection {
     /// Open a collection from a root directory.
     pub fn open(root: &Path) -> Result<Self, serde_json::Value> {
+        if std::fs::symlink_metadata(root.join("mdbase.yaml"))
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(crate::errors::op_error(
+                crate::errors::INVALID_CONFIG,
+                "mdbase.yaml must not be a symbolic link",
+            ));
+        }
         let config_result = config::load_config_for_open(root);
         if config_result.get("valid") != Some(&serde_json::Value::Bool(true)) {
             return Err(config_result);
@@ -176,6 +184,20 @@ impl Collection {
                 .unwrap_or(".mdbase")
                 .to_string(),
         };
+
+        for (label, path) in [
+            ("types_folder", settings.types_folder.as_str()),
+            ("migrations_folder", settings.migrations_folder.as_str()),
+            ("cache_folder", settings.cache_folder.as_str()),
+        ] {
+            crate::operations::ensure_safe_relative_path(path, spec_profile).map_err(|_| {
+                crate::errors::op_error(
+                    crate::errors::INVALID_CONFIG,
+                    &format!("settings.{label} must be relative to the collection"),
+                )
+            })?;
+            crate::operations::ensure_no_symlink_components(root, path, spec_profile)?;
+        }
 
         // Load types
         let load_result = loader::load_types_with_warnings(

@@ -32,7 +32,6 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
 sha2 = "0.10"
-glob = "0.3"
 regex = "1"
 fancy-regex = "0.14"
 semver = "1"

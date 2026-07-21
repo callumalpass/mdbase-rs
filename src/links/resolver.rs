@@ -234,21 +234,18 @@ impl Collection {
 
         // Try adding .md extension if needed
         if let Some(ref path) = resolved {
-            let full_path = self.root.join(path);
-            if full_path.exists() {
+            if self.safe_link_target_exists(path) {
                 return serde_json::json!({"resolved_path": path});
             }
             // Try with .md
             let md_path = format!("{}.md", path);
-            let md_full = self.root.join(&md_path);
-            if md_full.exists() {
+            if self.safe_link_target_exists(&md_path) {
                 return serde_json::json!({"resolved_path": md_path});
             }
             // Try configured extensions
             for ext in &self.settings.extensions {
                 let ext_path = format!("{}.{}", path, ext);
-                let ext_full = self.root.join(&ext_path);
-                if ext_full.exists() {
+                if self.safe_link_target_exists(&ext_path) {
                     return serde_json::json!({"resolved_path": ext_path});
                 }
             }
@@ -799,6 +796,9 @@ impl Collection {
 
     /// Get the types associated with a file by reading it and running type matching.
     pub(crate) fn get_file_types(&self, rel_path: &str) -> Vec<String> {
+        if !self.safe_link_target_exists(rel_path) {
+            return Vec::new();
+        }
         let full_path = self.root.join(rel_path);
         if let Ok(content) = std::fs::read_to_string(&full_path) {
             let doc = parse_document(&content);
@@ -808,5 +808,16 @@ impl Collection {
             }
         }
         Vec::new()
+    }
+
+    fn safe_link_target_exists(&self, rel_path: &str) -> bool {
+        crate::operations::ensure_safe_relative_path(rel_path, self.spec_profile).is_ok()
+            && crate::operations::ensure_no_symlink_components(
+                &self.root,
+                rel_path,
+                self.spec_profile,
+            )
+            .is_ok()
+            && self.root.join(rel_path).is_file()
     }
 }

@@ -208,8 +208,14 @@ fn collect_type_files(
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read dir entry: {}", e))?;
         let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to inspect type path {:?}: {}", path, e))?;
 
-        if path.is_dir() {
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             if let Some(skip) = migrations_dir {
                 if path == skip || path.starts_with(skip) {
                     continue;
@@ -217,7 +223,7 @@ fn collect_type_files(
             }
             // Recurse into subdirectories
             files.extend(collect_type_files(&path, migrations_dir)?);
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if ext == "md" || ext == "yaml" || ext == "yml" {
                 files.push(path);

@@ -205,6 +205,18 @@ impl<'a> Operations<'a> {
         result: &mut Map<String, Value>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
+        if let Err(error) = crate::operations::ensure_no_symlink_components(
+            &self.collection.root,
+            path,
+            self.collection.spec_profile,
+        ) {
+            diagnostics.push(diagnostic_from_value(
+                error.get("error").unwrap_or(&error),
+                "error",
+                Some(path),
+            ));
+            return;
+        }
         let full_path = self.collection.root.join(path);
         match std::fs::read(&full_path) {
             Ok(bytes) => {

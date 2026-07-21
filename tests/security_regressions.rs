@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use mdbase::Collection;
 use tempfile::TempDir;
 
 fn write_file(path: &Path, content: &str) {
@@ -80,6 +81,10 @@ fn symlinks_cannot_escape_the_collection_boundary() {
         &outside.join("secret.md"),
         "---\nsecret: never-return-this\n---\noutside\n",
     );
+    write_file(
+        &root.join("link.md"),
+        "---\ntarget: secret.md\n---\ninside\n",
+    );
     symlink(&outside, root.join("escape")).expect("create directory symlink");
     symlink(outside.join("secret.md"), root.join("secret.md")).expect("create file symlink");
 
@@ -91,6 +96,8 @@ fn symlinks_cannot_escape_the_collection_boundary() {
             "fields": { "compromised": true }
         })),
         collection.delete(&serde_json::json!({ "path": "secret.md" })),
+        collection.validate_op(&serde_json::json!({ "path": "secret.md" })),
+        collection.migrate(&serde_json::json!({ "path": "escape/migration.md" })),
         collection.create(&serde_json::json!({
             "path": "escape/created.md",
             "frontmatter": {},
@@ -126,7 +133,7 @@ fn symlinks_cannot_escape_the_collection_boundary() {
         .unwrap()
         .query(&serde_json::json!({}));
     assert!(query.valid, "{query:#?}");
-    assert_eq!(query.result["meta"]["total_count"], 0);
+    assert_eq!(query.result["meta"]["total_count"], 1);
     assert!(!serde_json::to_string(&query)
         .unwrap()
         .contains("never-return-this"));
@@ -138,6 +145,70 @@ fn symlinks_cannot_escape_the_collection_boundary() {
         &mdbase::runtime_contracts::LoadOptions::default(),
     );
     assert!(loaded.contracts.records.is_empty());
+
+    let resolved = collection.resolve_link(&serde_json::json!({
+        "path": "link.md",
+        "field": "target"
+    }));
+    assert!(resolved["resolved_path"].is_null(), "{resolved}");
+}
+
+#[cfg(unix)]
+#[test]
+fn collection_metadata_never_loads_through_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let external_config = tmp.path().join("external-config.yaml");
+    write_file(&external_config, "spec_version: 0.3.0\n");
+    let linked_config_root = tmp.path().join("linked-config");
+    fs::create_dir(&linked_config_root).unwrap();
+    symlink(&external_config, linked_config_root.join("mdbase.yaml")).unwrap();
+    let config_error = Collection::open(&linked_config_root)
+        .err()
+        .expect("config link must fail");
+    assert_eq!(
+        config_error
+            .pointer("/error/code")
+            .and_then(|value| value.as_str()),
+        Some("invalid_config")
+    );
+
+    for folder in ["_types", ".mdbase"] {
+        let root = tmp
+            .path()
+            .join(format!("linked-{}", folder.trim_start_matches('.')));
+        let outside = tmp
+            .path()
+            .join(format!("outside-{}", folder.trim_start_matches('.')));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        write_file(&root.join("mdbase.yaml"), "spec_version: 0.3.0\n");
+        symlink(&outside, root.join(folder)).unwrap();
+        let error = Collection::open(&root)
+            .err()
+            .expect("system folder link must fail");
+        assert_eq!(
+            error
+                .pointer("/error/code")
+                .and_then(|value| value.as_str()),
+            Some("path_traversal"),
+            "unexpected error for {folder}: {error}"
+        );
+    }
+
+    let root = tmp.path().join("linked-type-entry");
+    let outside = tmp.path().join("outside-type-entry");
+    fs::create_dir_all(root.join("_types")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    write_file(&root.join("mdbase.yaml"), "spec_version: 0.3.0\n");
+    write_file(
+        &outside.join("external.md"),
+        "---\nkind: mdbase.type\nname: external\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n",
+    );
+    symlink(outside.join("external.md"), root.join("_types/external.md")).unwrap();
+    let collection = open_collection(&root);
+    assert!(!collection.types.contains_key("external"));
 }
 
 #[test]

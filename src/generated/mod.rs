@@ -60,9 +60,9 @@ impl Collection {
     pub(crate) fn find_max_sequence_value(&self, type_name: &str, field_name: &str) -> Option<i64> {
         use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
         let mut max: Option<i64> = None;
-        // Scan all markdown files to find existing values
-        let pattern = format!("{}/**/*.md", self.root.display());
-        for entry in glob::glob(&pattern).ok()?.flatten() {
+        // Reuse collection discovery so exclusions, nested boundaries, custom
+        // extensions, and symlink containment exactly match normal reads.
+        for entry in self.scan_collection_files() {
             if let Ok(content) = std::fs::read_to_string(&entry) {
                 let doc = parse_document(&content);
                 if let Some(serde_yaml::Value::Mapping(ref m)) = doc.frontmatter {
