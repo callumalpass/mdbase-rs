@@ -89,6 +89,8 @@ type: view
 id: tasks.views
 version: 1
 name: Task views
+query:
+  types: [task]
 views:
   - id: all
     name: All tasks
@@ -101,6 +103,8 @@ views:
         "path": "views/tasks.md"
     }));
     assert_eq!(validation.get("valid"), Some(&serde_json::json!(true)));
+    let read = collection.read(&serde_json::json!({ "path": "views/tasks.md" }));
+    assert_eq!(read.get("types"), Some(&serde_json::json!(["view"])));
 }
 
 #[test]

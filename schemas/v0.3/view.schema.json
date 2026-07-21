@@ -10,10 +10,7 @@
     "version": { "type": "integer", "minimum": 1 },
     "name": { "type": "string", "minLength": 1 },
     "description": { "type": "string" },
-    "types": { "$ref": "#/$defs/typeList" },
-    "where": { "$ref": "#/$defs/expression" },
-    "context": { "$ref": "#/$defs/viewContext" },
-    "projections": { "$ref": "#/$defs/projectionSet" },
+    "query": { "$ref": "#/$defs/sharedQuery" },
     "properties": { "$ref": "#/$defs/propertyMetadataSet" },
     "summary_functions": { "$ref": "#/$defs/summaryFunctionSet" },
     "views": {
@@ -52,6 +49,19 @@
       "minItems": 1,
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/typeName" }
+    },
+    "sharedQuery": {
+      "type": "object",
+      "properties": {
+        "types": { "$ref": "#/$defs/typeList" },
+        "where": { "$ref": "#/$defs/expression" },
+        "context": { "$ref": "#/$defs/viewContext" },
+        "projections": { "$ref": "#/$defs/projectionSet" }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": { "$ref": "#/$defs/extension" }
+      },
+      "additionalProperties": false
     },
     "viewContext": {
       "type": "object",
