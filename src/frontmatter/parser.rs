@@ -53,12 +53,16 @@ pub fn parse_document(content: &str) -> ParsedDocument {
     // Search for a line that is exactly "---"
     let mut pos = 0;
     let mut found_close = None;
-    for line in rest.lines() {
+    for line_with_ending in rest.split_inclusive('\n') {
+        let line = line_with_ending
+            .strip_suffix('\n')
+            .unwrap_or(line_with_ending);
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if line.trim_end() == "---" {
             found_close = Some(pos);
             break;
         }
-        pos += line.len() + 1; // +1 for the newline
+        pos += line_with_ending.len();
     }
 
     let close_pos = match found_close {
@@ -235,5 +239,29 @@ pub fn json_to_yaml(json: &serde_json::Value) -> YamlValue {
             }
             YamlValue::Mapping(mapping)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_document;
+
+    #[test]
+    fn parses_crlf_frontmatter_without_shifting_the_closing_delimiter() {
+        let parsed = parse_document("---\r\ntitle: Windows\r\ncount: 2\r\n---\r\nBody\r\n");
+        let frontmatter = parsed
+            .frontmatter
+            .expect("CRLF frontmatter should parse")
+            .as_mapping()
+            .expect("frontmatter should be a mapping")
+            .clone();
+
+        assert_eq!(
+            frontmatter
+                .get(serde_yaml::Value::String("title".to_string()))
+                .and_then(serde_yaml::Value::as_str),
+            Some("Windows")
+        );
+        assert_eq!(parsed.body, "Body\r\n");
     }
 }
