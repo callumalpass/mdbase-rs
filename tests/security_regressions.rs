@@ -120,6 +120,24 @@ fn symlinks_cannot_escape_the_collection_boundary() {
         fs::read_to_string(outside.join("secret.md")).expect("external file remains readable"),
         "---\nsecret: never-return-this\n---\noutside\n"
     );
+
+    let query = collection
+        .v03_operations()
+        .unwrap()
+        .query(&serde_json::json!({}));
+    assert!(query.valid, "{query:#?}");
+    assert_eq!(query.result["meta"]["total_count"], 0);
+    assert!(!serde_json::to_string(&query)
+        .unwrap()
+        .contains("never-return-this"));
+
+    let runtime = mdbase::runtime_contracts::RuntimeContracts::new().unwrap();
+    let loaded = runtime.load(
+        &collection,
+        vec![],
+        &mdbase::runtime_contracts::LoadOptions::default(),
+    );
+    assert!(loaded.contracts.records.is_empty());
 }
 
 #[test]

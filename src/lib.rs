@@ -393,8 +393,19 @@ impl Collection {
                 Err(_) => continue,
             };
             let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
 
-            if path.is_dir() {
+            // Never follow links while discovering collection resources. A
+            // symlink below the authorized root can otherwise expose an
+            // unrelated directory to query, cache, links, runtime loading, or
+            // watch even when direct CRUD paths are contained.
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 if self.settings.include_subfolders {
                     let rel = path
                         .strip_prefix(&self.root)
@@ -404,7 +415,7 @@ impl Collection {
                         self.scan_dir_recursive(&path, files);
                     }
                 }
-            } else if path.is_file() {
+            } else if file_type.is_file() {
                 let rel = path
                     .strip_prefix(&self.root)
                     .map(|p| p.to_string_lossy().to_string())
