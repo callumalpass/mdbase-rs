@@ -493,6 +493,34 @@ fn v03_mutations_enforce_opaque_revision_preconditions() {
 }
 
 #[test]
+fn v03_update_accepts_the_canonical_patch_and_keeps_legacy_fields_compatible() {
+    let directory = v03_collection();
+    write(
+        directory.path(),
+        "tasks/update-shapes.md",
+        "---\ntype: task\ntitle: Original\nstatus: open\n---\nBody\n",
+    );
+
+    let collection = Collection::open(directory.path()).expect("open v0.3 collection");
+    let operations = collection.v03_operations().expect("v0.3 operations");
+    let patched = operations.update(&serde_json::json!({
+        "path": "tasks/update-shapes.md",
+        "patch": {"title": "Canonical", "status": "done"},
+        "fields": {"title": "Legacy must not win"}
+    }));
+    assert!(patched.valid, "{:#?}", patched.diagnostics);
+    assert_eq!(patched.result["frontmatter"]["title"], "Canonical");
+    assert_eq!(patched.result["frontmatter"]["status"], "done");
+
+    let legacy = operations.update(&serde_json::json!({
+        "path": "tasks/update-shapes.md",
+        "fields": {"title": "Legacy still works"}
+    }));
+    assert!(legacy.valid, "{:#?}", legacy.diagnostics);
+    assert_eq!(legacy.result["frontmatter"]["title"], "Legacy still works");
+}
+
+#[test]
 fn v03_query_uses_the_canonical_operation_envelope() {
     let directory = v03_collection();
     write(

@@ -79,7 +79,8 @@ impl UpdateInput {
             .and_then(|v| v.as_str())
             .ok_or_else(|| op_error(INVALID_PATH, "path is required"))?;
         let fields = input
-            .get("fields")
+            .get("patch")
+            .or_else(|| input.get("fields"))
             .or_else(|| input.get("frontmatter"))
             .cloned()
             .unwrap_or(serde_json::json!({}));
