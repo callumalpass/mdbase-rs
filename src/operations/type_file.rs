@@ -15,7 +15,7 @@ impl Collection {
     pub fn read_type_file(&self, input: &Value) -> OperationResult {
         let path = match self.resolve_type_path(input) {
             Ok(path) => path,
-            Err(diagnostic) => return failed(diagnostic),
+            Err(diagnostic) => return failed(*diagnostic),
         };
         self.type_file_result(&path)
     }
@@ -23,7 +23,7 @@ impl Collection {
     pub fn create_type_file(&self, input: &Value) -> OperationResult {
         let document = match required_document(input) {
             Ok(document) => document,
-            Err(diagnostic) => return failed(diagnostic),
+            Err(diagnostic) => return failed(*diagnostic),
         };
         let candidate =
             match self.parse_type_candidate(document, input.get("path").and_then(Value::as_str)) {
@@ -46,7 +46,7 @@ impl Collection {
             .map(str::to_string)
             .unwrap_or_else(|| format!("{}/{}.md", self.settings.types_folder, candidate.name));
         if let Err(diagnostic) = self.validate_type_path(&path) {
-            return failed(diagnostic);
+            return failed(*diagnostic);
         }
         let full_path = self.root.join(&path);
         if full_path.exists() {
@@ -71,11 +71,11 @@ impl Collection {
     pub fn update_type_file(&self, input: &Value) -> OperationResult {
         let path = match self.resolve_type_path(input) {
             Ok(path) => path,
-            Err(diagnostic) => return failed(diagnostic),
+            Err(diagnostic) => return failed(*diagnostic),
         };
         let document = match required_document(input) {
             Ok(document) => document,
-            Err(diagnostic) => return failed(diagnostic),
+            Err(diagnostic) => return failed(*diagnostic),
         };
         if let Err(diagnostics) = self.parse_type_candidate(document, Some(&path)) {
             return failed_many(diagnostics);
@@ -114,26 +114,26 @@ impl Collection {
         }
     }
 
-    fn resolve_type_path(&self, input: &Value) -> Result<String, Diagnostic> {
+    fn resolve_type_path(&self, input: &Value) -> Result<String, Box<Diagnostic>> {
         if let Some(name) = input.get("name").and_then(Value::as_str) {
             return self
                 .types
                 .get(&name.to_ascii_lowercase())
                 .and_then(|definition| definition.source_path.clone())
                 .ok_or_else(|| {
-                    Diagnostic::error(
+                    Box::new(Diagnostic::error(
                         "unknown_type",
                         format!("Type '{name}' does not exist."),
                         None,
-                    )
+                    ))
                 });
         }
         let path = input.get("path").and_then(Value::as_str).ok_or_else(|| {
-            Diagnostic::error(
+            Box::new(Diagnostic::error(
                 "invalid_request",
                 "Type operations require name or path.",
                 None,
-            )
+            ))
         })?;
         self.validate_type_path(path)?;
         let known = self
@@ -141,30 +141,30 @@ impl Collection {
             .values()
             .any(|definition| definition.source_path.as_deref() == Some(path));
         if !known {
-            return Err(Diagnostic::error(
+            return Err(Box::new(Diagnostic::error(
                 "unknown_type",
                 format!("No type definition is registered at '{path}'."),
                 Some(path.to_string()),
-            ));
+            )));
         }
         Ok(path.to_string())
     }
 
-    fn validate_type_path(&self, path: &str) -> Result<(), Diagnostic> {
+    fn validate_type_path(&self, path: &str) -> Result<(), Box<Diagnostic>> {
         ensure_safe_relative_path(path, self.spec_profile)
-            .map_err(|error| open_diagnostic(error, path))?;
+            .map_err(|error| Box::new(open_diagnostic(error, path)))?;
         let prefix = format!("{}/", self.settings.types_folder.trim_end_matches('/'));
         if !path.starts_with(&prefix)
             || Path::new(path).extension().and_then(|value| value.to_str()) != Some("md")
         {
-            return Err(Diagnostic::error(
+            return Err(Box::new(Diagnostic::error(
                 "invalid_type_path",
                 format!(
                     "Type definitions must be Markdown files inside '{}'.",
                     self.settings.types_folder
                 ),
                 Some(path.to_string()),
-            ));
+            )));
         }
         Ok(())
     }
@@ -177,7 +177,7 @@ impl Collection {
         let fallback = format!("{}/candidate.md", self.settings.types_folder);
         let path = requested_path.unwrap_or(&fallback);
         if let Err(diagnostic) = self.validate_type_path(path) {
-            return Err(vec![diagnostic]);
+            return Err(vec![*diagnostic]);
         }
         v03::parse_type_file(document, &self.root.join(path), &self.root, path)
     }
@@ -223,11 +223,17 @@ impl Collection {
     }
 }
 
-fn required_document(input: &Value) -> Result<&str, Diagnostic> {
+fn required_document(input: &Value) -> Result<&str, Box<Diagnostic>> {
     input
         .get("document")
         .and_then(Value::as_str)
-        .ok_or_else(|| Diagnostic::error("invalid_request", "document must be a string.", None))
+        .ok_or_else(|| {
+            Box::new(Diagnostic::error(
+                "invalid_request",
+                "document must be a string.",
+                None,
+            ))
+        })
 }
 
 fn candidate_path(input: &Value) -> Option<&str> {
