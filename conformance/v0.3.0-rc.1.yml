@@ -8,6 +8,7 @@ implementation:
   target: crate
   url: https://github.com/callumalpass/mdbase-rs
 spec_version: 0.3.0
+runtime_profile_version: 0.1.0
 profiles:
   - core_read
   - collection_semantics
@@ -17,7 +18,10 @@ profiles:
   - links
   - core_write
   - lifecycle
+  - runtime_contracts/0.1
   - watch
+optional_features:
+  - runtime_contract_materialization
 json_schema:
   dialect: https://json-schema.org/draft/2020-12/schema
   keywords:
@@ -72,6 +76,14 @@ limits:
   cel_as_file_hops: 10
   cel_clock_scope: operation
   watch_debounce: host_configurable
+  runtime_execution: false
+  runtime_external_schema_refs: false
+  runtime_source_order:
+    - built_in
+    - provider_id
+    - pack_id
+    - collection_path
+  runtime_authorization: embedding_host_final_boundary
 evidence:
   - kind: conformance_suite
     command: MDBASE_REQUIRE_V03_CONFORMANCE=1 cargo test --test v03_conformance
@@ -84,6 +96,12 @@ evidence:
     result: pass
     verified_at: "2026-07-22T00:46:33+10:00"
     artifact: tests/v03_*_profiles.rs and tests/v03_lifecycle.rs
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: conformance_suite
+    command: cargo test --release --test v03_runtime_conformance --test v03_runtime_contracts --test v03_runtime_performance --all-features
+    result: pass
+    verified_at: "2026-07-22T01:20:56+10:00"
+    artifact: tests/v03_runtime_conformance.rs
     environment: Linux x86_64, Rust 1.94.0
   - kind: test_suite
     command: cargo clippy --all-targets --all-features -- -D warnings
