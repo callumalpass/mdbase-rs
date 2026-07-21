@@ -14,6 +14,7 @@ use walkdir::{DirEntry, WalkDir};
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_to_json};
 use crate::{Collection, SpecProfile};
 
+mod batch;
 pub(crate) mod cel;
 mod lifecycle;
 mod operations;

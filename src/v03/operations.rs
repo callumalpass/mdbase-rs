@@ -130,6 +130,11 @@ impl<'a> Operations<'a> {
         self.normalize("rename", input, self.collection.rename(input))
     }
 
+    /// Execute or dry-run a deterministic sequence of core mutations.
+    pub fn batch(&self, input: &Value) -> OperationResult {
+        super::batch::execute(self.collection, input)
+    }
+
     pub fn read_type(&self, input: &Value) -> OperationResult {
         self.collection.read_type_file(input)
     }

@@ -23,8 +23,11 @@ pub struct FieldDef {
     pub fields: Option<HashMap<String, FieldDef>>, // object fields
     pub min_items: Option<usize>,
     pub max_items: Option<usize>,
-    pub list_unique: bool,             // unique constraint on list items
-    pub target: Option<String>,        // link target type
+    pub list_unique: bool,      // unique constraint on list items
+    pub target: Option<String>, // link target type
+    /// Portable v0.3 link target types. `target` remains the v0.2-compatible
+    /// single-target representation.
+    pub target_types: Vec<String>,
     pub validate_exists: Option<bool>, // link existence validation
     pub computed: Option<String>,      // computed field expression (§5.12)
 }
@@ -105,6 +108,7 @@ impl Default for FieldDef {
             max_items: None,
             list_unique: false,
             target: None,
+            target_types: Vec::new(),
             validate_exists: None,
             computed: None,
         }

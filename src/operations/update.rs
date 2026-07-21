@@ -4,7 +4,7 @@ use crate::api::operations::{UpdateInput, UpdateOutput};
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::frontmatter::serializer;
-use crate::operations::{ensure_revision, ensure_safe_relative_path};
+use crate::operations::{atomic_write, ensure_revision, ensure_safe_relative_path};
 use crate::Collection;
 
 impl Collection {
@@ -88,7 +88,12 @@ impl Collection {
 
         // Validate
         if self.settings.default_validation == "error" {
-            let mut validation = self.validate(&effective, &type_names, &path);
+            let validation_frontmatter = if self.spec_profile == crate::SpecProfile::V03 {
+                &serde_json::Value::Object(merged_obj.clone())
+            } else {
+                &effective
+            };
+            let mut validation = self.validate(validation_frontmatter, &type_names, &path);
 
             // Cross-file uniqueness checks for update
             let uniqueness_issues = self.check_uniqueness(&effective, &type_names, &path);
@@ -116,7 +121,7 @@ impl Collection {
 
         // Build frontmatter for writing (honor write_defaults/write_nulls)
         let mut write_obj = merged_obj.clone();
-        if self.settings.write_defaults {
+        if self.spec_profile != crate::SpecProfile::V03 && self.settings.write_defaults {
             if let Some(eff_map) = effective.as_object() {
                 for (k, v) in eff_map {
                     if !write_obj.contains_key(k) {
@@ -138,7 +143,7 @@ impl Collection {
         };
         let output = serializer::serialize_document(&write_mapping, body);
 
-        if let Err(e) = std::fs::write(&full_path, &output) {
+        if let Err(e) = atomic_write(&full_path, output.as_bytes()) {
             return op_error("io_error", &format!("Failed to write: {}", e));
         }
 

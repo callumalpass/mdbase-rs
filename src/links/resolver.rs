@@ -1,5 +1,13 @@
 //! Link resolution algorithm (§8.4).
 
+pub(crate) fn allowed_target_types(field: &crate::types::schema::FieldDef) -> Vec<String> {
+    if field.target_types.is_empty() {
+        field.target.iter().cloned().collect()
+    } else {
+        field.target_types.clone()
+    }
+}
+
 fn normalize_collection_path(path: &str) -> String {
     path.replace('\\', "/")
 }
@@ -190,7 +198,7 @@ impl Collection {
             .unwrap_or("");
 
         // Determine field type constraints
-        let target_type = self.get_field_target_type(source_path, field_name);
+        let target_types = self.get_field_target_types(source_path, field_name);
 
         // Resolution logic
         let resolved = if target.starts_with('/') {
@@ -210,7 +218,7 @@ impl Collection {
             }
         } else {
             // Simple name - try id_field, then filename
-            self.resolve_simple_name(&target, source_dir, target_type.as_deref())
+            self.resolve_simple_name(&target, source_dir, &target_types)
         }
         .map(|path| normalize_collection_path(&path));
 
@@ -289,7 +297,7 @@ impl Collection {
         &self,
         name: &str,
         source_dir: &str,
-        target_type: Option<&str>,
+        target_types: &[String],
     ) -> Option<String> {
         let files = self.scan_collection_files();
         let id_field_name = if self.settings.id_field.is_empty() {
@@ -322,12 +330,13 @@ impl Collection {
             };
 
             // Check target type constraint
-            if let Some(constraint_type) = target_type {
+            if !target_types.is_empty() {
                 let file_types = self.determine_types_for_path(&fm, Some(&rel_path));
-                if !file_types
-                    .iter()
-                    .any(|t| t.to_lowercase() == constraint_type.to_lowercase())
-                {
+                if !file_types.iter().any(|actual| {
+                    target_types
+                        .iter()
+                        .any(|expected| actual.eq_ignore_ascii_case(expected))
+                }) {
                     continue;
                 }
             }
@@ -385,24 +394,26 @@ impl Collection {
         Some(sorted[0].clone())
     }
 
-    /// Get the target type constraint for a field.
-    pub(crate) fn get_field_target_type(
+    /// Get the target type constraints for a field.
+    pub(crate) fn get_field_target_types(
         &self,
         source_path: &str,
         field_name: &str,
-    ) -> Option<String> {
+    ) -> Vec<String> {
         // Read source file to get its type, then look up the field definition
         let read_result = self.read(&serde_json::json!({"path": source_path}));
-        let fm = read_result.get("frontmatter")?;
+        let Some(fm) = read_result.get("frontmatter") else {
+            return Vec::new();
+        };
         let file_types = self.determine_types_for_path(fm, Some(source_path));
         for type_name in &file_types {
             if let Some(type_def) = self.types.get(&type_name.to_lowercase()) {
                 if let Some(field_def) = type_def.fields.get(field_name) {
-                    return field_def.target.clone();
+                    return allowed_target_types(field_def);
                 }
             }
         }
-        None
+        Vec::new()
     }
 
     /// Resolve a link target string to a file path.
@@ -508,6 +519,7 @@ impl Collection {
                 // represents links directly in the field type.
                 let link_field = if field_def.validate_exists.is_some()
                     || field_def.target.is_some()
+                    || !field_def.target_types.is_empty()
                     || field_def.field_type == "link"
                 {
                     Some(field_def)
@@ -652,16 +664,21 @@ impl Collection {
                     line: None,
                     column: None,
                 });
-            } else if let Some(ref target_type) = field_def.target {
+            } else if !allowed_target_types(field_def).is_empty() {
                 // Check target type constraint
                 let matched_path = &matches[0];
                 let target_types = self.get_file_types(matched_path);
-                if !target_types.iter().any(|t| t == target_type) {
+                let expected = allowed_target_types(field_def);
+                if !target_types.iter().any(|actual| {
+                    expected
+                        .iter()
+                        .any(|target| actual.eq_ignore_ascii_case(target))
+                }) {
                     issues.push(Issue {
                         code: "link_wrong_type".to_string(),
                         message: format!(
-                            "Link target '{}' is type {:?}, expected '{}'",
-                            target, target_types, target_type
+                            "Link target '{}' is type {:?}, expected one of {:?}",
+                            target, target_types, expected
                         ),
                         path: Some(path.to_string()),
                         field: Some(field_name.to_string()),
@@ -674,18 +691,23 @@ impl Collection {
                     });
                 }
             }
-        } else if let Some(ref target_type) = field_def.target {
+        } else if !allowed_target_types(field_def).is_empty() {
             // Even without validate_exists, check target type if we can resolve
             let matches = self.resolve_link_matches(&normalized, target);
             if matches.len() == 1 {
                 let matched_path = &matches[0];
                 let target_types = self.get_file_types(matched_path);
-                if !target_types.iter().any(|t| t == target_type) {
+                let expected = allowed_target_types(field_def);
+                if !target_types.iter().any(|actual| {
+                    expected
+                        .iter()
+                        .any(|target| actual.eq_ignore_ascii_case(target))
+                }) {
                     issues.push(Issue {
                         code: "link_wrong_type".to_string(),
                         message: format!(
-                            "Link target '{}' is type {:?}, expected '{}'",
-                            target, target_types, target_type
+                            "Link target '{}' is type {:?}, expected one of {:?}",
+                            target, target_types, expected
                         ),
                         path: Some(path.to_string()),
                         field: Some(field_name.to_string()),

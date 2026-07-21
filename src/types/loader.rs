@@ -450,6 +450,17 @@ fn v03_type_definition(type_file: crate::v03::TypeFile) -> Result<TypeDef, Strin
                 .and_then(serde_json::Value::as_str)
                 .filter(|target| *target != "any")
                 .map(String::from);
+            field.target_types = match rule.get("target_type") {
+                Some(serde_json::Value::String(target)) if target != "any" => {
+                    vec![target.clone()]
+                }
+                Some(serde_json::Value::Array(targets)) => targets
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(String::from)
+                    .collect(),
+                _ => Vec::new(),
+            };
         }
     }
 
@@ -800,6 +811,7 @@ fn parse_field_def(value: &serde_yaml::Value) -> Result<FieldDef, String> {
         min_items,
         max_items,
         list_unique,
+        target_types: target.iter().cloned().collect(),
         target,
         validate_exists,
         computed,

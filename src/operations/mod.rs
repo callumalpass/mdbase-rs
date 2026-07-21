@@ -10,6 +10,7 @@ pub mod rename;
 pub mod type_file;
 pub mod update;
 
+use std::io::Write;
 use std::path::Path;
 
 use crate::errors::{op_error, CONCURRENT_MODIFICATION, INVALID_PATH, PATH_TRAVERSAL};
@@ -67,6 +68,59 @@ pub(crate) fn ensure_revision(
             CONCURRENT_MODIFICATION,
             &format!("File '{display_path}' was modified externally"),
         ));
+    }
+    Ok(())
+}
+
+/// Atomically replace one collection file with fully written contents.
+///
+/// The temporary file lives beside the destination so persistence remains on
+/// the same filesystem. Existing permissions are retained on replacement.
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    atomic_write_mode(path, contents, false)
+}
+
+/// Atomically create a new file without replacing a concurrent creator.
+pub(crate) fn atomic_create(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    atomic_write_mode(path, contents, true)
+}
+
+fn atomic_write_mode(path: &Path, contents: &[u8], no_clobber: bool) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let permissions = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    if permissions
+        .as_ref()
+        .is_some_and(std::fs::Permissions::readonly)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "destination is read-only",
+        ));
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    if let Some(permissions) = permissions {
+        std::fs::set_permissions(temporary.path(), permissions)?;
+    }
+    if no_clobber {
+        temporary
+            .persist_noclobber(path)
+            .map_err(|error| error.error)?;
+    } else {
+        temporary.persist(path).map_err(|error| error.error)?;
+    }
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
     }
     Ok(())
 }

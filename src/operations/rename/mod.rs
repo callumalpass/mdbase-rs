@@ -112,7 +112,7 @@ impl Collection {
                 if let Some(parent) = full.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let _ = std::fs::write(&full, &sim.content);
+                let _ = crate::operations::atomic_write(&full, sim.content.as_bytes());
                 // Always bump mtime forward by 1 second to guarantee it
                 // differs from the pre-simulate value recorded by the
                 // test runner, regardless of filesystem granularity.
@@ -357,7 +357,7 @@ impl Collection {
                     }
                     output
                 };
-                if let Err(e) = std::fs::write(file_path, output) {
+                if let Err(e) = crate::operations::atomic_write(file_path, output.as_bytes()) {
                     ref_update_failures.push(serde_json::json!({
                         "path": rel_path,
                         "reason": "io_error",

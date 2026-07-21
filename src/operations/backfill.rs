@@ -260,7 +260,7 @@ impl Collection {
                 &serde_json::Value::Object(plan.write_obj),
             );
             let output = serializer::serialize_document(&yaml_mapping, &plan.body);
-            if let Err(e) = std::fs::write(&full_path, &output) {
+            if let Err(e) = crate::operations::atomic_write(&full_path, output.as_bytes()) {
                 failed += 1;
                 details.push(serde_json::json!({
                     "path": plan.path,
