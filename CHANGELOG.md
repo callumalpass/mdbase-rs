@@ -7,14 +7,39 @@ All notable changes to this project are documented in this file.
 ### Added
 - A real debounced `CollectionWatcher` backed by filesystem notifications and
   final-state collection snapshot diffs.
-- A provider-neutral runtime boundary with a serialized filesystem provider for
-  long-running hosts such as mdbase Connect.
 - Opaque `if_revision` preconditions for create, update, delete, and rename.
+- Canonical v0.3 query and view schemas, including ordinary Markdown view-record
+  validation through the existing type-file pipeline.
+- Canonical CEL Match and Query execution, with explicit invocation
+  context, ordered projections, selection, grouping, summaries, and pagination.
+- Runtime Contracts 0.1 loading, deterministic registry composition, workflow
+  preflight, event/action validation, virtual contracts, and materialization.
+- A provider/runtime boundary with payload-free performance observations,
+  opt-in error observations, and optional structured `tracing` output.
+- Portable Watch notifications and runtime-aware effective-registry changes.
 
 ### Changed
 - v0.3 queries now return the canonical operation envelope.
 - Watch events use stable sequence numbers, timestamps, revisions, and changed
   frontmatter field metadata.
+- Runtime schemas and embedded action/event schemas are compiled once and
+  reused across registry loads and validation.
+- Batch preflight shadows only collection-visible files and required type/schema
+  assets rather than caches, excluded trees, or nested collections.
+
+### Fixed
+- Collection operations and discovery reject symlink escapes, including config,
+  type, cache, validation, link, migration, batch, runtime, query, and watch
+  paths.
+- Record and type creation and record rename use atomic no-clobber persistence
+  under concurrent writers.
+- Provider performance observations are emitted for early failures as well as
+  successful and validation-failing operations.
+
+### Tests
+- Added shared Runtime Contracts fixture execution, filesystem-backed registry
+  end-to-end tests, runtime-aware watch tests, a 2,000-contract performance
+  regression, concurrent writer tests, and adversarial boundary tests.
 
 ## 0.3.0-rc.1 - 2026-07-19
 

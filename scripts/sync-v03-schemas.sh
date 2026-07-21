@@ -7,8 +7,13 @@ source_dir="$spec_root/schemas/v0.3"
 target_dir="$repo_root/schemas/v0.3"
 
 mkdir -p "$target_dir"
-for schema in config diagnostic operation-result query-result type-file; do
+for schema in config diagnostic operation-result query query-result type-file view; do
 	cp "$source_dir/$schema.schema.json" "$target_dir/$schema.schema.json"
+done
+
+mkdir -p "$target_dir/runtime"
+for schema in action capability checkpoint diagnostic event-envelope event provider run runtime-policy workflow; do
+	cp "$source_dir/runtime/$schema.schema.json" "$target_dir/runtime/$schema.schema.json"
 done
 
 echo "Synced mdbase v0.3 schemas from $source_dir"

@@ -6,15 +6,23 @@ Rust implementation of the [mdbase spec](https://mdbase.dev), with:
 - Query execution (filters, formulas, grouping, summaries)
 - Link parsing/resolution/traversal
 - CRUD, batch, backfill, and migrate operations
+- Pure Runtime Contracts 0.1 registry composition and preflight
 - SQLite cache support
 - Debounced filesystem watching with normalized collection events
 
 The `0.3.0-rc.1` crate dual-loads legacy v0.2 collections and v0.3 type
 wrappers. v0.3 records are validated against their embedded JSON Schema
 2020-12 schemas and report canonical structured diagnostics. The canonical
-config, type-file, diagnostic, operation-result, and query-result schemas are
-vendored under `schemas/v0.3/` and refreshed with
+config, type-file, diagnostic, operation-result, query, query-result, and view
+schemas are vendored under `schemas/v0.3/` and refreshed with
 `scripts/sync-v03-schemas.sh`.
+
+The canonical `view` schema is handled through the normal v0.3 type-file and
+record-validation pipeline. The v0.3 operation facade implements canonical CEL
+matching and query objects, including invocation context, projections,
+selection, deterministic grouping and summaries, pagination, and query result
+envelopes. It does not advertise the optional `view_records` execution feature:
+named-view resolution and merge behavior remain outside its verified claim.
 
 `mdb init` creates a minimal stable `0.3.0` collection by default. Supplying an
 explicit v0.2 version retains the legacy initializer and generated meta type.
@@ -35,9 +43,44 @@ The existing `Collection` operation methods retain their legacy native result
 shape for v0.2 consumers. The v0.3 facade returns `{ valid, result,
 diagnostics }`, canonicalizes diagnostics, reports persisted mutation state,
 and emits opaque `sha256:` revisions. Mutations enforce optional
-`if_revision` preconditions, and queries use the same envelope. The verified, evidence-scoped claim for
-`core_read` and `collection_semantics` is published under `conformance/`;
-unlisted profiles are not claimed.
+`if_revision` preconditions, and queries use the same envelope. The verified,
+evidence-scoped profile claim is published under `conformance/`; unlisted
+profiles and optional features are not claimed.
+
+## Runtime Contracts
+
+`mdbase::runtime_contracts::RuntimeContracts` is a pure registry and preflight
+engine. It loads materialized contract records from normal collection scope and
+composes them with built-in, provider, or pack contracts supplied in memory.
+`ContractDocument::virtual_contract` is the first-class representation for a
+non-materialized contract.
+
+The engine validates strict provider, action, event, capability, policy, and
+workflow shapes; compiles embedded schemas once; validates event and action
+values; resolves workflow requirements; and renders contracts as Markdown when
+materialization is requested. It deliberately does not execute workflows or
+grant filesystem authority. An embedding host such as mdbase-connect remains
+the final authorization boundary immediately before dispatch.
+
+`FilesystemProvider::load_runtime_contracts` performs loading under the same
+serialization gate as collection requests. A watcher opened with
+`CollectionWatcher::open_with_runtime_contracts` recomposes the effective
+registry and emits `runtime_registry_changed` only when its stable registry
+revision changes; virtual sources never need to be written to the collection.
+
+## Runtime Observability
+
+`FilesystemProvider::open_observed` and `FilesystemRuntime::open_observed`
+accept a `RuntimeObserver`. Every dispatched operation and Runtime Contracts
+load reports payload-free timing for queue, collection open, execution,
+synchronization, and total duration, including provider-level failures. Error
+observations are disabled by default and can opt into stable codes or local
+messages with `ErrorReporting`.
+
+Enable the `tracing` Cargo feature to use `TracingObserver`. It writes timings
+to the `mdbase::performance` target and optional errors to `mdbase::errors`.
+Neither observation shape contains collection paths, request values, or record
+payloads.
 
 `mdbase::watch::CollectionWatcher` observes real filesystem changes, debounces
 atomic-save sequences, and emits final-state record, type, and configuration
@@ -59,7 +102,8 @@ cargo build
 ## Test
 
 ```bash
-cargo test
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 ## Performance Profiling
@@ -76,11 +120,16 @@ Write results to a file with custom workload sizing:
 ./scripts/profile.sh --files 5000 --query-iters 500 --output .ops/profile/latest.json
 ```
 
-The profiler reports latency percentiles (`p50`, `p95`, `p99`), averages, and throughput for core operations (`open`, `read`, `query`, `update`, `rename/update_refs`, `create`, `delete`, `cache_rebuild`).
+The profiler reports latency percentiles (`p50`, `p95`, `p99`), averages, and
+throughput for core operations (`open`, `read`, `query`, `update`,
+`rename/update_refs`, `create`, `delete`, `cache_rebuild`). Runtime registry
+tests separately exercise deterministic composition of 2,000 virtual
+contracts in release mode.
 
 ## Notes
 
 - v0.2 conformance coverage is tracked in `tests/conformance.rs`; the shared
-  v0.3 adapter is `tests/v03_conformance.rs`.
+  v0.3 adapters are `tests/v03_conformance.rs` and
+  `tests/v03_runtime_conformance.rs`.
 - Operational status notes are in `PROGRESS.md`.
 - Release-level changes are in `CHANGELOG.md`.

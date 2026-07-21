@@ -153,13 +153,14 @@ fn check_field_conflicts(
     }
 
     // 8. Check conflicting link targets
-    let targets: Vec<&String> = defs
+    let targets: Vec<Vec<String>> = defs
         .iter()
-        .filter_map(|(_, fd)| fd.target.as_ref())
+        .map(|(_, field)| crate::links::resolver::allowed_target_types(field))
+        .filter(|targets| !targets.is_empty())
         .collect();
     if targets.len() >= 2 {
-        let first_target = targets[0];
-        if targets[1..].iter().any(|t| *t != first_target) {
+        let first_target = &targets[0];
+        if targets[1..].iter().any(|target| target != first_target) {
             issues.push(type_conflict_issue(
                 field_name,
                 path,

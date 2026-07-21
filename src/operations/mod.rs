@@ -10,9 +10,12 @@ pub mod rename;
 pub mod type_file;
 pub mod update;
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Component, Path};
 
-use crate::errors::{op_error, CONCURRENT_MODIFICATION, INVALID_PATH, PATH_TRAVERSAL};
+use crate::errors::{
+    op_error, CONCURRENT_MODIFICATION, INVALID_PATH, PATH_TRAVERSAL, PERMISSION_DENIED,
+};
 use crate::SpecProfile;
 
 /// Validate that a user-supplied path is relative to the collection root.
@@ -38,6 +41,81 @@ pub(crate) fn ensure_safe_relative_path(
             INVALID_PATH
         };
         return Err(op_error(code, "Path contains path traversal"));
+    }
+    Ok(())
+}
+
+/// Reject paths whose existing components contain symbolic links.
+///
+/// Collection operations accept paths relative to an authorized root. A
+/// lexical traversal check alone is insufficient because a symlink below the
+/// root can redirect a read or write elsewhere. The root itself is deliberately
+/// not inspected: hosts may authorize a collection through a symlink after
+/// resolving that grant themselves.
+pub(crate) fn ensure_no_symlink_components(
+    collection_root: &Path,
+    relative_path: &str,
+    spec_profile: SpecProfile,
+) -> Result<(), serde_json::Value> {
+    let mut candidate = collection_root.to_path_buf();
+    for component in Path::new(relative_path).components() {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(part) => candidate.push(part),
+            _ => {
+                return Err(path_boundary_error(
+                    spec_profile,
+                    "Path must remain inside the collection",
+                ))
+            }
+        }
+
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(path_boundary_error(
+                    spec_profile,
+                    "Symbolic links are not allowed in collection operation paths",
+                ))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => {
+                return Err(op_error(
+                    PERMISSION_DENIED,
+                    "Path could not be inspected safely",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn path_boundary_error(spec_profile: SpecProfile, message: &str) -> serde_json::Value {
+    op_error(
+        if spec_profile == SpecProfile::V03 {
+            PATH_TRAVERSAL
+        } else {
+            INVALID_PATH
+        },
+        message,
+    )
+}
+
+/// Move a regular collection file without ever replacing an existing target.
+///
+/// Creating the hard link is the atomic no-clobber point. Since both paths are
+/// inside one collection they are on the same filesystem. If unlinking the old
+/// name fails, the new link is rolled back and the source is left intact.
+pub(crate) fn atomic_rename_noclobber(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    if let Err(error) = std::fs::remove_file(from) {
+        let _ = std::fs::remove_file(to);
+        return Err(error);
+    }
+    if let Some(parent) = to.parent() {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
     }
     Ok(())
 }
@@ -71,8 +149,63 @@ pub(crate) fn ensure_revision(
     Ok(())
 }
 
+/// Atomically replace one collection file with fully written contents.
+///
+/// The temporary file lives beside the destination so persistence remains on
+/// the same filesystem. Existing permissions are retained on replacement.
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    atomic_write_mode(path, contents, false)
+}
+
+/// Atomically create a new file without replacing a concurrent creator.
+pub(crate) fn atomic_create(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    atomic_write_mode(path, contents, true)
+}
+
+fn atomic_write_mode(path: &Path, contents: &[u8], no_clobber: bool) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let permissions = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    if permissions
+        .as_ref()
+        .is_some_and(std::fs::Permissions::readonly)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "destination is read-only",
+        ));
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    if let Some(permissions) = permissions {
+        std::fs::set_permissions(temporary.path(), permissions)?;
+    }
+    if no_clobber {
+        temporary
+            .persist_noclobber(path)
+            .map_err(|error| error.error)?;
+    } else {
+        temporary.persist(path).map_err(|error| error.error)?;
+    }
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::ensure_no_symlink_components;
     use super::ensure_safe_relative_path;
     use crate::SpecProfile;
 
@@ -94,5 +227,24 @@ mod tests {
 
         assert!(ensure_safe_relative_path("notes/inside.md", SpecProfile::V03).is_ok());
         assert!(ensure_safe_relative_path(r"notes\inside.md", SpecProfile::V03).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinks_below_the_authorized_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        symlink(outside.path(), root.path().join("escape")).expect("create symlink");
+
+        let error = ensure_no_symlink_components(root.path(), "escape/record.md", SpecProfile::V03)
+            .expect_err("symlink must be rejected");
+        assert_eq!(
+            error
+                .pointer("/error/code")
+                .and_then(serde_json::Value::as_str),
+            Some("path_traversal")
+        );
     }
 }

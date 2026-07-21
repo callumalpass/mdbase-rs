@@ -19,6 +19,12 @@ pub(crate) fn load_config_for_open(collection_root: &Path) -> serde_json::Value 
 fn load_config_internal(collection_root: &Path, allow_future_minor: bool) -> serde_json::Value {
     let config_path = collection_root.join("mdbase.yaml");
 
+    if std::fs::symlink_metadata(&config_path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return error_json("invalid_config", "mdbase.yaml must not be a symbolic link");
+    }
+
     if !config_path.exists() {
         return error_json("missing_config", "mdbase.yaml not found");
     }

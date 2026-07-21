@@ -1329,6 +1329,7 @@ fn execute_operation(
                     backlinks_index: Some(backlinks_arc),
                     type_names: Some(type_names_for_file),
                     types: Some(types_arc),
+                    note_namespace_source: Default::default(),
                     string_concat: true,
                 }
             } else if let Some(context_val) = input_json.get("context") {
@@ -1347,6 +1348,7 @@ fn execute_operation(
                     backlinks_index: None,
                     type_names: None,
                     types: None,
+                    note_namespace_source: Default::default(),
                     string_concat: true,
                 }
             } else {

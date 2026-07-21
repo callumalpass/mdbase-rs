@@ -23,8 +23,11 @@ pub struct FieldDef {
     pub fields: Option<HashMap<String, FieldDef>>, // object fields
     pub min_items: Option<usize>,
     pub max_items: Option<usize>,
-    pub list_unique: bool,             // unique constraint on list items
-    pub target: Option<String>,        // link target type
+    pub list_unique: bool,      // unique constraint on list items
+    pub target: Option<String>, // link target type
+    /// Portable v0.3 link target types. `target` remains the v0.2-compatible
+    /// single-target representation.
+    pub target_types: Vec<String>,
     pub validate_exists: Option<bool>, // link existence validation
     pub computed: Option<String>,      // computed field expression (§5.12)
 }
@@ -57,6 +60,10 @@ pub struct TypeDef {
     pub match_rules: Option<MatchRules>,
     pub json_schema: Option<serde_json::Value>,
     pub read_defaults: HashMap<String, serde_json::Value>,
+    /// Raw v0.3 lifecycle policy. It remains data here so the v0.3 operation
+    /// facade can apply the canonical mutation pipeline without leaking the
+    /// policy into legacy v0.2 generated-field behavior.
+    pub lifecycle: Option<serde_json::Value>,
     pub source_path: Option<String>,
 }
 
@@ -75,6 +82,8 @@ pub struct MatchRules {
     pub path_globs: Option<Vec<String>>,
     pub fields_present: Option<Vec<String>>,
     pub where_clause: Option<serde_json::Value>,
+    /// Portable v0.3 CEL match expression source.
+    pub match_expr: Option<String>,
 }
 
 impl Default for FieldDef {
@@ -99,6 +108,7 @@ impl Default for FieldDef {
             max_items: None,
             list_unique: false,
             target: None,
+            target_types: Vec::new(),
             validate_exists: None,
             computed: None,
         }

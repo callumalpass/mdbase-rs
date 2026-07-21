@@ -1,7 +1,9 @@
 //! AST → value (Rust evaluator).
 
 use super::ast::*;
+use chrono::{FixedOffset, Local, Utc};
 use serde_json::Value;
+use std::cell::{Cell, RefCell};
 
 /// Error types from expression evaluation.
 #[derive(Debug)]
@@ -41,12 +43,74 @@ impl EvalError {
             message: "Expression nesting depth limit exceeded".to_string(),
         }
     }
+    fn expression_work_exceeded(limit: u64) -> Self {
+        EvalError {
+            code: "expression_work_exceeded".to_string(),
+            message: format!("Expression evaluation exceeded the {limit}-step work limit"),
+        }
+    }
 }
 
 const MAX_EVAL_DEPTH: u32 = 64;
 
 thread_local! {
-    static EVAL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static EVAL_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static EVAL_LIMIT: Cell<u32> = const { Cell::new(MAX_EVAL_DEPTH) };
+    static EVAL_WORK: Cell<u64> = const { Cell::new(0) };
+    static EVAL_WORK_LIMIT: Cell<u64> = const { Cell::new(u64::MAX) };
+    static EVAL_CLOCK: RefCell<Option<EvaluationClock>> = const { RefCell::new(None) };
+}
+
+/// A time snapshot shared by every expression in one logical operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvaluationClock {
+    now: String,
+    today: String,
+}
+
+impl EvaluationClock {
+    /// Capture UTC `now()` and timezone-aware `today()` values once.
+    pub fn capture(timezone: Option<&str>) -> Result<Self, String> {
+        let now = Utc::now();
+        let today = match timezone.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("local") => now.with_timezone(&Local).date_naive(),
+            Some("UTC" | "utc" | "Z") => now.date_naive(),
+            Some(value) if value.starts_with('+') || value.starts_with('-') => {
+                let offset = parse_fixed_offset(value)
+                    .ok_or_else(|| format!("Invalid fixed timezone offset '{value}'"))?;
+                now.with_timezone(&offset).date_naive()
+            }
+            Some(value) => {
+                let timezone = value
+                    .parse::<chrono_tz::Tz>()
+                    .map_err(|_| format!("Unknown IANA timezone '{value}'"))?;
+                now.with_timezone(&timezone).date_naive()
+            }
+        };
+        Ok(Self {
+            now: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            today: today.format("%Y-%m-%d").to_string(),
+        })
+    }
+
+    pub fn now(&self) -> &str {
+        &self.now
+    }
+
+    pub fn today(&self) -> &str {
+        &self.today
+    }
+}
+
+fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
+    let sign = match value.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let (hours, minutes) = value.get(1..)?.split_once(':')?;
+    let seconds = sign * (hours.parse::<i32>().ok()? * 3600 + minutes.parse::<i32>().ok()? * 60);
+    FixedOffset::east_opt(seconds)
 }
 
 /// Resolved file data for asFile() traversal
@@ -55,6 +119,17 @@ pub struct ResolvedFileData {
     pub path: String,
     pub frontmatter: Value,
     pub body: String,
+}
+
+/// Selects which frontmatter view backs the `note` namespace.
+///
+/// The legacy expression profile exposes persisted frontmatter through
+/// `note`; the v0.3 CEL host defines `note` as an alias for `record`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NoteNamespaceSource {
+    #[default]
+    Raw,
+    Effective,
 }
 
 /// Context for expression evaluation.
@@ -80,6 +155,7 @@ pub struct EvalContext {
     /// Types map for display_name_key lookup.
     pub types:
         Option<std::sync::Arc<std::collections::HashMap<String, crate::types::schema::TypeDef>>>,
+    pub note_namespace_source: NoteNamespaceSource,
     /// Whether string + number should concatenate (true in formulas) or return type error (false in where clauses).
     pub string_concat: bool,
 }
@@ -100,6 +176,7 @@ impl EvalContext {
             backlinks_index: None,
             type_names: None,
             types: None,
+            note_namespace_source: NoteNamespaceSource::Raw,
             string_concat: true,
         }
     }
@@ -109,14 +186,46 @@ impl EvalContext {
 pub fn evaluate(expr: &Expr, ctx: &EvalContext) -> Result<Value, EvalError> {
     EVAL_DEPTH.with(|d| {
         let depth = d.get();
-        if depth > MAX_EVAL_DEPTH {
+        if EVAL_LIMIT.with(std::cell::Cell::get) < depth {
             return Err(EvalError::expression_depth_exceeded());
         }
+        let work = EVAL_WORK.with(Cell::get);
+        let work_limit = EVAL_WORK_LIMIT.with(Cell::get);
+        if work >= work_limit {
+            return Err(EvalError::expression_work_exceeded(work_limit));
+        }
+        EVAL_WORK.with(|counter| counter.set(work + 1));
         d.set(depth + 1);
         let result = evaluate_inner(expr, ctx);
         d.set(depth);
         result
     })
+}
+
+/// Evaluate with a profile-specific recursive depth limit.
+///
+/// Nested evaluator calls inherit the limit selected by the outer operation.
+pub fn evaluate_with_limits(
+    expr: &Expr,
+    ctx: &EvalContext,
+    max_depth: u32,
+    max_work: u64,
+    clock: &EvaluationClock,
+) -> Result<Value, EvalError> {
+    let is_outermost = EVAL_DEPTH.with(|depth| depth.get() == 0);
+    if !is_outermost {
+        return evaluate(expr, ctx);
+    }
+    let previous_depth_limit = EVAL_LIMIT.with(|limit| limit.replace(max_depth));
+    let previous_work_limit = EVAL_WORK_LIMIT.with(|limit| limit.replace(max_work));
+    let previous_work = EVAL_WORK.with(|work| work.replace(0));
+    let previous_clock = EVAL_CLOCK.with(|value| value.replace(Some(clock.clone())));
+    let result = evaluate(expr, ctx);
+    EVAL_LIMIT.with(|limit| limit.set(previous_depth_limit));
+    EVAL_WORK_LIMIT.with(|limit| limit.set(previous_work_limit));
+    EVAL_WORK.with(|work| work.set(previous_work));
+    EVAL_CLOCK.with(|value| value.replace(previous_clock));
+    result
 }
 
 fn evaluate_inner(expr: &Expr, ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -192,6 +301,10 @@ fn eval_dot(obj_expr: &Expr, field: &str, ctx: &EvalContext) -> Result<Value, Ev
         }
         // note.* namespace accesses raw frontmatter (pre-defaults)
         if name == "note" {
+            if ctx.note_namespace_source == NoteNamespaceSource::Effective {
+                let note = ctx.frontmatter.get("note").unwrap_or(&Value::Null);
+                return Ok(note.get(field).cloned().unwrap_or(Value::Null));
+            }
             let fm = ctx.raw_frontmatter.as_ref().unwrap_or(&ctx.frontmatter);
             return Ok(fm.get(field).cloned().unwrap_or(Value::Null));
         }
@@ -628,7 +741,12 @@ fn eval_index(obj_expr: &Expr, idx_expr: &Expr, ctx: &EvalContext) -> Result<Val
         if name == "note" {
             let idx = evaluate(idx_expr, ctx)?;
             if let Some(key) = idx.as_str() {
-                return Ok(ctx.frontmatter.get(key).cloned().unwrap_or(Value::Null));
+                if ctx.note_namespace_source == NoteNamespaceSource::Effective {
+                    let note = ctx.frontmatter.get("note").unwrap_or(&Value::Null);
+                    return Ok(note.get(key).cloned().unwrap_or(Value::Null));
+                }
+                let fm = ctx.raw_frontmatter.as_ref().unwrap_or(&ctx.frontmatter);
+                return Ok(fm.get(key).cloned().unwrap_or(Value::Null));
             }
         }
     }
@@ -1036,10 +1154,20 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
             // Return the date string as-is
             Ok(val)
         }
-        "today" => Ok(Value::String(
-            chrono::Local::now().format("%Y-%m-%d").to_string(),
-        )),
-        "now" => Ok(Value::String(chrono::Utc::now().to_rfc3339())),
+        "today" => Ok(Value::String(EVAL_CLOCK.with(|clock| {
+            clock
+                .borrow()
+                .as_ref()
+                .map(|clock| clock.today.clone())
+                .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string())
+        }))),
+        "now" => Ok(Value::String(EVAL_CLOCK.with(|clock| {
+            clock
+                .borrow()
+                .as_ref()
+                .map(|clock| clock.now.clone())
+                .unwrap_or_else(|| Utc::now().to_rfc3339())
+        }))),
         "abs" => {
             if args.len() != 1 {
                 return Err(EvalError::wrong_argument_count("abs() requires 1 argument"));
@@ -1259,10 +1387,10 @@ fn eval_string_method(
     ctx: &EvalContext,
 ) -> Result<Value, EvalError> {
     match method {
-        "length" => {
+        "length" | "size" => {
             if !args.is_empty() {
                 return Err(EvalError::wrong_argument_count(
-                    "length() takes no arguments",
+                    "length()/size() takes no arguments",
                 ));
             }
             Ok(Value::Number(s.len().into()))
@@ -1577,7 +1705,14 @@ fn eval_array_method(
     ctx: &EvalContext,
 ) -> Result<Value, EvalError> {
     match method {
-        "length" => Ok(Value::Number(arr.len().into())),
+        "length" | "size" => {
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count(
+                    "length()/size() takes no arguments",
+                ));
+            }
+            Ok(Value::Number(arr.len().into()))
+        }
         "isEmpty" => Ok(Value::Bool(arr.is_empty())),
         "contains" => {
             if args.len() != 1 {
@@ -1713,6 +1848,7 @@ fn eval_array_method(
                     backlinks_index: ctx.backlinks_index.clone(),
                     type_names: ctx.type_names.clone(),
                     types: ctx.types.clone(),
+                    note_namespace_source: ctx.note_namespace_source,
                     string_concat: ctx.string_concat,
                 };
                 if let Ok(val) = evaluate(&args[0], &item_ctx) {
@@ -1748,6 +1884,7 @@ fn eval_array_method(
                     backlinks_index: ctx.backlinks_index.clone(),
                     type_names: ctx.type_names.clone(),
                     types: ctx.types.clone(),
+                    note_namespace_source: ctx.note_namespace_source,
                     string_concat: ctx.string_concat,
                 };
                 match evaluate(&args[0], &item_ctx) {
@@ -1788,6 +1925,7 @@ fn eval_array_method(
                     backlinks_index: ctx.backlinks_index.clone(),
                     type_names: ctx.type_names.clone(),
                     types: ctx.types.clone(),
+                    note_namespace_source: ctx.note_namespace_source,
                     string_concat: ctx.string_concat,
                 };
                 acc = evaluate(&args[0], &item_ctx)?;
@@ -1808,6 +1946,14 @@ fn eval_object_method(
     ctx: &EvalContext,
 ) -> Result<Value, EvalError> {
     match method {
+        "length" | "size" => {
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count(
+                    "length()/size() takes no arguments",
+                ));
+            }
+            Ok(Value::Number(map.len().into()))
+        }
         "keys" => {
             let keys: Vec<Value> = map.keys().map(|k| Value::String(k.clone())).collect();
             Ok(Value::Array(keys))
@@ -2185,6 +2331,10 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
         return None;
     }
 
+    if s.starts_with('P') || s.starts_with("-P") {
+        return parse_iso8601_duration_ms(s);
+    }
+
     // Try to parse as "<number><unit>"
     let mut num_end = 0;
     for (i, c) in s.char_indices() {
@@ -2214,6 +2364,60 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
     };
 
     Some((num * ms_per_unit) as i64)
+}
+
+/// Parse the fixed-length subset of ISO 8601 durations used by CEL.
+/// Calendar years and months are deliberately excluded because their length
+/// depends on an anchor date; date arithmetic handles those separately.
+fn parse_iso8601_duration_ms(source: &str) -> Option<i64> {
+    let (sign, source) = source
+        .strip_prefix('-')
+        .map_or((1.0, source), |rest| (-1.0, rest));
+    let mut chars = source.strip_prefix('P')?.chars().peekable();
+    let mut in_time = false;
+    let mut saw_component = false;
+    let mut total_ms = 0.0;
+
+    while chars.peek().is_some() {
+        if chars.peek() == Some(&'T') {
+            chars.next();
+            if in_time {
+                return None;
+            }
+            in_time = true;
+            continue;
+        }
+
+        let mut number = String::new();
+        while chars
+            .peek()
+            .is_some_and(|value| value.is_ascii_digit() || *value == '.')
+        {
+            number.push(chars.next()?);
+        }
+        if number.is_empty() {
+            return None;
+        }
+        let value = number.parse::<f64>().ok()?;
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+        let unit = chars.next()?;
+        let multiplier = match (in_time, unit) {
+            (false, 'W') => 604_800_000.0,
+            (false, 'D') => 86_400_000.0,
+            (true, 'H') => 3_600_000.0,
+            (true, 'M') => 60_000.0,
+            (true, 'S') => 1_000.0,
+            _ => return None,
+        };
+        total_ms += value * multiplier;
+        saw_component = true;
+    }
+
+    let signed = sign * total_ms;
+    (saw_component && signed.is_finite() && signed >= i64::MIN as f64 && signed <= i64::MAX as f64)
+        .then_some(signed.round() as i64)
 }
 
 /// Add a duration string to a date/datetime string.
@@ -2610,7 +2814,7 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
     links
 }
 
-/// Extract embeds from markdown body (![[target]]).
+/// Extract embeds from Markdown body (`![[target]]`).
 /// Embeds inside inline code spans are excluded.
 pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
     let clean = strip_code_blocks_and_inline_code(body);
@@ -2737,5 +2941,21 @@ pub fn extract_links_from_fm_value(val: &Value, links: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    use crate::expressions::parser::Parser;
+
+    #[test]
+    fn profile_specific_work_budget_stops_evaluation() {
+        let expression = Parser::parse("[1, 2, 3].map(value + 1)").unwrap();
+        let clock = EvaluationClock::capture(Some("UTC")).unwrap();
+        let error =
+            evaluate_with_limits(&expression, &EvalContext::empty(), 128, 3, &clock).unwrap_err();
+        assert_eq!(error.code, "expression_work_exceeded");
+        assert!(error.message.contains("3-step"));
     }
 }

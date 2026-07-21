@@ -14,7 +14,11 @@ use walkdir::{DirEntry, WalkDir};
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_to_json};
 use crate::{Collection, SpecProfile};
 
+mod batch;
+pub(crate) mod cel;
+mod lifecycle;
 mod operations;
+mod query;
 
 pub use operations::{OperationResult, Operations};
 
@@ -31,14 +35,17 @@ pub fn is_supported_spec_version(version: &str) -> bool {
 }
 
 const CONFIG_SCHEMA_ID: &str = "https://mdbase.dev/schemas/v0.3/config.schema.json";
+const DIAGNOSTIC_SCHEMA_ID: &str = "https://mdbase.dev/schemas/v0.3/diagnostic.schema.json";
 const TYPE_FILE_SCHEMA_ID: &str = "https://mdbase.dev/schemas/v0.3/type-file.schema.json";
 
 const CONFIG_SCHEMA: &str = include_str!("../../schemas/v0.3/config.schema.json");
 const DIAGNOSTIC_SCHEMA: &str = include_str!("../../schemas/v0.3/diagnostic.schema.json");
 const OPERATION_RESULT_SCHEMA: &str =
     include_str!("../../schemas/v0.3/operation-result.schema.json");
+const QUERY_SCHEMA: &str = include_str!("../../schemas/v0.3/query.schema.json");
 const QUERY_RESULT_SCHEMA: &str = include_str!("../../schemas/v0.3/query-result.schema.json");
 const TYPE_FILE_SCHEMA: &str = include_str!("../../schemas/v0.3/type-file.schema.json");
+const VIEW_SCHEMA: &str = include_str!("../../schemas/v0.3/view.schema.json");
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Diagnostic {
@@ -98,12 +105,14 @@ pub fn validate_canonical_schemas() -> Result<(), String> {
         ("config", CONFIG_SCHEMA),
         ("diagnostic", DIAGNOSTIC_SCHEMA),
         ("operation-result", OPERATION_RESULT_SCHEMA),
+        ("query", QUERY_SCHEMA),
         ("query-result", QUERY_RESULT_SCHEMA),
         ("type-file", TYPE_FILE_SCHEMA),
+        ("view", VIEW_SCHEMA),
     ] {
         let schema: Value = serde_json::from_str(source)
             .map_err(|error| format!("{name} schema is not valid JSON: {error}"))?;
-        compile_schema(&schema)
+        compile_canonical_schema(&schema)
             .map_err(|error| format!("{name} schema is not valid JSON Schema 2020-12: {error}"))?;
     }
     Ok(())
@@ -130,6 +139,26 @@ pub fn validate_type_file(value: &Value, path: &str) -> Vec<Diagnostic> {
         path,
         TYPE_FILE_SCHEMA_ID,
         type_name,
+    )
+}
+
+pub fn validate_query(value: &Value) -> Vec<Diagnostic> {
+    validate_canonical_value(
+        QUERY_SCHEMA,
+        value,
+        "query",
+        "https://mdbase.dev/schemas/v0.3/query.schema.json",
+        None,
+    )
+}
+
+pub fn validate_query_result(value: &Value) -> Vec<Diagnostic> {
+    validate_canonical_value(
+        QUERY_RESULT_SCHEMA,
+        value,
+        "query-result",
+        "https://mdbase.dev/schemas/v0.3/query-result.schema.json",
+        None,
     )
 }
 
@@ -401,7 +430,23 @@ fn validate_canonical_value(
             )]
         }
     };
-    validate_value(&schema, value, path, schema_id, type_name)
+    let compiled = match compile_canonical_schema(&schema) {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            return vec![Diagnostic::error(
+                "invalid_schema",
+                error,
+                Some(path.to_string()),
+            )]
+        }
+    };
+    let diagnostics = match compiled.validate(value) {
+        Ok(()) => Vec::new(),
+        Err(errors) => errors
+            .map(|error| validation_diagnostic(error, path, schema_id, type_name))
+            .collect(),
+    };
+    diagnostics
 }
 
 fn validate_value(
@@ -514,6 +559,17 @@ fn compile_schema(schema: &Value) -> Result<JSONSchema, String> {
     JSONSchema::options()
         .with_draft(Draft::Draft202012)
         .should_validate_formats(true)
+        .compile(schema)
+        .map_err(|error| error.to_string())
+}
+
+fn compile_canonical_schema(schema: &Value) -> Result<JSONSchema, String> {
+    let diagnostic_schema = serde_json::from_str(DIAGNOSTIC_SCHEMA)
+        .map_err(|error| format!("diagnostic schema is not valid JSON: {error}"))?;
+    JSONSchema::options()
+        .with_draft(Draft::Draft202012)
+        .should_validate_formats(true)
+        .with_document(DIAGNOSTIC_SCHEMA_ID.to_string(), diagnostic_schema)
         .compile(schema)
         .map_err(|error| error.to_string())
 }
@@ -682,8 +738,10 @@ pub fn schema_path(name: &str) -> Option<PathBuf> {
         "config" => Some(PathBuf::from("schemas/v0.3/config.schema.json")),
         "diagnostic" => Some(PathBuf::from("schemas/v0.3/diagnostic.schema.json")),
         "operation-result" => Some(PathBuf::from("schemas/v0.3/operation-result.schema.json")),
+        "query" => Some(PathBuf::from("schemas/v0.3/query.schema.json")),
         "query-result" => Some(PathBuf::from("schemas/v0.3/query-result.schema.json")),
         "type-file" => Some(PathBuf::from("schemas/v0.3/type-file.schema.json")),
+        "view" => Some(PathBuf::from("schemas/v0.3/view.schema.json")),
         _ => None,
     }
 }

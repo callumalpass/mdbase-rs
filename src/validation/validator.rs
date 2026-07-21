@@ -395,6 +395,16 @@ impl Collection {
         }
 
         if let Some(path) = path {
+            if let Err(error) =
+                crate::operations::ensure_safe_relative_path(path, self.spec_profile)
+            {
+                return error;
+            }
+            if let Err(error) =
+                crate::operations::ensure_no_symlink_components(&self.root, path, self.spec_profile)
+            {
+                return error;
+            }
             // Check if inline frontmatter is provided in input
             let inline_fm = input.get("frontmatter");
 

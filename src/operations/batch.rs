@@ -196,6 +196,22 @@ impl Collection {
         dry_run: bool,
         simulate_io_error: Option<&str>,
     ) -> serde_json::Value {
+        for update in updates {
+            let Some(path) = update.get("path").and_then(|value| value.as_str()) else {
+                return op_error(INVALID_PATH, "Each batch update requires path");
+            };
+            if let Err(error) =
+                crate::operations::ensure_safe_relative_path(path, self.spec_profile)
+            {
+                return error;
+            }
+            if let Err(error) =
+                crate::operations::ensure_no_symlink_components(&self.root, path, self.spec_profile)
+            {
+                return error;
+            }
+        }
+
         // Validate all first
         if self.settings.default_validation == "error" {
             for update in updates {

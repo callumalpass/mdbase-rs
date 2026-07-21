@@ -149,9 +149,9 @@ impl Collection {
                     // meaning it resolves via id lookup rather than filename.
                     // Generic link fields (no target type) resolve by filename
                     // and must be updated.
-                    if self
-                        .get_field_target_type(source_file_path, field_name)
-                        .is_some()
+                    if !self
+                        .get_field_target_types(source_file_path, field_name)
+                        .is_empty()
                     {
                         return true;
                     }

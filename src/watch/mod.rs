@@ -3,8 +3,10 @@
 //! Provides a real, debounced collection change stream and the deterministic
 //! simulation adapter used by the legacy conformance runner.
 
+mod portable;
 mod real;
 
+pub use portable::{PortableWatchEvent, WatchKind};
 pub use real::{CollectionWatcher, WatchError};
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,18 @@ pub struct WatchEvent {
     pub sequence: u64,
     pub occurred_at: String,
     pub payload: Value,
+}
+
+impl WatchEvent {
+    /// Convert the transport event into the portable v0.3 Watch profile.
+    ///
+    /// Conversion consumes the event because a portable notification is a new
+    /// observation with its own globally unique identifier. The legacy
+    /// transport shape remains available for hosts whose protocols already
+    /// expose `event_type`, `sequence`, and `payload`.
+    pub fn into_portable(self) -> PortableWatchEvent {
+        PortableWatchEvent::from(self)
+    }
 }
 
 /// Simulate watch mode for a collection root given a set of simulated actions.

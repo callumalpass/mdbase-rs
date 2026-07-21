@@ -1,0 +1,318 @@
+use std::fs;
+use std::path::Path;
+
+use serde_json::{json, Value};
+use walkdir::WalkDir;
+
+use super::{Diagnostic, OperationResult, Operations};
+use crate::Collection;
+
+pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult {
+    let Some(items) = input.get("operations").and_then(Value::as_array) else {
+        return invalid_request("Batch input requires an operations array.");
+    };
+    if items.is_empty() {
+        return invalid_request("Batch operations must not be empty.");
+    }
+    let dry_run = input
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let allow_partial = input
+        .get("allow_partial")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if dry_run || !allow_partial {
+        let shadow = match shadow_collection(collection) {
+            Ok(shadow) => shadow,
+            Err(diagnostic) => return failed(vec![*diagnostic]),
+        };
+        let shadow_operations = match shadow.collection.v03_operations() {
+            Ok(operations) => operations,
+            Err(diagnostic) => return failed(vec![*diagnostic]),
+        };
+        let preview = execute_items(&shadow_operations, items, false);
+        if dry_run || !preview.valid {
+            return batch_result(preview, true, dry_run);
+        }
+    }
+
+    let operations = match collection.v03_operations() {
+        Ok(operations) => operations,
+        Err(diagnostic) => return failed(vec![*diagnostic]),
+    };
+    batch_result(
+        execute_items(&operations, items, allow_partial),
+        false,
+        false,
+    )
+}
+
+struct ShadowCollection {
+    _directory: tempfile::TempDir,
+    collection: Collection,
+}
+
+fn shadow_collection(collection: &Collection) -> Result<ShadowCollection, Box<Diagnostic>> {
+    let directory = tempfile::tempdir().map_err(|error| {
+        Box::new(Diagnostic::error(
+            "batch_preflight_failed",
+            format!("Could not create batch preflight workspace: {error}"),
+            None,
+        ))
+    })?;
+    copy_collection(collection, directory.path())?;
+    let shadow = Collection::open(directory.path()).map_err(|error| {
+        Box::new(Diagnostic::error(
+            "batch_preflight_failed",
+            format!("Could not open batch preflight collection: {error:?}"),
+            None,
+        ))
+    })?;
+    Ok(ShadowCollection {
+        _directory: directory,
+        collection: shadow,
+    })
+}
+
+fn copy_collection(collection: &Collection, destination: &Path) -> Result<(), Box<Diagnostic>> {
+    let source = &collection.root;
+    for entry in WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| should_descend(collection, entry.path()))
+    {
+        let entry = entry.map_err(|error| {
+            Box::new(Diagnostic::error(
+                "batch_preflight_failed",
+                format!("Could not inspect collection for batch preflight: {error}"),
+                None,
+            ))
+        })?;
+        let relative = entry.path().strip_prefix(source).map_err(|error| {
+            Box::new(Diagnostic::error(
+                "batch_preflight_failed",
+                error.to_string(),
+                None,
+            ))
+        })?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let target = destination.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target).map_err(|error| Box::new(copy_error(relative, error)))?;
+        } else if entry.file_type().is_file() && should_copy_file(collection, relative) {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| Box::new(copy_error(relative, error)))?;
+            }
+            fs::copy(entry.path(), &target)
+                .map_err(|error| Box::new(copy_error(relative, error)))?;
+        }
+    }
+    Ok(())
+}
+
+fn should_descend(collection: &Collection, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(&collection.root) else {
+        return false;
+    };
+    if relative.as_os_str().is_empty() || is_system_definition_path(collection, relative) {
+        return true;
+    }
+    if !path.is_dir() {
+        return true;
+    }
+    let relative = portable_path(relative);
+    if collection.is_excluded(&relative) {
+        return false;
+    }
+    // A directory containing its own config is a nested collection boundary.
+    // Avoid copying any of it into the preflight workspace.
+    !path.join("mdbase.yaml").is_file()
+}
+
+fn should_copy_file(collection: &Collection, relative: &Path) -> bool {
+    if relative == Path::new("mdbase.yaml") || is_system_definition_path(collection, relative) {
+        return true;
+    }
+    let relative = portable_path(relative);
+    !collection.is_excluded(&relative)
+        && (collection.is_valid_extension(&relative)
+            || Path::new(&relative)
+                .extension()
+                .and_then(|value| value.to_str())
+                == Some("json"))
+}
+
+fn is_system_definition_path(collection: &Collection, relative: &Path) -> bool {
+    relative.starts_with(Path::new(&collection.settings.types_folder))
+        || relative.starts_with(Path::new(&collection.settings.migrations_folder))
+}
+
+fn portable_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn copy_error(path: &Path, error: std::io::Error) -> Diagnostic {
+    Diagnostic::error(
+        "batch_preflight_failed",
+        format!(
+            "Could not copy '{}' for batch preflight: {error}",
+            path.to_string_lossy()
+        ),
+        None,
+    )
+}
+
+struct BatchExecution {
+    valid: bool,
+    results: Vec<Value>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+fn execute_items(
+    operations: &Operations<'_>,
+    items: &[Value],
+    allow_partial: bool,
+) -> BatchExecution {
+    let mut results = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut valid = true;
+    for (index, item) in items.iter().enumerate() {
+        let Some(kind) = item.get("kind").and_then(Value::as_str) else {
+            let diagnostic = Diagnostic::error(
+                "invalid_request",
+                format!("Batch operation {index} requires kind."),
+                None,
+            );
+            diagnostics.push(diagnostic.clone());
+            results.push(json!({
+                "index": index,
+                "valid": false,
+                "result": {},
+                "diagnostics": [diagnostic],
+            }));
+            valid = false;
+            if !allow_partial {
+                break;
+            }
+            continue;
+        };
+        let operation_input = item.get("input").cloned().unwrap_or_else(|| json!({}));
+        let operation = match kind {
+            "create" => operations.create(&operation_input),
+            "update" => operations.update(&operation_input),
+            "delete" => operations.delete(&operation_input),
+            "rename" => operations.rename(&operation_input),
+            _ => OperationResult {
+                valid: false,
+                result: json!({}),
+                diagnostics: vec![Diagnostic::error(
+                    "invalid_request",
+                    format!("Unsupported batch operation kind '{kind}'."),
+                    None,
+                )],
+            },
+        };
+        if !operation.valid {
+            valid = false;
+        }
+        diagnostics.extend(operation.diagnostics.iter().cloned());
+        results.push(json!({
+            "index": index,
+            "kind": kind,
+            "valid": operation.valid,
+            "result": operation.result,
+            "diagnostics": operation.diagnostics,
+        }));
+        if !valid && !allow_partial {
+            break;
+        }
+    }
+    BatchExecution {
+        valid,
+        results,
+        diagnostics,
+    }
+}
+
+fn batch_result(execution: BatchExecution, preflight: bool, dry_run: bool) -> OperationResult {
+    let succeeded = execution
+        .results
+        .iter()
+        .filter(|result| result.get("valid") == Some(&Value::Bool(true)))
+        .count();
+    let failed = execution.results.len() - succeeded;
+    OperationResult {
+        valid: execution.valid,
+        result: json!({
+            "operations": execution.results,
+            "succeeded": succeeded,
+            "failed": failed,
+            "preflight": preflight,
+            "dry_run": dry_run,
+        }),
+        diagnostics: execution.diagnostics,
+    }
+}
+
+fn invalid_request(message: &str) -> OperationResult {
+    failed(vec![Diagnostic::error("invalid_request", message, None)])
+}
+
+fn failed(diagnostics: Vec<Diagnostic>) -> OperationResult {
+    OperationResult {
+        valid: false,
+        result: json!({}),
+        diagnostics,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn preflight_shadow_copies_only_collection_scope_and_required_assets() {
+        let source = tempfile::tempdir().unwrap();
+        write(
+            &source.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        );
+        write(
+            &source.path().join("_types/note.md"),
+            "---\nkind: mdbase.type\nname: note\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n",
+        );
+        write(&source.path().join("visible.md"), "---\ntype: note\n---\n");
+        write(
+            &source.path().join("schema.json"),
+            "{\"type\":\"object\"}\n",
+        );
+        write(&source.path().join(".git/large.md"), "must not copy");
+        write(
+            &source.path().join("nested/mdbase.yaml"),
+            "spec_version: 0.3.0\n",
+        );
+        write(&source.path().join("nested/hidden.md"), "must not copy");
+
+        let collection = Collection::open(source.path()).unwrap();
+        let shadow = shadow_collection(&collection).unwrap();
+        let root = &shadow.collection.root;
+        assert!(root.join("mdbase.yaml").is_file());
+        assert!(root.join("_types/note.md").is_file());
+        assert!(root.join("visible.md").is_file());
+        assert!(root.join("schema.json").is_file());
+        assert!(!root.join(".git").exists());
+        assert!(!root.join("nested").exists());
+    }
+}

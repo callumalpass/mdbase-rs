@@ -17,6 +17,7 @@ pub mod matching;
 pub mod operations;
 pub mod query;
 pub mod runtime;
+pub mod runtime_contracts;
 pub mod types;
 pub mod v03;
 pub mod validation;
@@ -140,7 +141,11 @@ impl Collection {
                         .collect()
                 })
                 .unwrap_or_else(|| vec!["type".into(), "types".into()]),
-            write_defaults: settings_json["write_defaults"].as_bool().unwrap_or(true),
+            write_defaults: if spec_profile == SpecProfile::V03 {
+                false
+            } else {
+                settings_json["write_defaults"].as_bool().unwrap_or(true)
+            },
             default_validation: settings_json["default_validation"]
                 .as_str()
                 .unwrap_or("warn")
@@ -154,10 +159,14 @@ impl Collection {
             id_field_explicit: settings_json["id_field_explicit"]
                 .as_bool()
                 .unwrap_or(false),
-            write_nulls: settings_json["write_nulls"]
-                .as_str()
-                .unwrap_or("omit")
-                .to_string(),
+            write_nulls: if spec_profile == SpecProfile::V03 {
+                "explicit".to_string()
+            } else {
+                settings_json["write_nulls"]
+                    .as_str()
+                    .unwrap_or("omit")
+                    .to_string()
+            },
             write_empty_lists: settings_json["write_empty_lists"].as_bool().unwrap_or(true),
             rename_update_refs: settings_json["rename_update_refs"]
                 .as_bool()
@@ -167,6 +176,20 @@ impl Collection {
                 .unwrap_or(".mdbase")
                 .to_string(),
         };
+
+        for (label, path) in [
+            ("types_folder", settings.types_folder.as_str()),
+            ("migrations_folder", settings.migrations_folder.as_str()),
+            ("cache_folder", settings.cache_folder.as_str()),
+        ] {
+            crate::operations::ensure_safe_relative_path(path, spec_profile).map_err(|_| {
+                crate::errors::op_error(
+                    crate::errors::INVALID_CONFIG,
+                    &format!("settings.{label} must be relative to the collection"),
+                )
+            })?;
+            crate::operations::ensure_no_symlink_components(root, path, spec_profile)?;
+        }
 
         // Load types
         let load_result = loader::load_types_with_warnings(
@@ -384,8 +407,19 @@ impl Collection {
                 Err(_) => continue,
             };
             let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
 
-            if path.is_dir() {
+            // Never follow links while discovering collection resources. A
+            // symlink below the authorized root can otherwise expose an
+            // unrelated directory to query, cache, links, runtime loading, or
+            // watch even when direct CRUD paths are contained.
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 if self.settings.include_subfolders {
                     let rel = path
                         .strip_prefix(&self.root)
@@ -395,7 +429,7 @@ impl Collection {
                         self.scan_dir_recursive(&path, files);
                     }
                 }
-            } else if path.is_file() {
+            } else if file_type.is_file() {
                 let rel = path
                     .strip_prefix(&self.root)
                     .map(|p| p.to_string_lossy().to_string())

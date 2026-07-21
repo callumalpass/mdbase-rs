@@ -2,6 +2,7 @@
 
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
+use crate::operations::{ensure_no_symlink_components, ensure_safe_relative_path};
 use crate::Collection;
 
 impl Collection {
@@ -22,8 +23,21 @@ impl Collection {
         }
 
         let manifest_path = if let Some(p) = path {
+            if let Err(error) = ensure_safe_relative_path(p, self.spec_profile) {
+                return error;
+            }
+            if let Err(error) = ensure_no_symlink_components(&self.root, p, self.spec_profile) {
+                return error;
+            }
             self.root.join(p)
         } else {
+            if let Err(error) = ensure_no_symlink_components(
+                &self.root,
+                &self.settings.migrations_folder,
+                self.spec_profile,
+            ) {
+                return error;
+            }
             let migrations_dir = self.root.join(&self.settings.migrations_folder);
             let mut found: Option<std::path::PathBuf> = None;
             if migrations_dir.exists() {
@@ -35,9 +49,15 @@ impl Collection {
                     };
                     for entry in entries.flatten() {
                         let entry_path = entry.path();
-                        if entry_path.is_dir() {
+                        let Ok(file_type) = entry.file_type() else {
+                            continue;
+                        };
+                        if file_type.is_symlink() {
+                            continue;
+                        }
+                        if file_type.is_dir() {
                             stack.push(entry_path);
-                        } else if entry_path.is_file() {
+                        } else if file_type.is_file() {
                             let ext = entry_path
                                 .extension()
                                 .and_then(|e| e.to_str())

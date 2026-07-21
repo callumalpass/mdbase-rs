@@ -59,6 +59,55 @@ fn canonical_v03_schemas_compile() {
 }
 
 #[test]
+fn canonical_view_type_validates_an_ordinary_markdown_record() {
+    let directory = v03_collection();
+    write(
+        directory.path(),
+        "schemas/v0.3/view.schema.json",
+        include_str!("../schemas/v0.3/view.schema.json"),
+    );
+    write(
+        directory.path(),
+        "_types/view.md",
+        r#"---
+kind: mdbase.type
+name: view
+version: 1
+match:
+  where: { type: view }
+schema:
+  dialect: json-schema-2020-12
+  ref: "../schemas/v0.3/view.schema.json"
+---
+"#,
+    );
+    write(
+        directory.path(),
+        "views/tasks.md",
+        r#"---
+type: view
+id: tasks.views
+version: 1
+name: Task views
+query:
+  types: [task]
+views:
+  - id: all
+    name: All tasks
+---
+"#,
+    );
+
+    let collection = Collection::open(directory.path()).expect("open collection with view type");
+    let validation = collection.validate_op(&serde_json::json!({
+        "path": "views/tasks.md"
+    }));
+    assert_eq!(validation.get("valid"), Some(&serde_json::json!(true)));
+    let read = collection.read(&serde_json::json!({ "path": "views/tasks.md" }));
+    assert_eq!(read.get("types"), Some(&serde_json::json!(["view"])));
+}
+
+#[test]
 fn v03_allows_disabling_explicit_type_keys() {
     let directory = tempfile::tempdir().expect("temp collection");
     write(

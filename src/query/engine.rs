@@ -195,6 +195,7 @@ impl Collection {
                     backlinks_index: None,
                     type_names: None,
                     types: None,
+                    note_namespace_source: Default::default(),
                     string_concat: true,
                 }))
             });
@@ -300,6 +301,7 @@ impl Collection {
                     backlinks_index: None,
                     type_names: None,
                     types: None,
+                    note_namespace_source: Default::default(),
                     string_concat: true,
                 };
                 match ExprParser::parse(fexpr) {
@@ -998,8 +1000,23 @@ impl Collection {
             Err(_) => return false,
         };
 
-        // Build an enriched frontmatter that includes special query namespaces
-        let mut enriched_fm = ctx.frontmatter.clone();
+        let mut enriched_fm = if self.spec_profile == crate::SpecProfile::V03 {
+            let known_fields = ctx
+                .type_names
+                .iter()
+                .filter_map(|type_name| self.types.get(type_name))
+                .flat_map(|type_definition| type_definition.fields.keys().cloned())
+                .collect::<std::collections::BTreeSet<_>>();
+            // Build the v0.3 record/raw/presence namespaces while retaining
+            // top-level effective field access.
+            crate::v03::cel::enrich_record_bindings(
+                ctx.frontmatter,
+                ctx.raw_frontmatter,
+                known_fields.iter(),
+            )
+        } else {
+            ctx.frontmatter.clone()
+        };
 
         // Add types array to context
         if let serde_json::Value::Object(ref mut map) = enriched_fm {
@@ -1035,6 +1052,7 @@ impl Collection {
             backlinks_index: ctx.backlinks_index.clone(),
             type_names: Some(ctx.type_names.to_vec()),
             types: Some(std::sync::Arc::new(self.types.clone())),
+            note_namespace_source: Default::default(),
             string_concat: false,
         };
 

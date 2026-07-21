@@ -127,7 +127,7 @@ struct Args {
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
-    /// Optional fixture root path; defaults to /tmp/mdbase-profile-<timestamp>-<pid>
+    /// Optional fixture root path; defaults to `/tmp/mdbase-profile-<timestamp>-<pid>`.
     #[arg(long)]
     fixture_root: Option<PathBuf>,
 

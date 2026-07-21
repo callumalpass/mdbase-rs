@@ -6,7 +6,7 @@ use crate::frontmatter;
 use crate::frontmatter::serializer;
 use crate::generated::derive_path;
 use crate::matching::engine::matches_rules;
-use crate::operations::ensure_safe_relative_path;
+use crate::operations::{atomic_create, ensure_no_symlink_components, ensure_safe_relative_path};
 use crate::Collection;
 
 impl Collection {
@@ -107,6 +107,9 @@ impl Collection {
         if let Err(error) = ensure_safe_relative_path(&path, self.spec_profile) {
             return error;
         }
+        if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
+            return error;
+        }
 
         // Check existence
         let full_path = self.root.join(&path);
@@ -128,7 +131,17 @@ impl Collection {
         for tn in &type_names {
             if let Some(type_def) = self.types.get(tn) {
                 if let Some(ref rules) = type_def.match_rules {
-                    if !matches_rules(rules, &path, &effective) {
+                    let match_frontmatter = if self.spec_profile == crate::SpecProfile::V03 {
+                        &serde_json::Value::Object(fm_obj.clone())
+                    } else {
+                        &effective
+                    };
+                    if !matches_rules(
+                        rules,
+                        &path,
+                        match_frontmatter,
+                        self.settings.timezone.as_deref(),
+                    ) {
                         return op_error(
                             "match_failed",
                             &format!(
@@ -144,12 +157,22 @@ impl Collection {
         // Validate
         let mut result_warnings: Vec<serde_json::Value> = Vec::new();
         if self.settings.default_validation == "error" {
-            let validation = self.validate(&effective, &type_names, &path);
+            let validation_frontmatter = if self.spec_profile == crate::SpecProfile::V03 {
+                &serde_json::Value::Object(fm_obj.clone())
+            } else {
+                &effective
+            };
+            let validation = self.validate(validation_frontmatter, &type_names, &path);
             if !validation.valid {
                 return validation_failed_error(&validation.issues);
             }
         } else if self.settings.default_validation == "warn" {
-            let validation = self.validate(&effective, &type_names, &path);
+            let validation_frontmatter = if self.spec_profile == crate::SpecProfile::V03 {
+                &serde_json::Value::Object(fm_obj.clone())
+            } else {
+                &effective
+            };
+            let validation = self.validate(validation_frontmatter, &type_names, &path);
             // §5.5: strict: true causes validation failure regardless of validation level
             let has_strict_errors = validation
                 .issues
@@ -178,7 +201,7 @@ impl Collection {
 
         // Build frontmatter for writing (honor write_defaults/write_nulls)
         let mut write_obj = fm_obj.clone();
-        if self.settings.write_defaults {
+        if self.spec_profile != crate::SpecProfile::V03 && self.settings.write_defaults {
             if let Some(eff_map) = effective.as_object() {
                 for (k, v) in eff_map {
                     if !write_obj.contains_key(k) {
@@ -196,11 +219,13 @@ impl Collection {
             frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
         let content = serializer::serialize_document(&yaml_mapping, body);
 
-        if let Some(parent) = full_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
+            return error;
         }
-
-        if let Err(e) = std::fs::write(&full_path, &content) {
+        if let Err(e) = atomic_create(&full_path, content.as_bytes()) {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                return op_error(PATH_CONFLICT, &format!("File already exists: {path}"));
+            }
             let error_str = e.to_string();
             if error_str.contains("NUL") || error_str.contains("null byte") {
                 return op_error(INVALID_PATH, &format!("Invalid path: {}", e));

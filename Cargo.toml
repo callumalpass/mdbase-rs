@@ -18,6 +18,10 @@ include = [
     "/tests/**",
 ]
 
+[features]
+default = []
+tracing = ["dep:tracing"]
+
 [[bin]]
 name = "mdb"
 path = "src/main.rs"
@@ -28,10 +32,11 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
 sha2 = "0.10"
-glob = "0.3"
 regex = "1"
 fancy-regex = "0.14"
+semver = "1"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 ulid = "1"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
@@ -41,6 +46,7 @@ jsonschema = { version = "0.18", features = ["draft202012"] }
 walkdir = "2"
 notify = "8"
 tempfile = "3"
+tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 insta = "1"
