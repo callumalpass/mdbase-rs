@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+#[cfg(unix)]
 use mdbase::Collection;
 use tempfile::TempDir;
 

@@ -204,7 +204,9 @@ fn atomic_write_mode(path: &Path, contents: &[u8], no_clobber: bool) -> std::io:
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_no_symlink_components, ensure_safe_relative_path};
+    #[cfg(unix)]
+    use super::ensure_no_symlink_components;
+    use super::ensure_safe_relative_path;
     use crate::SpecProfile;
 
     #[test]
