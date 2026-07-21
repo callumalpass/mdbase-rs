@@ -2814,7 +2814,7 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
     links
 }
 
-/// Extract embeds from markdown body (![[target]]).
+/// Extract embeds from Markdown body (`![[target]]`).
 /// Embeds inside inline code spans are excluded.
 pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
     let clean = strip_code_blocks_and_inline_code(body);
