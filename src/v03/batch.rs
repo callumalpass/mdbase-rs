@@ -62,11 +62,7 @@ fn shadow_collection(collection: &Collection) -> Result<ShadowCollection, Box<Di
             None,
         ))
     })?;
-    copy_collection(
-        &collection.root,
-        directory.path(),
-        &collection.settings.cache_folder,
-    )?;
+    copy_collection(collection, directory.path())?;
     let shadow = Collection::open(directory.path()).map_err(|error| {
         Box::new(Diagnostic::error(
             "batch_preflight_failed",
@@ -80,12 +76,13 @@ fn shadow_collection(collection: &Collection) -> Result<ShadowCollection, Box<Di
     })
 }
 
-fn copy_collection(
-    source: &Path,
-    destination: &Path,
-    cache_folder: &str,
-) -> Result<(), Box<Diagnostic>> {
-    for entry in WalkDir::new(source).follow_links(false) {
+fn copy_collection(collection: &Collection, destination: &Path) -> Result<(), Box<Diagnostic>> {
+    let source = &collection.root;
+    for entry in WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| should_descend(collection, entry.path()))
+    {
         let entry = entry.map_err(|error| {
             Box::new(Diagnostic::error(
                 "batch_preflight_failed",
@@ -100,13 +97,13 @@ fn copy_collection(
                 None,
             ))
         })?;
-        if relative.as_os_str().is_empty() || is_cache_path(relative, cache_folder) {
+        if relative.as_os_str().is_empty() {
             continue;
         }
         let target = destination.join(relative);
         if entry.file_type().is_dir() {
             fs::create_dir_all(&target).map_err(|error| Box::new(copy_error(relative, error)))?;
-        } else if entry.file_type().is_file() {
+        } else if entry.file_type().is_file() && should_copy_file(collection, relative) {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|error| Box::new(copy_error(relative, error)))?;
@@ -118,10 +115,45 @@ fn copy_collection(
     Ok(())
 }
 
-fn is_cache_path(path: &Path, cache_folder: &str) -> bool {
-    path.components()
-        .next()
-        .is_some_and(|component| component.as_os_str() == cache_folder)
+fn should_descend(collection: &Collection, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(&collection.root) else {
+        return false;
+    };
+    if relative.as_os_str().is_empty() || is_system_definition_path(collection, relative) {
+        return true;
+    }
+    if !path.is_dir() {
+        return true;
+    }
+    let relative = portable_path(relative);
+    if collection.is_excluded(&relative) {
+        return false;
+    }
+    // A directory containing its own config is a nested collection boundary.
+    // Avoid copying any of it into the preflight workspace.
+    !path.join("mdbase.yaml").is_file()
+}
+
+fn should_copy_file(collection: &Collection, relative: &Path) -> bool {
+    if relative == Path::new("mdbase.yaml") || is_system_definition_path(collection, relative) {
+        return true;
+    }
+    let relative = portable_path(relative);
+    !collection.is_excluded(&relative)
+        && (collection.is_valid_extension(&relative)
+            || Path::new(&relative)
+                .extension()
+                .and_then(|value| value.to_str())
+                == Some("json"))
+}
+
+fn is_system_definition_path(collection: &Collection, relative: &Path) -> bool {
+    relative.starts_with(Path::new(&collection.settings.types_folder))
+        || relative.starts_with(Path::new(&collection.settings.migrations_folder))
+}
+
+fn portable_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn copy_error(path: &Path, error: std::io::Error) -> Diagnostic {
@@ -236,5 +268,51 @@ fn failed(diagnostics: Vec<Diagnostic>) -> OperationResult {
         valid: false,
         result: json!({}),
         diagnostics,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn preflight_shadow_copies_only_collection_scope_and_required_assets() {
+        let source = tempfile::tempdir().unwrap();
+        write(
+            &source.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        );
+        write(
+            &source.path().join("_types/note.md"),
+            "---\nkind: mdbase.type\nname: note\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n",
+        );
+        write(&source.path().join("visible.md"), "---\ntype: note\n---\n");
+        write(
+            &source.path().join("schema.json"),
+            "{\"type\":\"object\"}\n",
+        );
+        write(&source.path().join(".git/large.md"), "must not copy");
+        write(
+            &source.path().join("nested/mdbase.yaml"),
+            "spec_version: 0.3.0\n",
+        );
+        write(&source.path().join("nested/hidden.md"), "must not copy");
+
+        let collection = Collection::open(source.path()).unwrap();
+        let shadow = shadow_collection(&collection).unwrap();
+        let root = &shadow.collection.root;
+        assert!(root.join("mdbase.yaml").is_file());
+        assert!(root.join("_types/note.md").is_file());
+        assert!(root.join("visible.md").is_file());
+        assert!(root.join("schema.json").is_file());
+        assert!(!root.join(".git").exists());
+        assert!(!root.join("nested").exists());
     }
 }
