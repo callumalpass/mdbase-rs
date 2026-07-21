@@ -76,21 +76,7 @@ impl<'a> Operations<'a> {
     }
 
     pub fn query(&self, input: &Value) -> OperationResult {
-        let mut result = self.normalize("query", input, self.collection.query(input));
-        if input.get("include_body").and_then(Value::as_bool) != Some(true) {
-            if let Some(records) = result
-                .result
-                .get_mut("results")
-                .and_then(Value::as_array_mut)
-            {
-                for record in records {
-                    if let Some(object) = record.as_object_mut() {
-                        object.remove("body");
-                    }
-                }
-            }
-        }
-        result
+        super::query::execute(self.collection, input)
     }
 
     /// Evaluate a portable expression against either a record or explicit

@@ -252,7 +252,7 @@ pub(crate) fn enrich_record_bindings<'a>(
     Value::Object(binding)
 }
 
-fn known_fields(collection: &Collection, type_names: &[String]) -> BTreeSet<String> {
+pub(crate) fn known_fields(collection: &Collection, type_names: &[String]) -> BTreeSet<String> {
     type_names
         .iter()
         .filter_map(|type_name| collection.types.get(type_name))

@@ -1387,10 +1387,10 @@ fn eval_string_method(
     ctx: &EvalContext,
 ) -> Result<Value, EvalError> {
     match method {
-        "length" => {
+        "length" | "size" => {
             if !args.is_empty() {
                 return Err(EvalError::wrong_argument_count(
-                    "length() takes no arguments",
+                    "length()/size() takes no arguments",
                 ));
             }
             Ok(Value::Number(s.len().into()))
@@ -1705,7 +1705,14 @@ fn eval_array_method(
     ctx: &EvalContext,
 ) -> Result<Value, EvalError> {
     match method {
-        "length" => Ok(Value::Number(arr.len().into())),
+        "length" | "size" => {
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count(
+                    "length()/size() takes no arguments",
+                ));
+            }
+            Ok(Value::Number(arr.len().into()))
+        }
         "isEmpty" => Ok(Value::Bool(arr.is_empty())),
         "contains" => {
             if args.len() != 1 {
@@ -1939,6 +1946,14 @@ fn eval_object_method(
     ctx: &EvalContext,
 ) -> Result<Value, EvalError> {
     match method {
+        "length" | "size" => {
+            if !args.is_empty() {
+                return Err(EvalError::wrong_argument_count(
+                    "length()/size() takes no arguments",
+                ));
+            }
+            Ok(Value::Number(map.len().into()))
+        }
         "keys" => {
             let keys: Vec<Value> = map.keys().map(|k| Value::String(k.clone())).collect();
             Ok(Value::Array(keys))
