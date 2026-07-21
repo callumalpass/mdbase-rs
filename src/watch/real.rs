@@ -1,4 +1,4 @@
-use super::WatchEvent;
+use super::{PortableWatchEvent, WatchEvent};
 use crate::Collection;
 use notify::{
     event::{MetadataKind, ModifyKind},
@@ -78,6 +78,20 @@ impl CollectionWatcher {
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(WatchError::Stopped),
         }
+    }
+
+    /// Receive the next event in the portable v0.3 Watch profile shape.
+    pub fn recv_portable(&self) -> Result<PortableWatchEvent, WatchError> {
+        self.recv().map(WatchEvent::into_portable)
+    }
+
+    /// Receive a portable event, returning `None` when the timeout expires.
+    pub fn recv_portable_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<PortableWatchEvent>, WatchError> {
+        self.recv_timeout(timeout)
+            .map(|event| event.map(WatchEvent::into_portable))
     }
 
     /// Request a snapshot comparison without waiting for an OS notification.
