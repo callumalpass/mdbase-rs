@@ -26,6 +26,9 @@ x-obsidian:
     - 'file.hasTag("task")'
 formulas:
   urgency: 'if(priority == "high", 2, 1)'
+properties:
+  formula.urgency:
+    displayName: Urgency
 views:
   - type: tasknotesTaskList
     name: Open tasks
@@ -34,11 +37,13 @@ views:
         - 'status != "done"'
     order: [status, formula.urgency, file.name]
     sort:
+      - property: tags
+        direction: DESC
       - property: formula.urgency
         direction: DESC
   - type: tasknotesKanban
     name: Board
-    order: [status, file.name]
+    order: [file.name]
     groupBy:
       property: status
       direction: ASC
@@ -80,6 +85,10 @@ fn discovers_and_executes_configured_obsidian_bases() {
         listed.result["views"][0]["views"][1]["presentation"]["type"],
         "tasknotes.kanban"
     );
+    assert_eq!(
+        listed.result["views"][0]["views"][0]["properties"][1],
+        json!({"key": "formula.urgency", "label": "Urgency"})
+    );
 
     let executed = operations.execute_view(&json!({
         "path": "TaskNotes/Views/tasks.base",
@@ -92,6 +101,17 @@ fn discovers_and_executes_configured_obsidian_bases() {
         executed.result["results"][0]["values"]["formula.urgency"],
         2
     );
+    assert!(!executed.result["results"][0]["values"]
+        .as_object()
+        .unwrap()
+        .contains_key("tags"));
+
+    let board = operations.execute_view(&json!({
+        "path": "TaskNotes/Views/tasks.base",
+        "view": "board"
+    }));
+    assert!(board.valid, "{:?}", board.diagnostics);
+    assert_eq!(board.result["results"][0]["values"]["status"], "done");
 }
 
 #[test]
