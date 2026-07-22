@@ -79,6 +79,12 @@ impl<'a> Operations<'a> {
         super::query::execute(self.collection, input)
     }
 
+    /// Execute a query and return payload-free phase timings for local
+    /// profiling and host observability.
+    pub fn query_profiled(&self, input: &Value) -> (OperationResult, super::QueryPerformance) {
+        super::query::execute_profiled(self.collection, input)
+    }
+
     /// Evaluate a portable expression against either a record or explicit
     /// workflow bindings.
     pub fn evaluate_cel(&self, input: &Value) -> OperationResult {

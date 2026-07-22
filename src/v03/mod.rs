@@ -21,6 +21,7 @@ mod operations;
 mod query;
 
 pub use operations::{OperationResult, Operations};
+pub use query::QueryPerformance;
 
 pub const SPEC_VERSION: &str = "0.3.0";
 pub const PRERELEASE_SPEC_VERSIONS: &[&str] = &["0.3.0-alpha.1"];

@@ -5,12 +5,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 use crate::cache::{indexer, sqlite, staleness};
 use crate::expressions::evaluator::ResolvedFileData;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::Collection;
+
+pub(crate) struct MetadataPage {
+    pub records: Vec<FileRecord>,
+    pub total: usize,
+    pub snapshot: String,
+    pub performance: LoadQueryPerf,
+}
+
+pub(crate) enum MetadataPageError {
+    SnapshotExpired,
+}
 
 /// Common intermediate representation that both the cache path and disk-fallback
 /// path produce. The query loop reads from these instead of touching disk.
@@ -56,6 +67,24 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
+fn current_cache_snapshot(conn: &Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = 'query_snapshot'",
+        [],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+fn replace_cache_snapshot(conn: &Connection) -> String {
+    let snapshot = uuid::Uuid::new_v4().simple().to_string();
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('query_snapshot', ?1)",
+        [&snapshot],
+    );
+    snapshot
+}
+
 /// Convert nanoseconds-since-epoch to ISO 8601 string.
 fn ns_to_iso(ns: i64) -> String {
     use chrono::{TimeZone, Utc};
@@ -84,27 +113,36 @@ impl Collection {
     fn refresh_cache(&self, conn: &Connection) -> Vec<PathBuf> {
         let disk_files = self.scan_collection_files();
 
-        let stale = staleness::find_stale(conn, &self.root, &disk_files);
-        let deleted = staleness::find_deleted(conn, &self.root);
+        let changes = staleness::find_changes(conn, &self.root, &disk_files);
 
-        if stale.is_empty() && deleted.is_empty() {
+        if changes.stale.is_empty() && changes.deleted.is_empty() {
             return disk_files;
         }
 
-        let _ = conn.execute_batch("BEGIN TRANSACTION;");
+        // A provider can execute independent queries concurrently. Serialize
+        // only the uncommon cache-write section, then recompute against the
+        // winning transaction so two refreshers cannot apply stale deltas.
+        if conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;").is_err() {
+            return disk_files;
+        }
+        let changes = staleness::find_changes(conn, &self.root, &disk_files);
 
         // Remove deleted files from cache
-        for rel_path in &deleted {
+        for rel_path in &changes.deleted {
             indexer::remove_file(conn, rel_path);
         }
 
         // Re-index stale/new files
-        for abs_path in &stale {
+        for abs_path in &changes.stale {
             let rel_path = match abs_path.strip_prefix(&self.root) {
                 Ok(p) => p.to_string_lossy().replace('\\', "/"),
                 Err(_) => continue,
             };
             indexer::reindex_file(conn, self, abs_path, &rel_path);
+        }
+
+        if !changes.stale.is_empty() || !changes.deleted.is_empty() {
+            replace_cache_snapshot(conn);
         }
 
         let _ = conn.execute_batch("COMMIT;");
@@ -181,6 +219,128 @@ impl Collection {
         }
 
         records
+    }
+
+    /// Refresh the cache, then let SQLite order and paginate metadata-only
+    /// queries before record payloads are decoded. Returns `None` when the
+    /// requested order cannot be represented exactly or no cache exists.
+    pub(crate) fn load_query_metadata_page_profiled(
+        &self,
+        order_by: &[(&str, bool)],
+        offset: u64,
+        limit: Option<u64>,
+        expected_snapshot: Option<&str>,
+    ) -> Result<Option<MetadataPage>, MetadataPageError> {
+        let mut clauses = Vec::new();
+        for (field, descending) in order_by {
+            let direction = if *descending { "DESC" } else { "ASC" };
+            let clause = match *field {
+                "file.path" => format!("f.path {direction}"),
+                "file.size" => format!("f.size {direction}"),
+                "file.mtime" => format!(
+                    "(f.mtime_ns = 0) {}, (f.mtime_ns / 1000000000) {direction}",
+                    if *descending { "DESC" } else { "ASC" }
+                ),
+                "file.ctime" => format!(
+                    "(f.ctime_ns IS NULL) {}, (f.ctime_ns / 1000000000) {direction}",
+                    if *descending { "DESC" } else { "ASC" }
+                ),
+                _ => return Ok(None),
+            };
+            clauses.push(clause);
+        }
+        clauses.push("f.path ASC".to_string());
+
+        let total_started = Instant::now();
+        let mut perf = LoadQueryPerf::default();
+        let open_started = Instant::now();
+        let conn = match sqlite::open_cache_db(&self.root, &self.settings.cache_folder) {
+            Ok(conn) => conn,
+            Err(_) if expected_snapshot.is_some() => {
+                return Err(MetadataPageError::SnapshotExpired)
+            }
+            Err(_) => return Ok(None),
+        };
+        perf.try_open_cache_ms = elapsed_ms(open_started);
+        perf.cache_used = true;
+
+        let snapshot = if let Some(expected) = expected_snapshot {
+            let Some(current) = current_cache_snapshot(&conn) else {
+                return Err(MetadataPageError::SnapshotExpired);
+            };
+            if current != expected {
+                return Err(MetadataPageError::SnapshotExpired);
+            }
+            current
+        } else {
+            let refresh_started = Instant::now();
+            self.refresh_cache(&conn);
+            perf.refresh_cache_ms = elapsed_ms(refresh_started);
+            current_cache_snapshot(&conn).unwrap_or_else(|| replace_cache_snapshot(&conn))
+        };
+
+        let load_started = Instant::now();
+        let total = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE parse_error = 0",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .map_err(|_| MetadataPageError::SnapshotExpired)?;
+        let sql = format!(
+            "SELECT f.path, f.frontmatter_json, f.body, f.size, f.mtime_ns, f.ctime_ns \
+             FROM files f WHERE f.parse_error = 0 ORDER BY {} LIMIT ?1 OFFSET ?2",
+            clauses.join(", ")
+        );
+        let mut statement = match conn.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(_) if expected_snapshot.is_some() => {
+                return Err(MetadataPageError::SnapshotExpired)
+            }
+            Err(_) => return Ok(None),
+        };
+        let limit = limit
+            .map(|value| value.min(i64::MAX as u64) as i64)
+            .unwrap_or(-1);
+        let offset = offset.min(i64::MAX as u64) as i64;
+        let rows = statement
+            .query_map(params![limit, offset], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })
+            .map_err(|_| MetadataPageError::SnapshotExpired)?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (path, frontmatter, body, size, mtime_ns, ctime_ns) =
+                row.map_err(|_| MetadataPageError::SnapshotExpired)?;
+            let raw_frontmatter =
+                serde_json::from_str(&frontmatter).unwrap_or_else(|_| serde_json::json!({}));
+            records.push(FileRecord {
+                rel_path: path,
+                effective_frontmatter: raw_frontmatter.clone(),
+                raw_frontmatter,
+                body,
+                type_names: Vec::new(),
+                file_size: size as u64,
+                file_mtime_iso: (mtime_ns != 0).then(|| ns_to_iso(mtime_ns)),
+                file_ctime_iso: ctime_ns.map(ns_to_iso),
+            });
+        }
+        perf.load_records_ms = elapsed_ms(load_started);
+        perf.file_records = records.len();
+        perf.total_ms = elapsed_ms(total_started);
+        Ok(Some(MetadataPage {
+            records,
+            total,
+            snapshot,
+            performance: perf,
+        }))
     }
 
     /// Load the file_types table into a HashMap for bulk access.

@@ -2,7 +2,7 @@ use super::{PortableWatchEvent, WatchEvent};
 use crate::runtime_contracts::{ContractSource, LoadOptions, RuntimeContracts};
 use crate::Collection;
 use notify::{
-    event::{MetadataKind, ModifyKind},
+    event::{MetadataKind, ModifyKind, RenameMode},
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use serde_json::{json, Map, Value};
@@ -32,13 +32,19 @@ pub enum WatchError {
 /// be completed before an event is forwarded.
 pub struct CollectionWatcher {
     events: mpsc::Receiver<WatchEvent>,
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::Sender<WorkerInput>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 enum Command {
     Rescan(mpsc::SyncSender<()>),
+    RescanPaths(Vec<PathBuf>, mpsc::SyncSender<()>),
     Stop,
+}
+
+enum WorkerInput {
+    Command(Command),
+    Filesystem(Result<Event, notify::Error>),
 }
 
 impl CollectionWatcher {
@@ -73,12 +79,22 @@ impl CollectionWatcher {
         let initial = Snapshot::load(&root, runtime.as_ref())?;
         let (events_tx, events) = mpsc::channel();
         let (commands, command_rx) = mpsc::channel();
+        let filesystem_tx = commands.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("mdbase-watch".to_string())
             .spawn(move || {
                 watch_loop(
-                    root, debounce, initial, runtime, command_rx, events_tx, ready_tx,
+                    root,
+                    debounce,
+                    initial,
+                    runtime,
+                    WorkerChannels {
+                        inputs: command_rx,
+                        filesystem_tx,
+                        events: events_tx,
+                        ready: ready_tx,
+                    },
                 )
             })
             .map_err(|error| WatchError::Collection(error.to_string()))?;
@@ -130,7 +146,25 @@ impl CollectionWatcher {
     pub fn rescan(&self) -> Result<(), WatchError> {
         let (ready, receiver) = mpsc::sync_channel(0);
         self.commands
-            .send(Command::Rescan(ready))
+            .send(WorkerInput::Command(Command::Rescan(ready)))
+            .map_err(|_| WatchError::Stopped)?;
+        receiver.recv().map_err(|_| WatchError::Stopped)
+    }
+
+    /// Compare only the supplied record paths with the current snapshot.
+    ///
+    /// This is the preferred synchronization path after an in-process
+    /// mutation. It preserves operation/event ordering without turning every
+    /// write into an O(collection size) reload.
+    pub fn rescan_paths<I, P>(&self, paths: I) -> Result<(), WatchError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        let paths = paths.into_iter().map(Into::into).collect();
+        let (ready, receiver) = mpsc::sync_channel(0);
+        self.commands
+            .send(WorkerInput::Command(Command::RescanPaths(paths, ready)))
             .map_err(|_| WatchError::Stopped)?;
         receiver.recv().map_err(|_| WatchError::Stopped)
     }
@@ -138,11 +172,18 @@ impl CollectionWatcher {
 
 impl Drop for CollectionWatcher {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Stop);
+        let _ = self.commands.send(WorkerInput::Command(Command::Stop));
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
     }
+}
+
+struct WorkerChannels {
+    inputs: mpsc::Receiver<WorkerInput>,
+    filesystem_tx: mpsc::Sender<WorkerInput>,
+    events: mpsc::Sender<WatchEvent>,
+    ready: mpsc::SyncSender<Result<(), notify::Error>>,
 }
 
 fn watch_loop(
@@ -150,13 +191,16 @@ fn watch_loop(
     debounce: Duration,
     mut snapshot: Snapshot,
     runtime: Option<RuntimeSnapshotter>,
-    commands: mpsc::Receiver<Command>,
-    events: mpsc::Sender<WatchEvent>,
-    ready: mpsc::SyncSender<Result<(), notify::Error>>,
+    channels: WorkerChannels,
 ) {
-    let (raw_tx, raw_rx) = mpsc::channel();
+    let WorkerChannels {
+        inputs,
+        filesystem_tx,
+        events,
+        ready,
+    } = channels;
     let mut watcher: RecommendedWatcher = match notify::recommended_watcher(move |event| {
-        let _ = raw_tx.send(event);
+        let _ = filesystem_tx.send(WorkerInput::Filesystem(event));
     }) {
         Ok(watcher) => watcher,
         Err(error) => {
@@ -168,34 +212,87 @@ fn watch_loop(
         let _ = ready.send(Err(error));
         return;
     }
+    let mut sequence = 0_u64;
+    // Close the gap between the caller's initial snapshot and OS watch
+    // registration before reporting readiness. Hosts can now treat `open` as
+    // a stable boundary instead of triggering an additional full rescan.
+    match Snapshot::load(&root, runtime.as_ref()) {
+        Ok(next) => {
+            for event in snapshot.diff(&next) {
+                sequence += 1;
+                if events
+                    .send(WatchEvent {
+                        event_type: event.event_type,
+                        sequence,
+                        occurred_at: now(),
+                        payload: event.payload,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            snapshot = next;
+        }
+        Err(error) => {
+            sequence += 1;
+            if events
+                .send(watch_error_event(sequence, error.to_string()))
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
     let _ = ready.send(Ok(()));
 
     let tick = debounce
         .min(Duration::from_millis(50))
         .max(Duration::from_millis(5));
-    // Compare once after the OS watch is installed. This closes the small gap
-    // between the caller's initial snapshot and watcher registration.
-    let mut deadline: Option<Instant> = Some(Instant::now());
+    let mut deadline: Option<Instant> = None;
     let mut pending_rescans = Vec::new();
-    let mut sequence = 0_u64;
+    let mut pending_paths = BTreeSet::new();
+    let mut full_rescan = false;
 
     loop {
-        while let Ok(command) = commands.try_recv() {
-            match command {
-                Command::Stop => return,
-                Command::Rescan(ready) => {
-                    deadline = Some(Instant::now());
-                    pending_rescans.push(ready);
-                }
+        let current_time = Instant::now();
+        let wait = deadline
+            .map(|deadline| deadline.saturating_duration_since(current_time).min(tick))
+            .unwrap_or(tick);
+        match inputs.recv_timeout(wait) {
+            Ok(WorkerInput::Command(Command::Stop)) => return,
+            Ok(WorkerInput::Command(Command::Rescan(ready))) => {
+                deadline = Some(Instant::now());
+                full_rescan = true;
+                pending_rescans.push(ready);
             }
-        }
-
-        match raw_rx.recv_timeout(tick) {
-            Ok(Ok(event)) if invalidates_snapshot(&event) => {
+            Ok(WorkerInput::Command(Command::RescanPaths(paths, ready))) => {
+                deadline = Some(Instant::now());
+                pending_paths.extend(paths);
+                pending_rescans.push(ready);
+            }
+            Ok(WorkerInput::Filesystem(Ok(event))) if invalidates_snapshot(&event) => {
+                let invalidation = snapshot.invalidation_paths(&root, &event);
+                if watch_profile_enabled() {
+                    eprintln!(
+                        "mdbase_watch invalidation kind={:?} mode={} record_paths={}",
+                        event.kind,
+                        if invalidation.is_some() {
+                            "incremental"
+                        } else {
+                            "full"
+                        },
+                        invalidation.as_ref().map_or(0, BTreeSet::len),
+                    );
+                }
+                match invalidation {
+                    Some(paths) => pending_paths.extend(paths),
+                    None => full_rescan = true,
+                }
                 deadline = Some(Instant::now() + debounce)
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
+            Ok(WorkerInput::Filesystem(Ok(_))) => {}
+            Ok(WorkerInput::Filesystem(Err(error))) => {
                 sequence += 1;
                 if events
                     .send(watch_error_event(sequence, error.to_string()))
@@ -210,9 +307,21 @@ fn watch_loop(
 
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             deadline = None;
-            match Snapshot::load(&root, runtime.as_ref()) {
-                Ok(next) => {
-                    for event in snapshot.diff(&next) {
+            let refresh_started = Instant::now();
+            let refresh_mode = if full_rescan { "full" } else { "incremental" };
+            let refresh_path_count = pending_paths.len();
+            let refreshed = if full_rescan {
+                Snapshot::load(&root, runtime.as_ref()).map(|next| {
+                    let diff = snapshot.diff(&next);
+                    snapshot = next;
+                    diff
+                })
+            } else {
+                snapshot.refresh_paths(&root, &pending_paths, runtime.as_ref())
+            };
+            match refreshed {
+                Ok(changes) => {
+                    for event in changes {
                         sequence += 1;
                         if events
                             .send(WatchEvent {
@@ -226,7 +335,6 @@ fn watch_loop(
                             return;
                         }
                     }
-                    snapshot = next;
                 }
                 Err(error) => {
                     sequence += 1;
@@ -238,11 +346,29 @@ fn watch_loop(
                     }
                 }
             }
+            if watch_profile_enabled() {
+                eprintln!(
+                    "mdbase_watch refresh mode={} record_paths={} elapsed_us={}",
+                    refresh_mode,
+                    refresh_path_count,
+                    refresh_started.elapsed().as_micros(),
+                );
+            }
+            pending_paths.clear();
+            full_rescan = false;
             for ready in pending_rescans.drain(..) {
                 let _ = ready.send(());
             }
         }
     }
+}
+
+fn watch_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MDBASE_WATCH_PROFILE")
+            .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+    })
 }
 
 /// Return whether a filesystem event could change the collection snapshot.
@@ -282,6 +408,9 @@ struct Snapshot {
     types: BTreeMap<String, String>,
     records: BTreeMap<String, RecordState>,
     runtime: Option<RuntimeRegistryState>,
+    types_folder: String,
+    cache_folder: String,
+    record_extensions: BTreeSet<String>,
 }
 
 struct RuntimeSnapshotter {
@@ -320,28 +449,9 @@ impl Snapshot {
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let bytes =
-                std::fs::read(&path).map_err(|error| WatchError::Collection(error.to_string()))?;
-            let read = collection.read(&json!({"path": relative}));
-            let raw_frontmatter = read
-                .get("raw_frontmatter")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            let effective_frontmatter = read
-                .get("frontmatter")
-                .cloned()
-                .unwrap_or_else(|| Value::Object(raw_frontmatter.clone()));
-            let matched_types = read.get("types").cloned().unwrap_or_else(|| json!([]));
-            records.insert(
-                relative,
-                RecordState {
-                    revision: crate::v03::revision(&bytes),
-                    raw_frontmatter,
-                    effective_frontmatter,
-                    types: matched_types,
-                },
-            );
+            if let Some(record) = load_record(&collection, &relative)? {
+                records.insert(relative, record);
+            }
         }
         let runtime = runtime.map(|snapshotter| {
             let loaded = snapshotter.engine.load(
@@ -369,7 +479,113 @@ impl Snapshot {
             types,
             records,
             runtime,
+            types_folder: collection.settings.types_folder.clone(),
+            cache_folder: collection.settings.cache_folder.clone(),
+            record_extensions: std::iter::once("md".to_string())
+                .chain(
+                    collection
+                        .settings
+                        .extensions
+                        .iter()
+                        .map(|extension| extension.trim_start_matches('.').to_string()),
+                )
+                .collect(),
         })
+    }
+
+    fn invalidation_paths(&self, root: &Path, event: &Event) -> Option<BTreeSet<PathBuf>> {
+        if event.paths.is_empty() || matches!(event.kind, EventKind::Any | EventKind::Other) {
+            return None;
+        }
+        let mut records = BTreeSet::new();
+        let mut may_change_record_tree = false;
+        for path in &event.paths {
+            let relative = path.strip_prefix(root).unwrap_or(path);
+            let normalized = relative.to_string_lossy().replace('\\', "/");
+            if normalized.is_empty() {
+                return None;
+            }
+            if normalized == "mdbase.yaml"
+                || normalized == self.types_folder
+                || normalized.starts_with(&format!("{}/", self.types_folder))
+            {
+                return None;
+            }
+            if normalized == self.cache_folder
+                || normalized.starts_with(&format!("{}/", self.cache_folder))
+                || normalized == ".git"
+                || normalized.starts_with(".git/")
+                || normalized == "node_modules"
+                || normalized.starts_with("node_modules/")
+            {
+                continue;
+            }
+            let extension = relative.extension().and_then(|value| value.to_str());
+            if extension.is_some_and(|extension| self.record_extensions.contains(extension)) {
+                records.insert(PathBuf::from(normalized));
+            } else if matches!(
+                event.kind,
+                EventKind::Create(notify::event::CreateKind::Folder)
+                    | EventKind::Remove(notify::event::RemoveKind::Folder)
+                    | EventKind::Modify(ModifyKind::Name(
+                        RenameMode::Any | RenameMode::To | RenameMode::Both | RenameMode::Other
+                    ))
+            ) {
+                may_change_record_tree = true;
+            }
+        }
+        if records.is_empty() && may_change_record_tree {
+            None
+        } else {
+            Some(records)
+        }
+    }
+
+    fn refresh_paths(
+        &mut self,
+        root: &Path,
+        paths: &BTreeSet<PathBuf>,
+        runtime: Option<&RuntimeSnapshotter>,
+    ) -> Result<Vec<PendingEvent>, WatchError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let collection = Collection::open(root)
+            .map_err(|error| WatchError::Collection(collection_error(&error)))?;
+        let mut before = BTreeMap::new();
+        let mut replacements = Vec::new();
+        for path in paths {
+            let relative = path.to_string_lossy().replace('\\', "/");
+            if let Some(record) = self.records.get(&relative) {
+                before.insert(relative.clone(), record.clone());
+            }
+            replacements.push((relative.clone(), load_record(&collection, &relative)?));
+        }
+        for (path, record) in replacements {
+            if let Some(record) = record {
+                self.records.insert(path, record);
+            } else {
+                self.records.remove(&path);
+            }
+        }
+        let after = paths
+            .iter()
+            .filter_map(|path| {
+                let path = path.to_string_lossy().replace('\\', "/");
+                self.records
+                    .get(&path)
+                    .cloned()
+                    .map(|record| (path, record))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut events = record_events(&before, &after);
+
+        if let Some(snapshotter) = runtime {
+            let previous = self.runtime.clone();
+            self.runtime = Some(load_runtime_state(&collection, snapshotter));
+            events.extend(runtime_events(previous.as_ref(), self.runtime.as_ref()));
+        }
+        Ok(events)
     }
 
     fn diff(&self, next: &Self) -> Vec<PendingEvent> {
@@ -404,109 +620,185 @@ impl Snapshot {
             }
         }
 
-        let mut deleted: BTreeSet<String> = self
-            .records
-            .keys()
-            .filter(|path| !next.records.contains_key(*path))
-            .cloned()
-            .collect();
-        let mut created: BTreeSet<String> = next
-            .records
-            .keys()
-            .filter(|path| !self.records.contains_key(*path))
-            .cloned()
-            .collect();
+        events.extend(record_events(&self.records, &next.records));
 
-        let deleted_paths = deleted.iter().cloned().collect::<Vec<_>>();
-        for from in deleted_paths {
-            let previous = &self.records[&from];
-            let matches = created
-                .iter()
-                .filter(|to| next.records[*to].revision == previous.revision)
-                .cloned()
-                .collect::<Vec<_>>();
-            if matches.len() == 1 {
-                let to = matches[0].clone();
-                let current = &next.records[&to];
-                deleted.remove(&from);
-                created.remove(&to);
-                events.push(PendingEvent::new(
-                    "mdbase.record.renamed",
-                    json!({
-                        "from": from,
-                        "to": to,
-                        "before": previous.effective_frontmatter,
-                        "after": current.effective_frontmatter,
-                        "previous_revision": previous.revision,
-                        "revision": current.revision,
-                        "previous_types": previous.types,
-                        "types": current.types,
-                    }),
-                ));
-            }
-        }
+        events.extend(runtime_events(self.runtime.as_ref(), next.runtime.as_ref()));
+        events
+    }
+}
 
-        for path in deleted {
-            let previous = &self.records[&path];
+fn record_events(
+    before: &BTreeMap<String, RecordState>,
+    after: &BTreeMap<String, RecordState>,
+) -> Vec<PendingEvent> {
+    let mut events = Vec::new();
+    let mut deleted: BTreeSet<String> = before
+        .keys()
+        .filter(|path| !after.contains_key(*path))
+        .cloned()
+        .collect();
+    let mut created: BTreeSet<String> = after
+        .keys()
+        .filter(|path| !before.contains_key(*path))
+        .cloned()
+        .collect();
+    let deleted_paths = deleted.iter().cloned().collect::<Vec<_>>();
+    for from in deleted_paths {
+        let previous = &before[&from];
+        let matches = created
+            .iter()
+            .filter(|to| after[*to].revision == previous.revision)
+            .cloned()
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            let to = matches[0].clone();
+            let current = &after[&to];
+            deleted.remove(&from);
+            created.remove(&to);
             events.push(PendingEvent::new(
-                "mdbase.record.deleted",
+                "mdbase.record.renamed",
                 json!({
-                    "path": path,
+                    "from": from,
+                    "to": to,
                     "before": previous.effective_frontmatter,
-                    "previous_revision": previous.revision,
-                    "types": previous.types,
-                }),
-            ));
-        }
-        for path in created {
-            let current = &next.records[&path];
-            events.push(PendingEvent::new(
-                "mdbase.record.created",
-                json!({
-                    "path": path,
                     "after": current.effective_frontmatter,
-                    "changed_fields": current.raw_frontmatter.keys().collect::<Vec<_>>(),
+                    "previous_revision": previous.revision,
                     "revision": current.revision,
+                    "previous_types": previous.types,
                     "types": current.types,
                 }),
             ));
         }
-        for path in self.records.keys() {
-            let (Some(previous), Some(current)) = (self.records.get(path), next.records.get(path))
-            else {
-                continue;
-            };
-            if previous.revision != current.revision {
-                events.push(PendingEvent::new(
-                    "mdbase.record.modified",
-                    json!({
-                        "path": path,
-                        "before": previous.effective_frontmatter,
-                        "after": current.effective_frontmatter,
-                        "changed_fields": changed_fields(previous, current),
-                        "previous_revision": previous.revision,
-                        "revision": current.revision,
-                        "previous_types": previous.types,
-                        "types": current.types,
-                    }),
-                ));
-            }
+    }
+
+    for path in deleted {
+        let previous = &before[&path];
+        events.push(PendingEvent::new(
+            "mdbase.record.deleted",
+            json!({
+                "path": path,
+                "before": previous.effective_frontmatter,
+                "previous_revision": previous.revision,
+                "types": previous.types,
+            }),
+        ));
+    }
+    for path in created {
+        let current = &after[&path];
+        events.push(PendingEvent::new(
+            "mdbase.record.created",
+            json!({
+                "path": path,
+                "after": current.effective_frontmatter,
+                "changed_fields": current.raw_frontmatter.keys().collect::<Vec<_>>(),
+                "revision": current.revision,
+                "types": current.types,
+            }),
+        ));
+    }
+    for path in before.keys() {
+        let (Some(previous), Some(current)) = (before.get(path), after.get(path)) else {
+            continue;
+        };
+        if previous.revision != current.revision {
+            events.push(PendingEvent::new(
+                "mdbase.record.modified",
+                json!({
+                    "path": path,
+                    "before": previous.effective_frontmatter,
+                    "after": current.effective_frontmatter,
+                    "changed_fields": changed_fields(previous, current),
+                    "previous_revision": previous.revision,
+                    "revision": current.revision,
+                    "previous_types": previous.types,
+                    "types": current.types,
+                }),
+            ));
         }
-        if self.runtime != next.runtime {
-            if let Some(current) = &next.runtime {
-                events.push(PendingEvent::new(
-                    "mdbase.runtime.registry.changed",
-                    json!({
-                        "identity": "effective_registry",
-                        "previous_revision": self.runtime.as_ref().map(|state| &state.revision),
-                        "revision": current.revision,
-                        "valid": current.valid,
-                        "diagnostic_codes": current.diagnostic_codes,
-                    }),
-                ));
-            }
-        }
-        events
+    }
+    events
+}
+
+fn runtime_events(
+    previous: Option<&RuntimeRegistryState>,
+    current: Option<&RuntimeRegistryState>,
+) -> Vec<PendingEvent> {
+    if previous == current {
+        return Vec::new();
+    }
+    current
+        .map(|current| {
+            vec![PendingEvent::new(
+                "mdbase.runtime.registry.changed",
+                json!({
+                    "identity": "effective_registry",
+                    "previous_revision": previous.map(|state| &state.revision),
+                    "revision": current.revision,
+                    "valid": current.valid,
+                    "diagnostic_codes": current.diagnostic_codes,
+                }),
+            )]
+        })
+        .unwrap_or_default()
+}
+
+fn load_record(collection: &Collection, path: &str) -> Result<Option<RecordState>, WatchError> {
+    if collection.is_excluded(path) || !collection.is_valid_extension(path) {
+        return Ok(None);
+    }
+    let full_path = collection.root.join(path);
+    match std::fs::symlink_metadata(&full_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(WatchError::Collection(error.to_string())),
+    }
+    let read = collection.read(&json!({"path": path}));
+    let revision = read
+        .get("revision")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WatchError::Collection(collection_error(&read)))?
+        .to_string();
+    let raw_frontmatter = read
+        .get("raw_frontmatter")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let effective_frontmatter = read
+        .get("frontmatter")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(raw_frontmatter.clone()));
+    let types = read.get("types").cloned().unwrap_or_else(|| json!([]));
+    Ok(Some(RecordState {
+        revision,
+        raw_frontmatter,
+        effective_frontmatter,
+        types,
+    }))
+}
+
+fn load_runtime_state(
+    collection: &Collection,
+    snapshotter: &RuntimeSnapshotter,
+) -> RuntimeRegistryState {
+    let loaded = snapshotter.engine.load(
+        collection,
+        snapshotter.implicit_sources.clone(),
+        &snapshotter.options,
+    );
+    let mut diagnostic_codes = loaded
+        .registry
+        .diagnostics
+        .iter()
+        .chain(loaded.preflight.diagnostics.iter())
+        .map(|diagnostic| diagnostic.code.clone())
+        .collect::<Vec<_>>();
+    diagnostic_codes.sort();
+    diagnostic_codes.dedup();
+    RuntimeRegistryState {
+        revision: loaded.registry.revision(),
+        valid: loaded.valid(),
+        diagnostic_codes,
     }
 }
 

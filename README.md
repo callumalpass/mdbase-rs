@@ -114,17 +114,41 @@ Run the profiler against a synthetic, deterministic dataset:
 ./scripts/profile.sh
 ```
 
-Write results to a file with custom workload sizing:
+The default `queries` scenario is the fast feedback loop. It exercises the
+canonical v0.3 query facade, reports payload-free phase timings, and includes
+the editor's two-pass paginated index workload:
 
 ```bash
-./scripts/profile.sh --files 5000 --query-iters 500 --output .ops/profile/latest.json
+./scripts/profile.sh --scenario queries --files 5000
+./scripts/profile.sh --scenario queries --files 5000 --json \
+  --output .ops/profile/query.json
 ```
 
-The profiler reports latency percentiles (`p50`, `p95`, `p99`), averages, and
-throughput for core operations (`open`, `read`, `query`, `update`,
-`rename/update_refs`, `create`, `delete`, `cache_rebuild`). Runtime registry
-tests separately exercise deterministic composition of 2,000 virtual
-contracts in release mode.
+Profile metadata paging and the editor workload against an existing collection
+without mutating records (the report redacts the collection path):
+
+```bash
+./scripts/profile.sh --collection /path/to/collection --editor-iters 3
+```
+
+Use `--scenario core` for CRUD, rename/reference updates, runtime startup, and
+mutation-plus-watcher synchronization. Use `--scenario all` before handing off
+a performance-sensitive change. Reports include latency percentiles (`p50`,
+`p95`, `p99`), throughput, query phases and plan counters.
+
+Set `MDBASE_WATCH_PROFILE=1` to print payload-free watcher invalidation mode,
+record counts, and refresh time. For CPU sampling with symbols:
+
+```bash
+cargo build --profile profiling --bin mdb-profile
+perf record -g --call-graph dwarf -- \
+  target/profiling/mdb-profile --scenario queries --files 5000
+perf report
+```
+
+The `profiling` Cargo profile retains debug symbols while keeping release
+optimizations. `samply record` or `cargo flamegraph` can be used in place of
+`perf record` on systems where those tools are preferred.
 
 ## Notes
 

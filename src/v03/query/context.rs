@@ -126,21 +126,12 @@ pub(super) fn candidate_context(
     }
 }
 
-pub(super) fn file_value(record: &FileRecord, effective: &Value) -> Value {
-    let mut tags = effective
-        .get("tags")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(String::from)
-        .collect::<Vec<_>>();
-    for tag in extract_tags_from_body(&record.body) {
-        if !tags.contains(&tag) {
-            tags.push(tag);
-        }
-    }
-    json!({
+pub(super) fn file_value(
+    record: &FileRecord,
+    effective: &Value,
+    include_body_metadata: bool,
+) -> Value {
+    let mut file = json!({
         "path": record.rel_path,
         "name": std::path::Path::new(&record.rel_path)
             .file_name().and_then(|value| value.to_str()).unwrap_or(""),
@@ -149,10 +140,35 @@ pub(super) fn file_value(record: &FileRecord, effective: &Value) -> Value {
         "size": record.file_size,
         "mtime": record.file_mtime_iso,
         "ctime": record.file_ctime_iso,
-        "tags": tags,
-        "links": extract_links_from_body(&record.body),
-        "embeds": extract_embeds_from_body(&record.body),
-    })
+    });
+    if include_body_metadata {
+        complete_file_value(&mut file, effective, &record.body);
+    }
+    file
+}
+
+pub(super) fn complete_file_value(file: &mut Value, effective: &Value, body: &str) {
+    if file.get("tags").is_some() {
+        return;
+    }
+    let mut tags = effective
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect::<Vec<_>>();
+    for tag in extract_tags_from_body(body) {
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    if let Some(object) = file.as_object_mut() {
+        object.insert("tags".to_string(), json!(tags));
+        object.insert("links".to_string(), json!(extract_links_from_body(body)));
+        object.insert("embeds".to_string(), json!(extract_embeds_from_body(body)));
+    }
 }
 
 pub(super) fn namespace_value(

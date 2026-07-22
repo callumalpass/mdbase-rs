@@ -24,6 +24,7 @@ pub(crate) struct Query {
     pub limit: Option<u64>,
     #[serde(default)]
     pub offset: u64,
+    pub snapshot: Option<String>,
     #[serde(default)]
     pub include_body: bool,
     #[serde(default)]
