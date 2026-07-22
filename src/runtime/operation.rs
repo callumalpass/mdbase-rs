@@ -12,6 +12,8 @@ use crate::v03::{Diagnostic, OperationResult};
 pub enum OperationKind {
     Read,
     Query,
+    ListViews,
+    ExecuteView,
     Validate,
     Create,
     Update,
@@ -31,6 +33,8 @@ impl OperationKind {
         match self {
             Self::Read => "read",
             Self::Query => "query",
+            Self::ListViews => "list_views",
+            Self::ExecuteView => "execute_view",
             Self::Validate => "validate",
             Self::Create => "create",
             Self::Update => "update",
@@ -47,6 +51,8 @@ impl FromStr for OperationKind {
         match value {
             "read" => Ok(Self::Read),
             "query" => Ok(Self::Query),
+            "list_views" => Ok(Self::ListViews),
+            "execute_view" => Ok(Self::ExecuteView),
             "validate" => Ok(Self::Validate),
             "create" => Ok(Self::Create),
             "update" => Ok(Self::Update),

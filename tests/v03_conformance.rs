@@ -134,6 +134,13 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
                 .flatten()
                 .any(|record| record.get("body").is_some());
             result["body_returned"] = Value::Bool(body_returned);
+            expose_query_aliases(&mut result);
+            result
+        }
+        "list_views" => flatten_envelope(operations.list_views(&input)),
+        "execute_view" => {
+            let mut result = flatten_envelope(operations.execute_view(&input));
+            expose_query_aliases(&mut result);
             result
         }
         "evaluate_cel" => {
@@ -243,6 +250,20 @@ fn expose_operation_issues(result: &mut Value) {
         {
             result["error"] = first.clone();
         }
+    }
+}
+
+fn expose_query_aliases(result: &mut Value) {
+    let paths = result
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|record| record.get("path").cloned())
+        .collect::<Vec<_>>();
+    result["paths"] = Value::Array(paths);
+    if let Some(context) = result.pointer("/meta/context").cloned() {
+        result["context"] = context;
     }
 }
 
@@ -388,6 +409,11 @@ fn shared_v03_lifecycle_fixture_passes() {
 #[test]
 fn shared_v03_cel_fixture_passes() {
     run_suite("cel/cel-profile.yaml", "cel");
+}
+
+#[test]
+fn shared_v03_saved_views_fixture_passes() {
+    run_suite("views/view-records.yaml", "views");
 }
 
 fn run_suite(relative_path: &str, fixture_set: &str) {

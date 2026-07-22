@@ -21,6 +21,7 @@ pub mod runtime_contracts;
 pub mod types;
 pub mod v03;
 pub mod validation;
+pub mod views;
 pub mod watch;
 
 use std::collections::HashMap;
@@ -86,6 +87,8 @@ pub struct Collection {
     pub root: PathBuf,
     pub spec_profile: SpecProfile,
     pub settings: Settings,
+    /// Namespaced collection configuration retained for optional adapters.
+    pub config_extensions: serde_json::Map<String, serde_json::Value>,
     pub types: HashMap<String, TypeDef>,
     pub type_warnings: Vec<String>,
 }
@@ -176,6 +179,13 @@ impl Collection {
                 .unwrap_or(".mdbase")
                 .to_string(),
         };
+        let config_extensions = config
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(key, _)| key.starts_with("x-"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
 
         for (label, path) in [
             ("types_folder", settings.types_folder.as_str()),
@@ -232,6 +242,7 @@ impl Collection {
             root: root.to_path_buf(),
             spec_profile,
             settings,
+            config_extensions,
             types,
             type_warnings,
         })
