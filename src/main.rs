@@ -118,6 +118,12 @@ enum Command {
         include_body: bool,
     },
 
+    /// Discover and execute saved views
+    Views {
+        #[command(subcommand)]
+        action: ViewAction,
+    },
+
     /// Validate a file or the entire collection
     Validate {
         /// File path (omit for collection-wide validation)
@@ -181,6 +187,27 @@ enum CacheAction {
     Rebuild,
     /// Clear the cache
     Clear,
+}
+
+#[derive(Subcommand)]
+enum ViewAction {
+    /// List saved views from every enabled source
+    List,
+    /// Execute one named saved view
+    Execute {
+        /// View source path
+        path: String,
+        /// Stable named-view ID
+        #[arg(long = "view")]
+        view_id: String,
+        /// Optional invocation-context record path
+        #[arg(long)]
+        context: Option<String>,
+        #[arg(long)]
+        limit: Option<u64>,
+        #[arg(long)]
+        offset: Option<u64>,
+    },
 }
 
 // Exit codes per spec Appendix C.9
@@ -402,6 +429,54 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
                 EXIT_SUCCESS
             };
             (result, exit)
+        }
+
+        Command::Views { action } => {
+            let operations = match collection.v03_operations() {
+                Ok(operations) => operations,
+                Err(diagnostic) => {
+                    return (
+                        serde_json::to_value(mdbase::v03::OperationResult {
+                            valid: false,
+                            result: serde_json::json!({}),
+                            diagnostics: vec![*diagnostic],
+                        })
+                        .expect("operation result serializes"),
+                        EXIT_GENERAL_ERROR,
+                    )
+                }
+            };
+            let result = match action {
+                ViewAction::List => operations.list_views(&serde_json::json!({})),
+                ViewAction::Execute {
+                    path,
+                    view_id,
+                    context,
+                    limit,
+                    offset,
+                } => {
+                    let mut input = serde_json::json!({"path": path, "view": view_id});
+                    if let Some(context) = context {
+                        input["context"] = serde_json::json!({"path": context});
+                    }
+                    if let Some(limit) = limit {
+                        input["limit"] = serde_json::json!(limit);
+                    }
+                    if let Some(offset) = offset {
+                        input["offset"] = serde_json::json!(offset);
+                    }
+                    operations.execute_view(&input)
+                }
+            };
+            let exit = if result.valid {
+                EXIT_SUCCESS
+            } else {
+                EXIT_GENERAL_ERROR
+            };
+            (
+                serde_json::to_value(result).expect("operation result serializes"),
+                exit,
+            )
         }
 
         Command::Validate { path } => {

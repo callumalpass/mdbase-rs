@@ -502,6 +502,8 @@ fn execute_collection(
     Ok(match request.operation {
         OperationKind::Read => operations.read(&request.input),
         OperationKind::Query => operations.query(&request.input),
+        OperationKind::ListViews => operations.list_views(&request.input),
+        OperationKind::ExecuteView => operations.execute_view(&request.input),
         OperationKind::Validate => operations.validate(&request.input),
         OperationKind::Create => operations.create(&request.input),
         OperationKind::Update => operations.update(&request.input),

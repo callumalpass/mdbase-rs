@@ -117,6 +117,13 @@ fn load_config_internal(collection_root: &Path, allow_future_minor: bool) -> ser
     if let Some(runtime) = map.get(ykey("runtime")) {
         config["runtime"] = crate::frontmatter::parser::yaml_to_json(runtime);
     }
+    for (key, value) in map {
+        if let serde_yaml::Value::String(key) = key {
+            if key.starts_with("x-") {
+                config[key] = crate::frontmatter::parser::yaml_to_json(value);
+            }
+        }
+    }
 
     let mut result = serde_json::json!({
         "valid": true,

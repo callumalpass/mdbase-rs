@@ -79,6 +79,16 @@ impl<'a> Operations<'a> {
         super::query::execute(self.collection, input)
     }
 
+    /// Discover canonical and configured compatibility view sources.
+    pub fn list_views(&self, input: &Value) -> OperationResult {
+        crate::views::list(self.collection, input)
+    }
+
+    /// Resolve and execute one named saved view headlessly.
+    pub fn execute_view(&self, input: &Value) -> OperationResult {
+        crate::views::execute(self.collection, input)
+    }
+
     /// Execute a query and return payload-free phase timings for local
     /// profiling and host observability.
     pub fn query_profiled(&self, input: &Value) -> (OperationResult, super::QueryPerformance) {

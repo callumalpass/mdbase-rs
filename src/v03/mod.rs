@@ -163,6 +163,25 @@ pub fn validate_query_result(value: &Value) -> Vec<Diagnostic> {
     )
 }
 
+/// Validate an ordinary `type: view` record against the canonical schema.
+pub fn validate_view(value: &Value, path: &str) -> Vec<Diagnostic> {
+    validate_canonical_value(
+        VIEW_SCHEMA,
+        value,
+        path,
+        "https://mdbase.dev/schemas/v0.3/view.schema.json",
+        None,
+    )
+    .into_iter()
+    .map(|mut diagnostic| {
+        if diagnostic.code == "schema_validation_failed" {
+            diagnostic.code = "invalid_view".to_string();
+        }
+        diagnostic
+    })
+    .collect()
+}
+
 pub fn validate_record(type_file: &TypeFile, value: &Value, path: &str) -> Vec<Diagnostic> {
     validate_value(
         &type_file.schema,
