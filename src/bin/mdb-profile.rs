@@ -1,14 +1,17 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use mdbase::frontmatter::parser::json_to_yaml_mapping;
 use mdbase::frontmatter::serializer::serialize_document;
+use mdbase::runtime::{FilesystemRuntime, OperationKind, OperationRequest};
+use mdbase::v03::QueryPerformance;
 use mdbase::Collection;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const TASK_TYPE_DEF: &str = r#"---
 kind: mdbase.type
@@ -79,8 +82,17 @@ const STATUS_CYCLE: [&str; 3] = ["open", "in-progress", "done"];
     about = "Run repeatable performance profiling for core mdbase operations"
 )]
 struct Args {
+    /// Profile an existing collection without mutating records. Existing mode
+    /// runs only metadata-page and editor query workloads.
+    #[arg(long)]
+    collection: Option<PathBuf>,
+
+    /// Workload to run; queries is the fastest feedback loop
+    #[arg(long, value_enum, default_value_t = Scenario::Queries)]
+    scenario: Scenario,
+
     /// Number of task files in the synthetic fixture
-    #[arg(long, default_value_t = 2000)]
+    #[arg(long, default_value_t = 5000)]
     files: usize,
 
     /// Number of project files in the synthetic fixture
@@ -96,31 +108,35 @@ struct Args {
     open_iterations: usize,
 
     /// Iterations for read operations
-    #[arg(long = "read-iters", default_value_t = 1000)]
+    #[arg(long = "read-iters", default_value_t = 200)]
     read_iterations: usize,
 
     /// Iterations for query operations
-    #[arg(long = "query-iters", default_value_t = 250)]
+    #[arg(long = "query-iters", default_value_t = 5)]
     query_iterations: usize,
 
+    /// Iterations for the two-pass paginated editor index workload
+    #[arg(long = "editor-iters", default_value_t = 1)]
+    editor_iterations: usize,
+
     /// Iterations for update operations
-    #[arg(long = "update-iters", default_value_t = 500)]
+    #[arg(long = "update-iters", default_value_t = 20)]
     update_iterations: usize,
 
     /// Iterations for rename operations
-    #[arg(long = "rename-iters", default_value_t = 50)]
+    #[arg(long = "rename-iters", default_value_t = 5)]
     rename_iterations: usize,
 
     /// Iterations for create operations
-    #[arg(long = "create-iters", default_value_t = 300)]
+    #[arg(long = "create-iters", default_value_t = 20)]
     create_iterations: usize,
 
     /// Iterations for delete operations
-    #[arg(long = "delete-iters", default_value_t = 300)]
+    #[arg(long = "delete-iters", default_value_t = 20)]
     delete_iterations: usize,
 
     /// Iterations for cache rebuild operations
-    #[arg(long = "cache-rebuild-iters", default_value_t = 5)]
+    #[arg(long = "cache-rebuild-iters", default_value_t = 1)]
     cache_rebuild_iterations: usize,
 
     /// Deterministic RNG seed for path selection
@@ -138,16 +154,29 @@ struct Args {
     /// Optional output path for JSON report (stdout if omitted)
     #[arg(long)]
     output: Option<PathBuf>,
+
+    /// Print the full JSON report instead of the concise local table
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Scenario {
+    Queries,
+    Core,
+    All,
 }
 
 #[derive(Debug, Serialize)]
 struct ProfileConfig {
+    scenario: &'static str,
     files: usize,
     projects: usize,
     rename_refs: usize,
     open_iterations: usize,
     read_iterations: usize,
     query_iterations: usize,
+    editor_iterations: usize,
     update_iterations: usize,
     rename_iterations: usize,
     create_iterations: usize,
@@ -178,6 +207,17 @@ struct OperationSummary {
     max_ms: f64,
     stddev_ms: f64,
     ops_per_sec: f64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    phases: BTreeMap<String, PhaseSummary>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    counters: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct PhaseSummary {
+    mean_ms: f64,
+    p95_ms: f64,
+    max_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -222,6 +262,9 @@ fn main() {
 fn run() -> Result<(), String> {
     let args = Args::parse();
     validate_args(&args)?;
+    if let Some(root) = &args.collection {
+        return run_existing_collection(&args, root);
+    }
 
     let fixture_root = determine_fixture_root(&args);
     if fixture_root.exists() {
@@ -245,32 +288,59 @@ fn run() -> Result<(), String> {
 
     let collection = Collection::open(&fixture.root).map_err(format_json_error)?;
 
-    operations.push(profile_read(
-        &collection,
-        &fixture.task_paths,
-        args.read_iterations,
-        args.seed,
-    )?);
-    operations.push(profile_query_basic(&collection, args.query_iterations)?);
-    operations.push(profile_query_formula(&collection, args.query_iterations)?);
-    operations.push(profile_update(
-        &collection,
-        &fixture.task_paths,
-        args.update_iterations,
-        args.seed.wrapping_add(1),
-    )?);
-    operations.push(profile_rename(
-        &collection,
-        &fixture.rename_source_a,
-        &fixture.rename_source_b,
-        args.rename_iterations,
-    )?);
-    operations.push(profile_create(&collection, args.create_iterations)?);
-    operations.push(profile_delete(&collection, args.delete_iterations)?);
-    operations.push(profile_cache_rebuild(
-        &collection,
-        args.cache_rebuild_iterations,
-    )?);
+    if matches!(args.scenario, Scenario::Core | Scenario::All) {
+        operations.push(profile_read(
+            &collection,
+            &fixture.task_paths,
+            args.read_iterations,
+            args.seed,
+        )?);
+    }
+    if matches!(args.scenario, Scenario::Queries | Scenario::All) {
+        // Query profiling represents the long-running provider path, where the
+        // SQLite cache has already been established by normal collection use.
+        operations.push(profile_cache_rebuild(&collection, 1)?);
+        operations.push(profile_query_basic(&collection, args.query_iterations)?);
+        operations.push(profile_query_formula(&collection, args.query_iterations)?);
+        operations.push(profile_editor_list(&collection, args.editor_iterations)?);
+    }
+    if matches!(args.scenario, Scenario::Core | Scenario::All) {
+        operations.push(profile_update(
+            &collection,
+            &fixture.task_paths,
+            args.update_iterations,
+            args.seed.wrapping_add(1),
+        )?);
+        operations.push(profile_rename(
+            &collection,
+            &fixture.rename_source_a,
+            &fixture.rename_source_b,
+            args.rename_iterations,
+        )?);
+        operations.push(profile_create(&collection, args.create_iterations)?);
+        operations.push(profile_delete(&collection, args.delete_iterations)?);
+
+        let runtime_started = Instant::now();
+        let runtime = FilesystemRuntime::open(&fixture.root, Duration::from_millis(120))
+            .map_err(|error| error.to_string())?;
+        operations.push(summarize(
+            "runtime_open_with_snapshot",
+            vec![runtime_started.elapsed().as_secs_f64() * 1_000.0],
+        ));
+        operations.push(profile_runtime_update(
+            &runtime,
+            &fixture.task_paths,
+            args.update_iterations,
+            args.seed.wrapping_add(2),
+        )?);
+    }
+    if matches!(args.scenario, Scenario::Core | Scenario::All) && args.cache_rebuild_iterations > 0
+    {
+        operations.push(profile_cache_rebuild(
+            &collection,
+            args.cache_rebuild_iterations,
+        )?);
+    }
 
     let report = ProfileReport {
         tool: "mdbase-profiler",
@@ -278,12 +348,18 @@ fn run() -> Result<(), String> {
         generated_at,
         total_runtime_ms: run_start.elapsed().as_secs_f64() * 1000.0,
         config: ProfileConfig {
+            scenario: match args.scenario {
+                Scenario::Queries => "queries",
+                Scenario::Core => "core",
+                Scenario::All => "all",
+            },
             files: args.files,
             projects: args.projects,
             rename_refs: args.rename_refs,
             open_iterations: args.open_iterations,
             read_iterations: args.read_iterations,
             query_iterations: args.query_iterations,
+            editor_iterations: args.editor_iterations,
             update_iterations: args.update_iterations,
             rename_iterations: args.rename_iterations,
             create_iterations: args.create_iterations,
@@ -301,20 +377,85 @@ fn run() -> Result<(), String> {
         operations,
     };
 
-    let report_json = serde_json::to_string_pretty(&report)
-        .map_err(|e| format!("Failed to serialize report JSON: {e}"))?;
+    emit_report(&args, &report)
+}
 
+fn run_existing_collection(args: &Args, root: &Path) -> Result<(), String> {
+    if !matches!(args.scenario, Scenario::Queries) {
+        return Err("--collection is read-only and supports only --scenario queries".to_string());
+    }
+    if args.fixture_root.is_some() || args.keep_fixture {
+        return Err(
+            "--fixture-root and --keep-fixture cannot be used with --collection".to_string(),
+        );
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("Collection path could not be resolved: {error}"))?;
+    let run_start = Instant::now();
+    let mut operations = vec![profile_open(&root, args.open_iterations)?];
+    let collection = Collection::open(&root).map_err(format_json_error)?;
+    operations.push(profile_existing_query_page(
+        &collection,
+        args.query_iterations,
+    )?);
+    operations.push(profile_editor_list(&collection, args.editor_iterations)?);
+    let records = operations
+        .iter()
+        .find(|operation| operation.name == "v03_query_page_200")
+        .and_then(|operation| operation.counters.get("candidates"))
+        .copied()
+        .unwrap_or(0.0) as usize;
+    let report = ProfileReport {
+        tool: "mdbase-profiler",
+        version: env!("CARGO_PKG_VERSION"),
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        total_runtime_ms: run_start.elapsed().as_secs_f64() * 1_000.0,
+        config: ProfileConfig {
+            scenario: "queries",
+            files: records,
+            projects: 0,
+            rename_refs: 0,
+            open_iterations: args.open_iterations,
+            read_iterations: 0,
+            query_iterations: args.query_iterations,
+            editor_iterations: args.editor_iterations,
+            update_iterations: 0,
+            rename_iterations: 0,
+            create_iterations: 0,
+            delete_iterations: 0,
+            cache_rebuild_iterations: 0,
+            seed: args.seed,
+        },
+        fixture: FixtureSummary {
+            root: "<existing collection>".to_string(),
+            kept: true,
+            task_files: records,
+            project_files: 0,
+            rename_reference_files: 0,
+        },
+        operations,
+    };
+    emit_report(args, &report)
+}
+
+fn emit_report(args: &Args, report: &ProfileReport) -> Result<(), String> {
+    let report_json = serde_json::to_string_pretty(report)
+        .map_err(|error| format!("Failed to serialize report JSON: {error}"))?;
     if let Some(output) = &args.output {
         if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create output directory {:?}: {e}", parent))?;
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("Failed to create output directory {:?}: {error}", parent)
+            })?;
         }
         fs::write(output, format!("{report_json}\n"))
-            .map_err(|e| format!("Failed to write report to {}: {e}", output.display()))?;
-    } else {
-        println!("{report_json}");
+            .map_err(|error| format!("Failed to write report to {}: {error}", output.display()))?;
     }
-
+    if args.json {
+        println!("{report_json}");
+    } else {
+        print_report(report);
+    }
     Ok(())
 }
 
@@ -477,6 +618,8 @@ fn summarize(name: &str, mut samples: Vec<f64>) -> OperationSummary {
             max_ms: 0.0,
             stddev_ms: 0.0,
             ops_per_sec: 0.0,
+            phases: BTreeMap::new(),
+            counters: BTreeMap::new(),
         };
     }
 
@@ -512,6 +655,179 @@ fn summarize(name: &str, mut samples: Vec<f64>) -> OperationSummary {
         max_ms,
         stddev_ms,
         ops_per_sec,
+        phases: BTreeMap::new(),
+        counters: BTreeMap::new(),
+    }
+}
+
+fn run_profiled_query<F>(
+    name: &str,
+    iterations: usize,
+    mut operation: F,
+) -> Result<OperationSummary, String>
+where
+    F: FnMut(usize) -> Result<QueryPerformance, String>,
+{
+    let mut samples = Vec::with_capacity(iterations);
+    let mut profiles = Vec::with_capacity(iterations);
+    for index in 0..iterations {
+        let started = Instant::now();
+        let profile = operation(index)
+            .map_err(|error| format!("{name} iteration {index} failed: {error}"))?;
+        samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+        profiles.push(profile);
+    }
+    let mut summary = summarize(name, samples);
+    summary.phases = summarize_query_phases(&profiles);
+    summary.counters = summarize_query_counters(&profiles);
+    Ok(summary)
+}
+
+fn summarize_query_phases(profiles: &[QueryPerformance]) -> BTreeMap<String, PhaseSummary> {
+    type QueryPhase = (&'static str, fn(&QueryPerformance) -> u64);
+    let fields: [QueryPhase; 13] = [
+        ("schema", |value| value.schema_us),
+        ("preflight", |value| value.preflight_us),
+        ("cache_open", |value| value.cache_open_us),
+        ("cache_refresh", |value| value.cache_refresh_us),
+        ("records_load", |value| value.records_load_us),
+        ("all_files", |value| value.all_files_us),
+        ("link_graph", |value| value.link_graph_us),
+        ("context", |value| value.context_us),
+        ("evaluate", |value| value.evaluate_us),
+        ("sort", |value| value.sort_us),
+        ("groups", |value| value.groups_us),
+        ("serialize", |value| value.serialize_us),
+        ("total", |value| value.total_us),
+    ];
+    fields
+        .into_iter()
+        .map(|(name, field)| {
+            let mut samples = profiles
+                .iter()
+                .map(|profile| field(profile) as f64 / 1_000.0)
+                .collect::<Vec<_>>();
+            samples.sort_by(|left, right| {
+                left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mean_ms = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
+            let p95_ms = percentile(&samples, 0.95);
+            let max_ms = samples.last().copied().unwrap_or_default();
+            (
+                name.to_string(),
+                PhaseSummary {
+                    mean_ms,
+                    p95_ms,
+                    max_ms,
+                },
+            )
+        })
+        .collect()
+}
+
+fn summarize_query_counters(profiles: &[QueryPerformance]) -> BTreeMap<String, f64> {
+    let count = profiles.len().max(1) as f64;
+    [
+        (
+            "records_loaded",
+            profiles
+                .iter()
+                .map(|profile| profile.records_loaded as f64)
+                .sum::<f64>()
+                / count,
+        ),
+        (
+            "candidates",
+            profiles
+                .iter()
+                .map(|profile| profile.candidates as f64)
+                .sum::<f64>()
+                / count,
+        ),
+        (
+            "results",
+            profiles
+                .iter()
+                .map(|profile| profile.results as f64)
+                .sum::<f64>()
+                / count,
+        ),
+        (
+            "link_graph_built",
+            profiles
+                .iter()
+                .filter(|profile| profile.link_graph_built)
+                .count() as f64
+                / count,
+        ),
+        (
+            "snapshot_reused",
+            profiles
+                .iter()
+                .filter(|profile| profile.snapshot_reused)
+                .count() as f64
+                / count,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_string(), value))
+    .collect()
+}
+
+fn merge_query_performance(target: &mut QueryPerformance, value: QueryPerformance) {
+    target.total_us += value.total_us;
+    target.schema_us += value.schema_us;
+    target.preflight_us += value.preflight_us;
+    target.clock_us += value.clock_us;
+    target.load_us += value.load_us;
+    target.cache_open_us += value.cache_open_us;
+    target.cache_refresh_us += value.cache_refresh_us;
+    target.records_load_us += value.records_load_us;
+    target.all_files_us += value.all_files_us;
+    target.link_graph_us += value.link_graph_us;
+    target.context_us += value.context_us;
+    target.evaluate_us += value.evaluate_us;
+    target.sort_us += value.sort_us;
+    target.groups_us += value.groups_us;
+    target.serialize_us += value.serialize_us;
+    target.records_loaded += value.records_loaded;
+    target.candidates += value.candidates;
+    target.results += value.results;
+    target.cache_used |= value.cache_used;
+    target.link_graph_built |= value.link_graph_built;
+    target.snapshot_reused |= value.snapshot_reused;
+}
+
+fn print_report(report: &ProfileReport) {
+    println!(
+        "mdbase profile: {} task records, {} project records ({:.2}s total)",
+        report.fixture.task_files,
+        report.fixture.project_files,
+        report.total_runtime_ms / 1_000.0
+    );
+    println!(
+        "{:<24} {:>6} {:>11} {:>11} {:>11}",
+        "operation", "runs", "mean", "p95", "max"
+    );
+    for operation in &report.operations {
+        println!(
+            "{:<24} {:>6} {:>8.2} ms {:>8.2} ms {:>8.2} ms",
+            operation.name,
+            operation.iterations,
+            operation.mean_ms,
+            operation.p95_ms,
+            operation.max_ms
+        );
+        let dominant = operation
+            .phases
+            .iter()
+            .filter(|(name, _)| name.as_str() != "total")
+            .filter(|(_, phase)| phase.mean_ms >= 0.05)
+            .map(|(name, phase)| format!("{name}={:.2}ms", phase.mean_ms))
+            .collect::<Vec<_>>();
+        if !dominant.is_empty() {
+            println!("  {}", dominant.join(" "));
+        }
     }
 }
 
@@ -572,20 +888,36 @@ fn profile_query_basic(
     iterations: usize,
 ) -> Result<OperationSummary, String> {
     let query = json!({
-        "query": {
-            "types": ["task"],
-            "where": "priority >= 3 && status != \"done\"",
-            "order_by": [
-                {"field": "priority", "direction": "desc"},
-                {"field": "points", "direction": "asc"}
-            ],
-            "limit": 120
-        }
+        "types": ["task"],
+        "where": "priority >= 3 && status != \"done\"",
+        "order_by": [
+            {"field": "priority", "direction": "desc"},
+            {"field": "points", "direction": "asc"}
+        ],
+        "limit": 120
     });
+    let operations = collection.v03_operations().map_err(|error| error.message)?;
 
-    run_timed("query_basic", iterations, |_| {
-        let result = collection.query(&query);
-        ensure_success(&result)
+    run_profiled_query("v03_query_basic", iterations, |_| {
+        let (result, profile) = operations.query_profiled(&query);
+        ensure_v03_success(&result)?;
+        Ok(profile)
+    })
+}
+
+fn profile_existing_query_page(
+    collection: &Collection,
+    iterations: usize,
+) -> Result<OperationSummary, String> {
+    let operations = collection.v03_operations().map_err(|error| error.message)?;
+    run_profiled_query("v03_query_page_200", iterations, |_| {
+        let (result, profile) = operations.query_profiled(&json!({
+            "order_by": [{"field": "file.mtime", "direction": "desc"}],
+            "limit": 200,
+            "include_body": false,
+        }));
+        ensure_v03_success(&result)?;
+        Ok(profile)
     })
 }
 
@@ -594,21 +926,77 @@ fn profile_query_formula(
     iterations: usize,
 ) -> Result<OperationSummary, String> {
     let query = json!({
-        "query": {
-            "types": ["task"],
-            "formulas": {
-                "weighted": "priority * points",
-                "is_open": "status == \"open\""
-            },
-            "where": "formula.weighted >= 8 && formula.is_open",
-            "limit": 80
-        }
+        "types": ["task"],
+        "projections": {
+            "weighted": {"expr": "priority * points"},
+            "is_open": {"expr": "status == \"open\""}
+        },
+        "where": "projection.weighted >= 8 && projection.is_open",
+        "limit": 80
     });
+    let operations = collection.v03_operations().map_err(|error| error.message)?;
 
-    run_timed("query_formula", iterations, |_| {
-        let result = collection.query(&query);
-        ensure_success(&result)
+    run_profiled_query("v03_query_projection", iterations, |_| {
+        let (result, profile) = operations.query_profiled(&query);
+        ensure_v03_success(&result)?;
+        Ok(profile)
     })
+}
+
+fn profile_editor_list(
+    collection: &Collection,
+    iterations: usize,
+) -> Result<OperationSummary, String> {
+    let operations = collection.v03_operations().map_err(|error| error.message)?;
+    run_profiled_query("editor_two_pass_index", iterations, |_| {
+        let mut combined = QueryPerformance::default();
+        let mut snapshot: Option<String> = None;
+        for include_body in [false, true] {
+            let mut offset = 0_u64;
+            loop {
+                let limit = if offset == 0 { 200 } else { 1_000 };
+                let mut input = json!({
+                    "order_by": [{"field": "file.mtime", "direction": "desc"}],
+                    "limit": limit,
+                    "offset": offset,
+                    "include_body": include_body,
+                });
+                if let Some(snapshot) = &snapshot {
+                    input["snapshot"] = Value::String(snapshot.clone());
+                }
+                let (result, profile) = operations.query_profiled(&input);
+                ensure_v03_success(&result)?;
+                if snapshot.is_none() {
+                    snapshot = result.result["meta"]["snapshot"]
+                        .as_str()
+                        .map(str::to_string);
+                }
+                let page = result.result["results"]
+                    .as_array()
+                    .ok_or("query result did not contain a results array")?;
+                let has_more = result.result["meta"]["has_more"].as_bool().unwrap_or(false);
+                offset += page.len() as u64;
+                merge_query_performance(&mut combined, profile);
+                if !has_more || page.is_empty() {
+                    break;
+                }
+            }
+        }
+        Ok(combined)
+    })
+}
+
+fn ensure_v03_success(result: &mdbase::v03::OperationResult) -> Result<(), String> {
+    if result.valid {
+        Ok(())
+    } else {
+        Err(result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; "))
+    }
 }
 
 fn profile_update(
@@ -634,6 +1022,39 @@ fn profile_update(
             "fields": fields,
         }));
         ensure_success(&result)
+    })
+}
+
+fn profile_runtime_update(
+    runtime: &FilesystemRuntime,
+    task_paths: &[String],
+    iterations: usize,
+    seed: u64,
+) -> Result<OperationSummary, String> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let picks: Vec<usize> = (0..iterations)
+        .map(|_| rng.gen_range(0..task_paths.len()))
+        .collect();
+    run_timed("runtime_update_and_watch", iterations, |i| {
+        let result = runtime
+            .execute(&OperationRequest::new(
+                OperationKind::Update,
+                json!({
+                    "path": task_paths[picks[i]],
+                    "fields": {
+                        "status": STATUS_CYCLE[i % STATUS_CYCLE.len()],
+                        "points": ((i + 1) % 13) as i64,
+                    },
+                }),
+            ))
+            .map_err(|error| error.to_string())?;
+        ensure_v03_success(&result)?;
+        while runtime
+            .recv_timeout(Duration::ZERO)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {}
+        Ok(())
     })
 }
 

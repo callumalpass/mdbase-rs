@@ -144,6 +144,7 @@ impl Collection {
 
         let mut result = serde_json::json!({
             "path": input.path,
+            "revision": crate::v03::revision(content.as_bytes()),
             "types": type_names,
             "frontmatter": effective,
             "raw_frontmatter": raw_frontmatter,

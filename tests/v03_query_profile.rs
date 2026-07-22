@@ -250,3 +250,112 @@ fn unresolved_context_and_null_this_have_distinct_results() {
     assert_eq!(no_context.result["meta"]["total_count"], 1);
     assert!(no_context.result["meta"].get("context").is_none());
 }
+
+#[test]
+fn profiling_exposes_lazy_query_plans_without_payloads() {
+    let (_root, collection) = query_collection();
+    assert_eq!(collection.cache_rebuild()["success"], true);
+    let operations = collection.v03_operations().unwrap();
+
+    let (metadata, metadata_profile) = operations.query_profiled(&json!({
+        "order_by": [{"field": "file.mtime", "direction": "desc"}],
+        "limit": 1,
+    }));
+    assert!(metadata.valid, "{metadata:#?}");
+    assert_eq!(metadata_profile.records_loaded, 1);
+    assert_eq!(metadata_profile.candidates, 4);
+    assert_eq!(metadata_profile.results, 1);
+    assert!(!metadata_profile.link_graph_built);
+    let serialized = serde_json::to_string(&metadata_profile).unwrap();
+    assert!(!serialized.contains("tasks/a.md"));
+    assert!(!serialized.contains("Alpha"));
+
+    let (traversal, traversal_profile) = operations.query_profiled(&json!({
+        "where": "project.asFile().title == 'Alpha'",
+    }));
+    assert!(traversal.valid, "{traversal:#?}");
+    assert!(traversal_profile.link_graph_built);
+
+    let (body_metadata, body_profile) = operations.query_profiled(&json!({
+        "select": ["file.tags"],
+        "where": "file.tags.size() > 0",
+    }));
+    assert!(body_metadata.valid, "{body_metadata:#?}");
+    assert!(!body_profile.link_graph_built);
+    assert_eq!(
+        body_metadata.result["results"][0]["values"]["tags"],
+        json!(["alpha"])
+    );
+}
+
+#[test]
+fn query_snapshots_reuse_a_consistent_cache_and_expire_explicitly() {
+    let (root, collection) = query_collection();
+    assert_eq!(collection.cache_rebuild()["success"], true);
+    let operations = collection.v03_operations().unwrap();
+    let input = json!({
+        "order_by": [{"field": "file.path", "direction": "asc"}],
+        "limit": 1,
+    });
+    let (first, first_profile) = operations.query_profiled(&input);
+    assert!(first.valid, "{first:#?}");
+    assert!(!first_profile.snapshot_reused);
+    let snapshot = first.result["meta"]["snapshot"].as_str().unwrap();
+
+    write_record(
+        &root,
+        "tasks/added.md",
+        "---\ntype: task\ntitle: Added\n---\n",
+    );
+    let (continued, continued_profile) = operations.query_profiled(&json!({
+        "order_by": [{"field": "file.path", "direction": "asc"}],
+        "offset": 1,
+        "limit": 1,
+        "snapshot": snapshot,
+    }));
+    assert!(continued.valid, "{continued:#?}");
+    assert!(continued_profile.snapshot_reused);
+    assert_eq!(continued.result["meta"]["total_count"], 4);
+    assert_eq!(continued_profile.cache_refresh_us, 0);
+
+    let refreshed = operations.query(&input);
+    assert!(refreshed.valid, "{refreshed:#?}");
+    assert_eq!(refreshed.result["meta"]["total_count"], 5);
+    assert_ne!(refreshed.result["meta"]["snapshot"], snapshot);
+
+    let expired = operations.query(&json!({
+        "order_by": [{"field": "file.path", "direction": "asc"}],
+        "snapshot": snapshot,
+    }));
+    assert!(!expired.valid);
+    assert_eq!(expired.diagnostics[0].code, "query_snapshot_expired");
+}
+
+#[test]
+fn sqlite_metadata_pagination_preserves_portable_ordering() {
+    let (_root, collection) = query_collection();
+    let operations = collection.v03_operations().unwrap();
+    let input = json!({
+        "order_by": [{"field": "file.mtime", "direction": "desc"}],
+        "offset": 1,
+        "limit": 2,
+    });
+    let uncached = operations.query(&input);
+    assert!(uncached.valid, "{uncached:#?}");
+    assert_eq!(collection.cache_rebuild()["success"], true);
+    let cached = operations.query(&input);
+    assert!(cached.valid, "{cached:#?}");
+    let paths = |result: &v03::OperationResult| {
+        result.result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["file"]["path"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(paths(&cached), paths(&uncached));
+    assert_eq!(
+        cached.result["meta"]["total_count"],
+        uncached.result["meta"]["total_count"]
+    );
+}

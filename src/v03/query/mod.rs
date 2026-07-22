@@ -7,4 +7,5 @@ mod model;
 mod preflight;
 mod result;
 
-pub(crate) use execute::execute;
+pub use execute::QueryPerformance;
+pub(crate) use execute::{execute, execute_profiled};

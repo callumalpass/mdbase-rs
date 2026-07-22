@@ -13,6 +13,74 @@ pub(crate) struct CompiledQuery {
     pub summary_functions: BTreeMap<String, Expr>,
 }
 
+impl CompiledQuery {
+    /// A metadata-only query can order and paginate before materializing
+    /// frontmatter, computed fields, body metadata, and expression contexts.
+    pub fn supports_metadata_page_plan(&self) -> bool {
+        self.query.types.is_empty()
+            && self.query.context.is_none()
+            && self.projections.is_empty()
+            && self.where_expression.is_none()
+            && self.query.select.is_none()
+            && self.query.group_by.is_empty()
+            && self.query.summaries.is_empty()
+            && self.query.summary_functions.is_empty()
+            && self
+                .query
+                .order_by
+                .iter()
+                .all(|order| metadata_sort_field(&order.field))
+    }
+
+    /// Cross-record link data is expensive to construct and is needed only by
+    /// expressions that explicitly traverse records or request backlinks.
+    pub fn requires_link_graph(&self) -> bool {
+        self.record_expressions()
+            .any(expression_requires_link_graph)
+    }
+
+    /// Body-derived file metadata can be deferred until after pagination when
+    /// no filter, projection, ordering, grouping, or summary reads it.
+    pub fn requires_file_body_metadata(&self) -> bool {
+        self.record_expressions()
+            .any(expression_requires_file_body_metadata)
+            || self.selections.iter().any(|selection| match selection {
+                CompiledSelection::Field { source, .. } => file_body_field(source),
+                CompiledSelection::Expression { .. } => false,
+            })
+            || self
+                .query
+                .order_by
+                .iter()
+                .any(|order| file_body_field(&order.field))
+            || self
+                .query
+                .group_by
+                .iter()
+                .any(|group| file_body_field(&group.field))
+            || self
+                .query
+                .summaries
+                .iter()
+                .any(|summary| file_body_field(&summary.field))
+    }
+
+    fn record_expressions(&self) -> impl Iterator<Item = &Expr> {
+        self.projections
+            .iter()
+            .map(|(_, expression)| expression)
+            .chain(self.where_expression.iter())
+            .chain(
+                self.selections
+                    .iter()
+                    .filter_map(|selection| match selection {
+                        CompiledSelection::Expression { expression, .. } => Some(expression),
+                        CompiledSelection::Field { .. } => None,
+                    }),
+            )
+    }
+}
+
 pub(crate) enum CompiledSelection {
     Field { source: String, name: String },
     Expression { expression: Expr, name: String },
@@ -348,6 +416,79 @@ fn collect_identifiers(expression: &Expr, identifiers: &mut BTreeSet<String>) {
         }
         Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) => {}
     }
+}
+
+fn expression_requires_link_graph(expression: &Expr) -> bool {
+    match expression {
+        Expr::Dot(object, field) => {
+            (field == "backlinks" && matches!(object.as_ref(), Expr::Ident(name) if name == "file"))
+                || expression_requires_link_graph(object)
+        }
+        Expr::Call(function, arguments) => {
+            matches!(function.as_ref(), Expr::Dot(_, method) if method == "asFile")
+                || expression_requires_link_graph(function)
+                || arguments.iter().any(expression_requires_link_graph)
+        }
+        Expr::Index(left, right)
+        | Expr::BinOp(left, _, right)
+        | Expr::NullCoalesce(left, right) => {
+            expression_requires_link_graph(left) || expression_requires_link_graph(right)
+        }
+        Expr::UnaryOp(_, inner) => expression_requires_link_graph(inner),
+        Expr::Conditional(condition, then_expression, else_expression) => {
+            expression_requires_link_graph(condition)
+                || expression_requires_link_graph(then_expression)
+                || expression_requires_link_graph(else_expression)
+        }
+        Expr::Array(values) => values.iter().any(expression_requires_link_graph),
+        Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) | Expr::Ident(_) => false,
+    }
+}
+
+fn expression_requires_file_body_metadata(expression: &Expr) -> bool {
+    match expression {
+        Expr::Dot(object, field) => {
+            (["tags", "links", "embeds"].contains(&field.as_str())
+                && matches!(object.as_ref(), Expr::Ident(name) if name == "file"))
+                || expression_requires_file_body_metadata(object)
+        }
+        Expr::Index(object, index) => {
+            (matches!(object.as_ref(), Expr::Ident(name) if name == "file")
+                && matches!(index.as_ref(), Expr::Str(field) if file_body_field(field)))
+                || expression_requires_file_body_metadata(object)
+                || expression_requires_file_body_metadata(index)
+        }
+        Expr::BinOp(left, _, right) | Expr::NullCoalesce(left, right) => {
+            expression_requires_file_body_metadata(left)
+                || expression_requires_file_body_metadata(right)
+        }
+        Expr::UnaryOp(_, inner) => expression_requires_file_body_metadata(inner),
+        Expr::Call(function, arguments) => {
+            expression_requires_file_body_metadata(function)
+                || arguments.iter().any(expression_requires_file_body_metadata)
+        }
+        Expr::Conditional(condition, then_expression, else_expression) => {
+            expression_requires_file_body_metadata(condition)
+                || expression_requires_file_body_metadata(then_expression)
+                || expression_requires_file_body_metadata(else_expression)
+        }
+        Expr::Array(values) => values.iter().any(expression_requires_file_body_metadata),
+        Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) | Expr::Ident(_) => false,
+    }
+}
+
+fn file_body_field(field: &str) -> bool {
+    matches!(
+        field,
+        "file.tags" | "file.links" | "file.embeds" | "tags" | "links" | "embeds"
+    )
+}
+
+fn metadata_sort_field(field: &str) -> bool {
+    matches!(
+        field,
+        "file.path" | "file.name" | "file.folder" | "file.size" | "file.mtime" | "file.ctime"
+    )
 }
 
 pub(crate) fn is_builtin_summary(name: &str) -> bool {

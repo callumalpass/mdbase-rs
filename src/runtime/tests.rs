@@ -1,7 +1,8 @@
 use super::*;
+use crate::v03::OperationResult;
 use serde_json::json;
 use std::fs;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -101,6 +102,43 @@ fn provider_serializes_conditional_writers() {
 }
 
 #[test]
+fn provider_allows_read_only_compound_operations_to_overlap() {
+    let directory = collection();
+    let provider = Arc::new(FilesystemProvider::open(directory.path()).unwrap());
+    let (entered, entered_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let handles = (0..2)
+        .map(|_| {
+            let provider = provider.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            thread::spawn(move || {
+                provider
+                    .with_collection_read(|_| {
+                        entered.send(()).unwrap();
+                        let (released, ready) = &*release;
+                        let guard = released.lock().unwrap();
+                        drop(ready.wait_while(guard, |released| !*released).unwrap());
+                        Ok::<_, ProviderError>(())
+                    })
+                    .unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+    drop(entered);
+
+    entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let overlapped = entered_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+    let (released, ready) = &*release;
+    *released.lock().unwrap() = true;
+    ready.notify_all();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    assert!(overlapped, "read-only operations were serialized");
+}
+
+#[test]
 fn runtime_queues_change_before_successful_mutation_returns() {
     let directory = collection();
     let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(40)).unwrap();
@@ -136,6 +174,34 @@ fn operation_kind_has_a_stable_wire_shape() {
         OperationKind::Query
     );
     assert!("unknown".parse::<OperationKind>().is_err());
+}
+
+#[test]
+fn mutation_affected_paths_include_rename_reference_rewrites() {
+    let request = OperationRequest::new(
+        OperationKind::Rename,
+        json!({
+            "from": "old.md",
+            "to": "new.md",
+            "simulate_before_ref_update": [{"path": "raced.md"}],
+        }),
+    );
+    let result = OperationResult {
+        valid: true,
+        result: json!({
+            "from": "old.md",
+            "to": "new.md",
+            "references_updated": [{"path": "linked.md", "location": "body"}],
+        }),
+        diagnostics: vec![],
+    };
+    assert_eq!(
+        request.affected_paths(&result),
+        ["linked.md", "new.md", "old.md", "raced.md"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
 }
 
 #[test]

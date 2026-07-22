@@ -10,6 +10,7 @@ pub(crate) fn open_cache_db(root: &Path, cache_folder: &str) -> Result<Connectio
         .map_err(|_e| rusqlite::Error::InvalidPath(db_dir.join("cache.db")))?;
     let db_path = db_dir.join("cache.db");
     let conn = Connection::open(&db_path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
     )?;

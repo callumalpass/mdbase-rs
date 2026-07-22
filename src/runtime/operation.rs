@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,48 @@ pub struct OperationRequest {
 impl OperationRequest {
     pub fn new(operation: OperationKind, input: Value) -> Self {
         Self { operation, input }
+    }
+
+    /// Return the records that may have changed after a successful mutation.
+    ///
+    /// Keeping this derivation next to the canonical operation envelope lets
+    /// hosts synchronize watchers without rescanning the entire collection or
+    /// duplicating mutation result semantics.
+    pub fn affected_paths(&self, result: &OperationResult) -> BTreeSet<String> {
+        if !self.operation.is_mutation() || !result.valid {
+            return BTreeSet::new();
+        }
+
+        let mut paths = BTreeSet::new();
+        let mut insert = |value: Option<&Value>| {
+            if let Some(path) = value.and_then(Value::as_str) {
+                paths.insert(path.to_string());
+            }
+        };
+        insert(self.input.get("path"));
+        insert(result.result.get("path"));
+        insert(self.input.get("from"));
+        insert(self.input.get("to"));
+        insert(result.result.get("from"));
+        insert(result.result.get("to"));
+
+        for pointer in ["/references_updated", "/partial_updates/failed"] {
+            if let Some(items) = result.result.pointer(pointer).and_then(Value::as_array) {
+                for item in items {
+                    insert(item.get("path"));
+                }
+            }
+        }
+        if let Some(items) = self
+            .input
+            .get("simulate_before_ref_update")
+            .and_then(Value::as_array)
+        {
+            for item in items {
+                insert(item.get("path"));
+            }
+        }
+        paths
     }
 }
 

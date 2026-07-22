@@ -1,5 +1,6 @@
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -12,6 +13,7 @@ use super::{
 use crate::runtime_contracts::{ContractSource, LoadOptions, RuntimeContracts, RuntimeLoadResult};
 use crate::v03::OperationResult;
 use crate::Collection;
+use walkdir::WalkDir;
 
 /// Provider-neutral execution boundary for one authoritative collection.
 ///
@@ -24,15 +26,17 @@ pub trait CollectionProvider: Send + Sync {
 
 /// Filesystem-backed provider using the canonical mdbase operation engine.
 ///
-/// A persistent gate serializes requests from local control, relay, watcher,
-/// and future replica paths. The collection is opened inside the gate so
-/// external config, type, and record changes are visible to the next request.
+/// A persistent gate allows concurrent reads while serializing mutations from
+/// local control, relay, watcher, and future replica paths. The collection is
+/// opened inside the gate so external config, type, and record changes are
+/// visible to the next request.
 pub struct FilesystemProvider {
     root: PathBuf,
-    operation_gate: Mutex<()>,
+    operation_gate: RwLock<()>,
     observer: Arc<dyn RuntimeObserver>,
     observer_options: ObserverOptions,
     runtime_contracts: OnceLock<Result<RuntimeContracts, String>>,
+    collection_cache: RwLock<CachedCollection>,
 }
 
 impl std::fmt::Debug for FilesystemProvider {
@@ -56,16 +60,24 @@ impl FilesystemProvider {
         observer_options: ObserverOptions,
     ) -> Result<Self, ProviderError> {
         let root = root.as_ref().to_path_buf();
-        if let Err(error) = open_collection(&root) {
-            report_provider_error(observer.as_ref(), observer_options, "open", "open", &error);
-            return Err(error);
-        }
+        let collection = match open_collection(&root) {
+            Ok(collection) => collection,
+            Err(error) => {
+                report_provider_error(observer.as_ref(), observer_options, "open", "open", &error);
+                return Err(error);
+            }
+        };
+        let stamp = CollectionStamp::load(&root, &collection.settings.types_folder);
         Ok(Self {
             root,
-            operation_gate: Mutex::new(()),
+            operation_gate: RwLock::new(()),
             observer,
             observer_options,
             runtime_contracts: OnceLock::new(),
+            collection_cache: RwLock::new(CachedCollection {
+                collection: Arc::new(collection),
+                stamp,
+            }),
         })
     }
 
@@ -85,9 +97,23 @@ impl FilesystemProvider {
     where
         E: From<ProviderError>,
     {
-        let _guard = self.lock().map_err(E::from)?;
-        let collection = open_collection(&self.root).map_err(E::from)?;
-        operation(&collection)
+        let _guard = self.write_lock().map_err(E::from)?;
+        let collection = self.current_collection().map_err(E::from)?;
+        operation(collection.as_ref())
+    }
+
+    /// Execute a compound read-only provider operation while allowing other
+    /// reads against the same collection to make progress concurrently.
+    pub fn with_collection_read<T, E>(
+        &self,
+        operation: impl FnOnce(&Collection) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<ProviderError>,
+    {
+        let _guard = self.read_lock().map_err(E::from)?;
+        let collection = self.current_collection().map_err(E::from)?;
+        operation(collection.as_ref())
     }
 
     /// Load and preflight the effective Runtime Contracts registry while
@@ -100,7 +126,7 @@ impl FilesystemProvider {
         let started = Instant::now();
         let mut timings = OperationTimings::default();
         let queue_started = Instant::now();
-        let _guard = match self.lock() {
+        let _guard = match self.read_lock() {
             Ok(guard) => guard,
             Err(error) => {
                 timings.queue = queue_started.elapsed();
@@ -115,7 +141,7 @@ impl FilesystemProvider {
         };
         timings.queue = queue_started.elapsed();
         let open_started = Instant::now();
-        let collection = match open_collection(&self.root) {
+        let collection = match self.current_collection() {
             Ok(collection) => collection,
             Err(error) => {
                 timings.open = open_started.elapsed();
@@ -144,7 +170,7 @@ impl FilesystemProvider {
                 ));
             }
         };
-        let result = engine.load(&collection, implicit_sources, options);
+        let result = engine.load(collection.as_ref(), implicit_sources, options);
         timings.execute = execute_started.elapsed();
         self.observe_performance(
             "runtime_contracts.load",
@@ -182,7 +208,7 @@ impl FilesystemProvider {
         let started = Instant::now();
         let mut timings = OperationTimings::default();
         let queue_started = Instant::now();
-        let _guard = match self.lock() {
+        let _guard = match self.lock_for(request.operation) {
             Ok(guard) => guard,
             Err(error) => {
                 timings.queue = queue_started.elapsed();
@@ -197,7 +223,7 @@ impl FilesystemProvider {
         };
         timings.queue = queue_started.elapsed();
         let open_started = Instant::now();
-        let collection = match open_collection(&self.root) {
+        let collection = match self.current_collection() {
             Ok(collection) => collection,
             Err(error) => {
                 timings.open = open_started.elapsed();
@@ -212,7 +238,7 @@ impl FilesystemProvider {
         };
         timings.open = open_started.elapsed();
         let execute_started = Instant::now();
-        let result = match execute_collection(&collection, request) {
+        let result = match execute_collection(collection.as_ref(), request) {
             Ok(result) => result,
             Err(error) => {
                 timings.execute = execute_started.elapsed();
@@ -264,10 +290,64 @@ impl FilesystemProvider {
         Ok(result)
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, ()>, ProviderError> {
+    fn read_lock(&self) -> Result<RwLockReadGuard<'_, ()>, ProviderError> {
         self.operation_gate
-            .lock()
+            .read()
             .map_err(|_| ProviderError::LockPoisoned)
+    }
+
+    fn write_lock(&self) -> Result<RwLockWriteGuard<'_, ()>, ProviderError> {
+        self.operation_gate
+            .write()
+            .map_err(|_| ProviderError::LockPoisoned)
+    }
+
+    fn lock_for(&self, operation: OperationKind) -> Result<OperationGuard<'_>, ProviderError> {
+        if operation.is_mutation() {
+            self.write_lock().map(OperationGuard::Write)
+        } else {
+            self.read_lock().map(OperationGuard::Read)
+        }
+    }
+
+    fn current_collection(&self) -> Result<Arc<Collection>, ProviderError> {
+        {
+            let cached = self
+                .collection_cache
+                .read()
+                .map_err(|_| ProviderError::LockPoisoned)?;
+            let current =
+                CollectionStamp::load(&self.root, &cached.collection.settings.types_folder);
+            if current == cached.stamp {
+                return Ok(cached.collection.clone());
+            }
+        }
+
+        let mut cached = self
+            .collection_cache
+            .write()
+            .map_err(|_| ProviderError::LockPoisoned)?;
+        let current = CollectionStamp::load(&self.root, &cached.collection.settings.types_folder);
+        if current == cached.stamp {
+            return Ok(cached.collection.clone());
+        }
+        let collection = open_collection(&self.root)?;
+        let stamp = CollectionStamp::load(&self.root, &collection.settings.types_folder);
+        cached.collection = Arc::new(collection);
+        cached.stamp = stamp;
+        Ok(cached.collection.clone())
+    }
+
+    fn reload_collection(&self) -> Result<(), ProviderError> {
+        let collection = open_collection(&self.root)?;
+        let stamp = CollectionStamp::load(&self.root, &collection.settings.types_folder);
+        let mut cached = self
+            .collection_cache
+            .write()
+            .map_err(|_| ProviderError::LockPoisoned)?;
+        cached.collection = Arc::new(collection);
+        cached.stamp = stamp;
+        Ok(())
     }
 
     fn report_error(&self, operation: &str, stage: &str, error: &ProviderError) {
@@ -351,8 +431,60 @@ impl CollectionProvider for FilesystemProvider {
     }
 
     fn refresh(&self) -> Result<(), ProviderError> {
-        let _guard = self.lock()?;
-        open_collection(&self.root).map(|_| ())
+        let _guard = self.write_lock()?;
+        self.reload_collection()
+    }
+}
+
+enum OperationGuard<'a> {
+    Read(#[allow(dead_code)] RwLockReadGuard<'a, ()>),
+    Write(#[allow(dead_code)] RwLockWriteGuard<'a, ()>),
+}
+
+struct CachedCollection {
+    collection: Arc<Collection>,
+    stamp: CollectionStamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CollectionStamp {
+    config_revision: Option<String>,
+    types_metadata: u64,
+}
+
+impl CollectionStamp {
+    fn load(root: &Path, types_folder: &str) -> Self {
+        let config_revision = std::fs::read(root.join("mdbase.yaml"))
+            .ok()
+            .map(|bytes| crate::v03::revision(&bytes));
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let types_root = root.join(types_folder);
+        for entry in WalkDir::new(&types_root)
+            .sort_by_file_name()
+            .follow_links(false)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.file_type().is_file())
+        {
+            entry
+                .path()
+                .strip_prefix(root)
+                .unwrap_or(entry.path())
+                .hash(&mut hasher);
+            if let Ok(metadata) = entry.metadata() {
+                metadata.len().hash(&mut hasher);
+                metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .hash(&mut hasher);
+            }
+        }
+        Self {
+            config_revision,
+            types_metadata: hasher.finish(),
+        }
     }
 }
 

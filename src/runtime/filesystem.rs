@@ -49,7 +49,7 @@ impl FilesystemRuntime {
             if request.operation.is_mutation() && result.valid {
                 // Hold the provider gate until the watcher compares the
                 // post-write snapshot, preserving operation/event order.
-                self.watcher.rescan()?;
+                self.watcher.rescan_paths(request.affected_paths(result))?;
             }
             Ok(())
         })
@@ -57,5 +57,11 @@ impl FilesystemRuntime {
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<WatchEvent>, ProviderError> {
         self.watcher.recv_timeout(timeout).map_err(Into::into)
+    }
+
+    /// Complete a full watcher comparison before accepting benchmark or host
+    /// traffic. Normal mutations use the incremental synchronization path.
+    pub fn synchronize(&self) -> Result<(), ProviderError> {
+        self.watcher.rescan().map_err(Into::into)
     }
 }

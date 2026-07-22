@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
+use super::context::complete_file_value;
 use super::diagnostics;
 use super::model::{Candidate, Direction, FrontmatterMode, OrderBy, Query};
 use super::preflight::{self, CompiledQuery};
@@ -91,9 +92,11 @@ pub(super) fn build_groups(
 }
 
 pub(super) fn serialize_candidate(candidate: &Candidate, query: &Query) -> Value {
+    let mut file = candidate.file.clone();
+    complete_file_value(&mut file, &candidate.effective, &candidate.body);
     let mut result = Map::from_iter([
         ("path".to_string(), Value::String(candidate.path.clone())),
-        ("file".to_string(), candidate.file.clone()),
+        ("file".to_string(), file),
         (
             "types".to_string(),
             Value::Array(candidate.types.iter().cloned().map(Value::String).collect()),
@@ -142,7 +145,7 @@ fn candidate_value(candidate: &Candidate, field: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn compare_values(left: &Value, right: &Value, direction: Direction) -> Ordering {
+pub(super) fn compare_values(left: &Value, right: &Value, direction: Direction) -> Ordering {
     let ascending = match (left.is_null(), right.is_null()) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater,
