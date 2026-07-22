@@ -658,6 +658,7 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
             property_types: Arc::new(BTreeMap::new()),
             link_resolutions: link_resolutions.clone(),
             now: Some(clock.clone()),
+            timezone: collection.settings.timezone.clone(),
         };
         match combined_filter_matches(document.filters.as_ref(), view.filters.as_ref(), &context) {
             Ok(true) => {}
