@@ -564,14 +564,11 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
             return OperationResult {
                 valid: false,
                 result: json!({}),
-                diagnostics: vec![diagnostic],
+                diagnostics: vec![*diagnostic],
             }
         }
     };
-    if !obsidian_source_paths(collection)
-        .iter()
-        .any(|path| *path == relative)
-    {
+    if !obsidian_source_paths(collection).contains(&relative) {
         return failed(
             "view_not_found",
             "The requested Obsidian Base is not enabled by collection configuration.",
@@ -790,7 +787,7 @@ fn sort_rows(rows: &mut [BaseRow<'_>], view: &ObsidianBaseView) {
                 .computed_values
                 .get(&sort.property)
                 .unwrap_or(&Value::Null);
-            let comparison = compare_json(&left_value, &right_value);
+            let comparison = compare_json(left_value, right_value);
             if !comparison.is_eq() {
                 return if sort.direction.eq_ignore_ascii_case("DESC") {
                     comparison.reverse()
@@ -1103,13 +1100,13 @@ fn glob_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
     regex::Regex::new(&output)
 }
 
-fn safe_view_path(collection: &Collection, path: &str) -> Result<PathBuf, Diagnostic> {
+fn safe_view_path(collection: &Collection, path: &str) -> Result<PathBuf, Box<Diagnostic>> {
     crate::operations::ensure_safe_relative_path(path, collection.spec_profile).map_err(|_| {
-        Diagnostic::error(
+        Box::new(Diagnostic::error(
             "invalid_path",
             "View source path must remain inside the collection.",
             Some(path.to_string()),
-        )
+        ))
     })?;
     crate::operations::ensure_no_symlink_components(
         &collection.root,
@@ -1117,11 +1114,11 @@ fn safe_view_path(collection: &Collection, path: &str) -> Result<PathBuf, Diagno
         collection.spec_profile,
     )
     .map_err(|_| {
-        Diagnostic::error(
+        Box::new(Diagnostic::error(
             "path_traversal",
             "View source path traverses a symbolic link.",
             Some(path.to_string()),
-        )
+        ))
     })?;
     Ok(collection.root.join(path))
 }

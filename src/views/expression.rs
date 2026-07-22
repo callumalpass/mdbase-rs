@@ -301,10 +301,7 @@ impl Parser {
     fn expression(&mut self, minimum: u8) -> Result<Expr, String> {
         let mut left = self.prefix()?;
         left = self.postfix(left)?;
-        loop {
-            let TokenKind::Operator(operator) = &self.current().kind else {
-                break;
-            };
+        while let TokenKind::Operator(operator) = &self.current().kind {
             let precedence = match operator.as_str() {
                 "||" => 1,
                 "&&" => 2,
@@ -462,7 +459,7 @@ enum RuntimeValue {
     Duration(DurationValue),
     List(Vec<RuntimeValue>),
     Object(BTreeMap<String, RuntimeValue>),
-    File(BasesFile),
+    File(Box<BasesFile>),
     Link(BasesLink),
     Regex(String, String),
     Html(String),
@@ -546,12 +543,7 @@ impl<'a> Evaluator<'a> {
     fn new(context: &'a BasesEvaluationContext) -> Self {
         Self {
             context,
-            now: parse_date(
-                context
-                    .now
-                    .as_deref()
-                    .unwrap_or_else(|| "1970-01-01T00:00:00Z"),
-            ),
+            now: parse_date(context.now.as_deref().unwrap_or("1970-01-01T00:00:00Z")),
             formula_cache: HashMap::new(),
             formula_stack: HashSet::new(),
         }
@@ -601,15 +593,15 @@ impl<'a> Evaluator<'a> {
                     .map(|(key, value)| (key.clone(), self.note_property(key, value)))
                     .collect(),
             ),
-            "file" => RuntimeValue::File(self.context.file.clone()),
+            "file" => RuntimeValue::File(Box::new(self.context.file.clone())),
             "this" => RuntimeValue::Object(BTreeMap::from([(
                 "file".to_string(),
-                RuntimeValue::File(
+                RuntimeValue::File(Box::new(
                     self.context
                         .this_file
                         .clone()
                         .unwrap_or_else(|| self.context.file.clone()),
-                ),
+                )),
             )])),
             "formula" => RuntimeValue::Object(BTreeMap::new()),
             "values" => self
@@ -1122,7 +1114,7 @@ impl<'a> Evaluator<'a> {
             }
             "sort" => {
                 let mut output = values.to_vec();
-                output.sort_by(|left, right| compare_sort_keys(left, right));
+                output.sort_by(compare_sort_keys);
                 RuntimeValue::List(output)
             }
             "unique" => {
@@ -1402,8 +1394,8 @@ impl<'a> Evaluator<'a> {
                 .iter()
                 .find(|file| file.path == path)
                 .cloned()
-                .map(RuntimeValue::File)
-                .unwrap_or_else(|| RuntimeValue::File(file_defaults(&path))),
+                .map(|file| RuntimeValue::File(Box::new(file)))
+                .unwrap_or_else(|| RuntimeValue::File(Box::new(file_defaults(&path)))),
         }
     }
 
@@ -1421,8 +1413,8 @@ impl<'a> Evaluator<'a> {
                 .iter()
                 .find(|file| file.path == path)
                 .cloned()
-                .map(RuntimeValue::File)
-                .unwrap_or_else(|| RuntimeValue::File(file_defaults(&path))),
+                .map(|file| RuntimeValue::File(Box::new(file)))
+                .unwrap_or_else(|| RuntimeValue::File(Box::new(file_defaults(&path)))),
         }
     }
 
@@ -2043,7 +2035,7 @@ fn file_property(file: &BasesFile, property: &str) -> RuntimeValue {
         "mtime" => RuntimeValue::Date(parse_date(
             file.mtime.as_deref().unwrap_or("1970-01-01T00:00:00Z"),
         )),
-        "file" => RuntimeValue::File(file.clone()),
+        "file" => RuntimeValue::File(Box::new(file.clone())),
         _ => member_not_found("File", property),
     }
 }
@@ -2390,16 +2382,18 @@ mod tests {
 
     #[test]
     fn evaluates_formula_dependencies_and_file_predicates() {
-        let mut context = BasesEvaluationContext::default();
-        context.note = Map::from_iter([
-            ("price".to_string(), Value::from(12.5)),
-            ("quantity".to_string(), Value::from(4)),
-        ]);
-        context.file = BasesFile {
-            path: "TaskNotes/task.md".to_string(),
-            folder: "TaskNotes".to_string(),
-            tags: vec!["task".to_string(), "project/a".to_string()],
-            ..file_defaults("TaskNotes/task.md")
+        let mut context = BasesEvaluationContext {
+            note: Map::from_iter([
+                ("price".to_string(), Value::from(12.5)),
+                ("quantity".to_string(), Value::from(4)),
+            ]),
+            file: BasesFile {
+                path: "TaskNotes/task.md".to_string(),
+                folder: "TaskNotes".to_string(),
+                tags: vec!["task".to_string(), "project/a".to_string()],
+                ..file_defaults("TaskNotes/task.md")
+            },
+            ..Default::default()
         };
         Arc::make_mut(&mut context.formulas)
             .insert("total".to_string(), "price * quantity".to_string());
@@ -2416,8 +2410,10 @@ mod tests {
 
     #[test]
     fn evaluates_tasknotes_date_formulas() {
-        let mut context = BasesEvaluationContext::default();
-        context.now = Some("2026-07-22T10:00:00Z".to_string());
+        let mut context = BasesEvaluationContext {
+            now: Some("2026-07-22T10:00:00Z".to_string()),
+            ..Default::default()
+        };
         context
             .note
             .insert("due".to_string(), Value::String("2026-07-24".to_string()));
