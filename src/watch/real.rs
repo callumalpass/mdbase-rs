@@ -754,11 +754,11 @@ fn load_record(collection: &Collection, path: &str) -> Result<Option<RecordState
         Err(error) => return Err(WatchError::Collection(error.to_string())),
     }
     let read = collection.read(&json!({"path": path}));
-    let revision = read
-        .get("revision")
-        .and_then(Value::as_str)
-        .ok_or_else(|| WatchError::Collection(collection_error(&read)))?
-        .to_string();
+    let revision = match read.get("revision").and_then(Value::as_str) {
+        Some(revision) => revision.to_string(),
+        None if is_invalid_yaml_frontmatter(&read) => return Ok(None),
+        None => return Err(WatchError::Collection(collection_error(&read))),
+    };
     let raw_frontmatter = read
         .get("raw_frontmatter")
         .and_then(Value::as_object)
@@ -775,6 +775,12 @@ fn load_record(collection: &Collection, path: &str) -> Result<Option<RecordState
         effective_frontmatter,
         types,
     }))
+}
+
+fn is_invalid_yaml_frontmatter(read: &Value) -> bool {
+    read.pointer("/error/code").and_then(Value::as_str) == Some(crate::errors::INVALID_FRONTMATTER)
+        && read.pointer("/error/message").and_then(Value::as_str)
+            == Some("Failed to parse YAML frontmatter")
 }
 
 fn load_runtime_state(
@@ -939,5 +945,70 @@ mod tests {
             .expect("rescan must queue the record event before returning");
         assert_eq!(event.event_type, "mdbase.record.created");
         assert_eq!(event.payload["path"], "note.md");
+    }
+
+    #[test]
+    fn watcher_skips_invalid_yaml_during_open_and_recovers_after_fix() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("broken.md"),
+            "---\ntitle: One\ntitle: Two\n---\n",
+        )
+        .unwrap();
+
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(60))
+            .expect("invalid record frontmatter must not prevent watcher startup");
+
+        fs::write(
+            directory.path().join("broken.md"),
+            "---\ntitle: Fixed\n---\n",
+        )
+        .unwrap();
+        watcher.rescan_paths(["broken.md"]).unwrap();
+
+        let event = watcher
+            .recv_timeout(Duration::ZERO)
+            .unwrap()
+            .expect("fixed record should enter the snapshot");
+        assert_eq!(event.event_type, "mdbase.record.created");
+        assert_eq!(event.payload["path"], "broken.md");
+        assert_eq!(event.payload["after"]["title"], "Fixed");
+    }
+
+    #[test]
+    fn watcher_skips_new_invalid_yaml_without_stopping() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(60)).unwrap();
+
+        fs::write(
+            directory.path().join("broken.md"),
+            "---\ntitle: One\ntitle: Two\n---\n",
+        )
+        .unwrap();
+        watcher.rescan_paths(["broken.md"]).unwrap();
+        assert!(watcher.recv_timeout(Duration::ZERO).unwrap().is_none());
+
+        fs::write(
+            directory.path().join("valid.md"),
+            "---\ntitle: Valid\n---\n",
+        )
+        .unwrap();
+        watcher.rescan_paths(["valid.md"]).unwrap();
+        let event = watcher
+            .recv_timeout(Duration::ZERO)
+            .unwrap()
+            .expect("watcher should continue after skipping invalid YAML");
+        assert_eq!(event.event_type, "mdbase.record.created");
+        assert_eq!(event.payload["path"], "valid.md");
     }
 }
