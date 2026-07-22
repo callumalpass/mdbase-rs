@@ -71,6 +71,44 @@ fn rename_rejects_absolute_target() {
 }
 
 #[test]
+fn rename_dry_run_reports_reference_impact_without_touching_files() {
+    let tmp = TempDir::new().expect("tempdir");
+    setup_minimal(tmp.path());
+    write_file(&tmp.path().join("target.md"), "---\ntitle: Target\n---\n");
+    write_file(
+        &tmp.path().join("ref.md"),
+        "---\ntitle: Referrer\n---\nLinks to [[target]].\n",
+    );
+    let before = fs::read_to_string(tmp.path().join("ref.md")).expect("read ref");
+    let collection = open_collection(tmp.path());
+
+    let preview = collection.rename(&serde_json::json!({
+        "from": "target.md",
+        "to": "Archive/renamed.md",
+        "update_refs": true,
+        "dry_run": true
+    }));
+
+    assert_eq!(preview.get("dry_run").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        preview.get("would_rename").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        preview
+            .pointer("/references_affected/0/path")
+            .and_then(|v| v.as_str()),
+        Some("ref.md")
+    );
+    assert!(tmp.path().join("target.md").exists());
+    assert!(!tmp.path().join("Archive").exists());
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("ref.md")).expect("read ref"),
+        before
+    );
+}
+
+#[test]
 fn formula_literal_string_does_not_create_dependency() {
     let tmp = TempDir::new().expect("tempdir");
     setup_minimal(tmp.path());
@@ -306,6 +344,35 @@ fn delete_with_backlink_check_reports_referrers() {
         .pointer("/broken_links/0/path")
         .and_then(|v| v.as_str());
     assert_eq!(broken, Some("b.md"));
+}
+
+#[test]
+fn delete_dry_run_reports_backlinks_without_removing_the_file() {
+    let tmp = TempDir::new().expect("tempdir");
+    setup_minimal(tmp.path());
+    write_file(&tmp.path().join("a.md"), "---\nid: a\n---\n");
+    write_file(&tmp.path().join("b.md"), "---\nref: \"[[a]]\"\n---\n");
+
+    let collection = open_collection(tmp.path());
+    let result = collection.delete(&serde_json::json!({
+        "path": "a.md",
+        "check_backlinks": true,
+        "dry_run": true
+    }));
+
+    assert_eq!(result.get("deleted").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(result.get("dry_run").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        result.get("would_delete").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        result
+            .pointer("/broken_links/0/path")
+            .and_then(|v| v.as_str()),
+        Some("b.md")
+    );
+    assert!(tmp.path().join("a.md").exists());
 }
 
 #[test]
