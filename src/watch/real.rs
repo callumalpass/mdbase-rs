@@ -914,7 +914,10 @@ mod tests {
         fs::write(directory.path().join("note.md"), "---\ntitle: Two\n---\n").unwrap();
 
         let event = watcher
-            .recv_timeout(Duration::from_secs(5))
+            // FSEvents delivery can lag behind an otherwise idle shared macOS
+            // runner, so keep the assertion bounded without treating normal
+            // platform latency as a watcher failure.
+            .recv_timeout(Duration::from_secs(15))
             .unwrap()
             .expect("record event");
         assert_eq!(event.event_type, "mdbase.record.created");
