@@ -130,8 +130,22 @@ pub struct ViewDocumentDescriptor {
 pub struct NamedViewDescriptor {
     pub id: String,
     pub name: String,
+    pub properties: Vec<ViewPropertyDescriptor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation: Option<ViewPresentation>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ViewPropertyDescriptor {
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]

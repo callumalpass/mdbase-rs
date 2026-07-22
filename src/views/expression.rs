@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use chrono::{
-    DateTime, Datelike, Duration as ChronoDuration, Local, Months, NaiveDate, NaiveDateTime,
-    TimeZone, Timelike, Utc,
+    DateTime, Datelike, FixedOffset, Local, Months, NaiveDate, NaiveDateTime, TimeZone, Timelike,
+    Utc,
 };
+use chrono_tz::Tz;
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value};
 
@@ -301,10 +302,7 @@ impl Parser {
     fn expression(&mut self, minimum: u8) -> Result<Expr, String> {
         let mut left = self.prefix()?;
         left = self.postfix(left)?;
-        loop {
-            let TokenKind::Operator(operator) = &self.current().kind else {
-                break;
-            };
+        while let TokenKind::Operator(operator) = &self.current().kind {
             let precedence = match operator.as_str() {
                 "||" => 1,
                 "&&" => 2,
@@ -407,6 +405,7 @@ pub(crate) struct BasesEvaluationContext {
     pub property_types: Arc<BTreeMap<String, String>>,
     pub link_resolutions: Arc<BTreeMap<String, Option<String>>>,
     pub now: Option<String>,
+    pub timezone: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -438,6 +437,64 @@ pub(crate) struct BasesLink {
 struct DateValue {
     millis: i64,
     date_only: bool,
+    timezone: BasesTimezone,
+}
+
+#[derive(Clone, Debug)]
+enum BasesTimezone {
+    Local,
+    Fixed(FixedOffset),
+    Named(Tz),
+}
+
+impl BasesTimezone {
+    fn from_setting(value: Option<&str>) -> Self {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Self::Local;
+        };
+        match value {
+            "local" => Self::Local,
+            "UTC" | "utc" | "Z" => Self::Fixed(FixedOffset::east_opt(0).expect("UTC offset")),
+            value if value.starts_with('+') || value.starts_with('-') => {
+                parse_timezone_offset(value)
+                    .map(Self::Fixed)
+                    .unwrap_or(Self::Local)
+            }
+            value => value.parse::<Tz>().map(Self::Named).unwrap_or(Self::Local),
+        }
+    }
+
+    fn local_datetime(&self, millis: i64) -> NaiveDateTime {
+        let utc = Utc
+            .timestamp_millis_opt(millis)
+            .single()
+            .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+        match self {
+            Self::Local => utc.with_timezone(&Local).naive_local(),
+            Self::Fixed(offset) => utc.with_timezone(offset).naive_local(),
+            Self::Named(timezone) => utc.with_timezone(timezone).naive_local(),
+        }
+    }
+
+    fn millis_from_local(&self, value: NaiveDateTime) -> i64 {
+        match self {
+            Self::Local => Local
+                .from_local_datetime(&value)
+                .earliest()
+                .unwrap_or_else(|| Local.from_utc_datetime(&value))
+                .timestamp_millis(),
+            Self::Fixed(offset) => offset
+                .from_local_datetime(&value)
+                .single()
+                .expect("fixed offsets are unambiguous")
+                .timestamp_millis(),
+            Self::Named(timezone) => timezone
+                .from_local_datetime(&value)
+                .earliest()
+                .unwrap_or_else(|| timezone.from_utc_datetime(&value))
+                .timestamp_millis(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -462,7 +519,7 @@ enum RuntimeValue {
     Duration(DurationValue),
     List(Vec<RuntimeValue>),
     Object(BTreeMap<String, RuntimeValue>),
-    File(BasesFile),
+    File(Box<BasesFile>),
     Link(BasesLink),
     Regex(String, String),
     Html(String),
@@ -536,6 +593,7 @@ fn parse_cached(expression: &str) -> Result<Arc<Expr>, String> {
 struct Evaluator<'a> {
     context: &'a BasesEvaluationContext,
     now: DateValue,
+    timezone: BasesTimezone,
     formula_cache: HashMap<String, RuntimeValue>,
     formula_stack: HashSet<String>,
 }
@@ -544,14 +602,14 @@ type Scope = BTreeMap<String, RuntimeValue>;
 
 impl<'a> Evaluator<'a> {
     fn new(context: &'a BasesEvaluationContext) -> Self {
+        let timezone = BasesTimezone::from_setting(context.timezone.as_deref());
         Self {
             context,
             now: parse_date(
-                context
-                    .now
-                    .as_deref()
-                    .unwrap_or_else(|| "1970-01-01T00:00:00Z"),
+                context.now.as_deref().unwrap_or("1970-01-01T00:00:00Z"),
+                &timezone,
             ),
+            timezone,
             formula_cache: HashMap::new(),
             formula_stack: HashSet::new(),
         }
@@ -601,15 +659,15 @@ impl<'a> Evaluator<'a> {
                     .map(|(key, value)| (key.clone(), self.note_property(key, value)))
                     .collect(),
             ),
-            "file" => RuntimeValue::File(self.context.file.clone()),
+            "file" => RuntimeValue::File(Box::new(self.context.file.clone())),
             "this" => RuntimeValue::Object(BTreeMap::from([(
                 "file".to_string(),
-                RuntimeValue::File(
+                RuntimeValue::File(Box::new(
                     self.context
                         .this_file
                         .clone()
                         .unwrap_or_else(|| self.context.file.clone()),
-                ),
+                )),
             )])),
             "formula" => RuntimeValue::Object(BTreeMap::new()),
             "values" => self
@@ -629,6 +687,12 @@ impl<'a> Evaluator<'a> {
 
     fn note_property(&self, name: &str, value: &Value) -> RuntimeValue {
         let hint = self.context.property_types.get(name).map(String::as_str);
+        if hint == Some("date") {
+            return RuntimeValue::Date(parse_date(
+                value.as_str().unwrap_or_default(),
+                &self.timezone,
+            ));
+        }
         if hint == Some("link") {
             if let Some(link) = runtime_link_from_json(value) {
                 return RuntimeValue::Link(link);
@@ -775,7 +839,7 @@ impl<'a> Evaluator<'a> {
         let first = arguments.first().cloned().unwrap_or(RuntimeValue::Null);
         match name {
             "escapeHTML" => RuntimeValue::String(escape_html(&plain_string(&first))),
-            "date" => RuntimeValue::Date(parse_date(&plain_string(&first))),
+            "date" => RuntimeValue::Date(parse_date(&plain_string(&first), &self.timezone)),
             "duration" => parse_duration(&plain_string(&first))
                 .map(RuntimeValue::Duration)
                 .unwrap_or_else(|| RuntimeValue::Error("Invalid duration".to_string())),
@@ -1122,7 +1186,7 @@ impl<'a> Evaluator<'a> {
             }
             "sort" => {
                 let mut output = values.to_vec();
-                output.sort_by(|left, right| compare_sort_keys(left, right));
+                output.sort_by(compare_sort_keys);
                 RuntimeValue::List(output)
             }
             "unique" => {
@@ -1241,7 +1305,7 @@ impl<'a> Evaluator<'a> {
                 values.get(property).cloned().unwrap_or(RuntimeValue::Null)
             }
             RuntimeValue::Date(value) => date_property(&value, property),
-            RuntimeValue::File(value) => file_property(&value, property),
+            RuntimeValue::File(value) => file_property(&value, property, &self.timezone),
             RuntimeValue::Error(message) => RuntimeValue::Error(message),
             value => member_not_found(value_type(&value), property),
         }
@@ -1402,8 +1466,8 @@ impl<'a> Evaluator<'a> {
                 .iter()
                 .find(|file| file.path == path)
                 .cloned()
-                .map(RuntimeValue::File)
-                .unwrap_or_else(|| RuntimeValue::File(file_defaults(&path))),
+                .map(|file| RuntimeValue::File(Box::new(file)))
+                .unwrap_or_else(|| RuntimeValue::File(Box::new(file_defaults(&path)))),
         }
     }
 
@@ -1421,8 +1485,8 @@ impl<'a> Evaluator<'a> {
                 .iter()
                 .find(|file| file.path == path)
                 .cloned()
-                .map(RuntimeValue::File)
-                .unwrap_or_else(|| RuntimeValue::File(file_defaults(&path))),
+                .map(|file| RuntimeValue::File(Box::new(file)))
+                .unwrap_or_else(|| RuntimeValue::File(Box::new(file_defaults(&path)))),
         }
     }
 
@@ -1503,12 +1567,9 @@ fn numeric_pair(
     }
 }
 
-fn from_json(value: &Value, hint: Option<&str>) -> RuntimeValue {
+fn from_json(value: &Value, _hint: Option<&str>) -> RuntimeValue {
     if let Some(link) = runtime_link_from_json(value) {
         return RuntimeValue::Link(link);
-    }
-    if hint == Some("date") {
-        return RuntimeValue::Date(parse_date(value.as_str().unwrap_or_default()));
     }
     match value {
         Value::Null => RuntimeValue::Null,
@@ -1700,66 +1761,61 @@ fn format_number(value: f64) -> String {
     }
 }
 
-fn parse_date(value: &str) -> DateValue {
+fn parse_timezone_offset(value: &str) -> Option<FixedOffset> {
+    let sign = match value.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let (hours, minutes) = value.get(1..)?.split_once(':')?;
+    let seconds = sign * (hours.parse::<i32>().ok()? * 3_600 + minutes.parse::<i32>().ok()? * 60);
+    FixedOffset::east_opt(seconds)
+}
+
+fn parse_date(value: &str, timezone: &BasesTimezone) -> DateValue {
     if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        let local = Local
-            .from_local_datetime(&date.and_hms_opt(0, 0, 0).expect("valid midnight"))
-            .earliest()
-            .unwrap_or_else(|| {
-                Local.from_utc_datetime(&date.and_hms_opt(0, 0, 0).expect("valid midnight"))
-            });
+        let local = date.and_hms_opt(0, 0, 0).expect("valid midnight");
         return DateValue {
-            millis: local.timestamp_millis(),
+            millis: timezone.millis_from_local(local),
             date_only: true,
+            timezone: timezone.clone(),
         };
     }
     if let Ok(value) = DateTime::parse_from_rfc3339(value) {
         return DateValue {
             millis: value.timestamp_millis(),
             date_only: false,
+            timezone: timezone.clone(),
         };
     }
     for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
         if let Ok(value) = NaiveDateTime::parse_from_str(value, format) {
-            let local = Local
-                .from_local_datetime(&value)
-                .earliest()
-                .unwrap_or_else(|| Local.from_utc_datetime(&value));
             return DateValue {
-                millis: local.timestamp_millis(),
+                millis: timezone.millis_from_local(value),
                 date_only: false,
+                timezone: timezone.clone(),
             };
         }
     }
     DateValue {
         millis: 0,
         date_only: false,
+        timezone: timezone.clone(),
     }
 }
 
 fn start_of_day(value: &DateValue) -> DateValue {
-    let date = Local
-        .timestamp_millis_opt(value.millis)
-        .single()
-        .unwrap_or_else(local_epoch)
-        .date_naive();
-    let local = Local
-        .from_local_datetime(&date.and_hms_opt(0, 0, 0).expect("valid midnight"))
-        .earliest()
-        .unwrap_or_else(|| {
-            Local.from_utc_datetime(&date.and_hms_opt(0, 0, 0).expect("valid midnight"))
-        });
+    let date = value.timezone.local_datetime(value.millis).date();
+    let local = date.and_hms_opt(0, 0, 0).expect("valid midnight");
     DateValue {
-        millis: local.timestamp_millis(),
+        millis: value.timezone.millis_from_local(local),
         date_only: true,
+        timezone: value.timezone.clone(),
     }
 }
 
 fn format_date(value: &DateValue, pattern: &str) -> String {
-    let date = Local
-        .timestamp_millis_opt(value.millis)
-        .single()
-        .unwrap_or_else(local_epoch);
+    let date = value.timezone.local_datetime(value.millis);
     let mut format = pattern.to_string();
     let literals = Regex::new(r"\[([^]]*)\]").expect("literal expression");
     let mut stored = Vec::new();
@@ -1790,10 +1846,7 @@ fn format_date(value: &DateValue, pattern: &str) -> String {
 }
 
 fn date_property(value: &DateValue, property: &str) -> RuntimeValue {
-    let date = Local
-        .timestamp_millis_opt(value.millis)
-        .single()
-        .unwrap_or_else(local_epoch);
+    let date = value.timezone.local_datetime(value.millis);
     let number = match property {
         "year" => date.year() as f64,
         "month" => date.month() as f64,
@@ -1801,7 +1854,7 @@ fn date_property(value: &DateValue, property: &str) -> RuntimeValue {
         "hour" => date.hour() as f64,
         "minute" => date.minute() as f64,
         "second" => date.second() as f64,
-        "millisecond" => date.timestamp_subsec_millis() as f64,
+        "millisecond" => date.and_utc().timestamp_subsec_millis() as f64,
         _ => return member_not_found("Date", property),
     };
     RuntimeValue::Number(number)
@@ -1846,10 +1899,7 @@ fn duration_millis(value: &DurationValue) -> f64 {
 }
 
 fn add_duration(value: &DateValue, duration: &DurationValue, direction: f64) -> DateValue {
-    let mut date = Local
-        .timestamp_millis_opt(value.millis)
-        .single()
-        .unwrap_or_else(local_epoch);
+    let mut date = value.timezone.local_datetime(value.millis);
     let months = ((duration.years * 12.0 + duration.months) * direction).round() as i32;
     if months > 0 {
         date = date
@@ -1869,8 +1919,9 @@ fn add_duration(value: &DateValue, duration: &DurationValue, direction: f64) -> 
         * direction)
         .round() as i64;
     DateValue {
-        millis: (date + ChronoDuration::milliseconds(millis)).timestamp_millis(),
+        millis: value.timezone.millis_from_local(date) + millis,
         date_only: value.date_only,
+        timezone: value.timezone.clone(),
     }
 }
 
@@ -2007,7 +2058,7 @@ fn file_defaults(path: &str) -> BasesFile {
     }
 }
 
-fn file_property(file: &BasesFile, property: &str) -> RuntimeValue {
+fn file_property(file: &BasesFile, property: &str, timezone: &BasesTimezone) -> RuntimeValue {
     match property {
         "name" | "basename" => RuntimeValue::String(file.basename.clone()),
         "path" => RuntimeValue::String(file.path.clone()),
@@ -2039,11 +2090,13 @@ fn file_property(file: &BasesFile, property: &str) -> RuntimeValue {
         ),
         "ctime" => RuntimeValue::Date(parse_date(
             file.ctime.as_deref().unwrap_or("1970-01-01T00:00:00Z"),
+            timezone,
         )),
         "mtime" => RuntimeValue::Date(parse_date(
             file.mtime.as_deref().unwrap_or("1970-01-01T00:00:00Z"),
+            timezone,
         )),
-        "file" => RuntimeValue::File(file.clone()),
+        "file" => RuntimeValue::File(Box::new(file.clone())),
         _ => member_not_found("File", property),
     }
 }
@@ -2260,10 +2313,6 @@ fn escape_html(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
-fn local_epoch() -> DateTime<Local> {
-    DateTime::<Utc>::UNIX_EPOCH.with_timezone(&Local)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2316,6 +2365,10 @@ mod tests {
                     .collect(),
             ),
             now: object.get("now").and_then(Value::as_str).map(String::from),
+            timezone: object
+                .get("timezone")
+                .and_then(Value::as_str)
+                .map(String::from),
         }
     }
 
@@ -2390,16 +2443,18 @@ mod tests {
 
     #[test]
     fn evaluates_formula_dependencies_and_file_predicates() {
-        let mut context = BasesEvaluationContext::default();
-        context.note = Map::from_iter([
-            ("price".to_string(), Value::from(12.5)),
-            ("quantity".to_string(), Value::from(4)),
-        ]);
-        context.file = BasesFile {
-            path: "TaskNotes/task.md".to_string(),
-            folder: "TaskNotes".to_string(),
-            tags: vec!["task".to_string(), "project/a".to_string()],
-            ..file_defaults("TaskNotes/task.md")
+        let mut context = BasesEvaluationContext {
+            note: Map::from_iter([
+                ("price".to_string(), Value::from(12.5)),
+                ("quantity".to_string(), Value::from(4)),
+            ]),
+            file: BasesFile {
+                path: "TaskNotes/task.md".to_string(),
+                folder: "TaskNotes".to_string(),
+                tags: vec!["task".to_string(), "project/a".to_string()],
+                ..file_defaults("TaskNotes/task.md")
+            },
+            ..Default::default()
         };
         Arc::make_mut(&mut context.formulas)
             .insert("total".to_string(), "price * quantity".to_string());
@@ -2416,8 +2471,10 @@ mod tests {
 
     #[test]
     fn evaluates_tasknotes_date_formulas() {
-        let mut context = BasesEvaluationContext::default();
-        context.now = Some("2026-07-22T10:00:00Z".to_string());
+        let mut context = BasesEvaluationContext {
+            now: Some("2026-07-22T10:00:00Z".to_string()),
+            ..Default::default()
+        };
         context
             .note
             .insert("due".to_string(), Value::String("2026-07-24".to_string()));

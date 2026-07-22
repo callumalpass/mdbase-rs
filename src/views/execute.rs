@@ -12,7 +12,7 @@ use super::expression::{self, BasesEvaluationContext, BasesFile, BasesLink};
 use super::model::{
     identifier, presentation_for, stable_named_view_ids, BaseFilter, BaseGroupBy,
     NamedViewDescriptor, ObsidianBaseDocument, ObsidianBaseView, ViewDocumentDescriptor,
-    ViewPresentation, ViewReferenceInput, ViewSourceDescriptor,
+    ViewPresentation, ViewPropertyDescriptor, ViewReferenceInput, ViewSourceDescriptor,
 };
 use crate::expressions::evaluator::{
     extract_embeds_from_body, extract_links_from_body, extract_tags_from_body,
@@ -99,6 +99,7 @@ fn canonical_descriptor(
             Some(NamedViewDescriptor {
                 id: view.get("id")?.as_str()?.to_string(),
                 name: view.get("name")?.as_str()?.to_string(),
+                properties: canonical_properties(&record.raw_frontmatter, view),
                 presentation: canonical_presentation(view.get("presentation")),
             })
         })
@@ -177,6 +178,99 @@ fn canonical_presentation(value: Option<&Value>) -> Option<ViewPresentation> {
     })
 }
 
+fn canonical_properties(record: &Value, view: &Value) -> Vec<ViewPropertyDescriptor> {
+    let metadata = record.get("properties").and_then(Value::as_object);
+    view.get("select")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|selection| match selection {
+            Value::String(selector) => {
+                let key = selector.rsplit('.').next().unwrap_or(selector);
+                let property_metadata =
+                    metadata.and_then(|values| values.get(selector).or_else(|| values.get(key)));
+                Some(property_descriptor(key, property_metadata, None))
+            }
+            Value::Object(selection) => {
+                let key = selection.get("name")?.as_str()?;
+                let property_metadata = metadata.and_then(|values| values.get(key));
+                Some(property_descriptor(key, property_metadata, Some(selection)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn obsidian_properties(
+    document: &ObsidianBaseDocument,
+    view: &ObsidianBaseView,
+) -> Vec<ViewPropertyDescriptor> {
+    view.order
+        .iter()
+        .map(|key| {
+            let metadata = document
+                .properties
+                .get(key)
+                .or_else(|| document.properties.get(&format!("note.{key}")));
+            let object = metadata.and_then(Value::as_object);
+            ViewPropertyDescriptor {
+                key: key.clone(),
+                label: object
+                    .and_then(|value| value.get("displayName").or_else(|| value.get("label")))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                description: object
+                    .and_then(|value| value.get("description"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                format: object
+                    .and_then(|value| value.get("format"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                hidden: object
+                    .and_then(|value| value.get("hidden"))
+                    .and_then(Value::as_bool),
+            }
+        })
+        .collect()
+}
+
+fn property_descriptor(
+    key: &str,
+    metadata: Option<&Value>,
+    selection: Option<&Map<String, Value>>,
+) -> ViewPropertyDescriptor {
+    let metadata = metadata.and_then(Value::as_object);
+    ViewPropertyDescriptor {
+        key: key.to_string(),
+        label: selection
+            .and_then(|value| value.get("label"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                metadata
+                    .and_then(|value| value.get("label"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string),
+        description: selection
+            .and_then(|value| value.get("description"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                metadata
+                    .and_then(|value| value.get("description"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string),
+        format: metadata
+            .and_then(|value| value.get("format"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        hidden: metadata
+            .and_then(|value| value.get("hidden"))
+            .and_then(Value::as_bool),
+    }
+}
+
 fn obsidian_documents(
     collection: &Collection,
     diagnostics: &mut Vec<Diagnostic>,
@@ -219,6 +313,7 @@ fn obsidian_documents(
                 .map(|(view, id)| NamedViewDescriptor {
                     id,
                     name: view.name.clone(),
+                    properties: obsidian_properties(&document, view),
                     presentation: Some(presentation_for(view)),
                 })
                 .collect::<Vec<_>>();
@@ -469,14 +564,11 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
             return OperationResult {
                 valid: false,
                 result: json!({}),
-                diagnostics: vec![diagnostic],
+                diagnostics: vec![*diagnostic],
             }
         }
     };
-    if !obsidian_source_paths(collection)
-        .iter()
-        .any(|path| *path == relative)
-    {
+    if !obsidian_source_paths(collection).contains(&relative) {
         return failed(
             "view_not_found",
             "The requested Obsidian Base is not enabled by collection configuration.",
@@ -566,6 +658,7 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
             property_types: Arc::new(BTreeMap::new()),
             link_resolutions: link_resolutions.clone(),
             now: Some(clock.clone()),
+            timezone: collection.settings.timezone.clone(),
         };
         match combined_filter_matches(document.filters.as_ref(), view.filters.as_ref(), &context) {
             Ok(true) => {}
@@ -584,25 +677,48 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
                 continue;
             }
         }
-        let mut values = Map::new();
+        let mut computed_values = Map::new();
         for property in view
             .order
             .iter()
             .chain(view.sort.iter().map(|sort| &sort.property))
         {
             let value = evaluate_property(property, &context).unwrap_or(Value::Null);
-            values.insert(property.clone(), value);
+            computed_values.insert(property.clone(), value);
         }
         if let Some(group_by) = &view.group_by {
             let property = group_by.property();
-            values
+            computed_values
                 .entry(property.to_string())
                 .or_insert_with(|| evaluate_property(property, &context).unwrap_or(Value::Null));
+        }
+        let mut values: Map<String, Value> = view
+            .order
+            .iter()
+            .map(|property| {
+                (
+                    property.clone(),
+                    computed_values
+                        .get(property)
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                )
+            })
+            .collect();
+        if let Some(group_by) = &view.group_by {
+            let property = group_by.property();
+            values.entry(property.to_string()).or_insert_with(|| {
+                computed_values
+                    .get(property)
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            });
         }
         rows.push(BaseRow {
             record,
             file,
             values,
+            computed_values,
         });
     }
     sort_rows(&mut rows, view);
@@ -638,6 +754,7 @@ struct BaseRow<'a> {
     record: &'a FileRecord,
     file: BasesFile,
     values: Map<String, Value>,
+    computed_values: Map<String, Value>,
 }
 
 fn serialize_base_row(row: &BaseRow<'_>) -> Value {
@@ -663,9 +780,15 @@ fn serialize_base_row(row: &BaseRow<'_>) -> Value {
 fn sort_rows(rows: &mut [BaseRow<'_>], view: &ObsidianBaseView) {
     rows.sort_by(|left, right| {
         for sort in &view.sort {
-            let left_value = left.values.get(&sort.property).unwrap_or(&Value::Null);
-            let right_value = right.values.get(&sort.property).unwrap_or(&Value::Null);
-            let comparison = compare_json(&left_value, &right_value);
+            let left_value = left
+                .computed_values
+                .get(&sort.property)
+                .unwrap_or(&Value::Null);
+            let right_value = right
+                .computed_values
+                .get(&sort.property)
+                .unwrap_or(&Value::Null);
+            let comparison = compare_json(left_value, right_value);
             if !comparison.is_eq() {
                 return if sort.direction.eq_ignore_ascii_case("DESC") {
                     comparison.reverse()
@@ -682,7 +805,7 @@ fn base_groups(rows: &[BaseRow<'_>], group_by: &BaseGroupBy) -> Value {
     let mut groups = BTreeMap::<String, (Value, usize)>::new();
     for row in rows {
         let value = row
-            .values
+            .computed_values
             .get(group_by.property())
             .cloned()
             .unwrap_or(Value::Null);
@@ -978,13 +1101,13 @@ fn glob_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
     regex::Regex::new(&output)
 }
 
-fn safe_view_path(collection: &Collection, path: &str) -> Result<PathBuf, Diagnostic> {
+fn safe_view_path(collection: &Collection, path: &str) -> Result<PathBuf, Box<Diagnostic>> {
     crate::operations::ensure_safe_relative_path(path, collection.spec_profile).map_err(|_| {
-        Diagnostic::error(
+        Box::new(Diagnostic::error(
             "invalid_path",
             "View source path must remain inside the collection.",
             Some(path.to_string()),
-        )
+        ))
     })?;
     crate::operations::ensure_no_symlink_components(
         &collection.root,
@@ -992,11 +1115,11 @@ fn safe_view_path(collection: &Collection, path: &str) -> Result<PathBuf, Diagno
         collection.spec_profile,
     )
     .map_err(|_| {
-        Diagnostic::error(
+        Box::new(Diagnostic::error(
             "path_traversal",
             "View source path traverses a symbolic link.",
             Some(path.to_string()),
-        )
+        ))
     })?;
     Ok(collection.root.join(path))
 }
