@@ -8,3 +8,4 @@ loop.sh
 
 # Test artifacts
 .mdbase-test-*/
+/.ops/
