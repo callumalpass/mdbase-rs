@@ -5,7 +5,9 @@ mod expression;
 mod model;
 mod source;
 
-pub use model::{NamedViewDescriptor, ViewDocumentDescriptor, ViewPresentation};
+pub use model::{
+    NamedViewDescriptor, ViewDocumentDescriptor, ViewPresentation, ViewPropertyDescriptor,
+};
 
 use serde_json::Value;
 

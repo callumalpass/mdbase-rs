@@ -436,7 +436,14 @@ fn parse_settings(
 
     // timezone
     let timezone = match get_setting(settings_map, "timezone") {
-        Some(serde_yaml::Value::String(s)) => Some(s.clone()),
+        Some(serde_yaml::Value::String(s)) => {
+            if let Err(error) =
+                crate::expressions::evaluator::validate_timezone_setting(Some(s.as_str()))
+            {
+                return Err(error_json("invalid_config", &error));
+            }
+            Some(s.clone())
+        }
         Some(serde_yaml::Value::Null) | None => None,
         Some(_) => {
             return Err(error_json(
