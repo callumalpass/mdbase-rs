@@ -24,6 +24,7 @@ impl Collection {
             from,
             to,
             update_refs,
+            dry_run,
             last_known_mtime,
             if_revision,
             simulate_before_ref_update,
@@ -67,13 +68,15 @@ impl Collection {
             return error;
         }
 
-        // Create parent dirs
-        if let Some(parent) = to_path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                return op_error(
-                    "io_error",
-                    &format!("Failed to create target folder: {error}"),
-                );
+        // A dry run must not create the destination folder.
+        if !dry_run {
+            if let Some(parent) = to_path.parent() {
+                if let Err(error) = std::fs::create_dir_all(parent) {
+                    return op_error(
+                        "io_error",
+                        &format!("Failed to create target folder: {error}"),
+                    );
+                }
             }
         }
         if let Err(error) = ensure_no_symlink_components(&self.root, &to, self.spec_profile) {
@@ -113,6 +116,39 @@ impl Collection {
                 }
             });
 
+        let update_refs = update_refs.unwrap_or(self.settings.rename_update_refs);
+        if dry_run {
+            let mut references_affected: Vec<serde_json::Value> = Vec::new();
+            let mut warnings: Vec<serde_json::Value> = Vec::new();
+            let mut ignored_failures: Vec<serde_json::Value> = Vec::new();
+            if update_refs {
+                self.update_references_after_rename_with_mtime(
+                    &from,
+                    &to,
+                    &source_id,
+                    &mut references_affected,
+                    &mut warnings,
+                    &mut ignored_failures,
+                    &std::collections::HashMap::new(),
+                    &std::collections::HashMap::new(),
+                    true,
+                );
+            }
+            let mut result = serde_json::json!({
+                "from": from,
+                "to": to,
+                "dry_run": true,
+                "would_rename": true,
+            });
+            if !references_affected.is_empty() {
+                result["references_affected"] = serde_json::Value::Array(references_affected);
+            }
+            if !warnings.is_empty() {
+                result["warnings"] = serde_json::Value::Array(warnings);
+            }
+            return result;
+        }
+
         if let Err(error) = ensure_revision(&from_path, &from, if_revision.as_deref()) {
             return error;
         }
@@ -131,8 +167,6 @@ impl Collection {
         }
 
         // Determine if we should update references
-        let update_refs = update_refs.unwrap_or(self.settings.rename_update_refs);
-
         let mut references_updated: Vec<serde_json::Value> = Vec::new();
         let mut warnings: Vec<serde_json::Value> = Vec::new();
         let mut ref_update_failures: Vec<serde_json::Value> = Vec::new();
@@ -188,6 +222,7 @@ impl Collection {
                 &mut ref_update_failures,
                 &file_mtimes,
                 &ref_mtime_overrides,
+                false,
             );
         }
 
@@ -225,6 +260,7 @@ impl Collection {
         ref_update_failures: &mut Vec<serde_json::Value>,
         recorded_mtimes: &std::collections::HashMap<String, std::time::SystemTime>,
         mtime_overrides: &std::collections::HashMap<String, u64>,
+        dry_run: bool,
     ) {
         let from_stem = std::path::Path::new(from)
             .file_stem()
@@ -244,7 +280,7 @@ impl Collection {
             .strip_suffix(".md")
             .or_else(|| to.strip_suffix(".mdx"))
             .unwrap_or(to);
-        let ambiguous_stem_counts = self.collect_wikilink_stem_counts(from);
+        let ambiguous_stem_counts = self.collect_wikilink_stem_counts(from, !dry_run);
 
         let files = self.scan_collection_files();
 
@@ -319,6 +355,10 @@ impl Collection {
 
             // Write back if changed
             if fm_changed || body_changed {
+                if dry_run {
+                    references_updated.extend(pending_updates);
+                    continue;
+                }
                 // Check for concurrent modification before writing
                 let mtime_conflict = if let Some(&override_ms) = mtime_overrides.get(&rel_path) {
                     // Use test-provided override mtime

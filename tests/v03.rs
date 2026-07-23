@@ -470,6 +470,45 @@ fn v03_operation_facade_returns_canonical_envelopes_and_revisions() {
 }
 
 #[test]
+fn v03_mutation_preflights_return_canonical_envelopes_without_persisting() {
+    let directory = v03_collection();
+    write(
+        directory.path(),
+        "tasks/source.md",
+        "---\ntype: task\ntitle: Source\n---\n",
+    );
+    write(
+        directory.path(),
+        "tasks/backlink.md",
+        "---\ntype: task\ntitle: Backlink\n---\n[[source]]\n",
+    );
+
+    let collection = Collection::open(directory.path()).expect("open v0.3 collection");
+    let operations = collection.v03_operations().expect("v0.3 operations");
+
+    let rename = operations.rename(&serde_json::json!({
+        "from": "tasks/source.md",
+        "to": "archive/source.md",
+        "update_refs": true,
+        "dry_run": true,
+    }));
+    assert!(rename.valid, "{:#?}", rename.diagnostics);
+    assert_eq!(rename.result["dry_run"], true);
+    assert_eq!(rename.result["would_rename"], true);
+    assert!(!directory.path().join("archive/source.md").exists());
+
+    let delete = operations.delete(&serde_json::json!({
+        "path": "tasks/source.md",
+        "dry_run": true,
+    }));
+    assert!(delete.valid, "{:#?}", delete.diagnostics);
+    assert_eq!(delete.result["dry_run"], true);
+    assert_eq!(delete.result["would_delete"], true);
+    assert!(directory.path().join("tasks/source.md").exists());
+    assert!(directory.path().join("tasks/backlink.md").exists());
+}
+
+#[test]
 fn v03_mutations_enforce_opaque_revision_preconditions() {
     let directory = v03_collection();
     write(

@@ -108,6 +108,7 @@ impl UpdateInput {
 pub struct DeleteInput {
     pub path: String,
     pub check_backlinks: bool,
+    pub dry_run: bool,
     pub last_known_mtime: Option<u64>,
     pub if_revision: Option<String>,
 }
@@ -122,6 +123,10 @@ impl DeleteInput {
             .get("check_backlinks")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let dry_run = input
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let last_known_mtime = input.get("last_known_mtime").and_then(|v| v.as_u64());
         let if_revision = input
             .get("if_revision")
@@ -131,6 +136,7 @@ impl DeleteInput {
         Ok(Self {
             path: path.to_string(),
             check_backlinks,
+            dry_run,
             last_known_mtime,
             if_revision,
         })
@@ -148,6 +154,7 @@ pub struct RenameInput {
     pub from: String,
     pub to: String,
     pub update_refs: Option<bool>,
+    pub dry_run: bool,
     pub last_known_mtime: Option<u64>,
     pub if_revision: Option<String>,
     pub simulate_before_ref_update: Vec<SimulatedRefWrite>,
@@ -198,6 +205,10 @@ impl RenameInput {
             from: from.to_string(),
             to: to.to_string(),
             update_refs: input.get("update_refs").and_then(|v| v.as_bool()),
+            dry_run: input
+                .get("dry_run")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             last_known_mtime: input.get("last_known_mtime").and_then(|v| v.as_u64()),
             if_revision: input
                 .get("if_revision")
@@ -261,6 +272,7 @@ impl UpdateOutput {
 pub struct DeleteOutput {
     pub path: String,
     pub deleted: bool,
+    pub dry_run: bool,
     pub broken_links: Vec<serde_json::Value>,
 }
 
@@ -270,6 +282,10 @@ impl DeleteOutput {
             "path": self.path,
             "deleted": self.deleted,
         });
+        if self.dry_run {
+            result["dry_run"] = serde_json::Value::Bool(true);
+            result["would_delete"] = serde_json::Value::Bool(true);
+        }
         if !self.broken_links.is_empty() {
             result["broken_links"] = serde_json::Value::Array(self.broken_links);
         }
