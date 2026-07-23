@@ -31,6 +31,9 @@ formulas:
 properties:
   formula.urgency:
     displayName: Urgency
+    description: Relative urgency score
+    format: number
+    hidden: false
 views:
   - type: tasknotesTaskList
     name: Open tasks
@@ -89,7 +92,13 @@ fn discovers_and_executes_configured_obsidian_bases() {
     );
     assert_eq!(
         listed.result["views"][0]["views"][0]["properties"][1],
-        json!({"key": "formula.urgency", "label": "Urgency"})
+        json!({
+            "key": "formula.urgency",
+            "label": "Urgency",
+            "description": "Relative urgency score",
+            "format": "number",
+            "hidden": false
+        })
     );
 
     let executed = operations.execute_view(&json!({
@@ -111,6 +120,18 @@ fn discovers_and_executes_configured_obsidian_bases() {
         .as_object()
         .unwrap()
         .contains_key("tags"));
+
+    let page = operations.execute_view(&json!({
+        "path": "TaskNotes/Views/tasks.base",
+        "view": "open-tasks",
+        "offset": 1,
+        "limit": 1
+    }));
+    assert!(page.valid, "{:?}", page.diagnostics);
+    assert_eq!(page.result["meta"]["total_count"], 2);
+    assert_eq!(page.result["meta"]["has_more"], false);
+    assert_eq!(page.result["results"].as_array().unwrap().len(), 1);
+    assert_eq!(page.result["results"][0]["path"], "tasks/low.md");
 
     let board = operations.execute_view(&json!({
         "path": "TaskNotes/Views/tasks.base",
@@ -218,4 +239,111 @@ fn configured_sources_are_not_ordinary_records() {
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "file_not_found"));
+}
+
+#[test]
+fn invalid_collection_timezone_is_rejected_deterministically() {
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("mdbase.yaml"),
+        "spec_version: 0.3.0\nsettings:\n  timezone: Australia/Atlantis\n",
+    )
+    .unwrap();
+    let loaded = mdbase::config::load_config(root.path());
+    assert_eq!(loaded["valid"], false);
+    assert_eq!(loaded["error"]["code"], "invalid_config");
+    assert!(loaded["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown IANA timezone"));
+}
+
+#[test]
+fn reports_invalid_missing_and_unsupported_view_requests() {
+    let (root, collection) = collection();
+    fs::write(
+        root.path().join("TaskNotes/Views/invalid.base"),
+        "views: [not: valid",
+    )
+    .unwrap();
+    let operations = collection.v03_operations().unwrap();
+
+    let listed = operations.list_views(&json!({}));
+    assert!(listed.valid, "{:?}", listed.diagnostics);
+    assert!(listed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "invalid_view" && diagnostic.severity == "warning"));
+
+    for (input, code) in [
+        (
+            json!({"path": "TaskNotes/Views/invalid.base", "view": "anything"}),
+            "invalid_view",
+        ),
+        (
+            json!({"path": "TaskNotes/Views/tasks.base", "view": "missing"}),
+            "view_not_found",
+        ),
+        (
+            json!({"path": "TaskNotes/Views/missing.base", "view": "missing"}),
+            "view_not_found",
+        ),
+        (
+            json!({
+                "path": "TaskNotes/Views/tasks.base",
+                "view": "open-tasks",
+                "render": true
+            }),
+            "unsupported_presentation",
+        ),
+        (
+            json!({"path": "../outside.base", "view": "anything"}),
+            "invalid_path",
+        ),
+    ] {
+        let result = operations.execute_view(&input);
+        assert!(!result.valid, "{input}: {:?}", result.diagnostics);
+        assert_eq!(result.diagnostics[0].code, code, "{input}");
+    }
+}
+
+#[test]
+fn rejects_invalid_expressions_before_scanning_records() {
+    let (root, collection) = collection();
+    fs::write(
+        root.path().join("TaskNotes/Views/bad-expression.base"),
+        "views:\n  - type: table\n    name: Bad\n    filters: 'status == '\n    order: [file.name]\n",
+    )
+    .unwrap();
+    let result = collection.v03_operations().unwrap().execute_view(&json!({
+        "path": "TaskNotes/Views/bad-expression.base",
+        "view": "bad"
+    }));
+    assert!(!result.valid);
+    assert!(result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "invalid_view"
+            && diagnostic.field.as_deref() == Some("views.filters")));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_view_paths_through_symbolic_links() {
+    use std::os::unix::fs::symlink;
+
+    let (root, collection) = collection();
+    let outside = tempdir().unwrap();
+    fs::write(
+        outside.path().join("outside.base"),
+        "views:\n  - type: table\n    name: Outside\n",
+    )
+    .unwrap();
+    symlink(outside.path(), root.path().join("TaskNotes/Views/link")).unwrap();
+    let result = collection.v03_operations().unwrap().execute_view(&json!({
+        "path": "TaskNotes/Views/link/outside.base",
+        "view": "outside"
+    }));
+    assert!(!result.valid);
+    assert_eq!(result.diagnostics[0].code, "path_traversal");
 }

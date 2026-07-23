@@ -115,6 +115,10 @@ struct Args {
     #[arg(long = "query-iters", default_value_t = 5)]
     query_iterations: usize,
 
+    /// Iterations for saved-view discovery and execution
+    #[arg(long = "view-iters", default_value_t = 5)]
+    view_iterations: usize,
+
     /// Iterations for the two-pass paginated editor index workload
     #[arg(long = "editor-iters", default_value_t = 1)]
     editor_iterations: usize,
@@ -163,6 +167,7 @@ struct Args {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Scenario {
     Queries,
+    Views,
     Core,
     All,
 }
@@ -176,6 +181,7 @@ struct ProfileConfig {
     open_iterations: usize,
     read_iterations: usize,
     query_iterations: usize,
+    view_iterations: usize,
     editor_iterations: usize,
     update_iterations: usize,
     rename_iterations: usize,
@@ -304,6 +310,26 @@ fn run() -> Result<(), String> {
         operations.push(profile_query_formula(&collection, args.query_iterations)?);
         operations.push(profile_editor_list(&collection, args.editor_iterations)?);
     }
+    if matches!(args.scenario, Scenario::Views | Scenario::All) {
+        if matches!(args.scenario, Scenario::Views) {
+            operations.push(profile_cache_rebuild(&collection, 1)?);
+        }
+        operations.push(profile_list_views(&collection, args.view_iterations)?);
+        operations.push(profile_execute_view(
+            &collection,
+            "view_execute_canonical",
+            "views/tasks.md",
+            "open-tasks",
+            args.view_iterations,
+        )?);
+        operations.push(profile_execute_view(
+            &collection,
+            "view_execute_obsidian",
+            "views/tasks.base",
+            "open-tasks",
+            args.view_iterations,
+        )?);
+    }
     if matches!(args.scenario, Scenario::Core | Scenario::All) {
         operations.push(profile_update(
             &collection,
@@ -350,6 +376,7 @@ fn run() -> Result<(), String> {
         config: ProfileConfig {
             scenario: match args.scenario {
                 Scenario::Queries => "queries",
+                Scenario::Views => "views",
                 Scenario::Core => "core",
                 Scenario::All => "all",
             },
@@ -359,6 +386,7 @@ fn run() -> Result<(), String> {
             open_iterations: args.open_iterations,
             read_iterations: args.read_iterations,
             query_iterations: args.query_iterations,
+            view_iterations: args.view_iterations,
             editor_iterations: args.editor_iterations,
             update_iterations: args.update_iterations,
             rename_iterations: args.rename_iterations,
@@ -419,6 +447,7 @@ fn run_existing_collection(args: &Args, root: &Path) -> Result<(), String> {
             open_iterations: args.open_iterations,
             read_iterations: 0,
             query_iterations: args.query_iterations,
+            view_iterations: 0,
             editor_iterations: args.editor_iterations,
             update_iterations: 0,
             rename_iterations: 0,
@@ -491,8 +520,12 @@ name: "Profiler"
 settings:
   types_folder: "_types"
   validation: "error"
+  timezone: "UTC"
   exclude:
     - "_types"
+x-obsidian:
+  bases:
+    include: ["views/*.base"]
 "#;
     fs::write(root.join("mdbase.yaml"), config)
         .map_err(|e| format!("Failed to write mdbase.yaml: {e}"))?;
@@ -560,6 +593,48 @@ settings:
         );
         write_plain_markdown_file(&ref_path, &body)?;
     }
+
+    write_plain_markdown_file(
+        &root.join("views/tasks.md"),
+        r#"---
+type: view
+id: profiler.tasks
+version: 1
+name: Profiler task views
+query:
+  types: [task]
+views:
+  - id: open-tasks
+    name: Open tasks
+    where: 'status != "done"'
+    select: [title, status, priority, points]
+    order_by:
+      - { field: priority, direction: desc }
+      - { field: title, direction: asc }
+---
+"#,
+    )?;
+    write_plain_markdown_file(
+        &root.join("views/tasks.base"),
+        r#"filters:
+  and:
+    - 'type == "task"'
+formulas:
+  score: 'priority * 10 + points'
+views:
+  - type: table
+    name: Open tasks
+    filters:
+      and:
+        - 'status != "done"'
+    order: [title, status, priority, formula.score]
+    sort:
+      - property: formula.score
+        direction: DESC
+      - property: title
+        direction: ASC
+"#,
+    )?;
 
     Ok(FixtureData {
         root: root.to_path_buf(),
@@ -941,6 +1016,68 @@ fn profile_query_formula(
         ensure_v03_success(&result)?;
         Ok(profile)
     })
+}
+
+fn profile_list_views(
+    collection: &Collection,
+    iterations: usize,
+) -> Result<OperationSummary, String> {
+    let operations = collection
+        .v03_operations()
+        .map_err(|diagnostic| diagnostic.message.clone())?;
+    let mut summary = run_timed("view_list", iterations, |_| {
+        ensure_view_success(operations.list_views(&json!({})))
+    })?;
+    let listed = operations.list_views(&json!({}));
+    ensure_view_success(listed.clone())?;
+    summary.counters.insert(
+        "view_documents".to_string(),
+        listed.result["meta"]["total_count"]
+            .as_u64()
+            .unwrap_or_default() as f64,
+    );
+    Ok(summary)
+}
+
+fn profile_execute_view(
+    collection: &Collection,
+    name: &str,
+    path: &str,
+    view: &str,
+    iterations: usize,
+) -> Result<OperationSummary, String> {
+    let operations = collection
+        .v03_operations()
+        .map_err(|diagnostic| diagnostic.message.clone())?;
+    let input = json!({"path": path, "view": view, "limit": 200});
+    let mut summary = run_timed(name, iterations, |_| {
+        ensure_view_success(operations.execute_view(&input))
+    })?;
+    let executed = operations.execute_view(&input);
+    ensure_view_success(executed.clone())?;
+    summary.counters.insert(
+        "matching_records".to_string(),
+        executed.result["meta"]["total_count"]
+            .as_u64()
+            .unwrap_or_default() as f64,
+    );
+    summary.counters.insert(
+        "page_results".to_string(),
+        executed.result["results"].as_array().map_or(0, Vec::len) as f64,
+    );
+    Ok(summary)
+}
+
+fn ensure_view_success(result: mdbase::v03::OperationResult) -> Result<(), String> {
+    if result.valid {
+        return Ok(());
+    }
+    Err(result
+        .diagnostics
+        .iter()
+        .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+        .collect::<Vec<_>>()
+        .join("; "))
 }
 
 fn profile_editor_list(

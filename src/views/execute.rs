@@ -8,7 +8,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use super::expression::{self, BasesEvaluationContext, BasesFile, BasesLink};
+use super::expression::{self, BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone};
 use super::model::{
     identifier, presentation_for, stable_named_view_ids, BaseFilter, BaseGroupBy,
     NamedViewDescriptor, ObsidianBaseDocument, ObsidianBaseView, ViewDocumentDescriptor,
@@ -619,11 +619,17 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
             diagnostics,
         };
     }
+    let timezone = match BasesTimezone::from_setting(collection.settings.timezone.as_deref()) {
+        Ok(timezone) => timezone,
+        Err(error) => return failed("invalid_config", error, Some("mdbase.yaml".to_string())),
+    };
     let include_backlinks = base_uses_backlinks(&document, view);
     let ((records, _, backlinks), _) =
         collection.load_query_data_profiled(false, include_backlinks);
     let all_files = Arc::new(records.iter().map(record_file).collect::<Vec<_>>());
     let link_resolutions = Arc::new(link_resolutions(&all_files));
+    let formulas = Arc::new(document.formulas.clone());
+    let property_types = Arc::new(BTreeMap::new());
     let clock = UtcClock::capture();
     let mut rows = Vec::new();
     for record in &records {
@@ -654,11 +660,11 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
                 .and_then(|context| all_files.iter().find(|file| file.path == context.path))
                 .cloned(),
             files: all_files.clone(),
-            formulas: Arc::new(document.formulas.clone()),
-            property_types: Arc::new(BTreeMap::new()),
+            formulas: formulas.clone(),
+            property_types: property_types.clone(),
             link_resolutions: link_resolutions.clone(),
             now: Some(clock.clone()),
-            timezone: collection.settings.timezone.clone(),
+            timezone: timezone.clone(),
         };
         match combined_filter_matches(document.filters.as_ref(), view.filters.as_ref(), &context) {
             Ok(true) => {}
@@ -683,8 +689,10 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
             .iter()
             .chain(view.sort.iter().map(|sort| &sort.property))
         {
-            let value = evaluate_property(property, &context).unwrap_or(Value::Null);
-            computed_values.insert(property.clone(), value);
+            if !computed_values.contains_key(property) {
+                let value = evaluate_property(property, &context).unwrap_or(Value::Null);
+                computed_values.insert(property.clone(), value);
+            }
         }
         if let Some(group_by) = &view.group_by {
             let property = group_by.property();

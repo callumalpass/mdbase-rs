@@ -405,7 +405,7 @@ pub(crate) struct BasesEvaluationContext {
     pub property_types: Arc<BTreeMap<String, String>>,
     pub link_resolutions: Arc<BTreeMap<String, Option<String>>>,
     pub now: Option<String>,
-    pub timezone: Option<String>,
+    pub timezone: BasesTimezone,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -440,27 +440,31 @@ struct DateValue {
     timezone: BasesTimezone,
 }
 
-#[derive(Clone, Debug)]
-enum BasesTimezone {
+#[derive(Clone, Debug, Default)]
+pub(crate) enum BasesTimezone {
+    #[default]
     Local,
     Fixed(FixedOffset),
     Named(Tz),
 }
 
 impl BasesTimezone {
-    fn from_setting(value: Option<&str>) -> Self {
+    pub(crate) fn from_setting(value: Option<&str>) -> Result<Self, String> {
         let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-            return Self::Local;
+            return Ok(Self::Local);
         };
         match value {
-            "local" => Self::Local,
-            "UTC" | "utc" | "Z" => Self::Fixed(FixedOffset::east_opt(0).expect("UTC offset")),
+            "local" => Ok(Self::Local),
+            "UTC" | "utc" | "Z" => Ok(Self::Fixed(FixedOffset::east_opt(0).expect("UTC offset"))),
             value if value.starts_with('+') || value.starts_with('-') => {
                 parse_timezone_offset(value)
                     .map(Self::Fixed)
-                    .unwrap_or(Self::Local)
+                    .ok_or_else(|| format!("Invalid fixed timezone offset '{value}'"))
             }
-            value => value.parse::<Tz>().map(Self::Named).unwrap_or(Self::Local),
+            value => value
+                .parse::<Tz>()
+                .map(Self::Named)
+                .map_err(|_| format!("Unknown IANA timezone '{value}'")),
         }
     }
 
@@ -602,7 +606,7 @@ type Scope = BTreeMap<String, RuntimeValue>;
 
 impl<'a> Evaluator<'a> {
     fn new(context: &'a BasesEvaluationContext) -> Self {
-        let timezone = BasesTimezone::from_setting(context.timezone.as_deref());
+        let timezone = context.timezone.clone();
         Self {
             context,
             now: parse_date(
@@ -2365,10 +2369,8 @@ mod tests {
                     .collect(),
             ),
             now: object.get("now").and_then(Value::as_str).map(String::from),
-            timezone: object
-                .get("timezone")
-                .and_then(Value::as_str)
-                .map(String::from),
+            timezone: BasesTimezone::from_setting(object.get("timezone").and_then(Value::as_str))
+                .expect("oracle timezone"),
         }
     }
 
@@ -2485,6 +2487,46 @@ mod tests {
         assert_eq!(
             evaluate("date(due).format(\"yyyy-MM-dd\")", &context).unwrap(),
             Value::String("2026-07-24".to_string())
+        );
+    }
+
+    #[test]
+    fn evaluates_fixed_and_dst_timezones_without_machine_local_fallbacks() {
+        let mut context = BasesEvaluationContext {
+            timezone: BasesTimezone::from_setting(Some("+10:00")).unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate("number(date(\"1970-01-02\"))", &context).unwrap(),
+            Value::from(50_400_000)
+        );
+
+        context.timezone = BasesTimezone::from_setting(Some("-05:00")).unwrap();
+        assert_eq!(
+            evaluate("number(date(\"1970-01-02\"))", &context).unwrap(),
+            Value::from(104_400_000)
+        );
+
+        context.timezone = BasesTimezone::from_setting(Some("Australia/Melbourne")).unwrap();
+        assert_eq!(
+            evaluate("number(date(\"2026-04-05\"))", &context).unwrap(),
+            Value::from(1_775_307_600_000_i64)
+        );
+        assert_eq!(
+            evaluate("number(date(\"2026-04-06\"))", &context).unwrap(),
+            Value::from(1_775_397_600_000_i64)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_timezone_settings() {
+        assert_eq!(
+            BasesTimezone::from_setting(Some("+25:00")).unwrap_err(),
+            "Invalid fixed timezone offset '+25:00'"
+        );
+        assert_eq!(
+            BasesTimezone::from_setting(Some("Australia/Atlantis")).unwrap_err(),
+            "Unknown IANA timezone 'Australia/Atlantis'"
         );
     }
 

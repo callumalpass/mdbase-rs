@@ -102,6 +102,22 @@ impl EvaluationClock {
     }
 }
 
+/// Validate a collection timezone without capturing the current clock.
+pub(crate) fn validate_timezone_setting(timezone: Option<&str>) -> Result<(), String> {
+    match timezone.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("local" | "UTC" | "utc" | "Z") => Ok(()),
+        Some(value) if value.starts_with('+') || value.starts_with('-') => {
+            parse_fixed_offset(value)
+                .map(|_| ())
+                .ok_or_else(|| format!("Invalid fixed timezone offset '{value}'"))
+        }
+        Some(value) => value
+            .parse::<chrono_tz::Tz>()
+            .map(|_| ())
+            .map_err(|_| format!("Unknown IANA timezone '{value}'")),
+    }
+}
+
 fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
     let sign = match value.as_bytes().first()? {
         b'+' => 1,
