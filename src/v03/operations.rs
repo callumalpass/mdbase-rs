@@ -89,6 +89,26 @@ impl<'a> Operations<'a> {
         crate::views::execute(self.collection, input)
     }
 
+    /// Read a complete saved-view source document and its opaque revision.
+    pub fn read_view_source(&self, input: &Value) -> OperationResult {
+        crate::views::read_source(self.collection, input)
+    }
+
+    /// Create a complete saved-view source without replacing an existing file.
+    pub fn create_view_source(&self, input: &Value) -> OperationResult {
+        crate::views::create_source(self.collection, input)
+    }
+
+    /// Replace a saved-view source after validating its complete document.
+    pub fn update_view_source(&self, input: &Value) -> OperationResult {
+        crate::views::update_source(self.collection, input)
+    }
+
+    /// Delete a saved-view source, optionally guarded by its opaque revision.
+    pub fn delete_view_source(&self, input: &Value) -> OperationResult {
+        crate::views::delete_source(self.collection, input)
+    }
+
     /// Execute a query and return payload-free phase timings for local
     /// profiling and host observability.
     pub fn query_profiled(&self, input: &Value) -> (OperationResult, super::QueryPerformance) {

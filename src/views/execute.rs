@@ -327,7 +327,7 @@ fn obsidian_documents(
                     path: relative.clone(),
                     format: "obsidian.base".to_string(),
                     revision: revision(source.as_bytes()),
-                    writable: false,
+                    writable: true,
                 },
                 id: identifier(&name, "base"),
                 name,
@@ -1036,7 +1036,7 @@ fn link_resolutions(files: &[BasesFile]) -> BTreeMap<String, Option<String>> {
     resolutions
 }
 
-fn obsidian_source_paths(collection: &Collection) -> Vec<PathBuf> {
+pub(crate) fn obsidian_source_paths(collection: &Collection) -> Vec<PathBuf> {
     let includes = collection
         .config_extensions
         .get("x-obsidian")
@@ -1066,6 +1066,21 @@ fn obsidian_source_paths(collection: &Collection) -> Vec<PathBuf> {
         })
         .map(|entry| entry.into_path())
         .collect()
+}
+
+pub(crate) fn is_configured_obsidian_source(collection: &Collection, path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    collection
+        .config_extensions
+        .get("x-obsidian")
+        .and_then(|value| value.get("bases"))
+        .and_then(|value| value.get("include"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|pattern| glob_regex(pattern).ok())
+        .any(|pattern| pattern.is_match(&normalized))
 }
 
 fn glob_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {

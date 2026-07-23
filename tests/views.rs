@@ -82,7 +82,7 @@ fn discovers_and_executes_configured_obsidian_bases() {
         listed.result["views"][0]["source"]["format"],
         "obsidian.base"
     );
-    assert_eq!(listed.result["views"][0]["source"]["writable"], false);
+    assert_eq!(listed.result["views"][0]["source"]["writable"], true);
     assert_eq!(
         listed.result["views"][0]["views"][1]["presentation"]["type"],
         "tasknotes.kanban"
@@ -118,6 +118,93 @@ fn discovers_and_executes_configured_obsidian_bases() {
     }));
     assert!(board.valid, "{:?}", board.diagnostics);
     assert_eq!(board.result["results"][0]["values"]["status"], "done");
+}
+
+#[test]
+fn saved_view_sources_are_revision_safe_resources() {
+    let (root, collection) = collection();
+    let operations = collection.v03_operations().unwrap();
+    let read = operations.read_view_source(&json!({
+        "path": "TaskNotes/Views/tasks.base"
+    }));
+    assert!(read.valid, "{:?}", read.diagnostics);
+    assert_eq!(read.result["format"], "obsidian.base");
+    let revision = read.result["revision"].as_str().unwrap();
+    let changed = read.result["document"]
+        .as_str()
+        .unwrap()
+        .replace("Open tasks", "Focused tasks");
+
+    let stale = operations.update_view_source(&json!({
+        "path": "TaskNotes/Views/tasks.base",
+        "if_revision": "sha256:stale",
+        "document": changed.clone(),
+    }));
+    assert!(!stale.valid);
+    assert_eq!(stale.diagnostics[0].code, "concurrent_modification");
+
+    let updated = operations.update_view_source(&json!({
+        "path": "TaskNotes/Views/tasks.base",
+        "if_revision": revision,
+        "document": changed,
+    }));
+    assert!(updated.valid, "{:?}", updated.diagnostics);
+    assert_ne!(updated.result["revision"], revision);
+    let listed = Collection::open(root.path())
+        .unwrap()
+        .v03_operations()
+        .unwrap()
+        .list_views(&json!({}));
+    assert_eq!(
+        listed.result["views"][0]["views"][0]["name"],
+        "Focused tasks"
+    );
+
+    let deleted = collection
+        .v03_operations()
+        .unwrap()
+        .delete_view_source(&json!({
+            "path": "TaskNotes/Views/tasks.base",
+            "if_revision": updated.result["revision"],
+        }));
+    assert!(deleted.valid, "{:?}", deleted.diagnostics);
+    assert!(!root.path().join("TaskNotes/Views/tasks.base").exists());
+}
+
+#[test]
+fn creates_valid_sources_without_clobbering_or_escaping_configuration() {
+    let (root, collection) = collection();
+    let operations = collection.v03_operations().unwrap();
+    let document = "views:\n  - type: tasknotesTaskList\n    name: Inbox\n";
+    let created = operations.create_view_source(&json!({
+        "format": "obsidian.base",
+        "name": "Inbox",
+        "document": document,
+    }));
+    assert!(created.valid, "{:?}", created.diagnostics);
+    assert_eq!(created.result["path"], "TaskNotes/Views/inbox.base");
+
+    let conflict = operations.create_view_source(&json!({
+        "path": "TaskNotes/Views/inbox.base",
+        "document": document,
+    }));
+    assert!(!conflict.valid);
+    assert_eq!(conflict.diagnostics[0].code, "path_conflict");
+
+    let outside = operations.create_view_source(&json!({
+        "path": "elsewhere/inbox.base",
+        "document": document,
+    }));
+    assert!(!outside.valid);
+    assert_eq!(outside.diagnostics[0].code, "invalid_view_path");
+
+    let invalid = operations.create_view_source(&json!({
+        "path": "TaskNotes/Views/broken.base",
+        "document": "views: [",
+    }));
+    assert!(!invalid.valid);
+    assert_eq!(invalid.diagnostics[0].code, "invalid_view");
+    assert!(!root.path().join("TaskNotes/Views/broken.base").exists());
 }
 
 #[test]

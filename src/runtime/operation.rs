@@ -14,6 +14,10 @@ pub enum OperationKind {
     Query,
     ListViews,
     ExecuteView,
+    ReadViewSource,
+    CreateViewSource,
+    UpdateViewSource,
+    DeleteViewSource,
     Validate,
     Create,
     Update,
@@ -25,7 +29,13 @@ impl OperationKind {
     pub fn is_mutation(self) -> bool {
         matches!(
             self,
-            Self::Create | Self::Update | Self::Delete | Self::Rename
+            Self::Create
+                | Self::Update
+                | Self::Delete
+                | Self::Rename
+                | Self::CreateViewSource
+                | Self::UpdateViewSource
+                | Self::DeleteViewSource
         )
     }
 
@@ -35,6 +45,10 @@ impl OperationKind {
             Self::Query => "query",
             Self::ListViews => "list_views",
             Self::ExecuteView => "execute_view",
+            Self::ReadViewSource => "read_view_source",
+            Self::CreateViewSource => "create_view_source",
+            Self::UpdateViewSource => "update_view_source",
+            Self::DeleteViewSource => "delete_view_source",
             Self::Validate => "validate",
             Self::Create => "create",
             Self::Update => "update",
@@ -53,6 +67,10 @@ impl FromStr for OperationKind {
             "query" => Ok(Self::Query),
             "list_views" => Ok(Self::ListViews),
             "execute_view" => Ok(Self::ExecuteView),
+            "read_view_source" => Ok(Self::ReadViewSource),
+            "create_view_source" => Ok(Self::CreateViewSource),
+            "update_view_source" => Ok(Self::UpdateViewSource),
+            "delete_view_source" => Ok(Self::DeleteViewSource),
             "validate" => Ok(Self::Validate),
             "create" => Ok(Self::Create),
             "update" => Ok(Self::Update),
