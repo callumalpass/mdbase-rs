@@ -162,8 +162,12 @@ impl Collection {
     }
 
     /// Check if a link was ambiguous before the rename (matched multiple files).
-    /// We check post-rename state but also account for the old file that was renamed.
-    pub(crate) fn collect_wikilink_stem_counts(&self, from_path: &str) -> HashMap<String, usize> {
+    /// Executed renames account for the old path, while dry runs still see it on disk.
+    pub(crate) fn collect_wikilink_stem_counts(
+        &self,
+        from_path: &str,
+        source_already_renamed: bool,
+    ) -> HashMap<String, usize> {
         let mut stem_counts: HashMap<String, usize> = HashMap::new();
         for file_path in self.scan_collection_files() {
             let rel_path = match file_path.strip_prefix(&self.root) {
@@ -179,13 +183,16 @@ impl Collection {
             }
         }
 
-        // Also count the old (now-renamed) file: its old stem may have matched targets pre-rename.
-        let from_stem = std::path::Path::new(from_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if !from_stem.is_empty() {
-            *stem_counts.entry(from_stem.to_string()).or_insert(0) += 1;
+        if source_already_renamed {
+            // The source no longer exists on disk, but its old stem participated
+            // in resolution immediately before the rename.
+            let from_stem = std::path::Path::new(from_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if !from_stem.is_empty() {
+                *stem_counts.entry(from_stem.to_string()).or_insert(0) += 1;
+            }
         }
 
         stem_counts

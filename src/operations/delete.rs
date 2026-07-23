@@ -21,6 +21,7 @@ impl Collection {
         }
         let path = input.path;
         let check_backlinks = input.check_backlinks;
+        let dry_run = input.dry_run;
 
         let full_path = self.root.join(&path);
         if !full_path.exists() {
@@ -62,19 +63,22 @@ impl Collection {
             }
         }
 
-        if let Err(error) = ensure_revision(&full_path, &path, input.if_revision.as_deref()) {
-            return error;
-        }
-        if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
-            return error;
-        }
-        if let Err(e) = std::fs::remove_file(&full_path) {
-            return op_error("io_error", &format!("Failed to delete: {}", e));
+        if !dry_run {
+            if let Err(error) = ensure_revision(&full_path, &path, input.if_revision.as_deref()) {
+                return error;
+            }
+            if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
+                return error;
+            }
+            if let Err(e) = std::fs::remove_file(&full_path) {
+                return op_error("io_error", &format!("Failed to delete: {}", e));
+            }
         }
 
         DeleteOutput {
             path,
-            deleted: true,
+            deleted: !dry_run,
+            dry_run,
             broken_links,
         }
         .into_json()

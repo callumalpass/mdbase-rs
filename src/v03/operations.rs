@@ -211,7 +211,13 @@ impl<'a> Operations<'a> {
             result.remove(envelope_key);
         }
 
-        if valid && matches!(operation, "read" | "create" | "update" | "rename") {
+        if valid
+            && !input
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && matches!(operation, "read" | "create" | "update" | "rename")
+        {
             let persisted_path = persisted_path(operation, input, &result);
             if let Some(persisted_path) = persisted_path {
                 self.hydrate_persisted_result(
