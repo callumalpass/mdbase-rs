@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
 use super::{Diagnostic, OperationResult};
@@ -21,6 +22,71 @@ pub(crate) const MAX_EVALUATION_STEPS: u64 = 1_000_000;
 pub(crate) struct CelFailure {
     pub code: String,
     pub message: String,
+}
+
+/// Stable error returned by the provider-neutral workflow CEL facade.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WorkflowCelError {
+    pub code: String,
+    pub message: String,
+}
+
+/// Compile a workflow expression without evaluating it.
+pub fn validate_runtime_expression(source: &str) -> Result<(), WorkflowCelError> {
+    compile(source).map(|_| ()).map_err(WorkflowCelError::from)
+}
+
+/// Evaluate one workflow CEL expression with an injected operation clock.
+pub fn evaluate_runtime_expression(
+    source: &str,
+    bindings: &Value,
+    now: DateTime<Utc>,
+    timezone: Option<&str>,
+) -> Result<Value, WorkflowCelError> {
+    let expression = compile(source).map_err(WorkflowCelError::from)?;
+    let mut context = EvalContext::empty();
+    context.frontmatter = bindings.clone();
+    context.string_concat = false;
+    let clock = EvaluationClock::from_utc(now, timezone).map_err(|message| WorkflowCelError {
+        code: "invalid_timezone".to_string(),
+        message,
+    })?;
+    evaluate_compiled(&expression, &context, &clock).map_err(WorkflowCelError::from)
+}
+
+/// Recursively evaluate canonical `{ "$expr": "..." }` workflow values with
+/// an injected operation clock.
+pub fn evaluate_runtime_template(
+    template: &Value,
+    bindings: &Value,
+    now: DateTime<Utc>,
+    timezone: Option<&str>,
+) -> Result<Value, Vec<WorkflowCelError>> {
+    let mut context = EvalContext::empty();
+    context.frontmatter = bindings.clone();
+    context.string_concat = false;
+    let clock = EvaluationClock::from_utc(now, timezone).map_err(|message| {
+        vec![WorkflowCelError {
+            code: "invalid_timezone".to_string(),
+            message,
+        }]
+    })?;
+    let mut diagnostics = Vec::new();
+    let value = evaluate_runtime_template_value(template, &context, &clock, &mut diagnostics);
+    if diagnostics.is_empty() {
+        Ok(value)
+    } else {
+        Err(diagnostics)
+    }
+}
+
+impl From<CelFailure> for WorkflowCelError {
+    fn from(value: CelFailure) -> Self {
+        Self {
+            code: value.code,
+            message: value.message,
+        }
+    }
 }
 
 pub(crate) fn compile(source: &str) -> Result<Expr, CelFailure> {
@@ -334,6 +400,57 @@ fn evaluate_template_value(
             values
                 .iter()
                 .map(|value| evaluate_template_value(value, context, clock, diagnostics))
+                .collect(),
+        ),
+        value => value.clone(),
+    }
+}
+
+fn evaluate_runtime_template_value(
+    value: &Value,
+    context: &EvalContext,
+    clock: &EvaluationClock,
+    diagnostics: &mut Vec<WorkflowCelError>,
+) -> Value {
+    match value {
+        Value::Object(object) if object.len() == 1 && object.contains_key("$expr") => {
+            let Some(source) = object.get("$expr").and_then(Value::as_str) else {
+                diagnostics.push(WorkflowCelError {
+                    code: "expression_compile_error".to_string(),
+                    message: "$expr must contain a string.".to_string(),
+                });
+                return Value::Null;
+            };
+            let expression = match compile(source) {
+                Ok(expression) => expression,
+                Err(error) => {
+                    diagnostics.push(error.into());
+                    return Value::Null;
+                }
+            };
+            match evaluate_compiled(&expression, context, clock) {
+                Ok(value) => value,
+                Err(error) => {
+                    diagnostics.push(error.into());
+                    Value::Null
+                }
+            }
+        }
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        evaluate_runtime_template_value(value, context, clock, diagnostics),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| evaluate_runtime_template_value(value, context, clock, diagnostics))
                 .collect(),
         ),
         value => value.clone(),

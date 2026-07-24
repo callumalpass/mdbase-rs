@@ -18,6 +18,10 @@ include = [
     "/tests/**",
 ]
 
+[workspace]
+members = [".", "crates/mdbase-runtime"]
+resolver = "2"
+
 [features]
 default = []
 tracing = ["dep:tracing"]

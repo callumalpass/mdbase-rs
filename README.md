@@ -6,7 +6,8 @@ Rust implementation of the [mdbase spec](https://mdbase.dev), with:
 - Query execution (filters, formulas, grouping, summaries)
 - Link parsing/resolution/traversal
 - CRUD, batch, backfill, and migrate operations
-- Pure Runtime Contracts 0.1 registry composition and preflight
+- Runtime Contracts 0.1 registry composition and preflight
+- Independently versioned durable workflow execution
 - SQLite cache support
 - Debounced filesystem watching with normalized collection events
 
@@ -55,12 +56,19 @@ composes them with built-in, provider, or pack contracts supplied in memory.
 `ContractDocument::virtual_contract` is the first-class representation for a
 non-materialized contract.
 
-The engine validates strict provider, action, event, capability, policy, and
+The contract engine validates strict provider, action, event, capability, policy, and
 workflow shapes; compiles embedded schemas once; validates event and action
 values; resolves workflow requirements; and renders contracts as Markdown when
-materialization is requested. It deliberately does not execute workflows or
-grant filesystem authority. An embedding host such as mdbase-connect remains
-the final authorization boundary immediately before dispatch.
+materialization is requested. It grants no filesystem authority.
+
+The independently versioned `mdbase-runtime` workspace crate adds durable event
+admission, deterministic workflow planning, stable action invocation IDs,
+leases, cancellation, crash recovery, cursor retention, and one-shot timers. It
+supports in-memory and SQLite stores by default and a horizontally safe
+PostgreSQL store behind the `postgres` feature. Provider calls remain neutral:
+an embedding host such as mdbase-connect is the final authorization boundary
+immediately before every dispatch. See
+[`crates/mdbase-runtime/README.md`](crates/mdbase-runtime/README.md).
 
 `FilesystemProvider::load_runtime_contracts` performs loading under the same
 serialization gate as collection requests. A watcher opened with
@@ -90,6 +98,7 @@ path for fixture-driven watch tests.
 ## Packages
 
 - Library crate: `mdbase`
+- Workflow crate: `mdbase-runtime` (Runtime profile 0.1)
 - CLI binary: `mdb` (`init`, CRUD/query/validate, `backfill`, `migrate`, cache)
 - Profiling binary: `mdb-profile` (synthetic workload profiler with JSON output)
 
@@ -103,6 +112,7 @@ cargo build
 
 ```bash
 cargo test --workspace --all-features
+cargo test -p mdbase-runtime --no-default-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 

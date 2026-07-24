@@ -12,7 +12,7 @@ for schema in config diagnostic operation-result query query-result type-file vi
 done
 
 mkdir -p "$target_dir/runtime"
-for schema in action capability checkpoint diagnostic event-envelope event provider run runtime-policy workflow; do
+for schema in action capability checkpoint diagnostic event-envelope event provider run runtime-policy timer workflow; do
 	cp "$source_dir/runtime/$schema.schema.json" "$target_dir/runtime/$schema.schema.json"
 done
 

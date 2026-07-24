@@ -103,6 +103,74 @@ impl RuntimeContracts {
         preflight::validate_action_output(registry, action_id, output)
     }
 
+    /// Validate input against the action contract snapshot pinned into an
+    /// admitted execution plan.
+    pub fn validate_pinned_action_input(&self, action: &Value, input: &Value) -> ValidationResult {
+        let document = ContractDocument::virtual_contract(action.clone());
+        let (mut validation, embedded) = self.validators.prepare_contract(&document);
+        if validation.valid {
+            validation
+                .diagnostics
+                .extend(embedded.action_input.map_or_else(
+                    || {
+                        vec![RuntimeDiagnostic::error(
+                            "invalid_embedded_schema",
+                            "Pinned action has no compiled input schema.",
+                        )]
+                    },
+                    |schema| {
+                        schemas::validate_compiled(&schema, input, "<pinned-action.input>")
+                            .diagnostics
+                    },
+                ));
+        }
+        ValidationResult::new(validation.diagnostics)
+    }
+
+    /// Validate output against the action contract snapshot pinned into an
+    /// admitted execution plan.
+    pub fn validate_pinned_action_output(
+        &self,
+        action: &Value,
+        output: &Value,
+    ) -> ValidationResult {
+        let document = ContractDocument::virtual_contract(action.clone());
+        let (mut validation, embedded) = self.validators.prepare_contract(&document);
+        if validation.valid
+            && action
+                .pointer("/schemas/output")
+                .is_some_and(|value| !value.is_null())
+        {
+            validation
+                .diagnostics
+                .extend(embedded.action_output.map_or_else(
+                    || {
+                        vec![RuntimeDiagnostic::error(
+                            "invalid_embedded_schema",
+                            "Pinned action has no compiled output schema.",
+                        )]
+                    },
+                    |schema| {
+                        schemas::validate_compiled(&schema, output, "<pinned-action.output>")
+                            .diagnostics
+                    },
+                ));
+        }
+        ValidationResult::new(validation.diagnostics)
+    }
+
+    /// Apply the currently selected policy to a previously pinned action
+    /// definition. Registry changes can tighten authorization without
+    /// replacing the execution plan's action shape.
+    pub fn preflight_pinned_action(
+        &self,
+        registry: &RuntimeRegistry,
+        action: &Value,
+        dispatch_context: &Value,
+    ) -> ValidationResult {
+        preflight::preflight_action_contract(registry, action, dispatch_context)
+    }
+
     /// Check registry policy for a prospective dispatch. Successful preflight
     /// is advisory; an embedding host must independently authorize the current
     /// actor, resource, grant, and action immediately before execution.

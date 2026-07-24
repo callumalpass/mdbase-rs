@@ -17,6 +17,7 @@ pub enum ContractKind {
     RuntimePolicy,
     RuntimeRun,
     RuntimeCheckpoint,
+    RuntimeTimer,
     RuntimeDiagnostic,
 }
 
@@ -31,6 +32,7 @@ impl ContractKind {
             "runtime_policy" => Some(Self::RuntimePolicy),
             "runtime_run" => Some(Self::RuntimeRun),
             "runtime_checkpoint" => Some(Self::RuntimeCheckpoint),
+            "runtime_timer" => Some(Self::RuntimeTimer),
             "runtime_diagnostic" => Some(Self::RuntimeDiagnostic),
             _ => None,
         }
@@ -46,6 +48,7 @@ impl ContractKind {
             Self::RuntimePolicy => "runtime_policy",
             Self::RuntimeRun => "runtime_run",
             Self::RuntimeCheckpoint => "runtime_checkpoint",
+            Self::RuntimeTimer => "runtime_timer",
             Self::RuntimeDiagnostic => "runtime_diagnostic",
         }
     }
@@ -246,6 +249,7 @@ pub struct RuntimePackage {
     pub policies: Vec<ContractDocument>,
     pub runs: Vec<ContractDocument>,
     pub checkpoints: Vec<ContractDocument>,
+    pub timers: Vec<ContractDocument>,
     pub runtime_diagnostics: Vec<ContractDocument>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
@@ -268,6 +272,7 @@ impl RuntimePackage {
             Some(ContractKind::RuntimePolicy) => self.policies.push(document.clone()),
             Some(ContractKind::RuntimeRun) => self.runs.push(document.clone()),
             Some(ContractKind::RuntimeCheckpoint) => self.checkpoints.push(document.clone()),
+            Some(ContractKind::RuntimeTimer) => self.timers.push(document.clone()),
             Some(ContractKind::RuntimeDiagnostic) => {
                 self.runtime_diagnostics.push(document.clone())
             }

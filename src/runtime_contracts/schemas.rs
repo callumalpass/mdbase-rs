@@ -16,6 +16,7 @@ const EVENT: &str = include_str!("../../schemas/v0.3/runtime/event.schema.json")
 const PROVIDER: &str = include_str!("../../schemas/v0.3/runtime/provider.schema.json");
 const RUN: &str = include_str!("../../schemas/v0.3/runtime/run.schema.json");
 const RUNTIME_POLICY: &str = include_str!("../../schemas/v0.3/runtime/runtime-policy.schema.json");
+const TIMER: &str = include_str!("../../schemas/v0.3/runtime/timer.schema.json");
 const WORKFLOW: &str = include_str!("../../schemas/v0.3/runtime/workflow.schema.json");
 
 pub(crate) struct CanonicalValidators {
@@ -42,6 +43,7 @@ impl CanonicalValidators {
             (ContractKind::RuntimePolicy, RUNTIME_POLICY),
             (ContractKind::RuntimeRun, RUN),
             (ContractKind::RuntimeCheckpoint, CHECKPOINT),
+            (ContractKind::RuntimeTimer, TIMER),
             (ContractKind::RuntimeDiagnostic, DIAGNOSTIC),
         ] {
             let schema = parse_schema(kind.as_str(), source)?;
