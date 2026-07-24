@@ -205,23 +205,10 @@ pub fn identifier(value: &str, fallback: &str) -> String {
 }
 
 pub fn presentation_for(view: &ObsidianBaseView) -> ViewPresentation {
-    let renderer = match view.renderer.as_str() {
-        "tasknotesKanban" => "tasknotes.kanban",
-        "tasknotesCalendar" | "tasknotesMiniCalendar" => "tasknotes.calendar",
-        "tasknotesTaskList" => "tasknotes.task-list",
-        "table" => "mdbase.table",
-        other => other,
-    };
-    let mut mappings = BTreeMap::new();
-    if renderer == "tasknotes.kanban" {
-        if let Some(property) = view.group_by.as_ref().map(BaseGroupBy::property) {
-            mappings.insert("column".to_string(), property.to_string());
-        }
-    }
     ViewPresentation {
-        renderer: renderer.to_string(),
+        renderer: view.renderer.clone(),
         fallback: "mdbase.table".to_string(),
-        mappings,
+        mappings: BTreeMap::new(),
         options: view.options.clone(),
     }
 }
@@ -239,5 +226,33 @@ impl BaseGroupBy {
             Self::Property(_) => "ASC",
             Self::Definition(definition) => &definition.direction,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_open_obsidian_renderer_identifiers() {
+        let view = |renderer: &str, group_by: Option<&str>| ObsidianBaseView {
+            name: "Dates".to_string(),
+            renderer: renderer.to_string(),
+            filters: None,
+            order: Vec::new(),
+            sort: Vec::new(),
+            group_by: group_by.map(|property| BaseGroupBy::Property(property.to_string())),
+            limit: None,
+            options: BTreeMap::new(),
+            extensions: BTreeMap::new(),
+        };
+
+        let tasknotes = presentation_for(&view("tasknotesKanban", Some("status")));
+        assert_eq!(tasknotes.renderer, "tasknotesKanban");
+        assert!(tasknotes.mappings.is_empty());
+
+        let unknown = presentation_for(&view("exampleCustomRenderer", None));
+        assert_eq!(unknown.renderer, "exampleCustomRenderer");
+        assert!(unknown.mappings.is_empty());
     }
 }
