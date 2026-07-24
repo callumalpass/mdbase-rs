@@ -163,7 +163,7 @@ fn obsidian_create_folder(collection: &Collection) -> String {
         .and_then(|value| value.get("bases"))
         .and_then(|value| value.get("create_folder"))
         .and_then(Value::as_str)
-        .unwrap_or("TaskNotes/Views")
+        .unwrap_or("views")
         .to_string()
 }
 

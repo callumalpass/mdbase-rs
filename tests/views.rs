@@ -17,6 +17,7 @@ settings:
 x-obsidian:
   bases:
     include: ["TaskNotes/Views/**/*.base"]
+    create_folder: TaskNotes/Views
 "#,
     )
     .unwrap();
@@ -88,7 +89,7 @@ fn discovers_and_executes_configured_obsidian_bases() {
     assert_eq!(listed.result["views"][0]["source"]["writable"], true);
     assert_eq!(
         listed.result["views"][0]["views"][1]["presentation"]["type"],
-        "tasknotes.kanban"
+        "tasknotesKanban"
     );
     assert_eq!(
         listed.result["views"][0]["views"][0]["properties"][1],
@@ -226,6 +227,34 @@ fn creates_valid_sources_without_clobbering_or_escaping_configuration() {
     assert!(!invalid.valid);
     assert_eq!(invalid.diagnostics[0].code, "invalid_view");
     assert!(!root.path().join("TaskNotes/Views/broken.base").exists());
+}
+
+#[test]
+fn creates_obsidian_sources_in_a_neutral_default_folder() {
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("mdbase.yaml"),
+        r#"spec_version: 0.3.0
+x-obsidian:
+  bases:
+    include: ["views/**/*.base"]
+"#,
+    )
+    .unwrap();
+    let collection = Collection::open(root.path()).unwrap();
+
+    let created = collection
+        .v03_operations()
+        .unwrap()
+        .create_view_source(&json!({
+            "format": "obsidian.base",
+            "name": "Inbox",
+            "document": "views:\n  - type: table\n    name: Inbox\n"
+        }));
+
+    assert!(created.valid, "{:?}", created.diagnostics);
+    assert_eq!(created.result["path"], "views/inbox.base");
+    assert!(root.path().join("views/inbox.base").exists());
 }
 
 #[test]
