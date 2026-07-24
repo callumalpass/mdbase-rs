@@ -147,6 +147,46 @@ pub(crate) fn validate_action_output(
     )
 }
 
+pub(crate) fn preflight_action_contract(
+    registry: &RuntimeRegistry,
+    action: &Value,
+    context: &Value,
+) -> ValidationResult {
+    let action_id = action
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("<pinned-action>");
+    let mut diagnostics = validate_dispatch_context(context);
+    let required = action_capabilities(action);
+    if required.is_empty() {
+        return ValidationResult::new(diagnostics);
+    }
+    let Some(policy) = selected_policy(registry) else {
+        diagnostics.push(
+            RuntimeDiagnostic::error(
+                "policy_not_selected",
+                format!(
+                    "Pinned action {action_id} has effects but no unique runtime policy is selected."
+                ),
+            )
+            .for_id(action_id),
+        );
+        return ValidationResult::new(diagnostics);
+    };
+    for capability in required {
+        if policy_mode(policy, &capability) != Some("allow") {
+            diagnostics.push(
+                RuntimeDiagnostic::error(
+                    "capability_denied",
+                    format!("Selected policy does not explicitly allow capability {capability}."),
+                )
+                .for_id(capability),
+            );
+        }
+    }
+    ValidationResult::new(diagnostics)
+}
+
 /// Pure dispatch preflight. This does not grant access or invoke a handler;
 /// hosts such as mdbase-connect remain the final authorization boundary.
 pub(crate) fn preflight_action(

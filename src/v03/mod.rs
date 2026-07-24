@@ -20,6 +20,10 @@ mod lifecycle;
 mod operations;
 mod query;
 
+pub use cel::{
+    evaluate_runtime_expression, evaluate_runtime_template, validate_runtime_expression,
+    WorkflowCelError,
+};
 pub use operations::{OperationResult, Operations};
 pub use query::QueryPerformance;
 

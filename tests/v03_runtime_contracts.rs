@@ -29,7 +29,7 @@ fn loads_composes_and_preflights_the_canonical_canvas_runtime_end_to_end() {
         "{:#?}",
         loaded.contracts.diagnostics
     );
-    assert_eq!(loaded.contracts.type_files.len(), 11);
+    assert_eq!(loaded.contracts.type_files.len(), 12);
     assert_eq!(loaded.contracts.providers.len(), 2);
     assert_eq!(loaded.contracts.actions.len(), 1);
     assert_eq!(loaded.contracts.events.len(), 2);

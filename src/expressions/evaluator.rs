@@ -72,6 +72,13 @@ impl EvaluationClock {
     /// Capture UTC `now()` and timezone-aware `today()` values once.
     pub fn capture(timezone: Option<&str>) -> Result<Self, String> {
         let now = Utc::now();
+        Self::from_utc(now, timezone)
+    }
+
+    pub(crate) fn from_utc(
+        now: chrono::DateTime<Utc>,
+        timezone: Option<&str>,
+    ) -> Result<Self, String> {
         let today = match timezone.map(str::trim).filter(|value| !value.is_empty()) {
             None | Some("local") => now.with_timezone(&Local).date_naive(),
             Some("UTC" | "utc" | "Z") => now.date_naive(),

@@ -14,6 +14,10 @@ All notable changes to this project are documented in this file.
   context, ordered projections, selection, grouping, summaries, and pagination.
 - Runtime Contracts 0.1 loading, deterministic registry composition, workflow
   preflight, event/action validation, virtual contracts, and materialization.
+- The independently versioned `mdbase-runtime` crate with atomic event/run
+  admission, leases, pinned execution plans, stable invocation receipts,
+  cancellation, honest indeterminate outcomes, one-shot timers, journal
+  retention, and in-memory, SQLite, and PostgreSQL stores.
 - A provider/runtime boundary with payload-free performance observations,
   opt-in error observations, and optional structured `tracing` output.
 - Portable Watch notifications and runtime-aware effective-registry changes.
@@ -24,6 +28,9 @@ All notable changes to this project are documented in this file.
   frontmatter field metadata.
 - Runtime schemas and embedded action/event schemas are compiled once and
   reused across registry loads and validation.
+- Dispatch validates against the admitted action snapshot while rechecking
+  current runtime policy and host authorization immediately before every
+  provider call.
 - Batch preflight shadows only collection-visible files and required type/schema
   assets rather than caches, excluded trees, or nested collections.
 
@@ -40,6 +47,9 @@ All notable changes to this project are documented in this file.
 - Added shared Runtime Contracts fixture execution, filesystem-backed registry
   end-to-end tests, runtime-aware watch tests, a 2,000-contract performance
   regression, concurrent writer tests, and adversarial boundary tests.
+- Added fake-clock execution tests, property-based event deduplication, SQLite
+  restart recovery, live PostgreSQL namespace/race/timer coverage, and bounded
+  admission throughput profiles.
 
 ## 0.3.0-rc.1 - 2026-07-19
 
