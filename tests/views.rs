@@ -143,6 +143,54 @@ fn discovers_and_executes_configured_obsidian_bases() {
 }
 
 #[test]
+fn project_relationship_view_filters_records_through_task_project_backlinks() {
+    let (root, collection) = collection();
+    fs::create_dir_all(root.path().join("Projects")).unwrap();
+    fs::write(
+        root.path().join("Projects/mobile.md"),
+        "---\ntitle: Mobile roadmap\n---\nProject notes\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("Projects/unlinked.md"),
+        "---\ntitle: Unlinked\n---\nNo active tasks\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("tasks/project-task.md"),
+        "---\nstatus: todo\npriority: high\ntags: [task]\nprojects: ['[[Projects/mobile]]']\n---\nShip mobile\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("TaskNotes/Views/projects.base"),
+        r##"views:
+  - type: tasknotesProjects
+    name: Projects
+    filters:
+      and:
+        - 'file.backlinks.filter((value.asFile().properties["status"].isEmpty() == false) && (value.asFile().properties["status"] != "done") && (value.asFile().hasTag("archived") != true) && (list(value.asFile().properties["projects"]).map(file(value.replace(/^\[[^\]]+\]\((.*)\)$/, "$1").replace("[[", "").replace("]]", "").split("|")[0].split("#")[0].replace(/%20/g, " ")).asLink()).contains(file.asLink()))).length > 0'
+    order: [file.name, file.folder]
+"##,
+    )
+    .unwrap();
+
+    let reopened = Collection::open(root.path()).unwrap();
+    let executed = reopened.v03_operations().unwrap().execute_view(&json!({
+        "path": "TaskNotes/Views/projects.base",
+        "view": "projects"
+    }));
+
+    assert!(executed.valid, "{:?}", executed.diagnostics);
+    assert_eq!(executed.result["meta"]["total_count"], 1);
+    assert_eq!(executed.result["results"][0]["path"], "Projects/mobile.md");
+    assert_eq!(
+        executed.result["results"][0]["frontmatter"]["title"],
+        "Mobile roadmap"
+    );
+    drop(collection);
+}
+
+#[test]
 fn saved_view_sources_are_revision_safe_resources() {
     let (root, collection) = collection();
     let operations = collection.v03_operations().unwrap();
