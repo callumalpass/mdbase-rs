@@ -13,7 +13,9 @@ use crate::model::{
 };
 use crate::store::{
     AdmitOutcome, Claim, EventPage, PreparedEvent, RuntimeStore, StoreSnapshot, TimerClaim,
+    TimerReconcileOutcome,
 };
+use crate::timer::{next_timer_generation, timer_matches};
 
 pub struct SqliteRuntimeStore {
     connection: Mutex<Connection>,
@@ -508,6 +510,117 @@ impl RuntimeStore for SqliteRuntimeStore {
             .map_err(store_error)?;
         transaction.commit().map_err(store_error)?;
         Ok(true)
+    }
+
+    async fn reconcile_timers(
+        &self,
+        id_prefix: &str,
+        desired: Vec<TimerRecord>,
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<TimerReconcileOutcome> {
+        let mut connection = self.connection.lock().map_err(lock_error)?;
+        let transaction = connection.transaction().map_err(store_error)?;
+        let existing = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT record_json FROM runtime_timers
+                     WHERE substr(id, 1, length(?1)) = ?1
+                     ORDER BY id",
+                )
+                .map_err(store_error)?;
+            let records = statement
+                .query_map(params![id_prefix], |row| row.get::<_, String>(0))
+                .map_err(store_error)?
+                .map(|value| {
+                    let value = value.map_err(store_error)?;
+                    let timer = serde_json::from_str::<TimerRecord>(&value)?;
+                    Ok((timer.id.clone(), timer))
+                })
+                .collect::<RuntimeResult<std::collections::BTreeMap<_, _>>>()?;
+            records
+        };
+        let desired_ids = desired
+            .iter()
+            .map(|timer| timer.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut cancelled_ids = Vec::new();
+        for timer in existing.values().filter(|timer| {
+            timer.id.starts_with(id_prefix)
+                && !desired_ids.contains(&timer.id)
+                && matches!(timer.status, TimerStatus::Scheduled | TimerStatus::Firing)
+        }) {
+            let mut cancelled = timer.clone();
+            cancelled.status = TimerStatus::Cancelled;
+            cancelled.updated_at = now;
+            transaction
+                .execute(
+                    "UPDATE runtime_timers
+                     SET status = 'cancelled', lease_worker = NULL, lease_token = NULL,
+                         lease_expires_at = NULL, record_json = ?1
+                     WHERE id = ?2",
+                    params![serde_json::to_string(&cancelled)?, cancelled.id],
+                )
+                .map_err(store_error)?;
+            cancelled_ids.push(timer.id.clone());
+        }
+        let mut timers = Vec::with_capacity(desired.len());
+        for desired in desired {
+            let current = existing.get(&desired.id);
+            if current.is_some_and(|current| timer_matches(current, &desired)) {
+                timers.push(current.expect("checked above").clone());
+                continue;
+            }
+            let next = next_timer_generation(current, desired, now)?;
+            transaction
+                .execute(
+                    "INSERT INTO runtime_timers
+                        (id, generation, status, fire_at, record_json)
+                     VALUES (?1, ?2, 'scheduled', ?3, ?4)
+                     ON CONFLICT(id) DO UPDATE SET
+                        generation = excluded.generation,
+                        status = 'scheduled',
+                        fire_at = excluded.fire_at,
+                        lease_worker = NULL,
+                        lease_token = NULL,
+                        lease_expires_at = NULL,
+                        record_json = excluded.record_json",
+                    params![
+                        next.id,
+                        next.generation,
+                        timestamp(next.fire_at),
+                        serde_json::to_string(&next)?
+                    ],
+                )
+                .map_err(store_error)?;
+            timers.push(next);
+        }
+        transaction.commit().map_err(store_error)?;
+        timers.sort_by(|left, right| left.id.cmp(&right.id));
+        cancelled_ids.sort();
+        Ok(TimerReconcileOutcome {
+            timers,
+            cancelled_ids,
+        })
+    }
+
+    async fn timers(&self, id_prefix: &str) -> RuntimeResult<Vec<TimerRecord>> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT record_json FROM runtime_timers
+                 WHERE substr(id, 1, length(?1)) = ?1
+                 ORDER BY id",
+            )
+            .map_err(store_error)?;
+        let timers = statement
+            .query_map(params![id_prefix], |row| row.get::<_, String>(0))
+            .map_err(store_error)?
+            .map(|value| {
+                let value = value.map_err(store_error)?;
+                serde_json::from_str::<TimerRecord>(&value).map_err(Into::into)
+            })
+            .collect();
+        timers
     }
 
     async fn claim_due_timer(

@@ -12,7 +12,9 @@ use crate::model::{
 };
 use crate::store::{
     AdmitOutcome, Claim, EventPage, PreparedEvent, RuntimeStore, StoreSnapshot, TimerClaim,
+    TimerReconcileOutcome,
 };
+use crate::timer::{next_timer_generation, timer_matches};
 
 /// PostgreSQL runtime store scoped by an embedding-host authority namespace.
 ///
@@ -462,6 +464,117 @@ impl RuntimeStore for PostgresRuntimeStore {
         .map_err(store_error)?;
         transaction.commit().await.map_err(store_error)?;
         Ok(true)
+    }
+
+    async fn reconcile_timers(
+        &self,
+        id_prefix: &str,
+        desired: Vec<TimerRecord>,
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<TimerReconcileOutcome> {
+        let mut transaction = self.pool.begin().await.map_err(store_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || ':timers', 0))")
+            .bind(&self.namespace)
+            .execute(&mut *transaction)
+            .await
+            .map_err(store_error)?;
+        let existing = sqlx::query(
+            "SELECT record_json FROM mdbase_runtime_timers
+             WHERE namespace = $1 AND left(id, char_length($2)) = $2
+             ORDER BY id FOR UPDATE",
+        )
+        .bind(&self.namespace)
+        .bind(id_prefix)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(store_error)?
+        .into_iter()
+        .map(|row| {
+            let value: Value = row.try_get("record_json").map_err(store_error)?;
+            let timer = serde_json::from_value::<TimerRecord>(value)?;
+            Ok((timer.id.clone(), timer))
+        })
+        .collect::<RuntimeResult<std::collections::BTreeMap<_, _>>>()?;
+        let desired_ids = desired
+            .iter()
+            .map(|timer| timer.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut cancelled_ids = Vec::new();
+        for timer in existing.values().filter(|timer| {
+            timer.id.starts_with(id_prefix)
+                && !desired_ids.contains(&timer.id)
+                && matches!(timer.status, TimerStatus::Scheduled | TimerStatus::Firing)
+        }) {
+            let mut cancelled = timer.clone();
+            cancelled.status = TimerStatus::Cancelled;
+            cancelled.updated_at = now;
+            sqlx::query(
+                "UPDATE mdbase_runtime_timers
+                 SET status = 'cancelled', lease_worker = NULL, lease_token = NULL,
+                     lease_expires_at = NULL, record_json = $3
+                 WHERE namespace = $1 AND id = $2",
+            )
+            .bind(&self.namespace)
+            .bind(&cancelled.id)
+            .bind(serde_json::to_value(&cancelled)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(store_error)?;
+            cancelled_ids.push(timer.id.clone());
+        }
+        let mut timers = Vec::with_capacity(desired.len());
+        for desired in desired {
+            let current = existing.get(&desired.id);
+            if current.is_some_and(|current| timer_matches(current, &desired)) {
+                timers.push(current.expect("checked above").clone());
+                continue;
+            }
+            let next = next_timer_generation(current, desired, now)?;
+            sqlx::query(
+                "INSERT INTO mdbase_runtime_timers
+                    (namespace, id, generation, status, fire_at, record_json)
+                 VALUES ($1, $2, $3, 'scheduled', $4, $5)
+                 ON CONFLICT(namespace, id) DO UPDATE SET
+                    generation = excluded.generation, status = 'scheduled',
+                    fire_at = excluded.fire_at, lease_worker = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, record_json = excluded.record_json",
+            )
+            .bind(&self.namespace)
+            .bind(&next.id)
+            .bind(as_i64(next.generation)?)
+            .bind(next.fire_at)
+            .bind(serde_json::to_value(&next)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(store_error)?;
+            timers.push(next);
+        }
+        transaction.commit().await.map_err(store_error)?;
+        timers.sort_by(|left, right| left.id.cmp(&right.id));
+        cancelled_ids.sort();
+        Ok(TimerReconcileOutcome {
+            timers,
+            cancelled_ids,
+        })
+    }
+
+    async fn timers(&self, id_prefix: &str) -> RuntimeResult<Vec<TimerRecord>> {
+        sqlx::query(
+            "SELECT record_json FROM mdbase_runtime_timers
+             WHERE namespace = $1 AND left(id, char_length($2)) = $2
+             ORDER BY id",
+        )
+        .bind(&self.namespace)
+        .bind(id_prefix)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_error)?
+        .into_iter()
+        .map(|row| {
+            let value: Value = row.try_get("record_json").map_err(store_error)?;
+            serde_json::from_value::<TimerRecord>(value).map_err(Into::into)
+        })
+        .collect()
     }
 
     async fn claim_due_timer(

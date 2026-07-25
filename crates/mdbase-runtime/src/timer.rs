@@ -3,9 +3,10 @@ use mdbase::runtime_contracts::RuntimeRegistry;
 use serde_json::{json, Value};
 
 use crate::engine::{DeliveryOutcome, Runtime};
-use crate::error::RuntimeResult;
+use crate::error::{RuntimeError, RuntimeResult};
 use crate::model::{TimerRecord, TimerStatus};
 use crate::planner::stable_id;
+use crate::store::TimerReconcileOutcome;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimerRequest {
@@ -14,6 +15,12 @@ pub struct TimerRequest {
     pub event_type: String,
     pub contract_version: u64,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimerReconcileRequest {
+    pub id_prefix: String,
+    pub timers: Vec<TimerRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +56,65 @@ impl Runtime {
         self.store
             .cancel_timer(id, generation, self.clock.now())
             .await
+    }
+
+    pub async fn reconcile_timers(
+        &self,
+        request: TimerReconcileRequest,
+    ) -> RuntimeResult<TimerReconcileOutcome> {
+        if request.id_prefix.is_empty() {
+            return Err(RuntimeError::diagnostic(
+                "invalid_timer_prefix",
+                "Timer reconciliation requires a non-empty ID prefix.",
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        let now = self.clock.now();
+        let mut desired = Vec::with_capacity(request.timers.len());
+        for timer in request.timers {
+            if !timer.id.starts_with(&request.id_prefix) {
+                return Err(RuntimeError::diagnostic(
+                    "timer_outside_reconciliation_prefix",
+                    format!(
+                        "Timer {} is outside reconciliation prefix {}.",
+                        timer.id, request.id_prefix
+                    ),
+                ));
+            }
+            if !ids.insert(timer.id.clone()) {
+                return Err(RuntimeError::diagnostic(
+                    "duplicate_timer_id",
+                    format!("Timer {} appears more than once.", timer.id),
+                ));
+            }
+            desired.push(TimerRecord {
+                id: timer.id,
+                generation: 0,
+                status: TimerStatus::Scheduled,
+                fire_at: timer.fire_at,
+                event_type: timer.event_type,
+                contract_version: timer.contract_version,
+                payload: timer.payload,
+                created_at: now,
+                updated_at: now,
+                fired_at: None,
+            });
+        }
+        self.store
+            .reconcile_timers(&request.id_prefix, desired, now)
+            .await
+    }
+
+    pub async fn timers(&self, id_prefix: &str) -> RuntimeResult<Vec<TimerRecord>> {
+        if id_prefix.is_empty() {
+            return Err(RuntimeError::diagnostic(
+                "invalid_timer_prefix",
+                "Timer listing requires a non-empty ID prefix.",
+            ));
+        }
+        let mut timers = self.store.timers(id_prefix).await?;
+        timers.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(timers)
     }
 
     pub async fn fire_due_timer(
@@ -109,4 +175,36 @@ impl Runtime {
             delivery: delivery.into(),
         })
     }
+}
+
+pub(crate) fn timer_matches(current: &TimerRecord, desired: &TimerRecord) -> bool {
+    !matches!(current.status, TimerStatus::Cancelled)
+        && current.fire_at == desired.fire_at
+        && current.event_type == desired.event_type
+        && current.contract_version == desired.contract_version
+        && current.payload == desired.payload
+}
+
+pub(crate) fn next_timer_generation(
+    current: Option<&TimerRecord>,
+    mut desired: TimerRecord,
+    now: DateTime<Utc>,
+) -> RuntimeResult<TimerRecord> {
+    desired.generation = current
+        .map(|timer| timer.generation)
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| {
+            RuntimeError::diagnostic(
+                "timer_generation_exhausted",
+                format!("Timer {} exhausted its generation counter.", desired.id),
+            )
+        })?;
+    if let Some(current) = current {
+        desired.created_at = current.created_at;
+    }
+    desired.status = TimerStatus::Scheduled;
+    desired.updated_at = now;
+    desired.fired_at = None;
+    Ok(desired)
 }
