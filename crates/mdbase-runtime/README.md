@@ -38,6 +38,20 @@ Register action handlers through `ProviderRegistry`, then call
 `Runtime::deliver_event` and run one or more workers with `Runtime::work_once`.
 Use `ManualClock` for deterministic scheduling and recovery tests.
 
+## Timers
+
+`Runtime::upsert_timer` and `Runtime::cancel_timer` manage individual one-shot
+timers. Hosts projecting application state should prefer
+`Runtime::reconcile_timers`: it atomically makes every timer under an ID prefix
+match a desired set. Identical scheduled or fired timers retain their
+generation and status, changed timers receive the next generation, new timers
+are scheduled, and active omitted timers are cancelled. `Runtime::timers`
+lists only the requested prefix without loading unrelated runtime state.
+
+Prefixes are a host authorization boundary, not an application credential.
+Embedding hosts must derive them from their authenticated tenant or grant and
+must reject desired timer IDs outside that prefix.
+
 ## Storage
 
 The default `sqlite` feature is intended for one local authority process:

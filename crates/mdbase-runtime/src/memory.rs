@@ -12,7 +12,9 @@ use crate::model::{
 };
 use crate::store::{
     AdmitOutcome, Claim, EventPage, PreparedEvent, RuntimeStore, StoreSnapshot, TimerClaim,
+    TimerReconcileOutcome,
 };
+use crate::timer::{next_timer_generation, timer_matches};
 
 #[derive(Debug, Clone)]
 struct Lease {
@@ -247,6 +249,75 @@ impl RuntimeStore for InMemoryRuntimeStore {
         timer.updated_at = now;
         state.timer_leases.remove(id);
         Ok(true)
+    }
+
+    async fn reconcile_timers(
+        &self,
+        id_prefix: &str,
+        desired: Vec<TimerRecord>,
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<TimerReconcileOutcome> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeError::Store("in-memory store lock poisoned".to_string()))?;
+        let desired_ids = desired
+            .iter()
+            .map(|timer| timer.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut cancelled_ids = Vec::new();
+        let cancel = state
+            .timers
+            .values()
+            .filter(|timer| {
+                timer.id.starts_with(id_prefix)
+                    && !desired_ids.contains(&timer.id)
+                    && matches!(timer.status, TimerStatus::Scheduled | TimerStatus::Firing)
+            })
+            .map(|timer| timer.id.clone())
+            .collect::<Vec<_>>();
+        for id in cancel {
+            if let Some(timer) = state.timers.get_mut(&id) {
+                timer.status = TimerStatus::Cancelled;
+                timer.updated_at = now;
+            }
+            state.timer_leases.remove(&id);
+            cancelled_ids.push(id);
+        }
+        let mut timers = Vec::with_capacity(desired.len());
+        for next in desired {
+            let unchanged = state
+                .timers
+                .get(&next.id)
+                .is_some_and(|current| timer_matches(current, &next));
+            if unchanged {
+                timers.push(state.timers[&next.id].clone());
+                continue;
+            }
+            let next = next_timer_generation(state.timers.get(&next.id), next, now)?;
+            state.timer_leases.remove(&next.id);
+            state.timers.insert(next.id.clone(), next.clone());
+            timers.push(next);
+        }
+        timers.sort_by(|left, right| left.id.cmp(&right.id));
+        cancelled_ids.sort();
+        Ok(TimerReconcileOutcome {
+            timers,
+            cancelled_ids,
+        })
+    }
+
+    async fn timers(&self, id_prefix: &str) -> RuntimeResult<Vec<TimerRecord>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeError::Store("in-memory store lock poisoned".to_string()))?;
+        Ok(state
+            .timers
+            .values()
+            .filter(|timer| timer.id.starts_with(id_prefix))
+            .cloned()
+            .collect())
     }
 
     async fn claim_due_timer(

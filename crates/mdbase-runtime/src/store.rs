@@ -42,6 +42,12 @@ pub struct TimerClaim {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TimerReconcileOutcome {
+    pub timers: Vec<TimerRecord>,
+    pub cancelled_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct StoreSnapshot {
     pub events: Vec<EventJournalEntry>,
     pub runs: Vec<RunRecord>,
@@ -89,6 +95,20 @@ pub trait RuntimeStore: Send + Sync {
         generation: Option<u64>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<bool>;
+
+    /// Atomically make the timers under `id_prefix` match `desired`.
+    ///
+    /// Identical active or fired timers retain their generation and status.
+    /// Missing timers are scheduled, changed timers receive a new generation,
+    /// and active timers omitted from `desired` are cancelled.
+    async fn reconcile_timers(
+        &self,
+        id_prefix: &str,
+        desired: Vec<TimerRecord>,
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<TimerReconcileOutcome>;
+
+    async fn timers(&self, id_prefix: &str) -> RuntimeResult<Vec<TimerRecord>>;
 
     async fn claim_due_timer(
         &self,

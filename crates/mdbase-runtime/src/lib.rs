@@ -38,8 +38,9 @@ pub use provider::{
 pub use sqlite::SqliteRuntimeStore;
 pub use store::{
     AdmitOutcome, Claim, EventPage, PreparedEvent, RuntimeStore, StoreSnapshot, TimerClaim,
+    TimerReconcileOutcome,
 };
-pub use timer::{TimerFireOutcome, TimerRequest};
+pub use timer::{TimerFireOutcome, TimerReconcileRequest, TimerRequest};
 
 /// Independently versioned implementation package.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

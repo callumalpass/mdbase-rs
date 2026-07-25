@@ -84,6 +84,46 @@ async fn postgres_store_preserves_dedupe_retention_timers_and_namespace_fencing(
     assert_eq!(original, 1);
 
     let now = Utc::now();
+    let reconciled = first
+        .reconcile_timers(
+            "grant-a:",
+            vec![
+                TimerRecord {
+                    id: "grant-a:one".to_string(),
+                    generation: 0,
+                    status: TimerStatus::Scheduled,
+                    fire_at: now,
+                    event_type: "timer.fired".to_string(),
+                    contract_version: 1,
+                    payload: json!({"purpose": "notification"}),
+                    created_at: now,
+                    updated_at: now,
+                    fired_at: None,
+                },
+                TimerRecord {
+                    id: "grant-a:two".to_string(),
+                    generation: 0,
+                    status: TimerStatus::Scheduled,
+                    fire_at: now,
+                    event_type: "timer.fired".to_string(),
+                    contract_version: 1,
+                    payload: json!({"purpose": "notification"}),
+                    created_at: now,
+                    updated_at: now,
+                    fired_at: None,
+                },
+            ],
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reconciled.timers.len(), 2);
+    let reconciled = first
+        .reconcile_timers("grant-a:", vec![reconciled.timers[0].clone()], now)
+        .await
+        .unwrap();
+    assert_eq!(reconciled.cancelled_ids, vec!["grant-a:two"]);
+
     let timer = first
         .upsert_timer(TimerRecord {
             id: "wake-up".to_string(),

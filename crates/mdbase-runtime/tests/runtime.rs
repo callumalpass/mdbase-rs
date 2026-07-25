@@ -14,7 +14,8 @@ use mdbase_runtime::{
     ActionDispatch, ActionProvider, ActionResponse, AdmitOutcome, AuthorizationDecision, Claim,
     Clock, DispatchAuthorizer, DispatchFailure, DispatchOutcome, InMemoryRuntimeStore, ManualClock,
     PreparedEvent, ProviderRegistry, RunStatus, Runtime, RuntimeConfig, RuntimeResult,
-    RuntimeStore, StoreSnapshot, TimerClaim, TimerFireOutcome, TimerRecord, TimerRequest,
+    RuntimeStore, StoreSnapshot, TimerClaim, TimerFireOutcome, TimerReconcileOutcome,
+    TimerReconcileRequest, TimerRecord, TimerRequest,
 };
 use serde_json::{json, Value};
 #[cfg(feature = "sqlite")]
@@ -113,6 +114,112 @@ async fn executes_variables_conditions_and_for_each_deterministically() {
         run.materialized_contract(),
     ));
     assert!(validation.valid, "{:#?}", validation.diagnostics);
+}
+
+#[tokio::test]
+async fn reconciles_a_timer_prefix_without_rescheduling_unchanged_or_fired_timers() {
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let provider = Arc::new(RecordingProvider::default());
+    let (runtime, clock) = runtime(store.clone(), provider);
+    let first_at = clock.now();
+    let second_at = clock.now() + TimeDelta::hours(2);
+    let request = |id: &str, fire_at| TimerRequest {
+        id: id.to_string(),
+        fire_at,
+        event_type: "timer.fired".to_string(),
+        contract_version: 1,
+        payload: json!({"owner": "grant-a"}),
+    };
+
+    runtime
+        .upsert_timer(request("grant-b:keep", second_at))
+        .await
+        .unwrap();
+    let first = runtime
+        .reconcile_timers(TimerReconcileRequest {
+            id_prefix: "grant-a:".to_string(),
+            timers: vec![
+                request("grant-a:one", first_at),
+                request("grant-a:two", second_at),
+            ],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .timers
+            .iter()
+            .map(|timer| (timer.id.clone(), timer.generation))
+            .collect::<Vec<_>>(),
+        vec![
+            ("grant-a:one".to_string(), 1),
+            ("grant-a:two".to_string(), 1)
+        ]
+    );
+    let fired = runtime.fire_due_timer(&registry(true)).await.unwrap();
+    assert!(matches!(
+        fired,
+        TimerFireOutcome::Fired {
+            ref timer_id,
+            generation: 1,
+            ..
+        } if timer_id == "grant-a:one"
+    ));
+
+    let second = runtime
+        .reconcile_timers(TimerReconcileRequest {
+            id_prefix: "grant-a:".to_string(),
+            timers: vec![
+                request("grant-a:one", first_at),
+                request("grant-a:three", second_at),
+            ],
+        })
+        .await
+        .unwrap();
+    assert_eq!(second.cancelled_ids, vec!["grant-a:two"]);
+    assert_eq!(second.timers[0].generation, 1);
+    assert_eq!(second.timers[0].status, mdbase_runtime::TimerStatus::Fired);
+
+    let moved = runtime
+        .reconcile_timers(TimerReconcileRequest {
+            id_prefix: "grant-a:".to_string(),
+            timers: vec![request("grant-a:one", second_at)],
+        })
+        .await
+        .unwrap();
+    assert_eq!(moved.timers[0].generation, 2);
+    let snapshot = store.snapshot().await.unwrap();
+    assert!(snapshot
+        .timers
+        .iter()
+        .any(|timer| timer.id == "grant-b:keep"));
+    assert!(runtime
+        .timers("grant-a:")
+        .await
+        .unwrap()
+        .iter()
+        .all(|timer| timer.id.starts_with("grant-a:")));
+}
+
+#[tokio::test]
+async fn rejects_timer_reconciliation_outside_its_prefix() {
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let provider = Arc::new(RecordingProvider::default());
+    let (runtime, clock) = runtime(store, provider);
+    let error = runtime
+        .reconcile_timers(TimerReconcileRequest {
+            id_prefix: "grant-a:".to_string(),
+            timers: vec![TimerRequest {
+                id: "grant-b:timer".to_string(),
+                fire_at: clock.now(),
+                event_type: "timer.fired".to_string(),
+                contract_version: 1,
+                payload: json!({}),
+            }],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "timer_outside_reconciliation_prefix");
 }
 
 #[tokio::test]
@@ -284,6 +391,47 @@ async fn sqlite_store_survives_reopen_and_preserves_event_deduplication() {
         let snapshot = store.snapshot().await.unwrap();
         assert_eq!(snapshot.events.len(), 1);
         assert_eq!(snapshot.runs.len(), 1);
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn sqlite_timer_reconciliation_is_atomic_and_survives_reopen() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("runtime.sqlite");
+    let fire_at = Utc.with_ymd_and_hms(2026, 7, 25, 9, 0, 0).single().unwrap();
+    let timer = |id: &str| TimerRequest {
+        id: id.to_string(),
+        fire_at,
+        event_type: "timer.fired".to_string(),
+        contract_version: 1,
+        payload: json!({"private": id}),
+    };
+    {
+        let store = Arc::new(SqliteRuntimeStore::open(&path).unwrap());
+        let (runtime, _) = runtime(store, Arc::new(RecordingProvider::default()));
+        let outcome = runtime
+            .reconcile_timers(TimerReconcileRequest {
+                id_prefix: "grant-a:".to_string(),
+                timers: vec![timer("grant-a:one"), timer("grant-a:two")],
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.timers.len(), 2);
+    }
+    {
+        let store = Arc::new(SqliteRuntimeStore::open(&path).unwrap());
+        let (runtime, _) = runtime(store, Arc::new(RecordingProvider::default()));
+        let outcome = runtime
+            .reconcile_timers(TimerReconcileRequest {
+                id_prefix: "grant-a:".to_string(),
+                timers: vec![timer("grant-a:one")],
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.timers[0].generation, 1);
+        assert_eq!(outcome.cancelled_ids, vec!["grant-a:two"]);
+        assert_eq!(runtime.timers("grant-a:").await.unwrap().len(), 2);
     }
 }
 
@@ -701,6 +849,19 @@ impl RuntimeStore for FailCommitStore {
         now: chrono::DateTime<Utc>,
     ) -> RuntimeResult<bool> {
         self.inner.cancel_timer(id, generation, now).await
+    }
+
+    async fn reconcile_timers(
+        &self,
+        id_prefix: &str,
+        desired: Vec<TimerRecord>,
+        now: chrono::DateTime<Utc>,
+    ) -> RuntimeResult<TimerReconcileOutcome> {
+        self.inner.reconcile_timers(id_prefix, desired, now).await
+    }
+
+    async fn timers(&self, id_prefix: &str) -> RuntimeResult<Vec<TimerRecord>> {
+        self.inner.timers(id_prefix).await
     }
 
     async fn claim_due_timer(
