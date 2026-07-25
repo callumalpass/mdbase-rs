@@ -100,3 +100,12 @@ an already admitted action.
 terminal immediately; an active cooperative provider receives a bounded
 best-effort cancellation signal and the returned outcome reports whether that
 signal was acknowledged.
+
+Queued runs occupy their concurrency group. `skip` therefore rejects work
+behind a queued predecessor, `queue` preserves event-cursor order even when an
+earlier run is not ready, and `replace` cancels queued predecessors
+transactionally. `DeliveryOutcome::cancellation_requested_run_ids` identifies
+active predecessors for which replacement recorded durable cancellation
+intent. If a cancelled cooperative dispatch has no durable outcome after
+recovery, it is not replayed: the predecessor becomes `indeterminate` and its
+replacement remains queued until that ambiguity is explicitly resolved.

@@ -52,6 +52,9 @@ pub struct DeliveryOutcome {
     pub duplicate: bool,
     pub admitted_run_ids: Vec<String>,
     pub skipped_run_ids: Vec<String>,
+    /// Existing runs for which this delivery durably recorded cancellation
+    /// intent before sending any best-effort cooperative cancellation signal.
+    pub cancellation_requested_run_ids: Vec<String>,
 }
 
 impl From<AdmitOutcome> for DeliveryOutcome {
@@ -61,6 +64,7 @@ impl From<AdmitOutcome> for DeliveryOutcome {
             duplicate: value.duplicate,
             admitted_run_ids: value.admitted_run_ids,
             skipped_run_ids: value.skipped_run_ids,
+            cancellation_requested_run_ids: value.cancellation_requested_run_ids,
         }
     }
 }
@@ -178,7 +182,11 @@ impl Runtime {
         event: Value,
     ) -> RuntimeResult<DeliveryOutcome> {
         let prepared = self.prepare_event(registry, event, self.clock.now())?;
-        self.store.admit_event(prepared).await.map(Into::into)
+        let admitted = self.store.admit_event(prepared).await?;
+        for run_id in &admitted.cancellation_requested_run_ids {
+            self.notify_cancellation_request(run_id).await;
+        }
+        Ok(admitted.into())
     }
 
     pub async fn work_once(&self, registry: &RuntimeRegistry) -> RuntimeResult<WorkerOutcome> {
@@ -244,23 +252,33 @@ impl Runtime {
                 "cancelled run disappeared from the runtime store".to_string(),
             ));
         };
+        Ok(self.cancellation_outcome(&run).await)
+    }
+
+    async fn notify_cancellation_request(&self, id: &str) {
+        if let Ok(Some(run)) = self.store.get_run(id).await {
+            let _ = self.cancellation_outcome(&run).await;
+        }
+    }
+
+    async fn cancellation_outcome(&self, run: &crate::model::RunRecord) -> CancellationOutcome {
         if run.status.terminal() {
-            return Ok(CancellationOutcome {
+            return CancellationOutcome {
                 accepted: true,
                 terminal: true,
                 invocation_id: None,
                 provider_notified: false,
                 provider_error: None,
-            });
+            };
         }
         let Some(active) = run.active_attempt.and_then(|index| run.attempts.get(index)) else {
-            return Ok(CancellationOutcome {
+            return CancellationOutcome {
                 accepted: true,
                 terminal: false,
                 invocation_id: None,
                 provider_notified: false,
                 provider_error: None,
-            });
+            };
         };
         let cooperative = run
             .plan
@@ -268,16 +286,16 @@ impl Runtime {
             .get(run.next_step)
             .is_some_and(|step| step.cooperative_cancellation);
         if !cooperative {
-            return Ok(CancellationOutcome {
+            return CancellationOutcome {
                 accepted: true,
                 terminal: false,
                 invocation_id: Some(active.invocation_id.clone()),
                 provider_notified: false,
                 provider_error: None,
-            });
+            };
         }
         let Some(provider) = self.providers.get(&active.action) else {
-            return Ok(CancellationOutcome {
+            return CancellationOutcome {
                 accepted: true,
                 terminal: false,
                 invocation_id: Some(active.invocation_id.clone()),
@@ -286,7 +304,7 @@ impl Runtime {
                     "unsupported_action_handler",
                     format!("No provider is registered for {}.", active.action),
                 )),
-            });
+            };
         };
         let notification = tokio::time::timeout(
             self.config.lease_duration,
@@ -301,13 +319,13 @@ impl Runtime {
                 "The provider did not acknowledge cancellation before the lease interval.",
             )),
         };
-        Ok(CancellationOutcome {
+        CancellationOutcome {
             accepted: true,
             terminal: false,
             invocation_id: Some(active.invocation_id.clone()),
             provider_notified: provider_error.is_none(),
             provider_error,
-        })
+        }
     }
 
     pub(crate) fn prepare_event(
@@ -406,6 +424,39 @@ impl Runtime {
         registry: &RuntimeRegistry,
         mut claim: Claim,
     ) -> RuntimeResult<WorkerOutcome> {
+        if claim.run.cancel_requested_at.is_some() {
+            if let Some(active) = claim.run.active_attempt {
+                let cooperative = claim
+                    .run
+                    .plan
+                    .steps
+                    .get(claim.run.next_step)
+                    .is_some_and(|step| step.cooperative_cancellation);
+                if cooperative
+                    && claim.run.attempts[active].status == ActionAttemptStatus::Dispatching
+                {
+                    let _ = self.cancellation_outcome(&claim.run).await;
+                    claim = self
+                        .indeterminate_active_attempt(
+                            claim,
+                            active,
+                            "action_cancellation_outcome_indeterminate",
+                            "A cooperative action was cancelled while its dispatch outcome was not durable.",
+                        )
+                        .await?;
+                    return Ok(WorkerOutcome::Completed {
+                        run_id: claim.run.plan.id,
+                        status: RunStatus::Indeterminate,
+                    });
+                }
+            } else {
+                claim = self.finish_cancelled(claim).await?;
+                return Ok(WorkerOutcome::Completed {
+                    run_id: claim.run.plan.id,
+                    status: RunStatus::Cancelled,
+                });
+            }
+        }
         if claim.run.active_attempt.is_none() && self.deadline_elapsed(&claim.run) {
             claim = self.timeout_run(claim).await?;
             return Ok(WorkerOutcome::Completed {
@@ -416,16 +467,14 @@ impl Runtime {
         if let Some(active) = claim.run.active_attempt {
             if claim.run.attempts[active].status == ActionAttemptStatus::Dispatching {
                 if !claim.run.attempts[active].idempotent {
-                    let now = self.clock.now();
-                    claim.run.attempts[active].status = ActionAttemptStatus::Indeterminate;
-                    claim.run.attempts[active].finished_at = Some(now);
-                    let step_index = claim.run.next_step;
-                    claim.run.steps[step_index].status = StepStatus::Indeterminate;
-                    claim.run.steps[step_index].finished_at = Some(now);
-                    claim.run.status = RunStatus::Indeterminate;
-                    claim.run.finished_at = Some(now);
-                    claim.run.updated_at = now;
-                    claim = self.store.commit_run(claim, Vec::new()).await?;
+                    claim = self
+                        .indeterminate_active_attempt(
+                            claim,
+                            active,
+                            "action_outcome_indeterminate",
+                            "A non-idempotent dispatch was interrupted before its outcome became durable.",
+                        )
+                        .await?;
                     return Ok(WorkerOutcome::Completed {
                         run_id: claim.run.plan.id,
                         status: RunStatus::Indeterminate,
@@ -467,13 +516,7 @@ impl Runtime {
                 break;
             }
             if claim.run.cancel_requested_at.is_some() {
-                let now = self.clock.now();
-                claim.run.steps[step_index].status = StepStatus::Cancelled;
-                claim.run.steps[step_index].finished_at = Some(now);
-                claim.run.status = RunStatus::Cancelled;
-                claim.run.finished_at = Some(now);
-                claim.run.updated_at = now;
-                claim = self.store.commit_run(claim, Vec::new()).await?;
+                claim = self.finish_cancelled(claim).await?;
                 return Ok(WorkerOutcome::Completed {
                     run_id: claim.run.plan.id,
                     status: RunStatus::Cancelled,
@@ -859,13 +902,16 @@ impl Runtime {
                 claim.run.attempts[active].receipt = response.receipt;
                 claim.run.attempts[active].finished_at = Some(now);
                 if self.deadline_elapsed(&claim.run) {
-                    claim.run.steps[claim.run.next_step].status = StepStatus::TimedOut;
-                    claim.run.steps[claim.run.next_step].error = Some(RuntimeFailure::new(
+                    let step_index = claim.run.next_step;
+                    claim.run.steps[step_index].status = StepStatus::TimedOut;
+                    claim.run.steps[step_index].error = Some(RuntimeFailure::new(
                         "workflow_timed_out",
                         "The action completed after the workflow deadline.",
                     ));
-                    claim.run.steps[claim.run.next_step].finished_at = Some(now);
+                    claim.run.steps[step_index].finished_at = Some(now);
+                    skip_remaining_steps(&mut claim.run, step_index.saturating_add(1), now);
                     claim.run.active_attempt = None;
+                    claim.run.next_step = claim.run.steps.len();
                     claim.run.status = RunStatus::Failed;
                     claim.run.finished_at = Some(now);
                     claim.run.updated_at = now;
@@ -900,12 +946,15 @@ impl Runtime {
                 claim.run.attempts[active].error =
                     Some(RuntimeFailure::new(&failure.code, &failure.message));
                 claim.run.attempts[active].finished_at = Some(now);
-                claim.run.steps[claim.run.next_step].status = StepStatus::Indeterminate;
-                claim.run.steps[claim.run.next_step].error = Some(RuntimeFailure::new(
+                let step_index = claim.run.next_step;
+                claim.run.steps[step_index].status = StepStatus::Indeterminate;
+                claim.run.steps[step_index].error = Some(RuntimeFailure::new(
                     "action_outcome_indeterminate",
                     failure.message,
                 ));
-                claim.run.steps[claim.run.next_step].finished_at = Some(now);
+                claim.run.steps[step_index].finished_at = Some(now);
+                skip_remaining_steps(&mut claim.run, step_index.saturating_add(1), now);
+                claim.run.next_step = claim.run.steps.len();
                 claim.run.status = RunStatus::Indeterminate;
                 claim.run.finished_at = Some(now);
                 claim.run.updated_at = now;
@@ -1049,12 +1098,58 @@ impl Runtime {
     }
 
     async fn advance_failed_step(&self, mut claim: Claim) -> RuntimeResult<Claim> {
+        let now = self.clock.now();
         if claim.run.plan.on_error == OnError::Stop {
+            let remaining_start = claim.run.next_step.saturating_add(1);
+            skip_remaining_steps(&mut claim.run, remaining_start, now);
+            claim.run.next_step = claim.run.steps.len();
             claim.run.status = RunStatus::Failed;
-            claim.run.finished_at = Some(self.clock.now());
+            claim.run.finished_at = Some(now);
+        } else {
+            claim.run.next_step += 1;
         }
-        claim.run.next_step += 1;
-        claim.run.updated_at = self.clock.now();
+        claim.run.updated_at = now;
+        self.store.commit_run(claim, Vec::new()).await
+    }
+
+    async fn finish_cancelled(&self, mut claim: Claim) -> RuntimeResult<Claim> {
+        let now = self.clock.now();
+        let step_index = claim.run.next_step;
+        if let Some(step) = claim.run.steps.get_mut(step_index) {
+            step.status = StepStatus::Cancelled;
+            step.finished_at = Some(now);
+        }
+        skip_remaining_steps(&mut claim.run, step_index.saturating_add(1), now);
+        claim.run.active_attempt = None;
+        claim.run.next_step = claim.run.steps.len();
+        claim.run.status = RunStatus::Cancelled;
+        claim.run.finished_at = Some(now);
+        claim.run.updated_at = now;
+        self.store.commit_run(claim, Vec::new()).await
+    }
+
+    async fn indeterminate_active_attempt(
+        &self,
+        mut claim: Claim,
+        active: usize,
+        code: &str,
+        message: &str,
+    ) -> RuntimeResult<Claim> {
+        let now = self.clock.now();
+        let failure = RuntimeFailure::new(code, message);
+        claim.run.attempts[active].status = ActionAttemptStatus::Indeterminate;
+        claim.run.attempts[active].error = Some(failure.clone());
+        claim.run.attempts[active].finished_at = Some(now);
+        let step_index = claim.run.next_step;
+        claim.run.steps[step_index].status = StepStatus::Indeterminate;
+        claim.run.steps[step_index].error = Some(failure);
+        claim.run.steps[step_index].finished_at = Some(now);
+        skip_remaining_steps(&mut claim.run, step_index.saturating_add(1), now);
+        claim.run.active_attempt = None;
+        claim.run.next_step = claim.run.steps.len();
+        claim.run.status = RunStatus::Indeterminate;
+        claim.run.finished_at = Some(now);
+        claim.run.updated_at = now;
         self.store.commit_run(claim, Vec::new()).await
     }
 
@@ -1079,7 +1174,8 @@ impl Runtime {
 
     async fn timeout_run(&self, mut claim: Claim) -> RuntimeResult<Claim> {
         let now = self.clock.now();
-        if let Some(step) = claim.run.steps.get_mut(claim.run.next_step) {
+        let step_index = claim.run.next_step;
+        if let Some(step) = claim.run.steps.get_mut(step_index) {
             step.status = StepStatus::TimedOut;
             step.error = Some(RuntimeFailure::new(
                 "workflow_timed_out",
@@ -1087,7 +1183,9 @@ impl Runtime {
             ));
             step.finished_at = Some(now);
         }
+        skip_remaining_steps(&mut claim.run, step_index.saturating_add(1), now);
         claim.run.active_attempt = None;
+        claim.run.next_step = claim.run.steps.len();
         claim.run.status = RunStatus::Failed;
         claim.run.finished_at = Some(now);
         claim.run.updated_at = now;
@@ -1113,6 +1211,15 @@ impl Runtime {
             event["trace"]["causation_id"] = Value::String(invocation_id.to_string());
         }
         event
+    }
+}
+
+fn skip_remaining_steps(run: &mut crate::model::RunRecord, start: usize, now: DateTime<Utc>) {
+    for step in run.steps.iter_mut().skip(start) {
+        if step.status == StepStatus::Pending {
+            step.status = StepStatus::Skipped;
+            step.finished_at = Some(now);
+        }
     }
 }
 

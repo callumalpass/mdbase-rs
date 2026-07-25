@@ -358,8 +358,13 @@ impl RuntimeStore for PostgresRuntimeStore {
             return Ok(false);
         }
         run.revision += 1;
+        let terminal = run.status.terminal();
         sqlx::query(
-            "UPDATE mdbase_runtime_runs SET status = $3, revision = $4, record_json = $5
+            "UPDATE mdbase_runtime_runs
+             SET status = $3, revision = $4, record_json = $5,
+                 lease_worker = CASE WHEN $6 THEN NULL ELSE lease_worker END,
+                 lease_token = CASE WHEN $6 THEN NULL ELSE lease_token END,
+                 lease_expires_at = CASE WHEN $6 THEN NULL ELSE lease_expires_at END
              WHERE namespace = $1 AND id = $2",
         )
         .bind(&self.namespace)
@@ -367,6 +372,7 @@ impl RuntimeStore for PostgresRuntimeStore {
         .bind(run_status(run.status))
         .bind(as_i64(run.revision)?)
         .bind(serde_json::to_value(&run)?)
+        .bind(terminal)
         .execute(&mut *transaction)
         .await
         .map_err(store_error)?;
@@ -726,6 +732,7 @@ async fn admit_tx(
             duplicate: true,
             admitted_run_ids: Vec::new(),
             skipped_run_ids: Vec::new(),
+            cancellation_requested_run_ids: Vec::new(),
         });
     }
     let cursor: i64 = sqlx::query(
@@ -771,6 +778,7 @@ async fn admit_tx(
 
     let mut admitted = Vec::new();
     let mut skipped = Vec::new();
+    let mut cancellation_requested = Vec::new();
     for mut plan in event.runs {
         plan.event_cursor = cursor;
         if minimum_interval_suppresses_tx(transaction, namespace, &plan).await? {
@@ -813,6 +821,7 @@ async fn admit_tx(
             continue;
         }
         if plan.concurrency_policy == ConcurrencyPolicy::Replace {
+            plan.replacement_blockers = active.clone();
             for id in active {
                 let row = sqlx::query(
                     "SELECT record_json FROM mdbase_runtime_runs
@@ -825,20 +834,29 @@ async fn admit_tx(
                 .map_err(store_error)?;
                 let mut run: RunRecord =
                     serde_json::from_value(row.try_get("record_json").map_err(store_error)?)?;
-                run.cancel_requested_at.get_or_insert(event.received_at);
-                run.updated_at = event.received_at;
+                if !run.request_cancel(event.received_at) {
+                    continue;
+                }
                 run.revision += 1;
+                let terminal = run.status.terminal();
                 sqlx::query(
-                    "UPDATE mdbase_runtime_runs SET revision = $3, record_json = $4
+                    "UPDATE mdbase_runtime_runs
+                     SET status = $3, revision = $4, record_json = $5,
+                         lease_worker = CASE WHEN $6 THEN NULL ELSE lease_worker END,
+                         lease_token = CASE WHEN $6 THEN NULL ELSE lease_token END,
+                         lease_expires_at = CASE WHEN $6 THEN NULL ELSE lease_expires_at END
                      WHERE namespace = $1 AND id = $2",
                 )
                 .bind(namespace)
                 .bind(&id)
+                .bind(run_status(run.status))
                 .bind(as_i64(run.revision)?)
                 .bind(serde_json::to_value(&run)?)
+                .bind(terminal)
                 .execute(&mut **transaction)
                 .await
                 .map_err(store_error)?;
+                cancellation_requested.push(id);
             }
         }
         let run = RunRecord::admitted(plan);
@@ -866,11 +884,14 @@ async fn admit_tx(
         .map_err(store_error)?;
         admitted.push(run.plan.id);
     }
+    cancellation_requested.sort();
+    cancellation_requested.dedup();
     Ok(AdmitOutcome {
         cursor,
         duplicate: false,
         admitted_run_ids: admitted,
         skipped_run_ids: skipped,
+        cancellation_requested_run_ids: cancellation_requested,
     })
 }
 
@@ -906,7 +927,9 @@ async fn active_group_runs_tx(
 ) -> RuntimeResult<Vec<String>> {
     let rows = sqlx::query(
         "SELECT id FROM mdbase_runtime_runs
-         WHERE namespace = $1 AND concurrency_group = $2 AND status IN ('running', 'waiting')",
+         WHERE namespace = $1 AND concurrency_group = $2
+           AND status IN ('queued', 'running', 'waiting')
+         ORDER BY id",
     )
     .bind(namespace)
     .bind(group)
@@ -926,18 +949,36 @@ async fn group_is_runnable_tx(
     if run.plan.concurrency_policy == ConcurrencyPolicy::Allow {
         return Ok(true);
     }
-    Ok(sqlx::query(
-        "SELECT 1 FROM mdbase_runtime_runs
-         WHERE namespace = $1 AND concurrency_group = $2 AND id != $3
-           AND status IN ('running', 'waiting') LIMIT 1",
+    let rows = sqlx::query(
+        "SELECT record_json FROM mdbase_runtime_runs
+         WHERE namespace = $1 AND concurrency_group = $2 AND id != $3",
     )
     .bind(namespace)
     .bind(&run.plan.concurrency_group)
     .bind(&run.plan.id)
-    .fetch_optional(&mut **transaction)
+    .fetch_all(&mut **transaction)
     .await
-    .map_err(store_error)?
-    .is_none())
+    .map_err(store_error)?;
+    let others = rows
+        .into_iter()
+        .map(|row| {
+            let value: Value = row.try_get("record_json").map_err(store_error)?;
+            serde_json::from_value::<RunRecord>(value).map_err(Into::into)
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    let blocked_by_group = others.iter().any(|other| {
+        matches!(other.status, RunStatus::Running | RunStatus::Waiting)
+            || (other.status == RunStatus::Queued
+                && (&other.plan.event_cursor, &other.plan.id)
+                    < (&run.plan.event_cursor, &run.plan.id))
+    });
+    if blocked_by_group {
+        return Ok(false);
+    }
+    Ok(!others.iter().any(|other| {
+        run.plan.replacement_blockers.contains(&other.plan.id)
+            && other.status == RunStatus::Indeterminate
+    }))
 }
 
 async fn read_records<T: serde::de::DeserializeOwned>(

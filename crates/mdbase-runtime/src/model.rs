@@ -30,6 +30,11 @@ pub struct PlannedRun {
     pub idempotency_scope: String,
     pub concurrency_group: String,
     pub concurrency_policy: ConcurrencyPolicy,
+    /// Runs whose cancellation was requested when this replacement was
+    /// admitted. An indeterminate blocker keeps the replacement queued until
+    /// an operator resolves that ambiguity.
+    #[serde(default)]
+    pub replacement_blockers: Vec<String>,
     pub on_error: OnError,
     pub not_before: DateTime<Utc>,
     #[serde(default)]
@@ -99,6 +104,10 @@ impl RunStatus {
             self,
             Self::Succeeded | Self::Failed | Self::Cancelled | Self::Indeterminate
         )
+    }
+
+    pub(crate) fn occupies_concurrency_group(self) -> bool {
+        matches!(self, Self::Queued | Self::Running | Self::Waiting)
     }
 }
 
@@ -322,10 +331,18 @@ impl RunRecord {
         self.cancel_requested_at.get_or_insert(now);
         self.updated_at = now;
         if matches!(self.status, RunStatus::Queued | RunStatus::Waiting) {
-            if let Some(step) = self.steps.get_mut(self.next_step) {
+            let current = self.next_step;
+            if let Some(step) = self.steps.get_mut(current) {
                 step.status = StepStatus::Cancelled;
                 step.finished_at = Some(now);
             }
+            for step in self.steps.iter_mut().skip(current.saturating_add(1)) {
+                if step.status == StepStatus::Pending {
+                    step.status = StepStatus::Skipped;
+                    step.finished_at = Some(now);
+                }
+            }
+            self.next_step = self.steps.len();
             self.status = RunStatus::Cancelled;
             self.finished_at = Some(now);
         }
