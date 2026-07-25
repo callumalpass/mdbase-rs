@@ -417,14 +417,20 @@ impl RuntimeStore for SqliteRuntimeStore {
             return Ok(false);
         }
         run.revision += 1;
+        let terminal = run.status.terminal();
         transaction
             .execute(
                 "UPDATE runtime_runs
-                 SET status = ?1, revision = ?2, record_json = ?3 WHERE id = ?4",
+                 SET status = ?1, revision = ?2, record_json = ?3,
+                     lease_worker = CASE WHEN ?4 THEN NULL ELSE lease_worker END,
+                     lease_token = CASE WHEN ?4 THEN NULL ELSE lease_token END,
+                     lease_expires_at = CASE WHEN ?4 THEN NULL ELSE lease_expires_at END
+                 WHERE id = ?5",
                 params![
                     run_status(run.status),
                     run.revision,
                     serde_json::to_string(&run)?,
+                    terminal,
                     id
                 ],
             )
@@ -783,6 +789,7 @@ fn admit_tx(transaction: &Transaction<'_>, event: PreparedEvent) -> RuntimeResul
             duplicate: true,
             admitted_run_ids: Vec::new(),
             skipped_run_ids: Vec::new(),
+            cancellation_requested_run_ids: Vec::new(),
         });
     }
     transaction
@@ -814,6 +821,7 @@ fn admit_tx(transaction: &Transaction<'_>, event: PreparedEvent) -> RuntimeResul
 
     let mut admitted = Vec::new();
     let mut skipped = Vec::new();
+    let mut cancellation_requested = Vec::new();
     for mut plan in event.runs {
         plan.event_cursor = cursor;
         if minimum_interval_suppresses_tx(transaction, &plan)? {
@@ -855,6 +863,7 @@ fn admit_tx(transaction: &Transaction<'_>, event: PreparedEvent) -> RuntimeResul
             continue;
         }
         if plan.concurrency_policy == ConcurrencyPolicy::Replace {
+            plan.replacement_blockers = active.clone();
             for id in active {
                 let json: String = transaction
                     .query_row(
@@ -864,15 +873,29 @@ fn admit_tx(transaction: &Transaction<'_>, event: PreparedEvent) -> RuntimeResul
                     )
                     .map_err(store_error)?;
                 let mut run: RunRecord = serde_json::from_str(&json)?;
-                run.cancel_requested_at.get_or_insert(event.received_at);
-                run.updated_at = event.received_at;
+                if !run.request_cancel(event.received_at) {
+                    continue;
+                }
                 run.revision += 1;
+                let terminal = run.status.terminal();
                 transaction
                     .execute(
-                        "UPDATE runtime_runs SET revision = ?1, record_json = ?2 WHERE id = ?3",
-                        params![run.revision, serde_json::to_string(&run)?, run.plan.id],
+                        "UPDATE runtime_runs
+                         SET status = ?1, revision = ?2, record_json = ?3,
+                             lease_worker = CASE WHEN ?4 THEN NULL ELSE lease_worker END,
+                             lease_token = CASE WHEN ?4 THEN NULL ELSE lease_token END,
+                             lease_expires_at = CASE WHEN ?4 THEN NULL ELSE lease_expires_at END
+                         WHERE id = ?5",
+                        params![
+                            run_status(run.status),
+                            run.revision,
+                            serde_json::to_string(&run)?,
+                            terminal,
+                            run.plan.id
+                        ],
                     )
                     .map_err(store_error)?;
+                cancellation_requested.push(id);
             }
         }
         let run = RunRecord::admitted(plan);
@@ -900,11 +923,14 @@ fn admit_tx(transaction: &Transaction<'_>, event: PreparedEvent) -> RuntimeResul
             .map_err(store_error)?;
         admitted.push(run.plan.id);
     }
+    cancellation_requested.sort();
+    cancellation_requested.dedup();
     Ok(AdmitOutcome {
         cursor,
         duplicate: false,
         admitted_run_ids: admitted,
         skipped_run_ids: skipped,
+        cancellation_requested_run_ids: cancellation_requested,
     })
 }
 
@@ -934,7 +960,8 @@ fn active_group_runs_tx(transaction: &Transaction<'_>, group: &str) -> RuntimeRe
     let mut statement = transaction
         .prepare(
             "SELECT id FROM runtime_runs
-             WHERE concurrency_group = ?1 AND status IN ('running', 'waiting')",
+             WHERE concurrency_group = ?1 AND status IN ('queued', 'running', 'waiting')
+             ORDER BY id",
         )
         .map_err(store_error)?;
     let result = statement
@@ -949,18 +976,38 @@ fn group_is_runnable_tx(transaction: &Transaction<'_>, run: &RunRecord) -> Runti
     if run.plan.concurrency_policy == ConcurrencyPolicy::Allow {
         return Ok(true);
     }
-    Ok(transaction
-        .query_row(
-            "SELECT 1 FROM runtime_runs
-             WHERE concurrency_group = ?1 AND id != ?2
-               AND status IN ('running', 'waiting')
-             LIMIT 1",
-            params![run.plan.concurrency_group, run.plan.id],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(store_error)?
-        .is_none())
+    let others = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT record_json FROM runtime_runs
+                 WHERE concurrency_group = ?1 AND id != ?2",
+            )
+            .map_err(store_error)?;
+        let rows = statement
+            .query_map(params![run.plan.concurrency_group, run.plan.id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(store_error)?
+            .map(|row| {
+                row.map_err(store_error)
+                    .and_then(|json| serde_json::from_str::<RunRecord>(&json).map_err(Into::into))
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        rows
+    };
+    let blocked_by_group = others.iter().any(|other| {
+        matches!(other.status, RunStatus::Running | RunStatus::Waiting)
+            || (other.status == RunStatus::Queued
+                && (&other.plan.event_cursor, &other.plan.id)
+                    < (&run.plan.event_cursor, &run.plan.id))
+    });
+    if blocked_by_group {
+        return Ok(false);
+    }
+    Ok(!others.iter().any(|other| {
+        run.plan.replacement_blockers.contains(&other.plan.id)
+            && other.status == RunStatus::Indeterminate
+    }))
 }
 
 fn read_json_column<T: serde::de::DeserializeOwned>(

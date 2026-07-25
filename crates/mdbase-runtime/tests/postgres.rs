@@ -1,7 +1,10 @@
 #![cfg(feature = "postgres")]
 
-use chrono::Utc;
-use mdbase_runtime::{PostgresRuntimeStore, PreparedEvent, RuntimeStore, TimerRecord, TimerStatus};
+use chrono::{TimeDelta, Utc};
+use mdbase_runtime::{
+    ConcurrencyPolicy, OnError, PlannedRun, PostgresRuntimeStore, PreparedEvent, RunStatus,
+    RuntimeStore, TimerRecord, TimerStatus,
+};
 use serde_json::json;
 use ulid::Ulid;
 
@@ -20,6 +23,43 @@ fn prepared_event(id: &str) -> PreparedEvent {
         received_at: Utc::now(),
         runs: Vec::new(),
     }
+}
+
+fn planned_run(id: &str, event_id: &str, policy: ConcurrencyPolicy) -> PlannedRun {
+    let now = Utc::now();
+    PlannedRun {
+        id: id.to_string(),
+        workflow: "test.workflow".to_string(),
+        workflow_version: 1,
+        workflow_revision: "workflow-revision".to_string(),
+        registry_revision: "registry-revision".to_string(),
+        policy_revision: Some("policy-revision".to_string()),
+        trigger: "changed".to_string(),
+        event_id: event_id.to_string(),
+        event_type: "test.changed".to_string(),
+        event_cursor: 0,
+        event: json!({"id": event_id, "type": "test.changed"}),
+        executor: "postgres-test".to_string(),
+        idempotency_key: format!("key:{id}"),
+        idempotency_scope: "postgres-test".to_string(),
+        concurrency_group: "test-group".to_string(),
+        concurrency_policy: policy,
+        replacement_blockers: Vec::new(),
+        on_error: OnError::Stop,
+        not_before: now,
+        timeout_at: None,
+        minimum_interval_ms: None,
+        vars: json!({}),
+        workflow_value: json!({}),
+        steps: Vec::new(),
+        created_at: now,
+    }
+}
+
+fn prepared_run_event(id: &str, run: PlannedRun) -> PreparedEvent {
+    let mut event = prepared_event(id);
+    event.runs.push(run);
+    event
 }
 
 /// Set `MDBASE_RUNTIME_TEST_DATABASE_URL` to run this against a disposable or
@@ -164,4 +204,103 @@ async fn postgres_store_preserves_dedupe_retention_timers_and_namespace_fencing(
         first.snapshot().await.unwrap().timers[0].status,
         TimerStatus::Fired
     );
+
+    let state_store = PostgresRuntimeStore::new(
+        first.pool().clone(),
+        format!("test:{test_id}:state-machine"),
+    )
+    .await
+    .unwrap();
+    let first_run = planned_run(
+        "run-skip-first",
+        "event-skip-first",
+        ConcurrencyPolicy::Skip,
+    );
+    state_store
+        .admit_event(prepared_run_event("event-skip-first", first_run))
+        .await
+        .unwrap();
+    let skipped = state_store
+        .admit_event(prepared_run_event(
+            "event-skip-second",
+            planned_run(
+                "run-skip-second",
+                "event-skip-second",
+                ConcurrencyPolicy::Skip,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(skipped.skipped_run_ids, ["run-skip-second"]);
+
+    let replaced = state_store
+        .admit_event(prepared_run_event(
+            "event-replace",
+            planned_run(
+                "run-replacement",
+                "event-replace",
+                ConcurrencyPolicy::Replace,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replaced.cancellation_requested_run_ids, ["run-skip-first"]);
+    let snapshot = state_store.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot
+            .runs
+            .iter()
+            .find(|run| run.plan.id == "run-skip-first")
+            .unwrap()
+            .status,
+        RunStatus::Cancelled
+    );
+
+    let queue_store =
+        PostgresRuntimeStore::new(first.pool().clone(), format!("test:{test_id}:queue-order"))
+            .await
+            .unwrap();
+    let mut older = planned_run(
+        "run-queue-older",
+        "event-queue-older",
+        ConcurrencyPolicy::Queue,
+    );
+    let queue_now = older.created_at;
+    older.not_before = queue_now + TimeDelta::minutes(1);
+    queue_store
+        .admit_event(prepared_run_event("event-queue-older", older))
+        .await
+        .unwrap();
+    let mut newer = planned_run(
+        "run-queue-newer",
+        "event-queue-newer",
+        ConcurrencyPolicy::Queue,
+    );
+    newer.created_at = queue_now;
+    newer.not_before = queue_now;
+    queue_store
+        .admit_event(prepared_run_event("event-queue-newer", newer))
+        .await
+        .unwrap();
+    assert!(queue_store
+        .claim_run(
+            "postgres-test",
+            "worker-a",
+            queue_now,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let claim = queue_store
+        .claim_run(
+            "postgres-test",
+            "worker-a",
+            queue_now + TimeDelta::minutes(1),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.run.plan.id, "run-queue-older");
 }

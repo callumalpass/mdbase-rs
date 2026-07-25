@@ -209,6 +209,9 @@ impl RuntimeStore for InMemoryRuntimeStore {
             return Ok(false);
         }
         run.revision += 1;
+        if run.status.terminal() {
+            state.run_leases.remove(id);
+        }
         Ok(true)
     }
 
@@ -422,6 +425,7 @@ fn admit(state: &mut MemoryState, event: PreparedEvent) -> AdmitOutcome {
             duplicate: true,
             admitted_run_ids: Vec::new(),
             skipped_run_ids: Vec::new(),
+            cancellation_requested_run_ids: Vec::new(),
         };
     }
 
@@ -438,6 +442,7 @@ fn admit(state: &mut MemoryState, event: PreparedEvent) -> AdmitOutcome {
 
     let mut admitted = Vec::new();
     let mut skipped = Vec::new();
+    let mut cancellation_requested = Vec::new();
     for mut plan in event.runs {
         plan.event_cursor = cursor;
         if minimum_interval_suppresses(state, &plan) {
@@ -476,11 +481,16 @@ fn admit(state: &mut MemoryState, event: PreparedEvent) -> AdmitOutcome {
             continue;
         }
         if plan.concurrency_policy == ConcurrencyPolicy::Replace {
+            plan.replacement_blockers = active.clone();
             for id in active {
                 if let Some(run) = state.runs.get_mut(&id) {
-                    run.cancel_requested_at.get_or_insert(event.received_at);
-                    run.updated_at = event.received_at;
-                    run.revision += 1;
+                    if run.request_cancel(event.received_at) {
+                        run.revision += 1;
+                        cancellation_requested.push(id.clone());
+                    }
+                    if run.status.terminal() {
+                        state.run_leases.remove(&id);
+                    }
                 }
             }
         }
@@ -490,11 +500,14 @@ fn admit(state: &mut MemoryState, event: PreparedEvent) -> AdmitOutcome {
             .insert(plan.id.clone(), RunRecord::admitted(plan));
     }
 
+    cancellation_requested.sort();
+    cancellation_requested.dedup();
     AdmitOutcome {
         cursor,
         duplicate: false,
         admitted_run_ids: admitted,
         skipped_run_ids: skipped,
+        cancellation_requested_run_ids: cancellation_requested,
     }
 }
 
@@ -516,8 +529,7 @@ fn active_group_runs(state: &MemoryState, group: &str) -> Vec<String> {
         .runs
         .values()
         .filter(|run| {
-            run.plan.concurrency_group == group
-                && matches!(run.status, RunStatus::Running | RunStatus::Waiting)
+            run.plan.concurrency_group == group && run.status.occupies_concurrency_group()
         })
         .map(|run| run.plan.id.clone())
         .collect()
@@ -527,11 +539,21 @@ fn group_is_runnable(state: &MemoryState, run: &RunRecord) -> bool {
     if run.plan.concurrency_policy == ConcurrencyPolicy::Allow {
         return true;
     }
-    !state.runs.values().any(|other| {
+    let blocked_by_group = state.runs.values().any(|other| {
         other.plan.id != run.plan.id
             && other.plan.concurrency_group == run.plan.concurrency_group
-            && matches!(other.status, RunStatus::Running | RunStatus::Waiting)
-    })
+            && (matches!(other.status, RunStatus::Running | RunStatus::Waiting)
+                || (other.status == RunStatus::Queued
+                    && (&other.plan.event_cursor, &other.plan.id)
+                        < (&run.plan.event_cursor, &run.plan.id)))
+    });
+    let blocked_by_indeterminate_replacement = run.plan.replacement_blockers.iter().any(|id| {
+        state
+            .runs
+            .get(id)
+            .is_some_and(|blocker| blocker.status == RunStatus::Indeterminate)
+    });
+    !blocked_by_group && !blocked_by_indeterminate_replacement
 }
 
 fn validate_claim(state: &MemoryState, claim: &Claim) -> RuntimeResult<()> {

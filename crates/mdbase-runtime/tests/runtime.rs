@@ -34,6 +34,7 @@ impl DispatchAuthorizer for AllowAuthorizer {
 #[derive(Default)]
 struct RecordingProvider {
     requests: Mutex<Vec<ActionDispatch>>,
+    cancellations: Mutex<Vec<String>>,
     fail_unknown_once: Mutex<bool>,
     always_unknown: bool,
 }
@@ -56,6 +57,10 @@ impl RecordingProvider {
     fn requests(&self) -> Vec<ActionDispatch> {
         self.requests.lock().unwrap().clone()
     }
+
+    fn cancellations(&self) -> Vec<String> {
+        self.cancellations.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -76,6 +81,14 @@ impl ActionProvider for RecordingProvider {
             receipt: Some(json!({"invocation_id": request.invocation_id})),
             emitted_events: Vec::new(),
         })
+    }
+
+    async fn cancel(&self, invocation_id: &str) -> Result<(), DispatchFailure> {
+        self.cancellations
+            .lock()
+            .unwrap()
+            .push(invocation_id.to_string());
+        Ok(())
     }
 }
 
@@ -242,6 +255,124 @@ async fn duplicate_delivery_returns_original_cursor_without_new_runs() {
 }
 
 #[tokio::test]
+async fn skip_treats_queued_work_as_active_in_every_local_store() {
+    for store in local_state_stores() {
+        let mut registry = registry(true);
+        registry
+            .workflows
+            .get_mut("test.workflow")
+            .unwrap()
+            .contract["run"]["concurrency"]["policy"] = json!("skip");
+        let (runtime, _) = runtime(store.clone(), Arc::new(RecordingProvider::default()));
+
+        let first = runtime
+            .deliver_event(&registry, changed_event("evt_skip_first", json!(["a"])))
+            .await
+            .unwrap();
+        let second = runtime
+            .deliver_event(&registry, changed_event("evt_skip_second", json!(["b"])))
+            .await
+            .unwrap();
+
+        assert_eq!(first.admitted_run_ids.len(), 1);
+        assert!(second.admitted_run_ids.is_empty());
+        assert_eq!(second.skipped_run_ids.len(), 1);
+        assert_eq!(store.snapshot().await.unwrap().runs.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn queue_preserves_event_order_when_earlier_work_is_not_ready() {
+    for store in local_state_stores() {
+        let mut delayed_registry = registry(true);
+        delayed_registry
+            .workflows
+            .get_mut("test.workflow")
+            .unwrap()
+            .contract["triggers"][0]["debounce"] = json!("1m");
+        let ready_registry = registry(true);
+        let provider = Arc::new(RecordingProvider::default());
+        let (runtime, clock) = runtime(store, provider.clone());
+
+        runtime
+            .deliver_event(
+                &delayed_registry,
+                changed_event("evt_queue_first", json!(["a"])),
+            )
+            .await
+            .unwrap();
+        runtime
+            .deliver_event(
+                &ready_registry,
+                changed_event("evt_queue_second", json!(["b"])),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.work_once(&ready_registry).await.unwrap(),
+            mdbase_runtime::WorkerOutcome::Idle
+        );
+        clock.advance(TimeDelta::minutes(1));
+        runtime.work_once(&ready_registry).await.unwrap();
+        runtime.work_once(&ready_registry).await.unwrap();
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].input["value"], json!("a"));
+        assert_eq!(requests[1].input["value"], json!("b"));
+    }
+}
+
+#[tokio::test]
+async fn replace_cancels_queued_work_before_admitting_its_successor() {
+    for store in local_state_stores() {
+        let mut registry = registry(true);
+        registry
+            .workflows
+            .get_mut("test.workflow")
+            .unwrap()
+            .contract["run"]["concurrency"]["policy"] = json!("replace");
+        let provider = Arc::new(RecordingProvider::default());
+        let (runtime, _) = runtime(store.clone(), provider.clone());
+
+        let first = runtime
+            .deliver_event(&registry, changed_event("evt_replace_first", json!(["a"])))
+            .await
+            .unwrap();
+        let second = runtime
+            .deliver_event(&registry, changed_event("evt_replace_second", json!(["b"])))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            second.cancellation_requested_run_ids,
+            first.admitted_run_ids
+        );
+        let replaced = runtime
+            .get_run(&first.admitted_run_ids[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replaced.status, RunStatus::Cancelled);
+        assert_eq!(
+            replaced.steps[0].status,
+            mdbase_runtime::StepStatus::Cancelled
+        );
+
+        let outcome = runtime.work_once(&registry).await.unwrap();
+        assert!(matches!(
+            outcome,
+            mdbase_runtime::WorkerOutcome::Completed {
+                status: RunStatus::Succeeded,
+                ..
+            }
+        ));
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(provider.requests()[0].input["value"], json!("b"));
+    }
+}
+
+#[tokio::test]
 async fn idempotent_unknown_dispatch_replays_the_same_invocation_after_lease_expiry() {
     let registry = registry(true);
     let store = Arc::new(InMemoryRuntimeStore::new());
@@ -268,6 +399,105 @@ async fn idempotent_unknown_dispatch_replays_the_same_invocation_after_lease_exp
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].invocation_id, requests[1].invocation_id);
     assert_eq!(requests[0].attempt, requests[1].attempt);
+}
+
+#[tokio::test]
+async fn cancelled_cooperative_dispatch_is_not_replayed_during_recovery() {
+    let registry = registry(true);
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let provider = Arc::new(RecordingProvider::fail_unknown_once());
+    let (runtime, clock) = runtime(store.clone(), provider.clone());
+    let delivery = runtime
+        .deliver_event(
+            &registry,
+            changed_event("evt_cancel_recovery", json!(["a"])),
+        )
+        .await
+        .unwrap();
+
+    runtime.work_once(&registry).await.unwrap_err();
+    let cancellation = runtime
+        .cancel_run(&delivery.admitted_run_ids[0])
+        .await
+        .unwrap();
+    assert!(cancellation.accepted);
+    assert!(cancellation.provider_notified);
+    clock.advance(TimeDelta::seconds(31));
+
+    let recovered = runtime.work_once(&registry).await.unwrap();
+    assert!(matches!(
+        recovered,
+        mdbase_runtime::WorkerOutcome::Completed {
+            status: RunStatus::Indeterminate,
+            ..
+        }
+    ));
+    assert_eq!(provider.requests().len(), 1);
+    assert!(!provider.cancellations().is_empty());
+    let run = runtime
+        .get_run(&delivery.admitted_run_ids[0])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        run.steps[0].status,
+        mdbase_runtime::StepStatus::Indeterminate
+    );
+    assert_eq!(run.next_step, run.steps.len());
+}
+
+#[tokio::test]
+async fn replacement_waits_when_cancelled_predecessor_is_indeterminate() {
+    let mut registry = registry(true);
+    registry
+        .workflows
+        .get_mut("test.workflow")
+        .unwrap()
+        .contract["run"]["concurrency"]["policy"] = json!("replace");
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let provider = Arc::new(RecordingProvider::fail_unknown_once());
+    let (runtime, clock) = runtime(store, provider.clone());
+    let first = runtime
+        .deliver_event(
+            &registry,
+            changed_event("evt_replace_running", json!(["a"])),
+        )
+        .await
+        .unwrap();
+    runtime.work_once(&registry).await.unwrap_err();
+
+    let replacement = runtime
+        .deliver_event(
+            &registry,
+            changed_event("evt_replace_waiting", json!(["b"])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replacement.cancellation_requested_run_ids,
+        first.admitted_run_ids
+    );
+    clock.advance(TimeDelta::seconds(31));
+    let predecessor = runtime.work_once(&registry).await.unwrap();
+    assert!(matches!(
+        predecessor,
+        mdbase_runtime::WorkerOutcome::Completed {
+            status: RunStatus::Indeterminate,
+            ..
+        }
+    ));
+
+    assert_eq!(
+        runtime.work_once(&registry).await.unwrap(),
+        mdbase_runtime::WorkerOutcome::Idle
+    );
+    let replacement = runtime
+        .get_run(&replacement.admitted_run_ids[0])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replacement.status, RunStatus::Queued);
+    assert_eq!(provider.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -331,11 +561,17 @@ async fn workflow_deadline_fails_before_a_new_effect_is_dispatched() {
 #[tokio::test]
 async fn deterministic_expression_failures_are_committed_not_retried_by_lease() {
     let mut registry = registry(true);
-    registry
+    let workflow = &mut registry
         .workflows
         .get_mut("test.workflow")
         .unwrap()
-        .contract["steps"][0]["input"] = json!({"value": {"$expr": "event.payload.items["}});
+        .contract;
+    workflow["steps"][0]["input"] = json!({"value": {"$expr": "event.payload.items["}});
+    workflow["steps"].as_array_mut().unwrap().push(json!({
+        "id": "must-not-run",
+        "action": "test.echo",
+        "input": {"value": "unexpected"}
+    }));
     let store = Arc::new(InMemoryRuntimeStore::new());
     let provider = Arc::new(RecordingProvider::default());
     let (runtime, clock) = runtime(store.clone(), provider.clone());
@@ -361,6 +597,10 @@ async fn deterministic_expression_failures_are_committed_not_retried_by_lease() 
         mdbase_runtime::WorkerOutcome::Idle
     );
     assert!(provider.requests().is_empty());
+    let run = &store.snapshot().await.unwrap().runs[0];
+    assert_eq!(run.steps[0].status, mdbase_runtime::StepStatus::Failed);
+    assert_eq!(run.steps[1].status, mdbase_runtime::StepStatus::Skipped);
+    assert_eq!(run.next_step, run.steps.len());
 }
 
 #[tokio::test]
@@ -616,6 +856,20 @@ fn runtime(
     )
     .unwrap();
     (runtime, clock)
+}
+
+fn local_state_stores() -> Vec<Arc<dyn RuntimeStore>> {
+    #[cfg(feature = "sqlite")]
+    {
+        vec![
+            Arc::new(InMemoryRuntimeStore::new()),
+            Arc::new(SqliteRuntimeStore::in_memory().unwrap()),
+        ]
+    }
+    #[cfg(not(feature = "sqlite"))]
+    {
+        vec![Arc::new(InMemoryRuntimeStore::new())]
+    }
 }
 
 fn registry(idempotent: bool) -> RuntimeRegistry {

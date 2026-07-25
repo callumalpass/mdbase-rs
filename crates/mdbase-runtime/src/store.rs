@@ -23,6 +23,10 @@ pub struct AdmitOutcome {
     pub duplicate: bool,
     pub admitted_run_ids: Vec<String>,
     pub skipped_run_ids: Vec<String>,
+    /// Existing runs for which this admission durably recorded cancellation
+    /// intent, normally because of a `replace` concurrency policy.
+    #[serde(default)]
+    pub cancellation_requested_run_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

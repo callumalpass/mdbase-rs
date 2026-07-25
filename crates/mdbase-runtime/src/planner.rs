@@ -227,6 +227,7 @@ pub(crate) fn plan_event(
                 idempotency_scope,
                 concurrency_group,
                 concurrency_policy,
+                replacement_blockers: Vec::new(),
                 on_error,
                 not_before,
                 timeout_at,
