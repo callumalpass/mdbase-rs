@@ -4,6 +4,8 @@ use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::CacheError;
+
 #[derive(Debug, Default)]
 pub(crate) struct CacheChanges {
     pub stale: Vec<PathBuf>,
@@ -15,34 +17,34 @@ pub(crate) struct CacheChanges {
 /// The previous implementation issued a SQLite lookup per collection file and
 /// then performed another filesystem existence pass for deletions. That made a
 /// no-op freshness check disproportionately expensive for paginated queries.
-pub(crate) fn find_changes(conn: &Connection, root: &Path, files: &[PathBuf]) -> CacheChanges {
+pub(crate) fn find_changes(
+    conn: &Connection,
+    root: &Path,
+    files: &[PathBuf],
+) -> Result<CacheChanges, CacheError> {
     let mut cached = HashMap::<String, i64>::new();
-    let mut statement = match conn.prepare("SELECT path, mtime_ns FROM files") {
-        Ok(statement) => statement,
-        Err(_) => return CacheChanges::default(),
-    };
-    let rows = match statement.query_map([], |row| {
+    let mut statement = conn.prepare("SELECT path, mtime_ns FROM files")?;
+    let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    }) {
-        Ok(rows) => rows,
-        Err(_) => return CacheChanges::default(),
-    };
-    for (path, mtime) in rows.flatten() {
+    })?;
+    for row in rows {
+        let (path, mtime) = row?;
         cached.insert(path, mtime);
     }
 
     let mut disk_paths = HashSet::with_capacity(files.len());
     let mut stale = Vec::new();
     for file_path in files {
-        let rel_path = match file_path.strip_prefix(root) {
-            Ok(path) => path.to_string_lossy().replace('\\', "/"),
-            Err(_) => continue,
-        };
+        let rel_path = file_path
+            .strip_prefix(root)
+            .map_err(|_| CacheError::OutsideRoot(file_path.display().to_string()))?
+            .to_string_lossy()
+            .replace('\\', "/");
         disk_paths.insert(rel_path.clone());
-        let filesystem_mtime = std::fs::metadata(file_path)
+        let filesystem_mtime = std::fs::metadata(file_path)?
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
             .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_nanos() as i64)
             .unwrap_or(0);
         if cached.get(&rel_path).copied() != Some(filesystem_mtime) {
@@ -53,7 +55,7 @@ pub(crate) fn find_changes(conn: &Connection, root: &Path, files: &[PathBuf]) ->
         .into_keys()
         .filter(|path| !disk_paths.contains(path))
         .collect();
-    CacheChanges { stale, deleted }
+    Ok(CacheChanges { stale, deleted })
 }
 
 /// Compare filesystem mtimes against cached `mtime_ns` and return paths that

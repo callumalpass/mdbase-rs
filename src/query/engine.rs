@@ -599,6 +599,7 @@ impl Collection {
                         },
                         "file_records": p.file_records,
                         "cache_used": p.cache_used,
+                        "cache_fallback": p.cache_fallback,
                         "built_link_graph": p.built_link_graph,
                     })),
                 });
@@ -694,6 +695,7 @@ impl Collection {
                     },
                     "file_records": p.file_records,
                     "cache_used": p.cache_used,
+                    "cache_fallback": p.cache_fallback,
                     "built_link_graph": p.built_link_graph,
                 })),
             });

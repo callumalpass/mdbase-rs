@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 
-use crate::cache::{indexer, sqlite, staleness};
+use crate::cache::{indexer, sqlite, staleness, CacheError};
 use crate::expressions::evaluator::ResolvedFileData;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::Collection;
@@ -60,6 +60,7 @@ pub(crate) struct LoadQueryPerf {
     pub backlinks_resolve_calls: usize,
     pub file_records: usize,
     pub cache_used: bool,
+    pub cache_fallback: bool,
     pub built_link_graph: bool,
 }
 
@@ -67,22 +68,25 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
-fn current_cache_snapshot(conn: &Connection) -> Option<String> {
-    conn.query_row(
-        "SELECT value FROM meta WHERE key = 'query_snapshot'",
-        [],
-        |row| row.get(0),
-    )
-    .ok()
+fn current_cache_snapshot(conn: &Connection) -> Result<Option<String>, CacheError> {
+    use rusqlite::OptionalExtension;
+
+    Ok(conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'query_snapshot'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
-fn replace_cache_snapshot(conn: &Connection) -> String {
+fn replace_cache_snapshot(conn: &Connection) -> Result<String, CacheError> {
     let snapshot = uuid::Uuid::new_v4().simple().to_string();
-    let _ = conn.execute(
+    conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('query_snapshot', ?1)",
         [&snapshot],
-    );
-    snapshot
+    )?;
+    Ok(snapshot)
 }
 
 /// Convert nanoseconds-since-epoch to ISO 8601 string.
@@ -99,68 +103,69 @@ fn ns_to_iso(ns: i64) -> String {
 impl Collection {
     /// Try to open the cache database. Returns `None` if the DB file doesn't
     /// exist or can't be opened.
-    fn try_open_cache(&self) -> Option<Connection> {
+    fn try_open_cache(&self) -> Result<Option<Connection>, CacheError> {
         let db_path = self.root.join(&self.settings.cache_folder).join("cache.db");
         if !db_path.exists() {
-            return None;
+            return Ok(None);
         }
-        sqlite::open_cache_db(&self.root, &self.settings.cache_folder).ok()
+        Ok(Some(sqlite::open_cache_db(
+            &self.root,
+            &self.settings.cache_folder,
+        )?))
     }
 
     /// Incremental freshness check: find stale/new/deleted files, re-index only
     /// what changed. Returns the full list of disk files (used for fallback and
     /// to know which paths exist).
-    fn refresh_cache(&self, conn: &Connection) -> Vec<PathBuf> {
+    fn refresh_cache(&self, conn: &mut Connection) -> Result<Vec<PathBuf>, CacheError> {
         let disk_files = self.scan_collection_files();
 
-        let changes = staleness::find_changes(conn, &self.root, &disk_files);
+        let changes = staleness::find_changes(conn, &self.root, &disk_files)?;
 
         if changes.stale.is_empty() && changes.deleted.is_empty() {
-            return disk_files;
+            return Ok(disk_files);
         }
 
         // A provider can execute independent queries concurrently. Serialize
         // only the uncommon cache-write section, then recompute against the
         // winning transaction so two refreshers cannot apply stale deltas.
-        if conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;").is_err() {
-            return disk_files;
-        }
-        let changes = staleness::find_changes(conn, &self.root, &disk_files);
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changes = staleness::find_changes(&transaction, &self.root, &disk_files)?;
 
         // Remove deleted files from cache
         for rel_path in &changes.deleted {
-            indexer::remove_file(conn, rel_path);
+            indexer::remove_file(&transaction, rel_path)?;
         }
 
         // Re-index stale/new files
         for abs_path in &changes.stale {
-            let rel_path = match abs_path.strip_prefix(&self.root) {
-                Ok(p) => p.to_string_lossy().replace('\\', "/"),
-                Err(_) => continue,
-            };
-            indexer::reindex_file(conn, self, abs_path, &rel_path);
+            let rel_path = abs_path
+                .strip_prefix(&self.root)
+                .map_err(|_| CacheError::OutsideRoot(abs_path.display().to_string()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            indexer::reindex_file(&transaction, self, abs_path, &rel_path)?;
         }
 
         if !changes.stale.is_empty() || !changes.deleted.is_empty() {
-            replace_cache_snapshot(conn);
+            replace_cache_snapshot(&transaction)?;
         }
 
-        let _ = conn.execute_batch("COMMIT;");
-
-        disk_files
+        transaction.commit()?;
+        Ok(disk_files)
     }
 
     /// Bulk-load FileRecords from the cache database.
-    fn load_file_records_from_cache(&self, conn: &Connection) -> Vec<FileRecord> {
-        let mut stmt = match conn.prepare(
+    fn load_file_records_from_cache(
+        &self,
+        conn: &Connection,
+    ) -> Result<Vec<FileRecord>, CacheError> {
+        let mut stmt = conn.prepare(
             "SELECT f.path, f.frontmatter_json, f.effective_json, f.body, f.size, f.mtime_ns, f.ctime_ns \
              FROM files f WHERE f.parse_error = 0"
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        )?;
 
-        let rows = match stmt.query_map([], |row| {
+        let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -170,27 +175,21 @@ impl Collection {
                 row.get::<_, i64>(5)?,
                 row.get::<_, Option<i64>>(6)?,
             ))
-        }) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
+        })?;
 
         // Pre-load all file_types into a map: path -> Vec<type_name>
-        let types_map = self.load_file_types_map(conn);
+        let types_map = self.load_file_types_map(conn)?;
 
         let mut records = Vec::new();
         for row in rows {
-            let (path, fm_json_str, eff_json_str, body, size, mtime_ns, ctime_ns) = match row {
-                Ok(r) => r,
-                Err(_) => continue,
+            let (path, fm_json_str, eff_json_str, body, size, mtime_ns, ctime_ns) = row?;
+
+            let raw_frontmatter: serde_json::Value = serde_json::from_str(&fm_json_str)?;
+
+            let effective_frontmatter: serde_json::Value = match eff_json_str {
+                Some(value) => serde_json::from_str(&value)?,
+                None => raw_frontmatter.clone(),
             };
-
-            let raw_frontmatter: serde_json::Value =
-                serde_json::from_str(&fm_json_str).unwrap_or(serde_json::json!({}));
-
-            let effective_frontmatter: serde_json::Value = eff_json_str
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_else(|| raw_frontmatter.clone());
 
             let mut type_names = types_map.get(&path).cloned().unwrap_or_default();
             if type_names.is_empty() {
@@ -218,7 +217,7 @@ impl Collection {
             });
         }
 
-        records
+        Ok(records)
     }
 
     /// Refresh the cache, then let SQLite order and paginate metadata-only
@@ -254,7 +253,7 @@ impl Collection {
         let total_started = Instant::now();
         let mut perf = LoadQueryPerf::default();
         let open_started = Instant::now();
-        let conn = match sqlite::open_cache_db(&self.root, &self.settings.cache_folder) {
+        let mut conn = match sqlite::open_cache_db(&self.root, &self.settings.cache_folder) {
             Ok(conn) => conn,
             Err(_) if expected_snapshot.is_some() => {
                 return Err(MetadataPageError::SnapshotExpired)
@@ -265,8 +264,9 @@ impl Collection {
         perf.cache_used = true;
 
         let snapshot = if let Some(expected) = expected_snapshot {
-            let Some(current) = current_cache_snapshot(&conn) else {
-                return Err(MetadataPageError::SnapshotExpired);
+            let current = match current_cache_snapshot(&conn) {
+                Ok(Some(current)) => current,
+                _ => return Err(MetadataPageError::SnapshotExpired),
             };
             if current != expected {
                 return Err(MetadataPageError::SnapshotExpired);
@@ -274,19 +274,32 @@ impl Collection {
             current
         } else {
             let refresh_started = Instant::now();
-            self.refresh_cache(&conn);
+            if self.refresh_cache(&mut conn).is_err() {
+                return Ok(None);
+            }
             perf.refresh_cache_ms = elapsed_ms(refresh_started);
-            current_cache_snapshot(&conn).unwrap_or_else(|| replace_cache_snapshot(&conn))
+            match current_cache_snapshot(&conn) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => match replace_cache_snapshot(&conn) {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => return Ok(None),
+                },
+                Err(_) => return Ok(None),
+            }
         };
 
         let load_started = Instant::now();
-        let total = conn
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE parse_error = 0",
-                [],
-                |row| row.get::<_, usize>(0),
-            )
-            .map_err(|_| MetadataPageError::SnapshotExpired)?;
+        let total = match conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE parse_error = 0",
+            [],
+            |row| row.get::<_, usize>(0),
+        ) {
+            Ok(total) => total,
+            Err(_) if expected_snapshot.is_some() => {
+                return Err(MetadataPageError::SnapshotExpired)
+            }
+            Err(_) => return Ok(None),
+        };
         let sql = format!(
             "SELECT f.path, f.frontmatter_json, f.body, f.size, f.mtime_ns, f.ctime_ns \
              FROM files f WHERE f.parse_error = 0 ORDER BY {} LIMIT ?1 OFFSET ?2",
@@ -303,24 +316,38 @@ impl Collection {
             .map(|value| value.min(i64::MAX as u64) as i64)
             .unwrap_or(-1);
         let offset = offset.min(i64::MAX as u64) as i64;
-        let rows = statement
-            .query_map(params![limit, offset], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                ))
-            })
-            .map_err(|_| MetadataPageError::SnapshotExpired)?;
+        let rows = match statement.query_map(params![limit, offset], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        }) {
+            Ok(rows) => rows,
+            Err(_) if expected_snapshot.is_some() => {
+                return Err(MetadataPageError::SnapshotExpired)
+            }
+            Err(_) => return Ok(None),
+        };
         let mut records = Vec::new();
         for row in rows {
-            let (path, frontmatter, body, size, mtime_ns, ctime_ns) =
-                row.map_err(|_| MetadataPageError::SnapshotExpired)?;
-            let raw_frontmatter =
-                serde_json::from_str(&frontmatter).unwrap_or_else(|_| serde_json::json!({}));
+            let (path, frontmatter, body, size, mtime_ns, ctime_ns) = match row {
+                Ok(row) => row,
+                Err(_) if expected_snapshot.is_some() => {
+                    return Err(MetadataPageError::SnapshotExpired)
+                }
+                Err(_) => return Ok(None),
+            };
+            let raw_frontmatter: serde_json::Value = match serde_json::from_str(&frontmatter) {
+                Ok(frontmatter) => frontmatter,
+                Err(_) if expected_snapshot.is_some() => {
+                    return Err(MetadataPageError::SnapshotExpired)
+                }
+                Err(_) => return Ok(None),
+            };
             records.push(FileRecord {
                 rel_path: path,
                 effective_frontmatter: raw_frontmatter.clone(),
@@ -344,22 +371,20 @@ impl Collection {
     }
 
     /// Load the file_types table into a HashMap for bulk access.
-    fn load_file_types_map(&self, conn: &Connection) -> HashMap<String, Vec<String>> {
+    fn load_file_types_map(
+        &self,
+        conn: &Connection,
+    ) -> Result<HashMap<String, Vec<String>>, CacheError> {
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
-        let mut stmt = match conn.prepare("SELECT path, type_name FROM file_types") {
-            Ok(s) => s,
-            Err(_) => return map,
-        };
-        let rows = match stmt.query_map([], |row| {
+        let mut stmt = conn.prepare("SELECT path, type_name FROM file_types")?;
+        let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        }) {
-            Ok(r) => r,
-            Err(_) => return map,
-        };
-        for (path, type_name) in rows.flatten() {
+        })?;
+        for row in rows {
+            let (path, type_name) = row?;
             map.entry(path).or_default().push(type_name);
         }
-        map
+        Ok(map)
     }
 
     /// Load FileRecords by reading every file from disk (fallback path).
@@ -433,23 +458,36 @@ impl Collection {
         };
 
         let try_open_start = Instant::now();
-        let conn = self.try_open_cache();
+        let cache = self.try_open_cache();
         perf.try_open_cache_ms = elapsed_ms(try_open_start);
 
-        let file_records = if let Some(conn) = conn {
-            perf.cache_used = true;
+        let mut cached_records = None;
+        match cache {
+            Ok(Some(mut conn)) => {
+                let refresh_start = Instant::now();
+                let refresh = self.refresh_cache(&mut conn);
+                perf.refresh_cache_ms = elapsed_ms(refresh_start);
+                match refresh {
+                    Ok(_) => {
+                        let load_start = Instant::now();
+                        let loaded = self.load_file_records_from_cache(&conn);
+                        perf.load_records_ms = elapsed_ms(load_start);
+                        match loaded {
+                            Ok(records) => {
+                                perf.cache_used = true;
+                                cached_records = Some(records);
+                            }
+                            Err(_) => perf.cache_fallback = true,
+                        }
+                    }
+                    Err(_) => perf.cache_fallback = true,
+                }
+            }
+            Ok(None) => {}
+            Err(_) => perf.cache_fallback = true,
+        }
 
-            let refresh_start = Instant::now();
-            self.refresh_cache(&conn);
-            perf.refresh_cache_ms = elapsed_ms(refresh_start);
-
-            let load_start = Instant::now();
-            let records = self.load_file_records_from_cache(&conn);
-            perf.load_records_ms = elapsed_ms(load_start);
-            records
-        } else {
-            perf.cache_used = false;
-
+        let file_records = cached_records.unwrap_or_else(|| {
             let scan_start = Instant::now();
             let files = self.scan_collection_files();
             perf.scan_files_ms = elapsed_ms(scan_start);
@@ -458,7 +496,7 @@ impl Collection {
             let records = self.load_file_records_from_disk(&files);
             perf.load_records_ms = elapsed_ms(load_start);
             records
-        };
+        });
 
         perf.file_records = file_records.len();
 

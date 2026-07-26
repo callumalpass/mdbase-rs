@@ -38,6 +38,7 @@ pub struct QueryPerformance {
     pub candidates: usize,
     pub results: usize,
     pub cache_used: bool,
+    pub cache_fallback: bool,
     pub link_graph_built: bool,
     pub snapshot_reused: bool,
 }
@@ -452,6 +453,7 @@ fn apply_load_performance(
     performance.link_graph_us = millis_to_micros(load.build_backlinks_ms);
     performance.records_loaded = load.file_records;
     performance.cache_used = load.cache_used;
+    performance.cache_fallback = load.cache_fallback;
     performance.link_graph_built = load.built_link_graph;
 }
 

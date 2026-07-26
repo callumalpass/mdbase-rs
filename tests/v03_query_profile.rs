@@ -359,3 +359,67 @@ fn sqlite_metadata_pagination_preserves_portable_ordering() {
         uncached.result["meta"]["total_count"]
     );
 }
+
+#[test]
+fn corrupt_cache_rows_fall_back_to_authoritative_markdown() {
+    let (root, collection) = query_collection();
+    assert_eq!(collection.cache_rebuild()["success"], true);
+    let database = root.path().join(".mdbase/cache.db");
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute(
+            "UPDATE files SET frontmatter_json = 'not-json' WHERE path = 'tasks/a.md'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let (result, performance) = collection
+        .v03_operations()
+        .unwrap()
+        .query_profiled(&json!({"types": ["task"]}));
+
+    assert!(result.valid, "{result:#?}");
+    assert_eq!(result.result["meta"]["total_count"], 3);
+    assert!(performance.cache_fallback);
+    assert!(!performance.cache_used);
+    assert!(result.result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["frontmatter"]["title"] == "A"
+            && record["file"]["path"] == "tasks/a.md"));
+}
+
+#[test]
+fn incompatible_cache_schema_falls_back_and_rebuild_reports_failure() {
+    let (root, collection) = query_collection();
+    assert_eq!(collection.cache_rebuild()["success"], true);
+    let database = root.path().join(".mdbase/cache.db");
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute_batch(
+            "
+        DROP TABLE files;
+        CREATE TABLE files (
+            path TEXT PRIMARY KEY,
+            ctime_ns INTEGER
+        );
+        ",
+        )
+        .unwrap();
+    drop(connection);
+
+    let (result, performance) = collection
+        .v03_operations()
+        .unwrap()
+        .query_profiled(&json!({"types": ["task"]}));
+    assert!(result.valid, "{result:#?}");
+    assert_eq!(result.result["meta"]["total_count"], 3);
+    assert!(performance.cache_fallback);
+    assert!(!performance.cache_used);
+
+    let rebuild = collection.cache_rebuild();
+    assert_eq!(rebuild["success"], false);
+    assert_eq!(rebuild["error"]["code"], "cache_rebuild_failed");
+}
