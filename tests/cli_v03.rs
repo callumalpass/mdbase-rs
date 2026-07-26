@@ -130,6 +130,93 @@ fn canonical_cli_runs_a_typed_record_lifecycle() {
 }
 
 #[test]
+fn canonical_cli_supports_revision_dry_run_and_typed_json_requests() {
+    let root = cli_collection();
+    let (_, created) = run(
+        &root,
+        &[
+            "create",
+            "--path",
+            "tasks/base.md",
+            "--type",
+            "task",
+            "--fields",
+            r#"{"title":"Base","status":"open"}"#,
+        ],
+    );
+    let revision = created["result"]["revision"].as_str().unwrap();
+
+    let (output, preview) = run(
+        &root,
+        &[
+            "update",
+            "tasks/base.md",
+            "--fields",
+            r#"{"status":"preview"}"#,
+            "--if-revision",
+            revision,
+            "--dry-run",
+        ],
+    );
+    assert!(output.status.success(), "{preview:#}");
+    assert!(!fs::read_to_string(root.path().join("tasks/base.md"))
+        .unwrap()
+        .contains("preview"));
+
+    let batch_path = root.path().join("batch.json");
+    fs::write(
+        &batch_path,
+        r#"{
+  "operations": [
+    {
+      "kind": "update",
+      "input": {
+        "path": "tasks/base.md",
+        "patch": {"status": "done"}
+      }
+    },
+    {
+      "kind": "create",
+      "input": {
+        "path": "tasks/second.md",
+        "type": "task",
+        "frontmatter": {"title": "Second", "status": "done"}
+      }
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+    let batch_path = batch_path.to_string_lossy();
+    let (output, batch) = run(&root, &["batch", "--request", &batch_path]);
+    assert!(output.status.success(), "{batch:#}");
+    assert_eq!(batch["result"]["succeeded"], 2);
+    assert_eq!(batch["result"]["failed"], 0);
+
+    let query_path = root.path().join("query.json");
+    fs::write(
+        &query_path,
+        r#"{
+  "types": ["task"],
+  "where": "status == 'done'",
+  "order_by": [{"field": "file.path", "direction": "asc"}]
+}"#,
+    )
+    .unwrap();
+    let query_path = query_path.to_string_lossy();
+    let (output, query) = run(&root, &["query", "--request", &query_path]);
+    assert!(output.status.success(), "{query:#}");
+    assert_eq!(query["result"]["meta"]["total_count"], 2);
+
+    let (output, stale) = run(
+        &root,
+        &["delete", "tasks/base.md", "--if-revision", "sha256:stale"],
+    );
+    assert!(!output.status.success(), "{stale:#}");
+    assert_eq!(stale["diagnostics"][0]["code"], "concurrent_modification");
+}
+
+#[test]
 fn legacy_cli_is_read_only_and_exposes_verified_migration() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.2.0\n").unwrap();

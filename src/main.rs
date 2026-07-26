@@ -4,9 +4,11 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use mdbase::api::{
-    CollectionPath, CreateRequest, DeleteRequest, MdbaseError, MdbaseResult, OperationOutcome,
-    QueryDirection, QueryRequest, ReadRequest, RenameRequest, UpdateRequest, V02MigrationRequest,
+    BatchRequest, CollectionPath, CreateRequest, DeleteRequest, MdbaseError, MdbaseResult,
+    OperationOutcome, QueryDirection, QueryRequest, ReadRequest, RenameRequest, Revision,
+    UpdateRequest, V02MigrationRequest,
 };
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 /// mdbase - a markdown-based data store
@@ -57,6 +59,14 @@ enum Command {
         /// Fields as JSON string
         #[arg(long)]
         fields: Option<String>,
+
+        /// Require this current revision before creating
+        #[arg(long)]
+        if_revision: Option<String>,
+
+        /// Validate and report the mutation without writing
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Update an existing file
@@ -67,6 +77,14 @@ enum Command {
         /// Fields as JSON string
         #[arg(long)]
         fields: Option<String>,
+
+        /// Require this current revision before updating
+        #[arg(long)]
+        if_revision: Option<String>,
+
+        /// Validate and report the mutation without writing
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Delete a file
@@ -77,6 +95,14 @@ enum Command {
         /// Check for backlinks before deleting
         #[arg(long)]
         check_backlinks: bool,
+
+        /// Require this current revision before deleting
+        #[arg(long)]
+        if_revision: Option<String>,
+
+        /// Validate and report the mutation without writing
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Rename or move a file
@@ -87,13 +113,33 @@ enum Command {
         /// Destination path
         to: String,
 
-        /// Update references in other files
-        #[arg(long)]
+        /// Update references in other files (the default)
+        #[arg(long, conflicts_with = "no_update_refs")]
         update_refs: bool,
+
+        /// Do not update references in other files
+        #[arg(long, conflicts_with = "update_refs")]
+        no_update_refs: bool,
+
+        /// Require this current revision before renaming
+        #[arg(long)]
+        if_revision: Option<String>,
+
+        /// Validate and report the mutation without writing
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Query the collection
     Query {
+        /// Read a complete typed query request from this JSON file (`-` for stdin)
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = ["types", "where_clause", "folder", "order_by", "limit", "offset", "include_body"]
+        )]
+        request: Option<String>,
+
         /// Filter by type(s), comma-separated
         #[arg(long)]
         types: Option<String>,
@@ -121,6 +167,13 @@ enum Command {
         /// Include body text in results
         #[arg(long)]
         include_body: bool,
+    },
+
+    /// Execute a typed mutation batch from JSON
+    Batch {
+        /// Batch request JSON file (`-` for stdin)
+        #[arg(long, value_name = "PATH", default_value = "-")]
+        request: String,
     },
 
     /// Discover and execute saved views
@@ -320,6 +373,8 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             path,
             file_type,
             fields,
+            if_revision,
+            dry_run,
         } => {
             let fields_value = parse_fields_or_stdin(fields.as_deref());
             let result = collection.typed().and_then(|api| {
@@ -330,15 +385,25 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
                 if let Some(file_type) = file_type {
                     request = request.with_type(file_type);
                 }
+                request.if_revision = parse_optional_revision(if_revision)?;
+                request.dry_run = dry_run;
                 api.create(request)
             });
             typed_result(result)
         }
 
-        Command::Update { path, fields } => {
+        Command::Update {
+            path,
+            fields,
+            if_revision,
+            dry_run,
+        } => {
             let fields_value = parse_fields_or_stdin(fields.as_deref());
             let result = collection.typed().and_then(|api| {
-                api.update(UpdateRequest::new(CollectionPath::new(path)?, fields_value))
+                let mut request = UpdateRequest::new(CollectionPath::new(path)?, fields_value);
+                request.if_revision = parse_optional_revision(if_revision)?;
+                request.dry_run = dry_run;
+                api.update(request)
             });
             typed_result(result)
         }
@@ -346,10 +411,14 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
         Command::Delete {
             path,
             check_backlinks,
+            if_revision,
+            dry_run,
         } => {
             let result = collection.typed().and_then(|api| {
                 let mut request = DeleteRequest::new(CollectionPath::new(path)?);
                 request.check_backlinks = check_backlinks;
+                request.if_revision = parse_optional_revision(if_revision)?;
+                request.dry_run = dry_run;
                 api.delete(request)
             });
             typed_result(result)
@@ -359,17 +428,23 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             from,
             to,
             update_refs,
+            no_update_refs,
+            if_revision,
+            dry_run,
         } => {
             let result = collection.typed().and_then(|api| {
                 let mut request =
                     RenameRequest::new(CollectionPath::new(from)?, CollectionPath::new(to)?);
-                request.update_refs = update_refs;
+                request.update_refs = update_refs || !no_update_refs;
+                request.if_revision = parse_optional_revision(if_revision)?;
+                request.dry_run = dry_run;
                 api.rename(request)
             });
             typed_result(result)
         }
 
         Command::Query {
+            request: request_file,
             types,
             where_clause,
             folder,
@@ -378,6 +453,12 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             offset,
             include_body,
         } => {
+            if let Some(request_file) = request_file {
+                return typed_result(
+                    parse_json_input::<QueryRequest>(&request_file)
+                        .and_then(|request| collection.typed()?.query(request)),
+                );
+            }
             let mut request = QueryRequest::builder();
             if let Some(types) = types {
                 for type_name in types
@@ -426,6 +507,17 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             request.include_body = include_body;
             typed_result(collection.typed().and_then(|api| api.query(request)))
         }
+
+        Command::Batch { request } => typed_result(
+            parse_json_input::<BatchRequest>(&request).and_then(|request| {
+                if request.operations.is_empty() {
+                    return Err(MdbaseError::InvalidRequest {
+                        message: "batch operations must not be empty".to_string(),
+                    });
+                }
+                collection.typed()?.batch(request)
+            }),
+        ),
 
         Command::Views { action } => {
             let operations = match collection.v03_operations() {
@@ -689,6 +781,7 @@ fn typed_error_diagnostics(error: &MdbaseError) -> Vec<mdbase::api::Diagnostic> 
         MdbaseError::UnsupportedProfile => "migration_required",
         MdbaseError::MigrationRequired { .. } => "migration_required",
         MdbaseError::LossyMigration { .. } => "migration_lossy",
+        MdbaseError::InvalidRequest { .. } => "invalid_request",
         MdbaseError::InvalidResult { .. } => "invalid_result",
         MdbaseError::Operation { .. } => "operation_failed",
     };
@@ -702,6 +795,29 @@ fn typed_error_diagnostics(error: &MdbaseError) -> Vec<mdbase::api::Diagnostic> 
         schema_location: None,
         details: None,
     }]
+}
+
+fn parse_optional_revision(value: Option<String>) -> MdbaseResult<Option<Revision>> {
+    value.map(Revision::parse).transpose()
+}
+
+fn parse_json_input<T: DeserializeOwned>(source: &str) -> MdbaseResult<T> {
+    let content = if source == "-" {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).map_err(|error| {
+            MdbaseError::InvalidRequest {
+                message: format!("could not read JSON request from stdin: {error}"),
+            }
+        })?;
+        input
+    } else {
+        std::fs::read_to_string(source).map_err(|error| MdbaseError::InvalidRequest {
+            message: format!("could not read JSON request '{source}': {error}"),
+        })?
+    };
+    serde_json::from_str(&content).map_err(|error| MdbaseError::InvalidRequest {
+        message: format!("could not parse JSON request: {error}"),
+    })
 }
 
 fn canonical_exit_code(result: &mdbase::v03::OperationResult) -> i32 {

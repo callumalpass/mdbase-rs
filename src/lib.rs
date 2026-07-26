@@ -1,7 +1,10 @@
-//! mdbase - Rust implementation of the mdbase specification.
+//! Typed Rust implementation of the mdbase specification.
 //!
-//! Uses SQLite as a backing store for queries, compiling mdbase expressions
-//! to SQL WHERE clauses via json_extract().
+//! Markdown files remain authoritative. Canonical v0.3 operations are exposed
+//! through [`Collection::typed`]; the SQLite query index is a derived,
+//! fallible accelerator with authoritative disk fallback. Legacy v0.2
+//! collections open through an isolated read/query adapter and require an
+//! explicit migration before mutation.
 
 pub mod errors;
 
@@ -57,7 +60,9 @@ pub struct Settings {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecProfile {
+    /// Legacy v0.2 collection loaded through read-only compatibility.
     V02,
+    /// Canonical v0.3 collection.
     V03,
 }
 

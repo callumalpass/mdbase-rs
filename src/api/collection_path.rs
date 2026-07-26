@@ -107,18 +107,25 @@ impl<'de> Deserialize<'de> for CollectionPath {
 /// Reason a logical collection path could not be constructed.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CollectionPathError {
+    /// The path contained no characters.
     #[error("collection path must not be empty")]
     Empty,
+    /// The path was rooted or carried a platform drive prefix.
     #[error("collection path must be relative")]
     Absolute,
+    /// The path contained a parent-directory component.
     #[error("collection path must not contain '..' traversal")]
     Traversal,
+    /// The path contained a current-directory component.
     #[error("collection path must not contain '.' components")]
     CurrentDirectory,
+    /// The path contained an empty component or trailing separator.
     #[error("collection path must not contain empty components")]
     EmptyComponent,
+    /// The path contained a NUL byte.
     #[error("collection path must not contain a NUL byte")]
     NullByte,
+    /// The platform path could not be represented as Unicode.
     #[error("collection path must be valid Unicode")]
     NonUnicode,
 }

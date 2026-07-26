@@ -1,8 +1,9 @@
 use std::fs;
 
 use mdbase::api::{
-    CollectionPath, CreateRequest, DeleteRequest, MdbaseError, QueryDirection, QueryRequest,
-    ReadRequest, RenameRequest, Revision, UpdateRequest, V02MigrationRequest,
+    BatchOperation, BatchRequest, CollectionPath, CreateRequest, DeleteRequest, MdbaseError,
+    QueryDirection, QueryRequest, ReadRequest, RenameRequest, Revision, UpdateRequest,
+    V02MigrationRequest,
 };
 use mdbase::{Collection, CompatibilityMode};
 use serde_json::json;
@@ -110,6 +111,38 @@ fn typed_crud_query_and_revision_failures_are_structured() {
 
     let deleted = api.delete(DeleteRequest::new(renamed_path)).unwrap();
     assert!(deleted.value.deleted);
+}
+
+#[test]
+fn typed_non_partial_batch_commits_all_mutations_together() {
+    let (root, collection) = typed_collection();
+    fs::create_dir_all(root.path().join("tasks")).unwrap();
+    fs::write(
+        root.path().join("tasks/existing.md"),
+        "---\ntype: task\ntitle: Existing\nstatus: open\n---\n",
+    )
+    .unwrap();
+    let api = collection.typed().unwrap();
+    let request = BatchRequest::new(vec![
+        BatchOperation::Update(UpdateRequest::new(
+            CollectionPath::new("tasks/existing.md").unwrap(),
+            json!({"status": "done"}),
+        )),
+        BatchOperation::Create(CreateRequest::new(
+            CollectionPath::new("tasks/created.md").unwrap(),
+            json!({"type": "task", "title": "Created"}),
+        )),
+    ])
+    .unwrap();
+
+    let outcome = api.batch(request).unwrap();
+    assert_eq!(outcome.value.succeeded, 2);
+    assert_eq!(outcome.value.failed, 0);
+    assert!(!outcome.value.preflight);
+    assert!(root.path().join("tasks/created.md").is_file());
+    assert!(fs::read_to_string(root.path().join("tasks/existing.md"))
+        .unwrap()
+        .contains("status: done"));
 }
 
 #[test]
