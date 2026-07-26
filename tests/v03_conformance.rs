@@ -185,7 +185,7 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
                 .get("name")
                 .and_then(Value::as_str)
                 .expect("get_type requires input.name");
-            match collection.types.get(name) {
+            match collection.types().get(name) {
                 Some(type_definition) => serde_json::json!({
                     "valid": true,
                     "type": {

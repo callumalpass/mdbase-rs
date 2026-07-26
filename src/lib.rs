@@ -60,6 +60,15 @@ pub enum SpecProfile {
     V03,
 }
 
+/// How a loaded collection relates to the canonical v0.3 data model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatibilityMode {
+    /// The collection is already canonical v0.3.
+    Canonical,
+    /// Legacy v0.2 data is translated for read-only compatibility.
+    V02ReadOnly,
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -85,16 +94,59 @@ impl Default for Settings {
 
 /// A loaded mdbase collection.
 pub struct Collection {
-    pub root: PathBuf,
-    pub spec_profile: SpecProfile,
-    pub settings: Settings,
+    pub(crate) root: PathBuf,
+    pub(crate) spec_profile: SpecProfile,
+    pub(crate) settings: Settings,
     /// Namespaced collection configuration retained for optional adapters.
-    pub config_extensions: serde_json::Map<String, serde_json::Value>,
-    pub types: HashMap<String, TypeDef>,
-    pub type_warnings: Vec<String>,
+    pub(crate) config_extensions: serde_json::Map<String, serde_json::Value>,
+    pub(crate) types: HashMap<String, TypeDef>,
+    pub(crate) type_warnings: Vec<String>,
 }
 
 impl Collection {
+    /// Authorized collection root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Immutable runtime settings loaded with this collection.
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// Specification profile detected at open time.
+    pub fn spec_profile(&self) -> SpecProfile {
+        self.spec_profile
+    }
+
+    /// Canonical or legacy compatibility mode.
+    pub fn compatibility_mode(&self) -> CompatibilityMode {
+        match self.spec_profile {
+            SpecProfile::V03 => CompatibilityMode::Canonical,
+            SpecProfile::V02 => CompatibilityMode::V02ReadOnly,
+        }
+    }
+
+    /// Loaded type definitions keyed by canonical lowercase name.
+    pub fn types(&self) -> &HashMap<String, TypeDef> {
+        &self.types
+    }
+
+    /// Warnings produced while translating or loading type definitions.
+    pub fn type_warnings(&self) -> &[String] {
+        &self.type_warnings
+    }
+
+    /// Namespaced configuration values retained for optional adapters.
+    pub fn config_extensions(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.config_extensions
+    }
+
+    /// Borrow the typed canonical operation service.
+    pub fn typed(&self) -> api::MdbaseResult<api::TypedCollection<'_>> {
+        api::TypedCollection::new(self)
+    }
+
     /// Open a collection from a root directory.
     pub fn open(root: &Path) -> Result<Self, serde_json::Value> {
         let config_result = config::load_config_for_open(root);

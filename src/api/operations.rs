@@ -292,37 +292,3 @@ impl DeleteOutput {
         result
     }
 }
-
-#[derive(Debug, Clone)]
-pub struct RenameOutput {
-    pub from: String,
-    pub to: String,
-    pub references_updated: Vec<serde_json::Value>,
-    pub warnings: Vec<serde_json::Value>,
-    pub ref_update_failures: Vec<serde_json::Value>,
-}
-
-impl RenameOutput {
-    pub fn into_json(self) -> serde_json::Value {
-        let mut result = serde_json::json!({
-            "from": self.from,
-            "to": self.to,
-        });
-        if !self.references_updated.is_empty() {
-            result["references_updated"] = serde_json::Value::Array(self.references_updated);
-        }
-        if !self.warnings.is_empty() {
-            result["warnings"] = serde_json::Value::Array(self.warnings);
-        }
-        if !self.ref_update_failures.is_empty() {
-            result["error"] = serde_json::json!({
-                "code": RENAME_REF_UPDATE_FAILED,
-                "message": "Some reference updates failed due to concurrent modification",
-            });
-            result["partial_updates"] = serde_json::json!({
-                "failed": self.ref_update_failures,
-            });
-        }
-        result
-    }
-}

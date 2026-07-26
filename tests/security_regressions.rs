@@ -235,7 +235,7 @@ fn collection_metadata_never_loads_through_symlinks() {
     );
     symlink(outside.join("external.md"), root.join("_types/external.md")).unwrap();
     let collection = open_collection(&root);
-    assert!(!collection.types.contains_key("external"));
+    assert!(!collection.types().contains_key("external"));
 }
 
 #[test]

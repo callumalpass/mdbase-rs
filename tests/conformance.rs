@@ -974,7 +974,7 @@ fn execute_operation(
                 "load_types" | "get_types" => {
                     // If a path is provided, determine types for that specific file
                     if let Some(path) = input_json.get("path").and_then(|v| v.as_str()) {
-                        let full_path = collection.root.join(path);
+                        let full_path = collection.root().join(path);
                         let frontmatter = if full_path.exists() {
                             let content = fs::read_to_string(&full_path).unwrap_or_default();
                             let doc = mdbase::frontmatter::parser::parse_document(&content);
@@ -995,9 +995,9 @@ fn execute_operation(
                         })
                     } else {
                         // Return list of all loaded type names
-                        let type_names: Vec<String> = collection.types.keys().cloned().collect();
+                        let type_names: Vec<String> = collection.types().keys().cloned().collect();
                         let types_detail: Vec<serde_json::Value> = collection
-                            .types
+                            .types()
                             .values()
                             .map(|t| {
                                 let mut obj = serde_json::json!({
@@ -1026,9 +1026,9 @@ fn execute_operation(
                             "names": type_names,
                             "count": type_names.len(),
                         });
-                        if !collection.type_warnings.is_empty() {
+                        if !collection.type_warnings().is_empty() {
                             let warnings: Vec<serde_json::Value> = collection
-                                .type_warnings
+                                .type_warnings()
                                 .iter()
                                 .map(|w| {
                                     serde_json::json!({
@@ -1048,7 +1048,7 @@ fn execute_operation(
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let name = raw_name.to_lowercase();
-                    match collection.types.get(&name) {
+                    match collection.types().get(&name) {
                         Some(t) => {
                             let mut fields = serde_json::Map::new();
                             for (k, v) in &t.fields {
@@ -1108,7 +1108,7 @@ fn execute_operation(
                     let fields_input = input_json.get("fields");
                     let parent_input = input_json.get("parent").and_then(|v| v.as_str());
                     let strict_input = input_json.get("strict").and_then(|v| v.as_bool());
-                    let types_dir = collection.root.join(&collection.settings.types_folder);
+                    let types_dir = collection.root().join(&collection.settings().types_folder);
                     let _ = std::fs::create_dir_all(&types_dir);
 
                     // Validate type name
@@ -1120,7 +1120,7 @@ fn execute_operation(
 
                     // Check for name conflicts (case-insensitive)
                     let name_lower = name.to_lowercase();
-                    if collection.types.contains_key(&name_lower) {
+                    if collection.types().contains_key(&name_lower) {
                         return Ok(serde_json::json!({
                             "error": { "code": "path_conflict", "message": format!("Type '{}' already exists", name) }
                         }));
@@ -1129,7 +1129,7 @@ fn execute_operation(
                     // Check parent exists
                     if let Some(parent) = parent_input {
                         let parent_lower = parent.to_lowercase();
-                        if !collection.types.contains_key(&parent_lower) {
+                        if !collection.types().contains_key(&parent_lower) {
                             return Ok(serde_json::json!({
                                 "error": { "code": "missing_parent_type", "message": format!("Parent type '{}' not found", parent) }
                             }));
@@ -1203,10 +1203,10 @@ fn execute_operation(
                             match reload_result {
                                 Ok(reloaded) => {
                                     let name_lower = name.to_lowercase();
-                                    let type_loaded = reloaded.types.contains_key(&name_lower);
+                                    let type_loaded = reloaded.types().contains_key(&name_lower);
                                     serde_json::json!({
                                         "name": name,
-                                        "path": format!("{}/{}.md", collection.settings.types_folder, name),
+                                        "path": format!("{}/{}.md", collection.settings().types_folder, name),
                                         "type_loaded": type_loaded,
                                     })
                                 }
@@ -1307,7 +1307,7 @@ fn execute_operation(
                 let backlinks_index = collection.build_backlinks_index(&all_files);
                 let all_files_arc = std::sync::Arc::new(all_files);
                 let backlinks_arc = std::sync::Arc::new(backlinks_index);
-                let types_arc = std::sync::Arc::new(collection.types.clone());
+                let types_arc = std::sync::Arc::new(collection.types().clone());
                 let type_names_for_file = collection.determine_types_for_path(
                     &read_result
                         .get("frontmatter")
