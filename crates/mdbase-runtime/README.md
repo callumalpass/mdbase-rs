@@ -1,7 +1,7 @@
 # mdbase-runtime
 
-`mdbase-runtime` is the durable workflow engine for mdbase Runtime profile 0.1.
-It is independently versioned from the `mdbase` collection crate.
+`mdbase-runtime` 0.2 is the durable workflow engine for mdbase Runtime profile
+0.1. It is independently versioned from the `mdbase` collection crate.
 
 The crate provides:
 
@@ -77,9 +77,16 @@ let store = PostgresRuntimeStore::connect(database_url, "collection:01J0").await
 # }
 ```
 
-Schema installation is idempotent. PostgreSQL admission is serialized per
-namespace so debounce, minimum interval, idempotency, and concurrency decisions
-remain one atomic boundary while independent action execution stays parallel.
+SQLite and PostgreSQL use explicit schema version 1 with transactional
+migrations and reject unknown newer schemas. SQLite work runs on a bounded
+dedicated thread so `rusqlite` never blocks Tokio executor workers. PostgreSQL
+schema migration is serialized with an advisory lock; admission is serialized
+per namespace so debounce, minimum interval, idempotency, and concurrency
+decisions remain one atomic boundary while independent action execution stays
+parallel.
+
+See [`docs/runtime-store.md`](../../docs/runtime-store.md) for backend
+selection, migration behavior, and the mandatory live PostgreSQL test.
 
 ## Safety model
 

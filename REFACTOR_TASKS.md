@@ -1,7 +1,21 @@
 # Codebase Improvement Tasks
 
-This file tracks the end-to-end refactor and hardening work as executable tasks.
-Each task should be completed and validated before moving to the next.
+Status: archived by the 0.4 typed-core release.
+
+This original checklist is retained for historical context. Its architectural
+requirements were superseded by
+[`docs/architecture/next-breaking-release.md`](docs/architecture/next-breaking-release.md),
+which deliberately allowed breaking API changes instead of preserving the
+legacy JSON boundary.
+
+Delivered equivalents include typed public requests/results, private
+collection invariants, `CollectionPath`, AST-derived compiled expression
+plans, fallible snapshots, fail-safe caching, decomposed rename modules,
+recoverable batches, isolated v0.2 migration, focused integration/fault tests,
+and hermetic release qualification. Further work should be filed against the
+current architecture rather than appended here.
+
+The checklist below is the pre-0.4 plan.
 
 ## Task 1: Restore a Green Baseline
 - Fix current conformance regressions so the main suite starts from known-good behavior.

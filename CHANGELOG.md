@@ -4,7 +4,39 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## 0.4.0-rc.1 - 2026-07-26
+
+### Breaking
+- Replaced the application-facing JSON operation surface with typed paths,
+  requests, results, diagnostics, revisions, outcomes, and errors under
+  `mdbase::api`.
+- Made `Collection` invariants private and exposed immutable inspection
+  accessors plus `Collection::typed()`.
+- Made canonical v0.3 the only writable profile. v0.2 collections are
+  read/query compatible but return `migration_required` for mutations.
+- Changed rename reference updates to the CLI default; use
+  `--no-update-refs` to opt out.
+- Raised the minimum supported Rust version to 1.94.0.
+- Released `mdbase-runtime` 0.2.0-rc.1 with versioned store schemas.
+
 ### Added
+- A verified, dry-runnable, crash-recoverable v0.2-to-v0.3 translator with
+  explicit opt-in for lossy mappings.
+- Typed recoverable batch requests/results and CLI JSON request files for
+  complete queries and batches.
+- Mutation `--if-revision` and `--dry-run` CLI controls.
+- Portable `CollectionPath` and opaque `Revision` types.
+- Fallible authoritative collection snapshots and cache fault recovery.
+- Transaction journals, staging, recovery, and cross-process write gating for
+  non-partial batches and migration.
+- Precompiled type match, computed-field, lifecycle, and formula plans.
+- Explicit SQLite/PostgreSQL runtime schema migrations and a bounded dedicated
+  SQLite worker thread.
+- One shared runtime store contract suite across memory, SQLite, and
+  PostgreSQL.
+- Hermetic pinned conformance counts, a cross-platform/feature/live-PostgreSQL
+  CI matrix, and dependency advisory/license/source policy.
+- Versioned, enforceable p95 release performance budgets.
 - A real debounced `CollectionWatcher` backed by filesystem notifications and
   final-state collection snapshot diffs.
 - Opaque `if_revision` preconditions for create, update, delete, and rename.
@@ -35,6 +67,13 @@ All notable changes to this project are documented in this file.
   assets rather than caches, excluded trees, or nested collections.
 
 ### Fixed
+- Cache corruption, lock contention, decode failures, and refresh failures now
+  fall back to authoritative disk snapshots or fail explicitly; they cannot
+  become successful empty/stale query results.
+- Stale SQLite runtime claim tokens now return the same `stale_lease`
+  diagnostic as memory and PostgreSQL.
+- Updated `rand` to 0.8.7 to address RUSTSEC-2026-0097 without suppressing the
+  advisory.
 - Collection operations and discovery reject symlink escapes, including config,
   type, cache, validation, link, migration, batch, runtime, query, and watch
   paths.
@@ -44,6 +83,12 @@ All notable changes to this project are documented in this file.
   successful and validation-failing operations.
 
 ### Tests
+- Require all 78 pinned historical fixture files and 1,794 cases, plus exact
+  canonical v0.3 suite counts; missing or malformed fixtures are fatal.
+- Added migration equivalence, interrupted-commit recovery, cache
+  fault-injection, typed API/CLI, backend schema rollback, and shared store
+  contract tests.
+- Qualified live PostgreSQL 17 and the release performance workload.
 - Added shared Runtime Contracts fixture execution, filesystem-backed registry
   end-to-end tests, runtime-aware watch tests, a 2,000-contract performance
   regression, concurrent writer tests, and adversarial boundary tests.

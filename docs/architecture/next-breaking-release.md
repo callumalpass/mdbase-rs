@@ -1,6 +1,6 @@
 # Next Breaking Release Architecture
 
-Status: accepted for implementation  
+Status: implemented for `mdbase` 0.4.0-rc.1
 Date: 2026-07-26
 
 ## Purpose
@@ -62,8 +62,9 @@ Illustrative shape:
 
 ```rust
 let collection = Collection::open(root)?;
-let record = collection.read(ReadRequest::new("tasks/example.md")?)?;
-let result = collection.query(QueryRequest::builder().type_name("task").build())?;
+let records = collection.typed()?;
+let record = records.read(ReadRequest::new("tasks/example.md")?)?;
+let result = records.query(QueryRequest::builder().type_name("task"))?;
 ```
 
 Core types:
@@ -268,11 +269,11 @@ service and emits one consistent wire envelope.
 
 The CLI adds:
 
-- raw request input from JSON files/stdin for complete query features;
+- typed request input from JSON files/stdin for complete query and batch
+  features;
 - revision preconditions for mutations;
-- dry-run and batch commands;
-- type inspection and management;
-- cache health/doctor output;
+- dry-run and recoverable batch commands;
+- cache status/rebuild/clear commands;
 - v0.2 migration planning and apply;
 - consistent diagnostic-derived exit codes.
 
@@ -295,24 +296,26 @@ CI includes:
 - Rustdoc with public missing-doc enforcement;
 - package tests for every publishable crate;
 - dependency advisory/license/source policy;
-- public API semver checks once the new baseline is published.
+- a versioned public API baseline from which semver checks can be added after
+  publication.
 
 ## Performance Qualification
 
 Correctness failures may fall back to slower authoritative paths, but healthy
 steady-state behavior must be measured.
 
-Track before and after for:
+The versioned release workload tracks:
 
 - collection open;
 - cold and warm metadata queries;
 - filtered/formula/link queries;
-- uniqueness validation;
 - rename with reference updates;
-- non-partial batch planning and commit;
 - cache rebuild and no-op refresh;
-- runtime event admission, claim, and timer operations;
-- concurrent query tail latency.
+- filesystem runtime startup and update/watch synchronization.
+
+Runtime event admission, claims, timers, non-partial batch recovery, and
+concurrent cache behavior are covered by deterministic regression and
+backend-contract tests rather than unstable wall-clock budgets.
 
 Expected improvements:
 

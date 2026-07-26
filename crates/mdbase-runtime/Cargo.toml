@@ -1,6 +1,6 @@
 [package]
 name = "mdbase-runtime"
-version = "0.1.0-rc.1"
+version = "0.2.0-rc.1"
 edition = "2021"
 rust-version = "1.94"
 description = "Durable, provider-neutral workflow runtime for mdbase"
@@ -18,7 +18,7 @@ tracing = ["dep:tracing"]
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
-mdbase = { version = "0.3.0-rc.1", path = "../.." }
+mdbase = { version = "0.4.0-rc.1", path = "../.." }
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 serde = { version = "1", features = ["derive"] }
