@@ -184,6 +184,9 @@ impl fmt::Display for Revision {
 pub struct ReadRequest {
     /// Record path relative to the collection root.
     pub path: CollectionPath,
+    /// Include the exact UTF-8 record source.
+    #[serde(default)]
+    pub include_document: bool,
 }
 
 impl ReadRequest {
@@ -191,7 +194,14 @@ impl ReadRequest {
     pub fn new(path: impl AsRef<str>) -> MdbaseResult<Self> {
         Ok(Self {
             path: CollectionPath::new(path)?,
+            include_document: false,
         })
+    }
+
+    /// Request the exact source document.
+    pub fn with_document(mut self) -> Self {
+        self.include_document = true;
+        self
     }
 }
 
@@ -212,6 +222,9 @@ pub struct CreateRequest {
     /// Optional optimistic-concurrency precondition.
     #[serde(default)]
     pub if_revision: Option<Revision>,
+    /// Include exact post-write source in the result.
+    #[serde(default)]
+    pub include_document: bool,
 }
 
 impl CreateRequest {
@@ -223,6 +236,7 @@ impl CreateRequest {
             frontmatter,
             body: String::new(),
             if_revision: None,
+            include_document: false,
         }
     }
 
@@ -234,6 +248,7 @@ impl CreateRequest {
             frontmatter,
             body: String::new(),
             if_revision: None,
+            include_document: false,
         }
     }
 
@@ -249,6 +264,12 @@ impl CreateRequest {
         self
     }
 
+    /// Include exact post-write source in the result.
+    pub fn with_document(mut self) -> Self {
+        self.include_document = true;
+        self
+    }
+
     fn into_wire(self) -> Value {
         let mut input = json!({
             "frontmatter": self.frontmatter,
@@ -261,6 +282,9 @@ impl CreateRequest {
             "if_revision",
             self.if_revision.map(|revision| json!(revision)),
         );
+        if self.include_document {
+            input["include_document"] = Value::Bool(true);
+        }
         input
     }
 }
@@ -272,12 +296,19 @@ pub struct UpdateRequest {
     pub path: CollectionPath,
     /// Frontmatter merge patch.
     pub patch: Value,
+    /// Complete replacement Markdown source, mutually exclusive with `patch`
+    /// and `body`.
+    #[serde(default)]
+    pub document: Option<String>,
     /// Complete replacement body, or `None` to preserve the current body.
     #[serde(default)]
     pub body: Option<String>,
     /// Optional optimistic-concurrency precondition.
     #[serde(default)]
     pub if_revision: Option<Revision>,
+    /// Include exact post-write source in the result.
+    #[serde(default)]
+    pub include_document: bool,
 }
 
 impl UpdateRequest {
@@ -286,22 +317,47 @@ impl UpdateRequest {
         Self {
             path,
             patch,
+            document: None,
             body: None,
             if_revision: None,
+            include_document: false,
         }
     }
 
+    /// Construct a complete source replacement.
+    pub fn replace_document(path: CollectionPath, document: impl Into<String>) -> Self {
+        Self {
+            path,
+            patch: json!({}),
+            document: Some(document.into()),
+            body: None,
+            if_revision: None,
+            include_document: true,
+        }
+    }
+
+    /// Include exact post-write source in the result.
+    pub fn with_document(mut self) -> Self {
+        self.include_document = true;
+        self
+    }
+
     fn into_wire(self) -> Value {
-        let mut input = json!({
-            "path": self.path,
-            "patch": self.patch,
-        });
-        set_optional(&mut input, "body", self.body.map(Value::String));
+        let mut input = json!({ "path": self.path });
+        if let Some(document) = self.document {
+            input["document"] = Value::String(document);
+        } else {
+            input["patch"] = self.patch;
+            set_optional(&mut input, "body", self.body.map(Value::String));
+        }
         set_optional(
             &mut input,
             "if_revision",
             self.if_revision.map(|revision| json!(revision)),
         );
+        if self.include_document {
+            input["include_document"] = Value::Bool(true);
+        }
         input
     }
 }
@@ -356,6 +412,9 @@ pub struct RenameRequest {
     /// Optional optimistic-concurrency precondition.
     #[serde(default)]
     pub if_revision: Option<Revision>,
+    /// Include exact post-write source in the result.
+    #[serde(default)]
+    pub include_document: bool,
 }
 
 /// Options for translating a v0.2 collection to canonical v0.3 files.
@@ -403,7 +462,14 @@ impl RenameRequest {
             to,
             update_refs: true,
             if_revision: None,
+            include_document: false,
         }
+    }
+
+    /// Include exact post-write source in the result.
+    pub fn with_document(mut self) -> Self {
+        self.include_document = true;
+        self
     }
 
     fn into_wire(self) -> Value {
@@ -417,6 +483,9 @@ impl RenameRequest {
             "if_revision",
             self.if_revision.map(|revision| json!(revision)),
         );
+        if self.include_document {
+            input["include_document"] = Value::Bool(true);
+        }
         input
     }
 }
@@ -706,6 +775,9 @@ pub struct RecordDocument {
     pub effective_frontmatter: Value,
     /// Markdown body.
     pub body: String,
+    /// Exact UTF-8 record source when requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
     /// Filesystem metadata.
     pub file: RecordFile,
 }
@@ -831,7 +903,10 @@ impl<'a> TypedCollection<'a> {
         if self.collection.spec_profile == SpecProfile::V02 {
             return crate::compat::v02::read(self.collection, request);
         }
-        self.execute(self.operations()?.read(&json!({"path": request.path})))
+        self.execute(self.operations()?.read(&json!({
+            "path": request.path,
+            "include_document": request.include_document,
+        })))
     }
 
     /// Create one canonical record.

@@ -20,6 +20,7 @@ impl Collection {
             path,
             fields,
             body: new_body,
+            document,
             last_known_mtime,
             if_revision,
         } = input;
@@ -70,15 +71,36 @@ impl Collection {
         }
 
         let doc = parse_document(&content);
+        let replacement_doc = document.as_deref().map(parse_document);
+        let replacement_mapping = match replacement_doc
+            .as_ref()
+            .and_then(|doc| doc.frontmatter.as_ref())
+        {
+            Some(serde_yaml::Value::Mapping(mapping)) => Some(mapping.clone()),
+            Some(_) => {
+                return op_error(
+                    INVALID_FRONTMATTER,
+                    "Replacement document frontmatter must be a YAML mapping",
+                )
+            }
+            None if document.is_some() => Some(serde_yaml::Mapping::new()),
+            None => None,
+        };
 
-        let existing_mapping = match &doc.frontmatter {
-            Some(serde_yaml::Value::Mapping(m)) => m.clone(),
-            _ => serde_yaml::Mapping::new(),
+        let existing_mapping = match replacement_mapping.as_ref() {
+            Some(mapping) => mapping.clone(),
+            None => match &doc.frontmatter {
+                Some(serde_yaml::Value::Mapping(m)) => m.clone(),
+                _ => serde_yaml::Mapping::new(),
+            },
         };
 
         // Merge fields
-        let merged =
-            serializer::merge_fields(&existing_mapping, &fields, &self.settings.write_nulls);
+        let merged = if document.is_some() {
+            existing_mapping.clone()
+        } else {
+            serializer::merge_fields(&existing_mapping, &fields, &self.settings.write_nulls)
+        };
         let merged_json = yaml_mapping_to_json(&merged);
 
         // Determine types
@@ -139,18 +161,25 @@ impl Collection {
                 }
             }
         }
-        if self.settings.write_nulls == "omit" {
+        if self.settings.write_nulls == "omit" && document.is_none() {
             write_obj.retain(|_, v| !v.is_null());
         }
 
         // Write file
         let write_mapping =
             crate::frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
-        let body = match new_body {
-            Some(b) => b,
-            None => &doc.body,
+        let body = match replacement_doc.as_ref() {
+            Some(candidate) => candidate.body.as_str(),
+            None => match new_body {
+                Some(b) => b,
+                None => &doc.body,
+            },
         };
-        let output = serializer::serialize_document(&write_mapping, body);
+        let output = if document.is_some() && replacement_mapping.as_ref() == Some(&write_mapping) {
+            document.as_deref().unwrap_or_default().to_string()
+        } else {
+            serializer::serialize_document(&write_mapping, body)
+        };
 
         if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
             return error;
