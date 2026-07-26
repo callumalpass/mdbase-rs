@@ -1,10 +1,11 @@
 use std::path::Path;
-use std::sync::Mutex;
+use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
 
 use crate::error::{RuntimeError, RuntimeResult};
@@ -17,8 +18,14 @@ use crate::store::{
 };
 use crate::timer::{next_timer_generation, timer_matches};
 
+pub const SQLITE_SCHEMA_VERSION: u32 = 1;
+const SQLITE_WORK_QUEUE_CAPACITY: usize = 64;
+
+type SqliteCommand = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
+
+#[derive(Clone)]
 pub struct SqliteRuntimeStore {
-    connection: Mutex<Connection>,
+    worker: mpsc::Sender<SqliteCommand>,
 }
 
 impl SqliteRuntimeStore {
@@ -34,14 +41,80 @@ impl SqliteRuntimeStore {
         Self::from_connection(connection)
     }
 
-    fn from_connection(connection: Connection) -> RuntimeResult<Self> {
+    pub async fn schema_version(&self) -> RuntimeResult<u32> {
+        self.execute(|connection| {
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    fn from_connection(mut connection: Connection) -> RuntimeResult<Self> {
         connection
             .execute_batch(
                 "
                 PRAGMA foreign_keys = ON;
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
+                ",
+            )
+            .map_err(store_error)?;
+        migrate(&mut connection)?;
 
+        let (worker, mut receiver) = mpsc::channel::<SqliteCommand>(SQLITE_WORK_QUEUE_CAPACITY);
+        thread::Builder::new()
+            .name("mdbase-runtime-sqlite".to_string())
+            .spawn(move || {
+                while let Some(command) = receiver.blocking_recv() {
+                    command(&mut connection);
+                }
+            })
+            .map_err(|error| {
+                RuntimeError::Store(format!("could not start SQLite worker: {error}"))
+            })?;
+        Ok(Self { worker })
+    }
+
+    async fn execute<T, F>(&self, operation: F) -> RuntimeResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> RuntimeResult<T> + Send + 'static,
+    {
+        let (result_sender, result_receiver) = oneshot::channel();
+        self.worker
+            .send(Box::new(move |connection| {
+                let _ = result_sender.send(operation(connection));
+            }))
+            .await
+            .map_err(|_| RuntimeError::Store("SQLite worker is unavailable".to_string()))?;
+        result_receiver
+            .await
+            .map_err(|_| RuntimeError::Store("SQLite worker stopped unexpectedly".to_string()))?
+    }
+}
+
+fn migrate(connection: &mut Connection) -> RuntimeResult<()> {
+    let installed = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+        .map_err(store_error)?;
+    if installed > SQLITE_SCHEMA_VERSION {
+        return Err(RuntimeError::diagnostic(
+            "runtime_schema_too_new",
+            format!(
+                "SQLite runtime schema version {installed} is newer than supported version {SQLITE_SCHEMA_VERSION}."
+            ),
+        ));
+    }
+    if installed == SQLITE_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction().map_err(store_error)?;
+    if installed == 0 {
+        transaction
+            .execute_batch(
+                "
                 CREATE TABLE IF NOT EXISTS runtime_events (
                     cursor INTEGER PRIMARY KEY AUTOINCREMENT,
                     source_runtime TEXT NOT NULL,
@@ -110,21 +183,24 @@ impl SqliteRuntimeStore {
                     ON runtime_timers(status, fire_at);
                 ",
             )
-            .map_err(|error| RuntimeError::Store(error.to_string()))?;
-        Ok(Self {
-            connection: Mutex::new(connection),
-        })
+            .map_err(store_error)?;
     }
+    transaction
+        .pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)
+        .map_err(store_error)?;
+    transaction.commit().map_err(store_error)
 }
 
 #[async_trait]
 impl RuntimeStore for SqliteRuntimeStore {
     async fn admit_event(&self, event: PreparedEvent) -> RuntimeResult<AdmitOutcome> {
-        let mut connection = self.connection.lock().map_err(lock_error)?;
-        let transaction = connection.transaction().map_err(store_error)?;
-        let outcome = admit_tx(&transaction, event)?;
-        transaction.commit().map_err(store_error)?;
-        Ok(outcome)
+        self.execute(move |connection| {
+            let transaction = connection.transaction().map_err(store_error)?;
+            let outcome = admit_tx(&transaction, event)?;
+            transaction.commit().map_err(store_error)?;
+            Ok(outcome)
+        })
+        .await
     }
 
     async fn claim_run(
@@ -134,20 +210,22 @@ impl RuntimeStore for SqliteRuntimeStore {
         now: DateTime<Utc>,
         lease_for: Duration,
     ) -> RuntimeResult<Option<Claim>> {
-        let mut connection = self.connection.lock().map_err(lock_error)?;
-        let transaction = connection.transaction().map_err(store_error)?;
-        transaction
-            .execute(
-                "UPDATE runtime_runs
+        let executor = executor.to_string();
+        let worker = worker.to_string();
+        self.execute(move |connection| {
+            let transaction = connection.transaction().map_err(store_error)?;
+            transaction
+                .execute(
+                    "UPDATE runtime_runs
                  SET lease_worker = NULL, lease_token = NULL, lease_expires_at = NULL
                  WHERE lease_expires_at <= ?1",
-                params![timestamp(now)],
-            )
-            .map_err(store_error)?;
-        let candidate_json = {
-            let mut statement = transaction
-                .prepare(
-                    "SELECT record_json
+                    params![timestamp(now)],
+                )
+                .map_err(store_error)?;
+            let candidate_json = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT record_json
                      FROM runtime_runs
                      WHERE executor = ?1
                        AND status IN ('queued', 'running')
@@ -155,64 +233,66 @@ impl RuntimeStore for SqliteRuntimeStore {
                        AND lease_token IS NULL
                      ORDER BY created_at, id
                      LIMIT 100",
-                )
-                .map_err(store_error)?;
-            let rows = statement
-                .query_map(params![executor, timestamp(now)], |row| {
-                    row.get::<_, String>(0)
-                })
-                .map_err(store_error)?;
-            let mut selected = None;
-            for row in rows {
-                let json = row.map_err(store_error)?;
-                let run: RunRecord = serde_json::from_str(&json)?;
-                if group_is_runnable_tx(&transaction, &run)? {
-                    selected = Some(json);
-                    break;
+                    )
+                    .map_err(store_error)?;
+                let rows = statement
+                    .query_map(params![executor, timestamp(now)], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(store_error)?;
+                let mut selected = None;
+                for row in rows {
+                    let json = row.map_err(store_error)?;
+                    let run: RunRecord = serde_json::from_str(&json)?;
+                    if group_is_runnable_tx(&transaction, &run)? {
+                        selected = Some(json);
+                        break;
+                    }
                 }
+                selected
+            };
+            let Some(json) = candidate_json else {
+                transaction.commit().map_err(store_error)?;
+                return Ok(None);
+            };
+            let mut run: RunRecord = serde_json::from_str(&json)?;
+            if run.status == RunStatus::Queued {
+                run.status = RunStatus::Running;
+                run.started_at.get_or_insert(now);
+                run.updated_at = now;
             }
-            selected
-        };
-        let Some(json) = candidate_json else {
-            transaction.commit().map_err(store_error)?;
-            return Ok(None);
-        };
-        let mut run: RunRecord = serde_json::from_str(&json)?;
-        if run.status == RunStatus::Queued {
-            run.status = RunStatus::Running;
-            run.started_at.get_or_insert(now);
-            run.updated_at = now;
-        }
-        let token = format!("lease_{}", Ulid::new());
-        let expires_at = add_duration(now, lease_for)?;
-        let changed = transaction
-            .execute(
-                "UPDATE runtime_runs
+            let token = format!("lease_{}", Ulid::new());
+            let expires_at = add_duration(now, lease_for)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE runtime_runs
                  SET status = ?1, lease_worker = ?2, lease_token = ?3,
                      lease_expires_at = ?4, record_json = ?5
                  WHERE id = ?6 AND lease_token IS NULL AND revision = ?7",
-                params![
-                    run_status(run.status),
-                    worker,
-                    token,
-                    timestamp(expires_at),
-                    serde_json::to_string(&run)?,
-                    run.plan.id,
-                    run.revision
-                ],
-            )
-            .map_err(store_error)?;
-        if changed != 1 {
-            transaction.rollback().map_err(store_error)?;
-            return Ok(None);
-        }
-        transaction.commit().map_err(store_error)?;
-        Ok(Some(Claim {
-            run,
-            worker: worker.to_string(),
-            token,
-            expires_at,
-        }))
+                    params![
+                        run_status(run.status),
+                        worker,
+                        token,
+                        timestamp(expires_at),
+                        serde_json::to_string(&run)?,
+                        run.plan.id,
+                        run.revision
+                    ],
+                )
+                .map_err(store_error)?;
+            if changed != 1 {
+                transaction.rollback().map_err(store_error)?;
+                return Ok(None);
+            }
+            transaction.commit().map_err(store_error)?;
+            Ok(Some(Claim {
+                run,
+                worker,
+                token,
+                expires_at,
+            }))
+        })
+        .await
     }
 
     async fn commit_run(
@@ -220,243 +300,255 @@ impl RuntimeStore for SqliteRuntimeStore {
         mut claim: Claim,
         emitted: Vec<PreparedEvent>,
     ) -> RuntimeResult<Claim> {
-        let mut connection = self.connection.lock().map_err(lock_error)?;
-        let transaction = connection.transaction().map_err(store_error)?;
-        let current: Option<(String, String, i64)> = transaction
-            .query_row(
-                "SELECT lease_worker, lease_token, revision
+        self.execute(move |connection| {
+            let transaction = connection.transaction().map_err(store_error)?;
+            let current: Option<(Option<String>, Option<String>, i64)> = transaction
+                .query_row(
+                    "SELECT lease_worker, lease_token, revision
                  FROM runtime_runs WHERE id = ?1",
-                params![claim.run.plan.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(store_error)?;
-        let Some((worker, token, revision)) = current else {
-            return Err(RuntimeError::diagnostic(
-                "stale_lease",
-                "Claimed run no longer exists.",
-            ));
-        };
-        if worker != claim.worker
-            || token != claim.token
-            || u64::try_from(revision).ok() != Some(claim.run.revision)
-        {
-            return Err(RuntimeError::diagnostic(
-                "stale_lease",
-                "Run lease or revision changed before commit.",
-            ));
-        }
-        claim.run.revision += 1;
-        let terminal = claim.run.status.terminal();
-        let changed = transaction
-            .execute(
-                "UPDATE runtime_runs
+                    params![claim.run.plan.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(store_error)?;
+            let Some((worker, token, revision)) = current else {
+                return Err(RuntimeError::diagnostic(
+                    "stale_lease",
+                    "Claimed run no longer exists.",
+                ));
+            };
+            if worker.as_deref() != Some(claim.worker.as_str())
+                || token.as_deref() != Some(claim.token.as_str())
+                || u64::try_from(revision).ok() != Some(claim.run.revision)
+            {
+                return Err(RuntimeError::diagnostic(
+                    "stale_lease",
+                    "Run lease or revision changed before commit.",
+                ));
+            }
+            claim.run.revision += 1;
+            let terminal = claim.run.status.terminal();
+            let changed = transaction
+                .execute(
+                    "UPDATE runtime_runs
                  SET status = ?1, revision = ?2, record_json = ?3,
                      lease_worker = CASE WHEN ?4 THEN NULL ELSE lease_worker END,
                      lease_token = CASE WHEN ?4 THEN NULL ELSE lease_token END,
                      lease_expires_at = CASE WHEN ?4 THEN NULL ELSE lease_expires_at END
                  WHERE id = ?5 AND lease_token = ?6 AND revision = ?7",
-                params![
-                    run_status(claim.run.status),
-                    claim.run.revision,
-                    serde_json::to_string(&claim.run)?,
-                    terminal,
-                    claim.run.plan.id,
-                    claim.token,
-                    revision
-                ],
-            )
-            .map_err(store_error)?;
-        if changed != 1 {
-            return Err(RuntimeError::diagnostic(
-                "stale_lease",
-                "Run changed during commit.",
-            ));
-        }
-        for event in emitted {
-            admit_tx(&transaction, event)?;
-        }
-        transaction.commit().map_err(store_error)?;
-        Ok(claim)
+                    params![
+                        run_status(claim.run.status),
+                        claim.run.revision,
+                        serde_json::to_string(&claim.run)?,
+                        terminal,
+                        claim.run.plan.id,
+                        claim.token,
+                        revision
+                    ],
+                )
+                .map_err(store_error)?;
+            if changed != 1 {
+                return Err(RuntimeError::diagnostic(
+                    "stale_lease",
+                    "Run changed during commit.",
+                ));
+            }
+            for event in emitted {
+                admit_tx(&transaction, event)?;
+            }
+            transaction.commit().map_err(store_error)?;
+            Ok(claim)
+        })
+        .await
     }
 
     async fn get_run(&self, id: &str) -> RuntimeResult<Option<RunRecord>> {
-        let connection = self.connection.lock().map_err(lock_error)?;
-        let json = connection
-            .query_row(
-                "SELECT record_json FROM runtime_runs WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(store_error)?;
-        json.map(|value| serde_json::from_str(&value).map_err(Into::into))
-            .transpose()
+        let id = id.to_string();
+        self.execute(move |connection| {
+            let json = connection
+                .query_row(
+                    "SELECT record_json FROM runtime_runs WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(store_error)?;
+            json.map(|value| serde_json::from_str(&value).map_err(Into::into))
+                .transpose()
+        })
+        .await
     }
 
     async fn events_after(&self, after: u64, limit: usize) -> RuntimeResult<EventPage> {
-        let connection = self.connection.lock().map_err(lock_error)?;
-        let retained_after = connection
-            .query_row(
-                "SELECT value FROM runtime_meta WHERE key = 'retained_after'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(store_error)
-            .and_then(nonnegative_cursor)?;
-        let head = connection
-            .query_row(
-                "SELECT COALESCE(MAX(cursor), 0) FROM runtime_event_dedup",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(store_error)
-            .and_then(nonnegative_cursor)?;
-        let reset_required = after < retained_after;
-        let limit = limit.clamp(1, 10_000);
-        let mut events = Vec::new();
-        if !reset_required {
-            let mut statement = connection
-                .prepare(
-                    "SELECT cursor, source_runtime, event_id, envelope_json, received_at
+        self.execute(move |connection| {
+            let retained_after = connection
+                .query_row(
+                    "SELECT value FROM runtime_meta WHERE key = 'retained_after'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(store_error)
+                .and_then(nonnegative_cursor)?;
+            let head = connection
+                .query_row(
+                    "SELECT COALESCE(MAX(cursor), 0) FROM runtime_event_dedup",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(store_error)
+                .and_then(nonnegative_cursor)?;
+            let reset_required = after < retained_after;
+            let limit = limit.clamp(1, 10_000);
+            let mut events = Vec::new();
+            if !reset_required {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT cursor, source_runtime, event_id, envelope_json, received_at
                      FROM runtime_events WHERE cursor > ?1 ORDER BY cursor LIMIT ?2",
-                )
-                .map_err(store_error)?;
-            let rows = statement
-                .query_map(
-                    params![
-                        i64::try_from(after).unwrap_or(i64::MAX),
-                        i64::try_from(limit + 1).unwrap_or(i64::MAX)
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                        ))
-                    },
-                )
-                .map_err(store_error)?;
-            for row in rows {
-                let (cursor, source_runtime, event_id, envelope, received_at) =
-                    row.map_err(store_error)?;
-                events.push(EventJournalEntry {
-                    cursor: nonnegative_cursor(cursor)?,
-                    source_runtime,
-                    event_id,
-                    envelope: serde_json::from_str(&envelope)?,
-                    received_at: parse_timestamp(&received_at)?,
-                });
+                    )
+                    .map_err(store_error)?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            i64::try_from(after).unwrap_or(i64::MAX),
+                            i64::try_from(limit + 1).unwrap_or(i64::MAX)
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        },
+                    )
+                    .map_err(store_error)?;
+                for row in rows {
+                    let (cursor, source_runtime, event_id, envelope, received_at) =
+                        row.map_err(store_error)?;
+                    events.push(EventJournalEntry {
+                        cursor: nonnegative_cursor(cursor)?,
+                        source_runtime,
+                        event_id,
+                        envelope: serde_json::from_str(&envelope)?,
+                        received_at: parse_timestamp(&received_at)?,
+                    });
+                }
             }
-        }
-        let has_more = events.len() > limit;
-        events.truncate(limit);
-        Ok(EventPage {
-            events,
-            retained_after,
-            head,
-            has_more,
-            reset_required,
+            let has_more = events.len() > limit;
+            events.truncate(limit);
+            Ok(EventPage {
+                events,
+                retained_after,
+                head,
+                has_more,
+                reset_required,
+            })
         })
+        .await
     }
 
     async fn prune_events_through(&self, cursor: u64) -> RuntimeResult<u64> {
-        let mut connection = self.connection.lock().map_err(lock_error)?;
-        let transaction = connection.transaction().map_err(store_error)?;
-        let head = transaction
-            .query_row(
-                "SELECT COALESCE(MAX(cursor), 0) FROM runtime_event_dedup",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(store_error)
-            .and_then(nonnegative_cursor)?;
-        let current = transaction
-            .query_row(
-                "SELECT value FROM runtime_meta WHERE key = 'retained_after'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(store_error)
-            .and_then(nonnegative_cursor)?;
-        let pruned_through = cursor.min(head).max(current);
-        transaction
-            .execute(
-                "DELETE FROM runtime_events WHERE cursor <= ?1",
-                params![i64::try_from(pruned_through).unwrap_or(i64::MAX)],
-            )
-            .map_err(store_error)?;
-        transaction
-            .execute(
-                "UPDATE runtime_meta SET value = ?1 WHERE key = 'retained_after'",
-                params![i64::try_from(pruned_through).unwrap_or(i64::MAX)],
-            )
-            .map_err(store_error)?;
-        transaction.commit().map_err(store_error)?;
-        Ok(pruned_through)
+        self.execute(move |connection| {
+            let transaction = connection.transaction().map_err(store_error)?;
+            let head = transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(cursor), 0) FROM runtime_event_dedup",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(store_error)
+                .and_then(nonnegative_cursor)?;
+            let current = transaction
+                .query_row(
+                    "SELECT value FROM runtime_meta WHERE key = 'retained_after'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(store_error)
+                .and_then(nonnegative_cursor)?;
+            let pruned_through = cursor.min(head).max(current);
+            transaction
+                .execute(
+                    "DELETE FROM runtime_events WHERE cursor <= ?1",
+                    params![i64::try_from(pruned_through).unwrap_or(i64::MAX)],
+                )
+                .map_err(store_error)?;
+            transaction
+                .execute(
+                    "UPDATE runtime_meta SET value = ?1 WHERE key = 'retained_after'",
+                    params![i64::try_from(pruned_through).unwrap_or(i64::MAX)],
+                )
+                .map_err(store_error)?;
+            transaction.commit().map_err(store_error)?;
+            Ok(pruned_through)
+        })
+        .await
     }
 
     async fn request_cancel(&self, id: &str, now: DateTime<Utc>) -> RuntimeResult<bool> {
-        let mut connection = self.connection.lock().map_err(lock_error)?;
-        let transaction = connection.transaction().map_err(store_error)?;
-        let json = transaction
-            .query_row(
-                "SELECT record_json FROM runtime_runs WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(store_error)?;
-        let Some(json) = json else {
-            return Ok(false);
-        };
-        let mut run: RunRecord = serde_json::from_str(&json)?;
-        if !run.request_cancel(now) {
-            return Ok(false);
-        }
-        run.revision += 1;
-        let terminal = run.status.terminal();
-        transaction
-            .execute(
-                "UPDATE runtime_runs
+        let id = id.to_string();
+        self.execute(move |connection| {
+            let transaction = connection.transaction().map_err(store_error)?;
+            let json = transaction
+                .query_row(
+                    "SELECT record_json FROM runtime_runs WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(store_error)?;
+            let Some(json) = json else {
+                return Ok(false);
+            };
+            let mut run: RunRecord = serde_json::from_str(&json)?;
+            if !run.request_cancel(now) {
+                return Ok(false);
+            }
+            run.revision += 1;
+            let terminal = run.status.terminal();
+            transaction
+                .execute(
+                    "UPDATE runtime_runs
                  SET status = ?1, revision = ?2, record_json = ?3,
                      lease_worker = CASE WHEN ?4 THEN NULL ELSE lease_worker END,
                      lease_token = CASE WHEN ?4 THEN NULL ELSE lease_token END,
                      lease_expires_at = CASE WHEN ?4 THEN NULL ELSE lease_expires_at END
                  WHERE id = ?5",
-                params![
-                    run_status(run.status),
-                    run.revision,
-                    serde_json::to_string(&run)?,
-                    terminal,
-                    id
-                ],
-            )
-            .map_err(store_error)?;
-        transaction.commit().map_err(store_error)?;
-        Ok(true)
+                    params![
+                        run_status(run.status),
+                        run.revision,
+                        serde_json::to_string(&run)?,
+                        terminal,
+                        id
+                    ],
+                )
+                .map_err(store_error)?;
+            transaction.commit().map_err(store_error)?;
+            Ok(true)
+        })
+        .await
     }
 
     async fn upsert_timer(&self, mut timer: TimerRecord) -> RuntimeResult<TimerRecord> {
-        let connection = self.connection.lock().map_err(lock_error)?;
-        let generation = connection
-            .query_row(
-                "SELECT generation FROM runtime_timers WHERE id = ?1",
-                params![timer.id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(store_error)?
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or(0)
-            + 1;
-        timer.generation = generation;
-        timer.status = TimerStatus::Scheduled;
-        connection
-            .execute(
-                "INSERT INTO runtime_timers
+        self.execute(move |connection| {
+            let generation = connection
+                .query_row(
+                    "SELECT generation FROM runtime_timers WHERE id = ?1",
+                    params![timer.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(store_error)?
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0)
+                + 1;
+            timer.generation = generation;
+            timer.status = TimerStatus::Scheduled;
+            connection
+                .execute(
+                    "INSERT INTO runtime_timers
                     (id, generation, status, fire_at, record_json)
                  VALUES (?1, ?2, 'scheduled', ?3, ?4)
                  ON CONFLICT(id) DO UPDATE SET
@@ -467,15 +559,17 @@ impl RuntimeStore for SqliteRuntimeStore {
                     lease_token = NULL,
                     lease_expires_at = NULL,
                     record_json = excluded.record_json",
-                params![
-                    timer.id,
-                    timer.generation,
-                    timestamp(timer.fire_at),
-                    serde_json::to_string(&timer)?
-                ],
-            )
-            .map_err(store_error)?;
-        Ok(timer)
+                    params![
+                        timer.id,
+                        timer.generation,
+                        timestamp(timer.fire_at),
+                        serde_json::to_string(&timer)?
+                    ],
+                )
+                .map_err(store_error)?;
+            Ok(timer)
+        })
+        .await
     }
 
     async fn cancel_timer(
@@ -484,38 +578,41 @@ impl RuntimeStore for SqliteRuntimeStore {
         generation: Option<u64>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<bool> {
-        let mut connection = self.connection.lock().map_err(lock_error)?;
-        let transaction = connection.transaction().map_err(store_error)?;
-        let json = transaction
-            .query_row(
-                "SELECT record_json FROM runtime_timers WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(store_error)?;
-        let Some(json) = json else {
-            return Ok(false);
-        };
-        let mut timer: TimerRecord = serde_json::from_str(&json)?;
-        if generation.is_some_and(|expected| expected != timer.generation)
-            || !matches!(timer.status, TimerStatus::Scheduled | TimerStatus::Firing)
-        {
-            return Ok(false);
-        }
-        timer.status = TimerStatus::Cancelled;
-        timer.updated_at = now;
-        transaction
-            .execute(
-                "UPDATE runtime_timers
+        let id = id.to_string();
+        self.execute(move |connection| {
+            let transaction = connection.transaction().map_err(store_error)?;
+            let json = transaction
+                .query_row(
+                    "SELECT record_json FROM runtime_timers WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(store_error)?;
+            let Some(json) = json else {
+                return Ok(false);
+            };
+            let mut timer: TimerRecord = serde_json::from_str(&json)?;
+            if generation.is_some_and(|expected| expected != timer.generation)
+                || !matches!(timer.status, TimerStatus::Scheduled | TimerStatus::Firing)
+            {
+                return Ok(false);
+            }
+            timer.status = TimerStatus::Cancelled;
+            timer.updated_at = now;
+            transaction
+                .execute(
+                    "UPDATE runtime_timers
                  SET status = 'cancelled', lease_worker = NULL, lease_token = NULL,
                      lease_expires_at = NULL, record_json = ?1
                  WHERE id = ?2",
-                params![serde_json::to_string(&timer)?, id],
-            )
-            .map_err(store_error)?;
-        transaction.commit().map_err(store_error)?;
-        Ok(true)
+                    params![serde_json::to_string(&timer)?, id],
+                )
+                .map_err(store_error)?;
+            transaction.commit().map_err(store_error)?;
+            Ok(true)
+        })
+        .await
     }
 
     async fn reconcile_timers(
@@ -524,62 +621,63 @@ impl RuntimeStore for SqliteRuntimeStore {
         desired: Vec<TimerRecord>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<TimerReconcileOutcome> {
-        let mut connection = self.connection.lock().map_err(lock_error)?;
-        let transaction = connection.transaction().map_err(store_error)?;
-        let existing = {
-            let mut statement = transaction
-                .prepare(
-                    "SELECT record_json FROM runtime_timers
+        let id_prefix = id_prefix.to_string();
+        self.execute(move |connection| {
+            let transaction = connection.transaction().map_err(store_error)?;
+            let existing = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT record_json FROM runtime_timers
                      WHERE substr(id, 1, length(?1)) = ?1
                      ORDER BY id",
-                )
-                .map_err(store_error)?;
-            let records = statement
-                .query_map(params![id_prefix], |row| row.get::<_, String>(0))
-                .map_err(store_error)?
-                .map(|value| {
-                    let value = value.map_err(store_error)?;
-                    let timer = serde_json::from_str::<TimerRecord>(&value)?;
-                    Ok((timer.id.clone(), timer))
-                })
-                .collect::<RuntimeResult<std::collections::BTreeMap<_, _>>>()?;
-            records
-        };
-        let desired_ids = desired
-            .iter()
-            .map(|timer| timer.id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut cancelled_ids = Vec::new();
-        for timer in existing.values().filter(|timer| {
-            timer.id.starts_with(id_prefix)
-                && !desired_ids.contains(&timer.id)
-                && matches!(timer.status, TimerStatus::Scheduled | TimerStatus::Firing)
-        }) {
-            let mut cancelled = timer.clone();
-            cancelled.status = TimerStatus::Cancelled;
-            cancelled.updated_at = now;
-            transaction
-                .execute(
-                    "UPDATE runtime_timers
+                    )
+                    .map_err(store_error)?;
+                let records = statement
+                    .query_map(params![id_prefix], |row| row.get::<_, String>(0))
+                    .map_err(store_error)?
+                    .map(|value| {
+                        let value = value.map_err(store_error)?;
+                        let timer = serde_json::from_str::<TimerRecord>(&value)?;
+                        Ok((timer.id.clone(), timer))
+                    })
+                    .collect::<RuntimeResult<std::collections::BTreeMap<_, _>>>()?;
+                records
+            };
+            let desired_ids = desired
+                .iter()
+                .map(|timer| timer.id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut cancelled_ids = Vec::new();
+            for timer in existing.values().filter(|timer| {
+                timer.id.starts_with(&id_prefix)
+                    && !desired_ids.contains(&timer.id)
+                    && matches!(timer.status, TimerStatus::Scheduled | TimerStatus::Firing)
+            }) {
+                let mut cancelled = timer.clone();
+                cancelled.status = TimerStatus::Cancelled;
+                cancelled.updated_at = now;
+                transaction
+                    .execute(
+                        "UPDATE runtime_timers
                      SET status = 'cancelled', lease_worker = NULL, lease_token = NULL,
                          lease_expires_at = NULL, record_json = ?1
                      WHERE id = ?2",
-                    params![serde_json::to_string(&cancelled)?, cancelled.id],
-                )
-                .map_err(store_error)?;
-            cancelled_ids.push(timer.id.clone());
-        }
-        let mut timers = Vec::with_capacity(desired.len());
-        for desired in desired {
-            let current = existing.get(&desired.id);
-            if current.is_some_and(|current| timer_matches(current, &desired)) {
-                timers.push(current.expect("checked above").clone());
-                continue;
+                        params![serde_json::to_string(&cancelled)?, cancelled.id],
+                    )
+                    .map_err(store_error)?;
+                cancelled_ids.push(timer.id.clone());
             }
-            let next = next_timer_generation(current, desired, now)?;
-            transaction
-                .execute(
-                    "INSERT INTO runtime_timers
+            let mut timers = Vec::with_capacity(desired.len());
+            for desired in desired {
+                let current = existing.get(&desired.id);
+                if current.is_some_and(|current| timer_matches(current, &desired)) {
+                    timers.push(current.expect("checked above").clone());
+                    continue;
+                }
+                let next = next_timer_generation(current, desired, now)?;
+                transaction
+                    .execute(
+                        "INSERT INTO runtime_timers
                         (id, generation, status, fire_at, record_json)
                      VALUES (?1, ?2, 'scheduled', ?3, ?4)
                      ON CONFLICT(id) DO UPDATE SET
@@ -590,43 +688,48 @@ impl RuntimeStore for SqliteRuntimeStore {
                         lease_token = NULL,
                         lease_expires_at = NULL,
                         record_json = excluded.record_json",
-                    params![
-                        next.id,
-                        next.generation,
-                        timestamp(next.fire_at),
-                        serde_json::to_string(&next)?
-                    ],
-                )
-                .map_err(store_error)?;
-            timers.push(next);
-        }
-        transaction.commit().map_err(store_error)?;
-        timers.sort_by(|left, right| left.id.cmp(&right.id));
-        cancelled_ids.sort();
-        Ok(TimerReconcileOutcome {
-            timers,
-            cancelled_ids,
+                        params![
+                            next.id,
+                            next.generation,
+                            timestamp(next.fire_at),
+                            serde_json::to_string(&next)?
+                        ],
+                    )
+                    .map_err(store_error)?;
+                timers.push(next);
+            }
+            transaction.commit().map_err(store_error)?;
+            timers.sort_by(|left, right| left.id.cmp(&right.id));
+            cancelled_ids.sort();
+            Ok(TimerReconcileOutcome {
+                timers,
+                cancelled_ids,
+            })
         })
+        .await
     }
 
     async fn timers(&self, id_prefix: &str) -> RuntimeResult<Vec<TimerRecord>> {
-        let connection = self.connection.lock().map_err(lock_error)?;
-        let mut statement = connection
-            .prepare(
-                "SELECT record_json FROM runtime_timers
-                 WHERE substr(id, 1, length(?1)) = ?1
-                 ORDER BY id",
-            )
-            .map_err(store_error)?;
-        let timers = statement
-            .query_map(params![id_prefix], |row| row.get::<_, String>(0))
-            .map_err(store_error)?
-            .map(|value| {
-                let value = value.map_err(store_error)?;
-                serde_json::from_str::<TimerRecord>(&value).map_err(Into::into)
-            })
-            .collect();
-        timers
+        let id_prefix = id_prefix.to_string();
+        self.execute(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT record_json FROM runtime_timers
+                     WHERE substr(id, 1, length(?1)) = ?1
+                     ORDER BY id",
+                )
+                .map_err(store_error)?;
+            let timers = statement
+                .query_map(params![id_prefix], |row| row.get::<_, String>(0))
+                .map_err(store_error)?
+                .map(|value| {
+                    let value = value.map_err(store_error)?;
+                    serde_json::from_str::<TimerRecord>(&value).map_err(Into::into)
+                })
+                .collect();
+            timers
+        })
+        .await
     }
 
     async fn claim_due_timer(
@@ -635,63 +738,66 @@ impl RuntimeStore for SqliteRuntimeStore {
         now: DateTime<Utc>,
         lease_for: Duration,
     ) -> RuntimeResult<Option<TimerClaim>> {
-        let mut connection = self.connection.lock().map_err(lock_error)?;
-        let transaction = connection.transaction().map_err(store_error)?;
-        transaction
-            .execute(
-                "UPDATE runtime_timers
+        let worker = worker.to_string();
+        self.execute(move |connection| {
+            let transaction = connection.transaction().map_err(store_error)?;
+            transaction
+                .execute(
+                    "UPDATE runtime_timers
                  SET lease_worker = NULL, lease_token = NULL, lease_expires_at = NULL
                  WHERE lease_expires_at <= ?1",
-                params![timestamp(now)],
-            )
-            .map_err(store_error)?;
-        let json = transaction
-            .query_row(
-                "SELECT record_json FROM runtime_timers
+                    params![timestamp(now)],
+                )
+                .map_err(store_error)?;
+            let json = transaction
+                .query_row(
+                    "SELECT record_json FROM runtime_timers
                  WHERE status IN ('scheduled', 'firing')
                    AND fire_at <= ?1
                    AND lease_token IS NULL
                  ORDER BY fire_at, id LIMIT 1",
-                params![timestamp(now)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(store_error)?;
-        let Some(json) = json else {
-            transaction.commit().map_err(store_error)?;
-            return Ok(None);
-        };
-        let mut timer: TimerRecord = serde_json::from_str(&json)?;
-        timer.status = TimerStatus::Firing;
-        timer.updated_at = now;
-        let token = format!("timer_lease_{}", Ulid::new());
-        let expires_at = add_duration(now, lease_for)?;
-        let changed = transaction
-            .execute(
-                "UPDATE runtime_timers
+                    params![timestamp(now)],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(store_error)?;
+            let Some(json) = json else {
+                transaction.commit().map_err(store_error)?;
+                return Ok(None);
+            };
+            let mut timer: TimerRecord = serde_json::from_str(&json)?;
+            timer.status = TimerStatus::Firing;
+            timer.updated_at = now;
+            let token = format!("timer_lease_{}", Ulid::new());
+            let expires_at = add_duration(now, lease_for)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE runtime_timers
                  SET status = 'firing', lease_worker = ?1, lease_token = ?2,
                      lease_expires_at = ?3, record_json = ?4
                  WHERE id = ?5 AND generation = ?6 AND lease_token IS NULL",
-                params![
-                    worker,
-                    token,
-                    timestamp(expires_at),
-                    serde_json::to_string(&timer)?,
-                    timer.id,
-                    timer.generation
-                ],
-            )
-            .map_err(store_error)?;
-        if changed != 1 {
-            return Ok(None);
-        }
-        transaction.commit().map_err(store_error)?;
-        Ok(Some(TimerClaim {
-            timer,
-            worker: worker.to_string(),
-            token,
-            expires_at,
-        }))
+                    params![
+                        worker,
+                        token,
+                        timestamp(expires_at),
+                        serde_json::to_string(&timer)?,
+                        timer.id,
+                        timer.generation
+                    ],
+                )
+                .map_err(store_error)?;
+            if changed != 1 {
+                return Ok(None);
+            }
+            transaction.commit().map_err(store_error)?;
+            Ok(Some(TimerClaim {
+                timer,
+                worker,
+                token,
+                expires_at,
+            }))
+        })
+        .await
     }
 
     async fn fire_timer(
@@ -700,75 +806,80 @@ impl RuntimeStore for SqliteRuntimeStore {
         fired: TimerRecord,
         event: PreparedEvent,
     ) -> RuntimeResult<AdmitOutcome> {
-        let mut connection = self.connection.lock().map_err(lock_error)?;
-        let transaction = connection.transaction().map_err(store_error)?;
-        let changed = transaction
-            .execute(
-                "UPDATE runtime_timers
+        self.execute(move |connection| {
+            let transaction = connection.transaction().map_err(store_error)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE runtime_timers
                  SET status = 'fired', lease_worker = NULL, lease_token = NULL,
                      lease_expires_at = NULL, record_json = ?1
                  WHERE id = ?2 AND generation = ?3 AND lease_worker = ?4 AND lease_token = ?5",
-                params![
-                    serde_json::to_string(&fired)?,
-                    claim.timer.id,
-                    claim.timer.generation,
-                    claim.worker,
-                    claim.token
-                ],
-            )
-            .map_err(store_error)?;
-        if changed != 1 {
-            return Err(RuntimeError::diagnostic(
-                "stale_timer_generation",
-                "Timer generation or lease changed before firing.",
-            ));
-        }
-        let outcome = admit_tx(&transaction, event)?;
-        transaction.commit().map_err(store_error)?;
-        Ok(outcome)
+                    params![
+                        serde_json::to_string(&fired)?,
+                        claim.timer.id,
+                        claim.timer.generation,
+                        claim.worker,
+                        claim.token
+                    ],
+                )
+                .map_err(store_error)?;
+            if changed != 1 {
+                return Err(RuntimeError::diagnostic(
+                    "stale_timer_generation",
+                    "Timer generation or lease changed before firing.",
+                ));
+            }
+            let outcome = admit_tx(&transaction, event)?;
+            transaction.commit().map_err(store_error)?;
+            Ok(outcome)
+        })
+        .await
     }
 
     async fn snapshot(&self) -> RuntimeResult<StoreSnapshot> {
-        let connection = self.connection.lock().map_err(lock_error)?;
-        let events = {
-            let mut statement = connection
-                .prepare(
-                    "SELECT cursor, source_runtime, event_id, envelope_json, received_at
+        self.execute(move |connection| {
+            let events = {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT cursor, source_runtime, event_id, envelope_json, received_at
                      FROM runtime_events ORDER BY cursor",
-                )
-                .map_err(store_error)?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
+                    )
+                    .map_err(store_error)?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })
+                    .map_err(store_error)?;
+                rows.map(|row| {
+                    let (cursor, source_runtime, event_id, envelope, received_at) =
+                        row.map_err(store_error)?;
+                    Ok(EventJournalEntry {
+                        cursor: u64::try_from(cursor).map_err(|_| {
+                            RuntimeError::Store("negative event cursor".to_string())
+                        })?,
+                        source_runtime,
+                        event_id,
+                        envelope: serde_json::from_str(&envelope)?,
+                        received_at: parse_timestamp(&received_at)?,
+                    })
                 })
-                .map_err(store_error)?;
-            rows.map(|row| {
-                let (cursor, source_runtime, event_id, envelope, received_at) =
-                    row.map_err(store_error)?;
-                Ok(EventJournalEntry {
-                    cursor: u64::try_from(cursor)
-                        .map_err(|_| RuntimeError::Store("negative event cursor".to_string()))?,
-                    source_runtime,
-                    event_id,
-                    envelope: serde_json::from_str(&envelope)?,
-                    received_at: parse_timestamp(&received_at)?,
-                })
+                .collect::<RuntimeResult<Vec<_>>>()?
+            };
+            let runs = read_json_column::<RunRecord>(connection, "runtime_runs")?;
+            let timers = read_json_column::<TimerRecord>(connection, "runtime_timers")?;
+            Ok(StoreSnapshot {
+                events,
+                runs,
+                timers,
             })
-            .collect::<RuntimeResult<Vec<_>>>()?
-        };
-        let runs = read_json_column::<RunRecord>(&connection, "runtime_runs")?;
-        let timers = read_json_column::<TimerRecord>(&connection, "runtime_timers")?;
-        Ok(StoreSnapshot {
-            events,
-            runs,
-            timers,
         })
+        .await
     }
 }
 
@@ -1072,6 +1183,29 @@ fn store_error(error: rusqlite::Error) -> RuntimeError {
     RuntimeError::Store(error.to_string())
 }
 
-fn lock_error<T>(_error: std::sync::PoisonError<T>) -> RuntimeError {
-    RuntimeError::Store("SQLite connection lock poisoned".to_string())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_database_work_does_not_stall_the_async_executor() {
+        let store = SqliteRuntimeStore::in_memory().unwrap();
+        let database_work = tokio::spawn(async move {
+            store
+                .execute(|_| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    Ok(())
+                })
+                .await
+        });
+        let heartbeat = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            "executor-responsive"
+        };
+        let heartbeat = tokio::time::timeout(Duration::from_millis(50), heartbeat)
+            .await
+            .expect("dedicated SQLite work must not starve the Tokio executor");
+        assert_eq!(heartbeat, "executor-responsive");
+        database_work.await.unwrap().unwrap();
+    }
 }

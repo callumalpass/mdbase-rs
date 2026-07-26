@@ -3,7 +3,7 @@
 use chrono::{TimeDelta, Utc};
 use mdbase_runtime::{
     ConcurrencyPolicy, OnError, PlannedRun, PostgresRuntimeStore, PreparedEvent, RunStatus,
-    RuntimeStore, TimerRecord, TimerStatus,
+    RuntimeStore, TimerRecord, TimerStatus, POSTGRES_SCHEMA_VERSION,
 };
 use serde_json::json;
 use ulid::Ulid;
@@ -75,6 +75,10 @@ async fn postgres_store_preserves_dedupe_retention_timers_and_namespace_fencing(
     let first = PostgresRuntimeStore::connect(&database_url, format!("test:{test_id}:a"))
         .await
         .unwrap();
+    assert_eq!(
+        first.schema_version().await.unwrap(),
+        POSTGRES_SCHEMA_VERSION
+    );
     let second = PostgresRuntimeStore::new(first.pool().clone(), format!("test:{test_id}:b"))
         .await
         .unwrap();
@@ -124,6 +128,7 @@ async fn postgres_store_preserves_dedupe_retention_timers_and_namespace_fencing(
     assert_eq!(original, 1);
 
     let now = Utc::now();
+    let later = now + TimeDelta::hours(1);
     let reconciled = first
         .reconcile_timers(
             "grant-a:",
@@ -132,7 +137,7 @@ async fn postgres_store_preserves_dedupe_retention_timers_and_namespace_fencing(
                     id: "grant-a:one".to_string(),
                     generation: 0,
                     status: TimerStatus::Scheduled,
-                    fire_at: now,
+                    fire_at: later,
                     event_type: "timer.fired".to_string(),
                     contract_version: 1,
                     payload: json!({"purpose": "notification"}),
@@ -144,7 +149,7 @@ async fn postgres_store_preserves_dedupe_retention_timers_and_namespace_fencing(
                     id: "grant-a:two".to_string(),
                     generation: 0,
                     status: TimerStatus::Scheduled,
-                    fire_at: now,
+                    fire_at: later,
                     event_type: "timer.fired".to_string(),
                     contract_version: 1,
                     payload: json!({"purpose": "notification"}),
@@ -200,8 +205,14 @@ async fn postgres_store_preserves_dedupe_retention_timers_and_namespace_fencing(
         .await
         .unwrap();
     assert_eq!(outcome.cursor, 3);
+    let snapshot = first.snapshot().await.unwrap();
     assert_eq!(
-        first.snapshot().await.unwrap().timers[0].status,
+        snapshot
+            .timers
+            .iter()
+            .find(|timer| timer.id == "wake-up")
+            .unwrap()
+            .status,
         TimerStatus::Fired
     );
 

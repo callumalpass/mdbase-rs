@@ -30,12 +30,12 @@ pub use model::{
     TimerStatus,
 };
 #[cfg(feature = "postgres")]
-pub use postgres::PostgresRuntimeStore;
+pub use postgres::{PostgresRuntimeStore, POSTGRES_SCHEMA_VERSION};
 pub use provider::{
     ActionProvider, AuthorizationDecision, DenyAllAuthorizer, DispatchAuthorizer, ProviderRegistry,
 };
 #[cfg(feature = "sqlite")]
-pub use sqlite::SqliteRuntimeStore;
+pub use sqlite::{SqliteRuntimeStore, SQLITE_SCHEMA_VERSION};
 pub use store::{
     AdmitOutcome, Claim, EventPage, PreparedEvent, RuntimeStore, StoreSnapshot, TimerClaim,
     TimerReconcileOutcome,

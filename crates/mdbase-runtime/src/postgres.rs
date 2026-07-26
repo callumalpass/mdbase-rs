@@ -16,6 +16,9 @@ use crate::store::{
 };
 use crate::timer::{next_timer_generation, timer_matches};
 
+pub const POSTGRES_SCHEMA_VERSION: u32 = 1;
+const POSTGRES_MIGRATION_LOCK: i64 = 7_567_456_982_327_403_786;
+
 /// PostgreSQL runtime store scoped by an embedding-host authority namespace.
 ///
 /// Multiple collections and workers may share one pool. Every durable key,
@@ -50,6 +53,17 @@ impl PostgresRuntimeStore {
 
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    pub async fn schema_version(&self) -> RuntimeResult<u32> {
+        let version = sqlx::query_scalar::<_, i32>(
+            "SELECT version FROM mdbase_runtime_schema WHERE singleton = TRUE",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(store_error)?;
+        u32::try_from(version)
+            .map_err(|_| RuntimeError::Store("negative PostgreSQL schema version".to_string()))
     }
 }
 
@@ -1018,6 +1032,44 @@ async fn read_records<T: serde::de::DeserializeOwned>(
 }
 
 async fn migrate(pool: &PgPool) -> RuntimeResult<()> {
+    let mut transaction = pool.begin().await.map_err(store_error)?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(POSTGRES_MIGRATION_LOCK)
+        .execute(&mut *transaction)
+        .await
+        .map_err(store_error)?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mdbase_runtime_schema (
+            singleton boolean PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+            version integer NOT NULL CHECK (version >= 1)
+        )",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(store_error)?;
+    let installed = sqlx::query_scalar::<_, i32>(
+        "SELECT version FROM mdbase_runtime_schema WHERE singleton = TRUE",
+    )
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(store_error)?
+    .unwrap_or(0);
+    let installed = u32::try_from(installed)
+        .map_err(|_| RuntimeError::Store("negative PostgreSQL schema version".to_string()))?;
+    if installed > POSTGRES_SCHEMA_VERSION {
+        transaction.rollback().await.map_err(store_error)?;
+        return Err(RuntimeError::diagnostic(
+            "runtime_schema_too_new",
+            format!(
+                "PostgreSQL runtime schema version {installed} is newer than supported version {POSTGRES_SCHEMA_VERSION}."
+            ),
+        ));
+    }
+    if installed == POSTGRES_SCHEMA_VERSION {
+        transaction.commit().await.map_err(store_error)?;
+        return Ok(());
+    }
+
     sqlx::raw_sql(
         "
         CREATE TABLE IF NOT EXISTS mdbase_runtime_meta (
@@ -1084,10 +1136,19 @@ async fn migrate(pool: &PgPool) -> RuntimeResult<()> {
             ON mdbase_runtime_timers(namespace, status, fire_at);
         ",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(store_error)?;
-    Ok(())
+    sqlx::query(
+        "INSERT INTO mdbase_runtime_schema(singleton, version)
+         VALUES (TRUE, $1)
+         ON CONFLICT(singleton) DO UPDATE SET version = excluded.version",
+    )
+    .bind(i32::try_from(POSTGRES_SCHEMA_VERSION).expect("schema version fits PostgreSQL integer"))
+    .execute(&mut *transaction)
+    .await
+    .map_err(store_error)?;
+    transaction.commit().await.map_err(store_error)
 }
 
 fn add_duration(now: DateTime<Utc>, duration: Duration) -> RuntimeResult<DateTime<Utc>> {
