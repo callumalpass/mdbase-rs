@@ -3,6 +3,10 @@ use serde_json::{Map, Value};
 
 use super::lifecycle::LifecycleEvent;
 use super::Diagnostic;
+use crate::frontmatter::parser::{
+    is_parse_error, json_to_yaml_mapping, parse_document, yaml_mapping_to_json,
+};
+use crate::frontmatter::serializer;
 use crate::{Collection, SpecProfile};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,7 +224,17 @@ impl<'a> Operations<'a> {
         {
             let persisted_path = persisted_path(operation, input, &result);
             if let Some(persisted_path) = persisted_path {
-                self.hydrate_persisted_result(&persisted_path, &mut result, &mut diagnostics);
+                let include_document = input
+                    .get("include_document")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    || input.get("document").is_some();
+                self.hydrate_persisted_result(
+                    &persisted_path,
+                    include_document,
+                    &mut result,
+                    &mut diagnostics,
+                );
             }
         }
 
@@ -238,6 +252,7 @@ impl<'a> Operations<'a> {
     fn hydrate_persisted_result(
         &self,
         path: &str,
+        include_document: bool,
         result: &mut Map<String, Value>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
@@ -253,7 +268,10 @@ impl<'a> Operations<'a> {
             ));
             return;
         }
-        let read = self.collection.read(&serde_json::json!({"path": path}));
+        let read = self.collection.read(&serde_json::json!({
+            "path": path,
+            "include_document": include_document,
+        }));
         if let Some(error) = read.get("error") {
             diagnostics.push(diagnostic_from_value(error, "error", Some(path)));
             return;
@@ -265,6 +283,7 @@ impl<'a> Operations<'a> {
             "frontmatter",
             "effective_frontmatter",
             "body",
+            "document",
             "file",
         ] {
             if let Some(value) = read.get(key) {
@@ -313,34 +332,75 @@ impl<'a> Operations<'a> {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        let patch = input
-            .get("patch")
-            .or_else(|| input.get("fields"))
-            .or_else(|| input.get("frontmatter"))
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let mut draft = old.clone();
-        apply_patch(&mut draft, &patch, &self.collection.settings.write_nulls);
+        let candidate_document = input.get("document").and_then(Value::as_str);
+        let candidate = candidate_document.map(parse_document);
+        let draft = if let Some(candidate) = candidate.as_ref() {
+            match candidate.frontmatter.as_ref() {
+                Some(frontmatter) if is_parse_error(frontmatter) => {
+                    return Err(vec![Diagnostic::error(
+                        "invalid_frontmatter",
+                        "Failed to parse replacement document YAML frontmatter.",
+                        Some(path.to_string()),
+                    )]);
+                }
+                Some(serde_yaml::Value::Mapping(mapping)) => yaml_mapping_to_json(mapping)
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+                Some(_) => {
+                    return Err(vec![Diagnostic::error(
+                        "invalid_frontmatter",
+                        "Replacement document frontmatter must be a YAML mapping.",
+                        Some(path.to_string()),
+                    )]);
+                }
+                None => Map::new(),
+            }
+        } else {
+            let patch = input
+                .get("patch")
+                .or_else(|| input.get("fields"))
+                .or_else(|| input.get("frontmatter"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut draft = old.clone();
+            apply_patch(&mut draft, &patch, &self.collection.settings.write_nulls);
+            draft
+        };
         let type_names = self
             .collection
             .determine_types_for_path(&Value::Object(draft.clone()), Some(path));
         let lifecycle_draft = self.collection.apply_v03_lifecycle(
             LifecycleEvent::Update,
             &type_names,
-            draft,
+            draft.clone(),
             Some(&old),
             path,
         )?;
         ensure_membership_unchanged(self.collection, &type_names, &lifecycle_draft, path)?;
 
         let mut normalized = input.as_object().cloned().unwrap_or_default();
-        normalized.remove("patch");
-        normalized.remove("frontmatter");
-        normalized.insert(
-            "fields".to_string(),
-            Value::Object(diff_frontmatter(&old, &lifecycle_draft)),
-        );
+        if let Some(candidate) = candidate {
+            if lifecycle_draft != draft {
+                let frontmatter = json_to_yaml_mapping(&Value::Object(lifecycle_draft));
+                normalized.insert(
+                    "document".to_string(),
+                    Value::String(serializer::serialize_document(
+                        &frontmatter,
+                        &candidate.body,
+                    )),
+                );
+            }
+            normalized.insert("include_document".to_string(), Value::Bool(true));
+        } else {
+            normalized.remove("patch");
+            normalized.remove("frontmatter");
+            normalized.insert(
+                "fields".to_string(),
+                Value::Object(diff_frontmatter(&old, &lifecycle_draft)),
+            );
+        }
         Ok(Value::Object(normalized))
     }
 

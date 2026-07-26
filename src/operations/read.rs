@@ -162,6 +162,10 @@ impl Collection {
             },
         });
 
+        if input.include_document {
+            result["document"] = serde_json::Value::String(content);
+        }
+
         if !warnings.is_empty() {
             result["warnings"] = serde_json::Value::Array(warnings);
         }

@@ -11,7 +11,10 @@ pub(crate) fn read(
     collection: &Collection,
     request: ReadRequest,
 ) -> MdbaseResult<OperationOutcome<RecordDocument>> {
-    let result = collection.read(&json!({"path": request.path}));
+    let result = collection.read(&json!({
+        "path": request.path,
+        "include_document": request.include_document,
+    }));
     decode_legacy(result, Some(request.path.as_str()))
 }
 

@@ -5,6 +5,7 @@ use crate::errors::*;
 #[derive(Debug, Clone)]
 pub struct ReadInput {
     pub path: String,
+    pub include_document: bool,
 }
 
 impl ReadInput {
@@ -15,6 +16,10 @@ impl ReadInput {
             .ok_or_else(|| op_error(INVALID_PATH, "path is required"))?;
         Ok(Self {
             path: path.to_string(),
+            include_document: input
+                .get("include_document")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         })
     }
 }
@@ -68,6 +73,7 @@ pub struct UpdateInput {
     pub path: String,
     pub fields: serde_json::Value,
     pub body: Option<String>,
+    pub document: Option<String>,
     pub last_known_mtime: Option<u64>,
     pub if_revision: Option<String>,
 }
@@ -78,6 +84,9 @@ impl UpdateInput {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| op_error(INVALID_PATH, "path is required"))?;
+        let has_fields = input.get("patch").is_some()
+            || input.get("fields").is_some()
+            || input.get("frontmatter").is_some();
         let fields = input
             .get("patch")
             .or_else(|| input.get("fields"))
@@ -88,6 +97,22 @@ impl UpdateInput {
             .get("body")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let document = match input.get("document") {
+            Some(serde_json::Value::String(document)) => Some(document.clone()),
+            Some(_) => {
+                return Err(op_error(
+                    INVALID_REQUEST,
+                    "document must be a string when provided",
+                ))
+            }
+            None => None,
+        };
+        if document.is_some() && (has_fields || body.is_some()) {
+            return Err(op_error(
+                INVALID_REQUEST,
+                "document cannot be combined with patch, fields, frontmatter, or body",
+            ));
+        }
         let last_known_mtime = input.get("last_known_mtime").and_then(|v| v.as_u64());
         let if_revision = input
             .get("if_revision")
@@ -98,6 +123,7 @@ impl UpdateInput {
             path: path.to_string(),
             fields,
             body,
+            document,
             last_known_mtime,
             if_revision,
         })

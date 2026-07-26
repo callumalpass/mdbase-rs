@@ -6,7 +6,7 @@ use mdbase::api::{
     V02MigrationRequest,
 };
 use mdbase::{Collection, CompatibilityMode};
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn typed_collection() -> (tempfile::TempDir, Collection) {
     let root = tempfile::tempdir().unwrap();
@@ -56,7 +56,8 @@ fn typed_crud_query_and_revision_failures_are_structured() {
                 original_path.clone(),
                 json!({"type": "task", "title": "First"}),
             )
-            .with_body("Body"),
+            .with_body("Body")
+            .with_document(),
         )
         .unwrap();
     assert!(created.diagnostics.is_empty(), "{created:#?}");
@@ -64,14 +65,20 @@ fn typed_crud_query_and_revision_failures_are_structured() {
     assert_eq!(created.value.frontmatter["title"], "First");
     assert_eq!(created.value.effective_frontmatter["title"], "First");
     assert_eq!(created.value.body, "Body\n");
+    assert!(created
+        .value
+        .document
+        .as_deref()
+        .is_some_and(|source| source.contains("title: First")));
     assert_eq!(created.value.file.name, "first.md");
     let initial_revision = created.value.revision;
 
     let read = api
-        .read(ReadRequest::new("tasks/first.md").unwrap())
+        .read(ReadRequest::new("tasks/first.md").unwrap().with_document())
         .unwrap();
     assert_eq!(read.value.frontmatter["title"], "First");
     assert_eq!(read.value.body, "Body\n");
+    assert_eq!(read.value.document, created.value.document);
     assert_eq!(read.value.revision, initial_revision);
 
     let mut update = UpdateRequest::new(
@@ -79,6 +86,7 @@ fn typed_crud_query_and_revision_failures_are_structured() {
         json!({"status": "done"}),
     );
     update.if_revision = Some(initial_revision.clone());
+    update = update.with_document();
     let updated = api.update(update).unwrap();
     assert_eq!(updated.value.frontmatter["status"], "done");
     assert_eq!(updated.value.effective_frontmatter["status"], "done");
@@ -112,6 +120,7 @@ fn typed_crud_query_and_revision_failures_are_structured() {
     let renamed_path = CollectionPath::new("archive/first.md").unwrap();
     let mut rename = RenameRequest::new(original_path, renamed_path.clone());
     rename.if_revision = Some(updated_revision);
+    rename = rename.with_document();
     let rename_preview = api.preflight_rename(rename.clone()).unwrap();
     assert!(rename_preview.value.would_rename);
     assert_eq!(rename_preview.value.to, renamed_path);
@@ -123,6 +132,7 @@ fn typed_crud_query_and_revision_failures_are_structured() {
     assert_eq!(renamed.value.document.path, renamed_path);
     assert_eq!(renamed.value.document.frontmatter["status"], "done");
     assert_eq!(renamed.value.document.file.name, "first.md");
+    assert!(renamed.value.document.document.is_some());
 
     let delete_request = DeleteRequest::new(renamed_path.clone());
     let delete_preview = api.preflight_delete(delete_request.clone()).unwrap();
@@ -132,6 +142,77 @@ fn typed_crud_query_and_revision_failures_are_structured() {
         .is_ok());
     let deleted = api.delete(delete_request).unwrap();
     assert!(deleted.value.deleted);
+}
+
+#[test]
+fn exact_record_documents_round_trip_without_reformatting() {
+    let (root, collection) = typed_collection();
+    fs::create_dir_all(root.path().join("tasks")).unwrap();
+    let original = "\u{feff}---\r\ntype: task\r\ntitle: \"Exact\" # keep this comment\r\ncustom: null\r\n---\r\nBody with CRLF.\r\n";
+    fs::write(root.path().join("tasks/exact.md"), original).unwrap();
+    let api = collection.typed().unwrap();
+
+    let read = api
+        .read(ReadRequest::new("tasks/exact.md").unwrap().with_document())
+        .unwrap();
+    assert_eq!(read.value.document.as_deref(), Some(original));
+    assert_eq!(read.value.frontmatter["custom"], Value::Null);
+
+    let replacement =
+        "---\ntype: task\ntitle: 'Replacement' # preserve source\ncustom: null\n---\n\nNew body.\n";
+    let mut update = UpdateRequest::replace_document(
+        CollectionPath::new("tasks/exact.md").unwrap(),
+        replacement,
+    );
+    update.if_revision = Some(read.value.revision);
+    let updated = api.update(update).unwrap();
+
+    assert_eq!(updated.value.document.as_deref(), Some(replacement));
+    assert_eq!(updated.value.frontmatter["title"], "Replacement");
+    assert_eq!(updated.value.frontmatter["custom"], Value::Null);
+    assert_eq!(
+        fs::read_to_string(root.path().join("tasks/exact.md")).unwrap(),
+        replacement
+    );
+}
+
+#[test]
+fn document_updates_reject_invalid_or_ambiguous_candidates_without_writing() {
+    let (root, collection) = typed_collection();
+    fs::create_dir_all(root.path().join("tasks")).unwrap();
+    let original = "---\ntype: task\ntitle: Original\n---\nBody\n";
+    fs::write(root.path().join("tasks/exact.md"), original).unwrap();
+    let operations = collection.v03_operations().unwrap();
+
+    let invalid = operations.update(&json!({
+        "path": "tasks/exact.md",
+        "document": "---\n- not\n- a\n- mapping\n---\nBody\n",
+    }));
+    assert!(!invalid.valid);
+    assert_eq!(invalid.diagnostics[0].code, "invalid_frontmatter");
+    assert_eq!(
+        fs::read_to_string(root.path().join("tasks/exact.md")).unwrap(),
+        original
+    );
+
+    let ambiguous = operations.update(&json!({
+        "path": "tasks/exact.md",
+        "patch": {"title": "Patched"},
+        "document": "---\ntype: task\ntitle: Replacement\n---\nBody\n",
+    }));
+    assert!(!ambiguous.valid);
+    assert_eq!(ambiguous.diagnostics[0].code, "invalid_request");
+    assert_eq!(
+        fs::read_to_string(root.path().join("tasks/exact.md")).unwrap(),
+        original
+    );
+
+    let wrong_type = operations.update(&json!({
+        "path": "tasks/exact.md",
+        "document": {"frontmatter": "is not source"},
+    }));
+    assert!(!wrong_type.valid);
+    assert_eq!(wrong_type.diagnostics[0].code, "invalid_request");
 }
 
 #[test]
