@@ -128,3 +128,48 @@ fn canonical_cli_runs_a_typed_record_lifecycle() {
     assert_eq!(invalid["valid"], false);
     assert_eq!(invalid["diagnostics"][0]["code"], "invalid_path");
 }
+
+#[test]
+fn legacy_cli_is_read_only_and_exposes_verified_migration() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.2.0\n").unwrap();
+    fs::create_dir(root.path().join("_types")).unwrap();
+    fs::write(
+        root.path().join("_types/task.md"),
+        "---\nname: task\nfields:\n  title: { type: string, required: true }\n---\n",
+    )
+    .unwrap();
+    let record = "---\ntype: task\ntitle: Legacy\n---\n";
+    fs::write(root.path().join("legacy.md"), record).unwrap();
+
+    let (output, read) = run(&root, &["read", "legacy.md"]);
+    assert!(output.status.success(), "{read:#}");
+    assert_eq!(read["valid"], true);
+    assert_eq!(read["result"]["frontmatter"]["title"], "Legacy");
+
+    let (output, rejected) = run(
+        &root,
+        &["update", "legacy.md", "--fields", r#"{"title":"Changed"}"#],
+    );
+    assert!(!output.status.success(), "{rejected:#}");
+    assert_eq!(rejected["diagnostics"][0]["code"], "migration_required");
+    assert_eq!(
+        fs::read_to_string(root.path().join("legacy.md")).unwrap(),
+        record
+    );
+
+    let (output, plan) = run(&root, &["migrate-v02", "--dry-run"]);
+    assert!(output.status.success(), "{plan:#}");
+    assert_eq!(plan["result"]["applied"], false);
+    assert_eq!(plan["result"]["verified_records"], 1);
+    assert!(fs::read_to_string(root.path().join("mdbase.yaml"))
+        .unwrap()
+        .contains("0.2.0"));
+
+    let (output, applied) = run(&root, &["migrate-v02"]);
+    assert!(output.status.success(), "{applied:#}");
+    assert_eq!(applied["result"]["applied"], true);
+    assert!(fs::read_to_string(root.path().join("mdbase.yaml"))
+        .unwrap()
+        .contains("0.3.0"));
+}

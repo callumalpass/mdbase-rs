@@ -9,5 +9,6 @@ pub use typed::{
     CreateRequest, DeleteRequest, DeleteResult, Diagnostic, DiagnosticCode, FrontmatterMode,
     MdbaseError, MdbaseResult, MutationResult, OperationOutcome, QueryDirection, QueryOrder,
     QueryRequest, QueryResult, ReadRequest, ReadResult, RecordFile, RenameRequest, RenameResult,
-    Revision, Severity, TypedCollection, UpdateRequest,
+    Revision, Severity, TypedCollection, UpdateRequest, V02MigrationChange, V02MigrationRequest,
+    V02MigrationResult,
 };

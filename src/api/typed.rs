@@ -27,6 +27,10 @@ pub enum MdbaseError {
     InvalidPath(#[from] CollectionPathError),
     #[error("typed canonical operations require a v0.3 collection")]
     UnsupportedProfile,
+    #[error("operation '{operation}' requires migrating this v0.2 collection to v0.3")]
+    MigrationRequired { operation: &'static str },
+    #[error("v0.2 migration contains lossy translations; inspect diagnostics and opt in")]
+    LossyMigration { diagnostics: Vec<Diagnostic> },
     #[error("mdbase operation failed")]
     Operation { diagnostics: Vec<Diagnostic> },
     #[error("could not decode canonical operation result: {message}")]
@@ -38,6 +42,7 @@ impl MdbaseError {
     pub fn diagnostics(&self) -> &[Diagnostic] {
         match self {
             Self::Operation { diagnostics } => diagnostics,
+            Self::LossyMigration { diagnostics } => diagnostics,
             _ => &[],
         }
     }
@@ -244,6 +249,32 @@ pub struct RenameRequest {
     pub dry_run: bool,
 }
 
+/// Options for translating a v0.2 collection to canonical v0.3 files.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct V02MigrationRequest {
+    pub dry_run: bool,
+    pub allow_lossy: bool,
+}
+
+/// One file that a v0.2 migration will create or replace.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct V02MigrationChange {
+    pub path: String,
+    pub before_revision: Option<Revision>,
+    pub after_revision: Option<Revision>,
+}
+
+/// Verified v0.2-to-v0.3 migration plan or applied result.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct V02MigrationResult {
+    pub id: String,
+    pub applied: bool,
+    pub verified_records: usize,
+    pub manifest_path: String,
+    pub changes: Vec<V02MigrationChange>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 impl RenameRequest {
     pub fn new(from: CollectionPath, to: CollectionPath) -> Self {
         Self {
@@ -327,7 +358,7 @@ impl QueryRequest {
         self
     }
 
-    fn to_wire(&self) -> Value {
+    pub(crate) fn to_wire(&self) -> Value {
         let mut value = Map::new();
         if !self.types.is_empty() {
             value.insert("types".to_string(), json!(self.types));
@@ -476,17 +507,18 @@ pub struct TypedCollection<'a> {
 
 impl<'a> TypedCollection<'a> {
     pub(crate) fn new(collection: &'a Collection) -> MdbaseResult<Self> {
-        if collection.spec_profile != SpecProfile::V03 {
-            return Err(MdbaseError::UnsupportedProfile);
-        }
         Ok(Self { collection })
     }
 
     pub fn read(&self, request: ReadRequest) -> MdbaseResult<OperationOutcome<ReadResult>> {
+        if self.collection.spec_profile == SpecProfile::V02 {
+            return crate::compat::v02::read(self.collection, request);
+        }
         self.execute(self.operations()?.read(&json!({"path": request.path})))
     }
 
     pub fn create(&self, request: CreateRequest) -> MdbaseResult<OperationOutcome<MutationResult>> {
+        self.require_canonical("create")?;
         let mut input = json!({
             "frontmatter": request.frontmatter,
             "body": request.body,
@@ -503,6 +535,7 @@ impl<'a> TypedCollection<'a> {
     }
 
     pub fn update(&self, request: UpdateRequest) -> MdbaseResult<OperationOutcome<MutationResult>> {
+        self.require_canonical("update")?;
         let mut input = json!({
             "path": request.path,
             "patch": request.patch,
@@ -518,6 +551,7 @@ impl<'a> TypedCollection<'a> {
     }
 
     pub fn delete(&self, request: DeleteRequest) -> MdbaseResult<OperationOutcome<DeleteResult>> {
+        self.require_canonical("delete")?;
         let mut input = json!({
             "path": request.path,
             "check_backlinks": request.check_backlinks,
@@ -532,6 +566,7 @@ impl<'a> TypedCollection<'a> {
     }
 
     pub fn rename(&self, request: RenameRequest) -> MdbaseResult<OperationOutcome<RenameResult>> {
+        self.require_canonical("rename")?;
         let mut input = json!({
             "from": request.from,
             "to": request.to,
@@ -547,6 +582,9 @@ impl<'a> TypedCollection<'a> {
     }
 
     pub fn query(&self, request: QueryRequest) -> MdbaseResult<OperationOutcome<QueryResult>> {
+        if self.collection.spec_profile == SpecProfile::V02 {
+            return crate::compat::v02::query(self.collection, request);
+        }
         let result = self.operations()?.query(&request.to_wire());
         let diagnostics = result
             .diagnostics
@@ -596,12 +634,24 @@ impl<'a> TypedCollection<'a> {
         })
     }
 
+    /// Plan or atomically apply the explicit v0.2-to-v0.3 migration.
+    pub fn migrate_v02(&self, request: V02MigrationRequest) -> MdbaseResult<V02MigrationResult> {
+        crate::compat::v02_migration::migrate(self.collection, request)
+    }
+
     fn operations(&self) -> MdbaseResult<v03::Operations<'_>> {
         self.collection
             .v03_operations()
             .map_err(|diagnostic| MdbaseError::Operation {
                 diagnostics: vec![(*diagnostic).into()],
             })
+    }
+
+    fn require_canonical(&self, operation: &'static str) -> MdbaseResult<()> {
+        if self.collection.spec_profile == SpecProfile::V02 {
+            return Err(MdbaseError::MigrationRequired { operation });
+        }
+        Ok(())
     }
 
     fn execute<T: DeserializeOwned>(

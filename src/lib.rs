@@ -7,6 +7,7 @@ pub mod errors;
 
 pub mod api;
 pub mod cache;
+pub(crate) mod compat;
 pub mod config;
 pub mod expressions;
 pub mod frontmatter;
@@ -233,7 +234,7 @@ impl Collection {
                 .unwrap_or(".mdbase")
                 .to_string(),
         };
-        let config_extensions = config
+        let config_extensions: serde_json::Map<String, serde_json::Value> = config
             .as_object()
             .into_iter()
             .flatten()
@@ -253,6 +254,34 @@ impl Collection {
                 )
             })?;
             crate::operations::ensure_no_symlink_components(root, path, spec_profile)?;
+        }
+
+        // Recovery must precede type loading. A system migration may have
+        // replaced or removed legacy type definitions before the config flip;
+        // loading types first could otherwise make the recovery journal
+        // unreachable. Re-open from scratch if recovery changed any files so
+        // config and settings are parsed from the completed transaction.
+        let recovery_collection = Collection {
+            root: root.to_path_buf(),
+            spec_profile,
+            settings: settings.clone(),
+            config_extensions: config_extensions.clone(),
+            types: HashMap::new(),
+            type_plans: HashMap::new(),
+            type_warnings: Vec::new(),
+        };
+        let recovered =
+            crate::transactions::recover_pending(&recovery_collection).map_err(|error| {
+                serde_json::json!({
+                    "valid": false,
+                    "error": {
+                        "code": error.code(),
+                        "message": error.to_string(),
+                    }
+                })
+            })?;
+        if recovered {
+            return Self::open(root);
         }
 
         // Load types
@@ -306,17 +335,6 @@ impl Collection {
             type_plans,
             type_warnings,
         };
-        if collection.spec_profile == SpecProfile::V03 {
-            crate::transactions::recover_pending(&collection).map_err(|error| {
-                serde_json::json!({
-                    "valid": false,
-                    "error": {
-                        "code": error.code(),
-                        "message": error.to_string(),
-                    }
-                })
-            })?;
-        }
         Ok(collection)
     }
 

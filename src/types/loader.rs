@@ -550,6 +550,38 @@ fn field_from_json_schema(schema: &serde_json::Value) -> Result<FieldDef, String
             }),
         ..FieldDef::default()
     };
+    if let Some(legacy) = object
+        .get("x-mdbase-v02-field")
+        .and_then(serde_json::Value::as_object)
+    {
+        if let Some(field_type) = legacy.get("type").and_then(serde_json::Value::as_str) {
+            field.field_type = field_type.to_string();
+        }
+        field.computed = legacy
+            .get("computed")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from);
+        field.deprecated = legacy
+            .get("deprecated_message")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+            .or(field.deprecated);
+        field.target = legacy
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from);
+        field.target_types = legacy
+            .get("target_types")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(String::from)
+            .collect();
+        field.validate_exists = legacy
+            .get("validate_exists")
+            .and_then(serde_json::Value::as_bool);
+    }
     if field.values.is_none() {
         field.values = object
             .get("const")
@@ -571,6 +603,16 @@ fn field_from_json_schema(schema: &serde_json::Value) -> Result<FieldDef, String
                 .collect::<Result<HashMap<_, _>, String>>()
         })
         .transpose()?;
+    if let (Some(fields), Some(required)) = (
+        field.fields.as_mut(),
+        object.get("required").and_then(serde_json::Value::as_array),
+    ) {
+        for name in required.iter().filter_map(serde_json::Value::as_str) {
+            if let Some(nested) = fields.get_mut(name) {
+                nested.required = true;
+            }
+        }
+    }
     Ok(field)
 }
 

@@ -2,7 +2,7 @@ use std::fs;
 
 use mdbase::api::{
     CollectionPath, CreateRequest, DeleteRequest, MdbaseError, QueryDirection, QueryRequest,
-    ReadRequest, RenameRequest, Revision, UpdateRequest,
+    ReadRequest, RenameRequest, Revision, UpdateRequest, V02MigrationRequest,
 };
 use mdbase::{Collection, CompatibilityMode};
 use serde_json::json;
@@ -110,4 +110,181 @@ fn typed_crud_query_and_revision_failures_are_structured() {
 
     let deleted = api.delete(DeleteRequest::new(renamed_path)).unwrap();
     assert!(deleted.value.deleted);
+}
+
+#[test]
+fn typed_v02_adapter_is_read_only_until_migration() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("mdbase.yaml"),
+        "spec_version: 0.2.0\nsettings:\n  default_validation: error\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("_types")).unwrap();
+    fs::write(
+        root.path().join("_types/task.md"),
+        "---\nname: task\nfields:\n  title: { type: string, required: true }\n  status: { type: string, default: open }\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("legacy.md"),
+        "---\ntype: task\ntitle: Legacy\n---\nBody\n",
+    )
+    .unwrap();
+    let collection = Collection::open(root.path()).unwrap();
+    assert_eq!(
+        collection.compatibility_mode(),
+        CompatibilityMode::V02ReadOnly
+    );
+    let api = collection.typed().unwrap();
+
+    let read = api.read(ReadRequest::new("legacy.md").unwrap()).unwrap();
+    assert_eq!(read.value.frontmatter["status"], "open");
+    let query = api
+        .query(QueryRequest::builder().type_name("task"))
+        .unwrap();
+    assert_eq!(query.value.total_count, 1);
+
+    let error = api
+        .update(UpdateRequest::new(
+            CollectionPath::new("legacy.md").unwrap(),
+            json!({"status": "done"}),
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MdbaseError::MigrationRequired {
+            operation: "update"
+        }
+    ));
+    assert!(!fs::read_to_string(root.path().join("legacy.md"))
+        .unwrap()
+        .contains("status: done"));
+}
+
+#[test]
+fn v02_migration_is_verified_dry_runnable_and_enables_canonical_writes() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("mdbase.yaml"),
+        "spec_version: 0.2.0\nname: Legacy\nsettings:\n  default_validation: error\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("_types")).unwrap();
+    fs::write(
+        root.path().join("_types/task.yaml"),
+        r#"---
+name: task
+fields:
+  title: { type: string, required: true }
+  status: { type: string, default: open }
+  label: { type: string, computed: "title + '!'"}
+  uid: { type: string, generated: uuid }
+---
+"#,
+    )
+    .unwrap();
+    let record = "---\ntype: task\ntitle: Legacy\n---\nBody\n";
+    fs::write(root.path().join("legacy.md"), record).unwrap();
+    let collection = Collection::open(root.path()).unwrap();
+    let api = collection.typed().unwrap();
+
+    let plan = api
+        .migrate_v02(V02MigrationRequest {
+            dry_run: true,
+            allow_lossy: false,
+        })
+        .unwrap();
+    assert!(!plan.applied);
+    assert_eq!(plan.verified_records, 1);
+    assert!(plan.changes.iter().any(|change| {
+        change.path == "_types/task.yaml"
+            && change.before_revision.is_some()
+            && change.after_revision.is_none()
+    }));
+    assert_eq!(
+        fs::read_to_string(root.path().join("mdbase.yaml"))
+            .unwrap()
+            .lines()
+            .next(),
+        Some("spec_version: 0.2.0")
+    );
+    assert!(!root.path().join(&plan.manifest_path).exists());
+
+    let applied = api
+        .migrate_v02(V02MigrationRequest {
+            dry_run: false,
+            allow_lossy: false,
+        })
+        .unwrap();
+    assert!(applied.applied);
+    assert!(root.path().join(&applied.manifest_path).is_file());
+    assert!(!root.path().join("_types/task.yaml").exists());
+    assert_eq!(
+        fs::read_to_string(root.path().join("legacy.md")).unwrap(),
+        record
+    );
+
+    drop(collection);
+    let canonical = Collection::open(root.path()).unwrap();
+    assert_eq!(canonical.compatibility_mode(), CompatibilityMode::Canonical);
+    let api = canonical.typed().unwrap();
+    let read = api.read(ReadRequest::new("legacy.md").unwrap()).unwrap();
+    assert_eq!(read.value.frontmatter["status"], "open");
+    assert_eq!(read.value.frontmatter["label"], "Legacy!");
+
+    let created = api
+        .create(CreateRequest::new(
+            CollectionPath::new("new.md").unwrap(),
+            json!({"type": "task", "title": "New"}),
+        ))
+        .unwrap();
+    assert!(created.value.frontmatter["uid"]
+        .as_str()
+        .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok()));
+}
+
+#[test]
+fn lossy_v02_migration_requires_explicit_apply_opt_in() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.2.0\n").unwrap();
+    fs::create_dir(root.path().join("_types")).unwrap();
+    fs::write(
+        root.path().join("_types/item.md"),
+        "---\nname: item\nfields:\n  sequence: { type: integer, generated: sequence }\n---\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("item.md"), "---\ntype: item\n---\n").unwrap();
+    let collection = Collection::open(root.path()).unwrap();
+    let api = collection.typed().unwrap();
+
+    let plan = api
+        .migrate_v02(V02MigrationRequest {
+            dry_run: true,
+            allow_lossy: false,
+        })
+        .unwrap();
+    assert!(plan
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code.as_str() == "migration_lossy"));
+
+    let error = api
+        .migrate_v02(V02MigrationRequest {
+            dry_run: false,
+            allow_lossy: false,
+        })
+        .unwrap_err();
+    assert!(matches!(error, MdbaseError::LossyMigration { .. }));
+    assert!(fs::read_to_string(root.path().join("mdbase.yaml"))
+        .unwrap()
+        .contains("0.2.0"));
+
+    let applied = api
+        .migrate_v02(V02MigrationRequest {
+            dry_run: false,
+            allow_lossy: true,
+        })
+        .unwrap();
+    assert!(applied.applied);
 }

@@ -5,7 +5,7 @@ use std::process;
 use clap::{Parser, Subcommand};
 use mdbase::api::{
     CollectionPath, CreateRequest, DeleteRequest, MdbaseError, MdbaseResult, OperationOutcome,
-    QueryDirection, QueryRequest, ReadRequest, RenameRequest, UpdateRequest,
+    QueryDirection, QueryRequest, ReadRequest, RenameRequest, UpdateRequest, V02MigrationRequest,
 };
 use serde::Serialize;
 
@@ -177,6 +177,17 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Translate a read-only v0.2 collection to canonical v0.3
+    MigrateV02 {
+        /// Verify and report changes without writing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Apply translations that cannot preserve future write behavior
+        #[arg(long)]
+        allow_lossy: bool,
+    },
+
     /// Cache management
     Cache {
         #[command(subcommand)]
@@ -298,21 +309,11 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
         }
 
         Command::Read { path } => {
-            if collection.spec_profile() == mdbase::SpecProfile::V03 {
-                let result = collection.typed().and_then(|api| {
-                    let request = ReadRequest::new(path)?;
-                    api.read(request)
-                });
-                return typed_result(result);
-            }
-            let input = serde_json::json!({ "path": path });
-            let result = collection.read(&input);
-            let exit = if result.get("error").is_some() {
-                error_to_exit_code(&result)
-            } else {
-                EXIT_SUCCESS
-            };
-            (result, exit)
+            let result = collection.typed().and_then(|api| {
+                let request = ReadRequest::new(path)?;
+                api.read(request)
+            });
+            typed_result(result)
         }
 
         Command::Create {
@@ -321,76 +322,37 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             fields,
         } => {
             let fields_value = parse_fields_or_stdin(fields.as_deref());
-            if collection.spec_profile() == mdbase::SpecProfile::V03 {
-                let result = collection.typed().and_then(|api| {
-                    let mut request = match path {
-                        Some(path) => CreateRequest::new(CollectionPath::new(path)?, fields_value),
-                        None => CreateRequest::derived(fields_value),
-                    };
-                    if let Some(file_type) = file_type {
-                        request = request.with_type(file_type);
-                    }
-                    api.create(request)
-                });
-                return typed_result(result);
-            }
-            let mut input = serde_json::json!({ "fields": fields_value });
-            if let Some(p) = path {
-                input["path"] = serde_json::Value::String(p);
-            }
-            if let Some(t) = file_type {
-                input["type"] = serde_json::Value::String(t);
-            }
-            let result = collection.create(&input);
-            let exit = if result.get("error").is_some() {
-                error_to_exit_code(&result)
-            } else {
-                EXIT_SUCCESS
-            };
-            (result, exit)
+            let result = collection.typed().and_then(|api| {
+                let mut request = match path {
+                    Some(path) => CreateRequest::new(CollectionPath::new(path)?, fields_value),
+                    None => CreateRequest::derived(fields_value),
+                };
+                if let Some(file_type) = file_type {
+                    request = request.with_type(file_type);
+                }
+                api.create(request)
+            });
+            typed_result(result)
         }
 
         Command::Update { path, fields } => {
             let fields_value = parse_fields_or_stdin(fields.as_deref());
-            if collection.spec_profile() == mdbase::SpecProfile::V03 {
-                let result = collection.typed().and_then(|api| {
-                    api.update(UpdateRequest::new(CollectionPath::new(path)?, fields_value))
-                });
-                return typed_result(result);
-            }
-            let input = serde_json::json!({ "path": path, "fields": fields_value });
-            let result = collection.update(&input);
-            let exit = if result.get("error").is_some() {
-                error_to_exit_code(&result)
-            } else {
-                EXIT_SUCCESS
-            };
-            (result, exit)
+            let result = collection.typed().and_then(|api| {
+                api.update(UpdateRequest::new(CollectionPath::new(path)?, fields_value))
+            });
+            typed_result(result)
         }
 
         Command::Delete {
             path,
             check_backlinks,
         } => {
-            if collection.spec_profile() == mdbase::SpecProfile::V03 {
-                let result = collection.typed().and_then(|api| {
-                    let mut request = DeleteRequest::new(CollectionPath::new(path)?);
-                    request.check_backlinks = check_backlinks;
-                    api.delete(request)
-                });
-                return typed_result(result);
-            }
-            let mut input = serde_json::json!({ "path": path });
-            if check_backlinks {
-                input["check_backlinks"] = serde_json::Value::Bool(true);
-            }
-            let result = collection.delete(&input);
-            let exit = if result.get("error").is_some() {
-                error_to_exit_code(&result)
-            } else {
-                EXIT_SUCCESS
-            };
-            (result, exit)
+            let result = collection.typed().and_then(|api| {
+                let mut request = DeleteRequest::new(CollectionPath::new(path)?);
+                request.check_backlinks = check_backlinks;
+                api.delete(request)
+            });
+            typed_result(result)
         }
 
         Command::Rename {
@@ -398,27 +360,13 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             to,
             update_refs,
         } => {
-            if collection.spec_profile() == mdbase::SpecProfile::V03 {
-                let result = collection.typed().and_then(|api| {
-                    let mut request =
-                        RenameRequest::new(CollectionPath::new(from)?, CollectionPath::new(to)?);
-                    request.update_refs = update_refs;
-                    api.rename(request)
-                });
-                return typed_result(result);
-            }
-            let input = serde_json::json!({
-                "from": from,
-                "to": to,
-                "update_refs": update_refs,
+            let result = collection.typed().and_then(|api| {
+                let mut request =
+                    RenameRequest::new(CollectionPath::new(from)?, CollectionPath::new(to)?);
+                request.update_refs = update_refs;
+                api.rename(request)
             });
-            let result = collection.rename(&input);
-            let exit = if result.get("error").is_some() {
-                error_to_exit_code(&result)
-            } else {
-                EXIT_SUCCESS
-            };
-            (result, exit)
+            typed_result(result)
         }
 
         Command::Query {
@@ -430,102 +378,53 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             offset,
             include_body,
         } => {
-            if collection.spec_profile() == mdbase::SpecProfile::V03 {
-                let mut request = QueryRequest::builder();
-                if let Some(types) = types {
-                    for type_name in types
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                    {
-                        request = request.type_name(type_name);
-                    }
-                }
-                let mut expression = where_clause;
-                if let Some(folder) = folder {
-                    let folder = folder.trim_end_matches(['/', '\\']).replace('\\', "/");
-                    let quoted = serde_json::to_string(&folder).expect("string serializes");
-                    let child =
-                        serde_json::to_string(&format!("{folder}/")).expect("string serializes");
-                    let folder_expression =
-                        format!("(file.folder == {quoted} || file.folder.startsWith({child}))");
-                    expression = Some(match expression {
-                        Some(existing) => format!("({existing}) && {folder_expression}"),
-                        None => folder_expression,
-                    });
-                }
-                if let Some(expression) = expression {
-                    request = request.where_expression(expression);
-                }
-                if let Some(order_by) = order_by {
-                    for field in order_by
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|field| !field.is_empty())
-                    {
-                        let (field, direction) = match field.strip_prefix('-') {
-                            Some(field) => (field, QueryDirection::Desc),
-                            None => (field, QueryDirection::Asc),
-                        };
-                        request = request.order_by(field, direction);
-                    }
-                }
-                if let Some(limit) = limit {
-                    request = request.limit(limit);
-                }
-                if let Some(offset) = offset {
-                    request = request.offset(offset);
-                }
-                request.include_body = include_body;
-                return typed_result(collection.typed().and_then(|api| api.query(request)));
-            }
-            let mut query = serde_json::Map::new();
-
-            if let Some(t) = types {
-                let type_list: Vec<serde_json::Value> = t
+            let mut request = QueryRequest::builder();
+            if let Some(types) = types {
+                for type_name in types
                     .split(',')
-                    .map(|s| serde_json::Value::String(s.trim().to_string()))
-                    .collect();
-                query.insert("types".to_string(), serde_json::Value::Array(type_list));
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                {
+                    request = request.type_name(type_name);
+                }
             }
-            if let Some(w) = where_clause {
-                query.insert("where".to_string(), serde_json::Value::String(w));
+            let mut expression = where_clause;
+            if let Some(folder) = folder {
+                let folder = folder.trim_end_matches(['/', '\\']).replace('\\', "/");
+                let quoted = serde_json::to_string(&folder).expect("string serializes");
+                let child =
+                    serde_json::to_string(&format!("{folder}/")).expect("string serializes");
+                let folder_expression =
+                    format!("(file.folder == {quoted} || file.folder.startsWith({child}))");
+                expression = Some(match expression {
+                    Some(existing) => format!("({existing}) && {folder_expression}"),
+                    None => folder_expression,
+                });
             }
-            if let Some(f) = folder {
-                query.insert("folder".to_string(), serde_json::Value::String(f));
+            if let Some(expression) = expression {
+                request = request.where_expression(expression);
             }
-            if let Some(ob) = order_by {
-                let order_list: Vec<serde_json::Value> = ob
+            if let Some(order_by) = order_by {
+                for field in order_by
                     .split(',')
-                    .map(|s| {
-                        let s = s.trim();
-                        if let Some(field) = s.strip_prefix('-') {
-                            serde_json::json!({ "field": field, "direction": "desc" })
-                        } else {
-                            serde_json::json!({ "field": s, "direction": "asc" })
-                        }
-                    })
-                    .collect();
-                query.insert("order_by".to_string(), serde_json::Value::Array(order_list));
+                    .map(str::trim)
+                    .filter(|field| !field.is_empty())
+                {
+                    let (field, direction) = match field.strip_prefix('-') {
+                        Some(field) => (field, QueryDirection::Desc),
+                        None => (field, QueryDirection::Asc),
+                    };
+                    request = request.order_by(field, direction);
+                }
             }
-            if let Some(l) = limit {
-                query.insert("limit".to_string(), serde_json::json!(l));
+            if let Some(limit) = limit {
+                request = request.limit(limit);
             }
-            if let Some(o) = offset {
-                query.insert("offset".to_string(), serde_json::json!(o));
+            if let Some(offset) = offset {
+                request = request.offset(offset);
             }
-            if include_body {
-                query.insert("include_body".to_string(), serde_json::Value::Bool(true));
-            }
-
-            let input = serde_json::json!({ "query": query });
-            let result = collection.query(&input);
-            let exit = if result.get("error").is_some() {
-                error_to_exit_code(&result)
-            } else {
-                EXIT_SUCCESS
-            };
-            (result, exit)
+            request.include_body = include_body;
+            typed_result(collection.typed().and_then(|api| api.query(request)))
         }
 
         Command::Views { action } => {
@@ -616,6 +515,11 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             apply_defaults,
             apply_generated,
         } => {
+            if collection.spec_profile() == mdbase::SpecProfile::V02 {
+                return typed_error_result(MdbaseError::MigrationRequired {
+                    operation: "backfill",
+                });
+            }
             let mut input = serde_json::Map::new();
             if let Some(t) = file_type {
                 input.insert("type".to_string(), serde_json::Value::String(t));
@@ -656,6 +560,11 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
         }
 
         Command::Migrate { id, path, dry_run } => {
+            if collection.spec_profile() == mdbase::SpecProfile::V02 {
+                return typed_error_result(MdbaseError::MigrationRequired {
+                    operation: "migrate",
+                });
+            }
             let mut input = serde_json::Map::new();
             if let Some(v) = id {
                 input.insert("id".to_string(), serde_json::Value::String(v));
@@ -673,6 +582,32 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
                 EXIT_SUCCESS
             };
             (result, exit)
+        }
+
+        Command::MigrateV02 {
+            dry_run,
+            allow_lossy,
+        } => {
+            let result = collection.typed().and_then(|api| {
+                api.migrate_v02(V02MigrationRequest {
+                    dry_run,
+                    allow_lossy,
+                })
+            });
+            match result {
+                Ok(value) => {
+                    let diagnostics = value.diagnostics.clone();
+                    (
+                        serde_json::json!({
+                            "valid": true,
+                            "result": value,
+                            "diagnostics": diagnostics,
+                        }),
+                        EXIT_SUCCESS,
+                    )
+                }
+                Err(error) => typed_error_result(error),
+            }
         }
 
         Command::Cache { action } => {
@@ -729,6 +664,22 @@ fn typed_result<T: Serialize>(
     }
 }
 
+fn typed_error_result(error: MdbaseError) -> (serde_json::Value, i32) {
+    let diagnostics = typed_error_diagnostics(&error);
+    let exit = diagnostics
+        .first()
+        .map(|diagnostic| diagnostic_code_to_exit(diagnostic.code.as_str()))
+        .unwrap_or(EXIT_GENERAL_ERROR);
+    (
+        serde_json::json!({
+            "valid": false,
+            "result": {},
+            "diagnostics": diagnostics,
+        }),
+        exit,
+    )
+}
+
 fn typed_error_diagnostics(error: &MdbaseError) -> Vec<mdbase::api::Diagnostic> {
     if !error.diagnostics().is_empty() {
         return error.diagnostics().to_vec();
@@ -736,6 +687,8 @@ fn typed_error_diagnostics(error: &MdbaseError) -> Vec<mdbase::api::Diagnostic> 
     let code = match error {
         MdbaseError::InvalidPath(_) => "invalid_path",
         MdbaseError::UnsupportedProfile => "migration_required",
+        MdbaseError::MigrationRequired { .. } => "migration_required",
+        MdbaseError::LossyMigration { .. } => "migration_lossy",
         MdbaseError::InvalidResult { .. } => "invalid_result",
         MdbaseError::Operation { .. } => "operation_failed",
     };

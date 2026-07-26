@@ -68,10 +68,20 @@ enum Phase {
     Committed,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TransactionScope {
+    #[default]
+    Records,
+    SystemMigration,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct Journal {
     version: u32,
     id: String,
+    #[serde(default)]
+    scope: TransactionScope,
     phase: Phase,
     applied: usize,
     entries: Vec<JournalEntry>,
@@ -93,13 +103,34 @@ pub(crate) fn commit_shadow(
     baseline: &FileBaseline,
     desired: &FileBaseline,
 ) -> Result<CommitOutcome, TransactionError> {
-    commit_shadow_controlled(collection, baseline, desired, None)
+    commit_shadow_controlled(
+        collection,
+        baseline,
+        desired,
+        TransactionScope::Records,
+        None,
+    )
+}
+
+pub(crate) fn commit_migration(
+    collection: &Collection,
+    baseline: &FileBaseline,
+    desired: &FileBaseline,
+) -> Result<CommitOutcome, TransactionError> {
+    commit_shadow_controlled(
+        collection,
+        baseline,
+        desired,
+        TransactionScope::SystemMigration,
+        None,
+    )
 }
 
 fn commit_shadow_controlled(
     collection: &Collection,
     baseline: &FileBaseline,
     desired: &FileBaseline,
+    scope: TransactionScope,
     _fail_after_applied: Option<usize>,
 ) -> Result<CommitOutcome, TransactionError> {
     ensure_transaction_root(collection)?;
@@ -126,7 +157,7 @@ fn commit_shadow_controlled(
         if before == after {
             continue;
         }
-        validate_entry_path(collection, &path)?;
+        validate_entry_path(collection, &path, scope)?;
         let index = entries.len();
         let stage_file = after.map(|bytes| {
             let name = format!("stage/{index}");
@@ -167,6 +198,7 @@ fn commit_shadow_controlled(
     let mut journal = Journal {
         version: 1,
         id,
+        scope,
         phase: Phase::Prepared,
         applied: 0,
         entries,
@@ -189,7 +221,12 @@ fn commit_shadow_controlled(
     persist_journal(&directory, &journal)?;
 
     for index in 0..journal.entries.len() {
-        apply_entry(collection, &directory, &journal.entries[index])?;
+        apply_entry(
+            collection,
+            &directory,
+            &journal.entries[index],
+            journal.scope,
+        )?;
         journal.applied = index + 1;
         persist_journal(&directory, &journal)?;
         #[cfg(test)]
@@ -208,12 +245,12 @@ fn commit_shadow_controlled(
 }
 
 /// Recover every durable transaction before a collection becomes available.
-pub(crate) fn recover_pending(collection: &Collection) -> Result<(), TransactionError> {
+pub(crate) fn recover_pending(collection: &Collection) -> Result<bool, TransactionError> {
     ensure_no_symlink_components(&collection.root, TRANSACTIONS_DIR, SpecProfile::V03)
         .map_err(|error| TransactionError::UnsafePath(error.to_string()))?;
     let root = collection.root.join(TRANSACTIONS_DIR);
     if !root.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let mut directories = fs::read_dir(&root)
         .map_err(|source| io_error(root.clone(), source))?
@@ -225,7 +262,7 @@ pub(crate) fn recover_pending(collection: &Collection) -> Result<(), Transaction
         .collect::<Result<Vec<_>, _>>()?;
     directories.sort();
     if directories.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let _write_lock = WriteLock::acquire(collection)?;
@@ -240,7 +277,7 @@ pub(crate) fn recover_pending(collection: &Collection) -> Result<(), Transaction
         }
         recover_one(collection, &directory)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn recover_one(collection: &Collection, directory: &Path) -> Result<(), TransactionError> {
@@ -262,7 +299,7 @@ fn recover_one(collection: &Collection, directory: &Path) -> Result<(), Transact
         ));
     }
     for (index, entry) in journal.entries.iter().enumerate() {
-        validate_entry_path(collection, &entry.path)?;
+        validate_entry_path(collection, &entry.path, journal.scope)?;
         let expected_stage = entry
             .after_revision
             .as_ref()
@@ -333,7 +370,7 @@ fn recover_one(collection: &Collection, directory: &Path) -> Result<(), Transact
                 entry.path
             )));
         }
-        apply_entry(collection, directory, entry)?;
+        apply_entry(collection, directory, entry, journal.scope)?;
         journal.applied = index + 1;
         persist_journal(directory, &journal)?;
     }
@@ -363,8 +400,9 @@ fn apply_entry(
     collection: &Collection,
     directory: &Path,
     entry: &JournalEntry,
+    scope: TransactionScope,
 ) -> Result<(), TransactionError> {
-    validate_entry_path(collection, &entry.path)?;
+    validate_entry_path(collection, &entry.path, scope)?;
     let path = CollectionPath::new(&entry.path)
         .map_err(|error| TransactionError::UnsafePath(error.to_string()))?
         .under(&collection.root);
@@ -395,14 +433,19 @@ fn apply_entry(
     Ok(())
 }
 
-fn validate_entry_path(collection: &Collection, path: &str) -> Result<(), TransactionError> {
+fn validate_entry_path(
+    collection: &Collection,
+    path: &str,
+    scope: TransactionScope,
+) -> Result<(), TransactionError> {
     let logical = CollectionPath::new(path)
         .map_err(|error| TransactionError::UnsafePath(error.to_string()))?;
     let platform_path = logical.to_path_buf();
-    if path == "mdbase.yaml"
-        || platform_path.starts_with(&collection.settings.types_folder)
-        || platform_path.starts_with(&collection.settings.migrations_folder)
-        || platform_path.starts_with(".mdbase")
+    if scope == TransactionScope::Records
+        && (path == "mdbase.yaml"
+            || platform_path.starts_with(&collection.settings.types_folder)
+            || platform_path.starts_with(&collection.settings.migrations_folder)
+            || platform_path.starts_with(".mdbase"))
     {
         return Err(TransactionError::UnsafePath(format!(
             "batch transactions cannot mutate system definition path '{path}'"
@@ -560,7 +603,14 @@ mod tests {
     fn open_completes_an_interrupted_commit() {
         let (root, collection) = collection();
         let (before, after) = versions();
-        let error = commit_shadow_controlled(&collection, &before, &after, Some(1)).unwrap_err();
+        let error = commit_shadow_controlled(
+            &collection,
+            &before,
+            &after,
+            TransactionScope::Records,
+            Some(1),
+        )
+        .unwrap_err();
         assert!(matches!(error, TransactionError::SimulatedCrash));
         assert_eq!(fs::read(root.path().join("a.md")).unwrap(), b"new-a\n");
         assert_eq!(fs::read(root.path().join("b.md")).unwrap(), b"old-b\n");
@@ -581,7 +631,14 @@ mod tests {
     fn recovery_fails_closed_after_an_unrelated_external_edit() {
         let (root, collection) = collection();
         let (before, after) = versions();
-        commit_shadow_controlled(&collection, &before, &after, Some(1)).unwrap_err();
+        commit_shadow_controlled(
+            &collection,
+            &before,
+            &after,
+            TransactionScope::Records,
+            Some(1),
+        )
+        .unwrap_err();
         fs::write(root.path().join("b.md"), "external\n").unwrap();
 
         drop(collection);
@@ -619,5 +676,51 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn open_completes_an_interrupted_system_migration_before_loading_types() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy_config = b"spec_version: 0.2.0\n".to_vec();
+        fs::write(root.path().join("mdbase.yaml"), &legacy_config).unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        let canonical_type = br#"---
+kind: mdbase.type
+name: task
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    properties: {}
+---
+"#
+        .to_vec();
+        let before = BTreeMap::from([("mdbase.yaml".to_string(), legacy_config)]);
+        let after = BTreeMap::from([
+            ("mdbase.yaml".to_string(), b"spec_version: 0.3.0\n".to_vec()),
+            ("_types/task.md".to_string(), canonical_type),
+        ]);
+
+        let error = commit_shadow_controlled(
+            &collection,
+            &before,
+            &after,
+            TransactionScope::SystemMigration,
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(matches!(error, TransactionError::SimulatedCrash));
+        assert!(root.path().join("_types/task.md").is_file());
+        assert!(fs::read_to_string(root.path().join("mdbase.yaml"))
+            .unwrap()
+            .contains("0.2.0"));
+
+        drop(collection);
+        let recovered = Collection::open(root.path()).expect("migration recovery should complete");
+        assert_eq!(recovered.spec_profile, SpecProfile::V03);
+        assert!(recovered.types.contains_key("task"));
+        assert!(fs::read_to_string(root.path().join("mdbase.yaml"))
+            .unwrap()
+            .contains("0.3.0"));
     }
 }
