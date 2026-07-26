@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -472,9 +472,14 @@ fn persist_journal(directory: &Path, journal: &Journal) -> Result<(), Transactio
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), TransactionError> {
-    fs::write(path, bytes).map_err(|source| io_error(path.to_path_buf(), source))?;
-    File::open(path)
-        .and_then(|file| file.sync_all())
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
         .map_err(|source| io_error(path.to_path_buf(), source))
 }
 
