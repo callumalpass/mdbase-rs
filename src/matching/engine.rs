@@ -22,6 +22,16 @@ pub(crate) fn matches_rules_checked(
     frontmatter: &serde_json::Value,
     timezone: Option<&str>,
 ) -> Result<bool, crate::v03::cel::CelFailure> {
+    matches_rules_checked_compiled(rules, None, rel_path, frontmatter, timezone)
+}
+
+pub(crate) fn matches_rules_checked_compiled(
+    rules: &MatchRules,
+    match_expression: Option<&crate::expressions::ast::Expr>,
+    rel_path: &str,
+    frontmatter: &serde_json::Value,
+    timezone: Option<&str>,
+) -> Result<bool, crate::v03::cel::CelFailure> {
     // All conditions in a match rule are AND'd together
     if let Some(ref path_glob) = rules.path_glob {
         if !matches_path_glob(rel_path, path_glob) {
@@ -49,8 +59,21 @@ pub(crate) fn matches_rules_checked(
         }
     }
     if let Some(ref expression) = rules.match_expr {
-        if !crate::v03::cel::evaluate_match_expression(expression, frontmatter, rel_path, timezone)?
-        {
+        let matched = match match_expression {
+            Some(expression) => crate::v03::cel::evaluate_match_expression_compiled(
+                expression,
+                frontmatter,
+                rel_path,
+                timezone,
+            )?,
+            None => crate::v03::cel::evaluate_match_expression(
+                expression,
+                frontmatter,
+                rel_path,
+                timezone,
+            )?,
+        };
+        if !matched {
             return Ok(false);
         }
     }
@@ -564,8 +587,13 @@ impl Collection {
             definitions.sort_by_key(|(type_name, _)| type_name.as_str());
             for (type_name, type_def) in definitions {
                 if let Some(ref rules) = type_def.match_rules {
-                    match matches_rules_checked(
+                    let compiled = self
+                        .type_plans
+                        .get(type_name)
+                        .and_then(|plan| plan.match_expression.as_deref());
+                    match matches_rules_checked_compiled(
                         rules,
+                        compiled,
                         path,
                         frontmatter,
                         self.settings.timezone.as_deref(),

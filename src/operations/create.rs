@@ -5,7 +5,7 @@ use crate::errors::*;
 use crate::frontmatter;
 use crate::frontmatter::serializer;
 use crate::generated::derive_path;
-use crate::matching::engine::matches_rules;
+use crate::matching::engine::matches_rules_checked_compiled;
 use crate::operations::{atomic_create, ensure_no_symlink_components, ensure_safe_relative_path};
 use crate::Collection;
 
@@ -140,12 +140,19 @@ impl Collection {
                     } else {
                         &effective
                     };
-                    if !matches_rules(
+                    let compiled = self
+                        .type_plans
+                        .get(tn)
+                        .and_then(|plan| plan.match_expression.as_deref());
+                    if !matches_rules_checked_compiled(
                         rules,
+                        compiled,
                         &path,
                         match_frontmatter,
                         self.settings.timezone.as_deref(),
-                    ) {
+                    )
+                    .unwrap_or(false)
+                    {
                         return op_error(
                             "match_failed",
                             &format!(

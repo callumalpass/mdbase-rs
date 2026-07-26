@@ -381,18 +381,6 @@ fn v03_type_definition(type_file: crate::v03::TypeFile) -> Result<TypeDef, Strin
     }
 
     let mut match_rules = frontmatter.get("match").map(parse_v03_match_rules);
-    if let Some(expression) = match_rules
-        .as_ref()
-        .and_then(|rules| rules.match_expr.as_deref())
-    {
-        crate::v03::cel::compile(expression).map_err(|error| {
-            format!(
-                "Type '{}' has an invalid CEL match expression: {}",
-                type_file.name, error.message,
-            )
-        })?;
-    }
-    validate_v03_lifecycle_expressions(frontmatter, &type_file.name)?;
     if match_rules.as_ref().is_some_and(|rules| {
         rules.path_glob.is_none()
             && rules.path_globs.is_none()
@@ -493,39 +481,6 @@ fn v03_type_definition(type_file: crate::v03::TypeFile) -> Result<TypeDef, Strin
         lifecycle: frontmatter.get("lifecycle").cloned(),
         source_path: Some(type_file.path),
     })
-}
-
-fn validate_v03_lifecycle_expressions(
-    frontmatter: &serde_json::Map<String, serde_json::Value>,
-    type_name: &str,
-) -> Result<(), String> {
-    let Some(lifecycle) = frontmatter
-        .get("lifecycle")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return Ok(());
-    };
-    for event in ["on_create", "on_update"] {
-        let Some(policy) = lifecycle.get(event) else {
-            continue;
-        };
-        let actions: Vec<&serde_json::Value> = match policy {
-            serde_json::Value::Array(actions) => actions.iter().collect(),
-            action => vec![action],
-        };
-        for (index, action) in actions.into_iter().enumerate() {
-            let Some(expression) = action.get("if").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            crate::v03::cel::compile(expression).map_err(|error| {
-                format!(
-                    "Type '{type_name}' has an invalid lifecycle guard at lifecycle.{event}[{index}]: {}",
-                    error.message,
-                )
-            })?;
-        }
-    }
-    Ok(())
 }
 
 fn field_from_json_schema(schema: &serde_json::Value) -> Result<FieldDef, String> {

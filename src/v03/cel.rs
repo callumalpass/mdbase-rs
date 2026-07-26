@@ -254,6 +254,15 @@ pub(crate) fn evaluate_match_expression(
     timezone: Option<&str>,
 ) -> Result<bool, CelFailure> {
     let parsed = compile(source)?;
+    evaluate_match_expression_compiled(&parsed, raw, path, timezone)
+}
+
+pub(crate) fn evaluate_match_expression_compiled(
+    parsed: &Expr,
+    raw: &Value,
+    path: &str,
+    timezone: Option<&str>,
+) -> Result<bool, CelFailure> {
     let mut context = EvalContext::empty();
     let known = raw.as_object().into_iter().flat_map(|object| object.keys());
     context.frontmatter = enrich_record_bindings(raw, raw, known);
@@ -262,7 +271,7 @@ pub(crate) fn evaluate_match_expression(
     context.file_path = Some(path.to_string());
     context.string_concat = false;
     let clock = operation_clock(timezone)?;
-    let value = evaluate_compiled(&parsed, &context, &clock)?;
+    let value = evaluate_compiled(parsed, &context, &clock)?;
     Ok(value == Value::Bool(true))
 }
 

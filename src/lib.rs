@@ -29,7 +29,6 @@ pub mod watch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::expressions::expression_references_field;
 use crate::types::inheritance;
 use crate::types::loader;
 use crate::types::schema::*;
@@ -101,6 +100,7 @@ pub struct Collection {
     /// Namespaced collection configuration retained for optional adapters.
     pub(crate) config_extensions: serde_json::Map<String, serde_json::Value>,
     pub(crate) types: HashMap<String, TypeDef>,
+    pub(crate) type_plans: HashMap<String, crate::types::compiled::CompiledTypePlan>,
     pub(crate) type_warnings: Vec<String>,
 }
 
@@ -287,10 +287,15 @@ impl Collection {
             })
         })?;
 
-        // Validate computed fields (§5.12)
-        for type_def in types.values() {
-            Self::validate_computed_fields(type_def)?;
-        }
+        let type_plans = crate::types::compiled::compile_registry(&types).map_err(|error| {
+            serde_json::json!({
+                "valid": false,
+                "error": {
+                    "code": error.code,
+                    "message": error.message,
+                }
+            })
+        })?;
 
         let collection = Collection {
             root: root.to_path_buf(),
@@ -298,6 +303,7 @@ impl Collection {
             settings,
             config_extensions,
             types,
+            type_plans,
             type_warnings,
         };
         if collection.spec_profile == SpecProfile::V03 {
@@ -312,148 +318,6 @@ impl Collection {
             })?;
         }
         Ok(collection)
-    }
-
-    /// Validate computed field constraints (§5.12).
-    fn validate_computed_fields(type_def: &TypeDef) -> Result<(), serde_json::Value> {
-        let mut computed_fields: Vec<(&str, &str)> = Vec::new(); // (name, expression)
-
-        for (name, field) in &type_def.fields {
-            if let Some(ref expr) = field.computed {
-                // Computed fields MUST NOT be required
-                if field.required {
-                    return Err(serde_json::json!({
-                        "valid": false,
-                        "error": { "code": "invalid_type_definition", "message": format!("Computed field '{}' cannot be required", name) }
-                    }));
-                }
-                // Computed fields MUST NOT have default
-                if field.default.is_some() {
-                    return Err(serde_json::json!({
-                        "valid": false,
-                        "error": { "code": "invalid_type_definition", "message": format!("Computed field '{}' cannot have a default value", name) }
-                    }));
-                }
-                // Computed fields MUST NOT have generated
-                if field.generated.is_some() {
-                    return Err(serde_json::json!({
-                        "valid": false,
-                        "error": { "code": "invalid_type_definition", "message": format!("Computed field '{}' cannot have a generated strategy", name) }
-                    }));
-                }
-                computed_fields.push((name, expr));
-            }
-        }
-
-        // Check for circular dependencies
-        if computed_fields.len() > 1 {
-            // Build dependency graph: for each computed field, find which other
-            // computed fields its expression references
-            let computed_names: std::collections::HashSet<&str> =
-                computed_fields.iter().map(|(n, _)| *n).collect();
-
-            // Simple dependency detection: check if expression contains field name as identifier
-            for (name, expr) in &computed_fields {
-                // Check for self-reference
-                if expression_references_field(expr, name) {
-                    return Err(serde_json::json!({
-                        "valid": false,
-                        "error": { "code": "circular_computed", "message": format!("Computed field '{}' references itself", name) }
-                    }));
-                }
-            }
-
-            // Check for cycles using topological sort
-            let mut deps: HashMap<&str, Vec<&str>> = HashMap::new();
-            for (name, expr) in &computed_fields {
-                let mut field_deps = Vec::new();
-                for dep_name in &computed_names {
-                    if dep_name != name && expression_references_field(expr, dep_name) {
-                        field_deps.push(*dep_name);
-                    }
-                }
-                deps.insert(name, field_deps);
-            }
-
-            // Topological sort to detect cycles
-            let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            let mut in_progress: std::collections::HashSet<&str> = std::collections::HashSet::new();
-
-            fn has_cycle<'a>(
-                node: &'a str,
-                deps: &HashMap<&'a str, Vec<&'a str>>,
-                visited: &mut std::collections::HashSet<&'a str>,
-                in_progress: &mut std::collections::HashSet<&'a str>,
-            ) -> bool {
-                if in_progress.contains(node) {
-                    return true;
-                }
-                if visited.contains(node) {
-                    return false;
-                }
-                in_progress.insert(node);
-                if let Some(node_deps) = deps.get(node) {
-                    for dep in node_deps {
-                        if has_cycle(dep, deps, visited, in_progress) {
-                            return true;
-                        }
-                    }
-                }
-                in_progress.remove(node);
-                visited.insert(node);
-                false
-            }
-
-            for (name, _) in &computed_fields {
-                if has_cycle(name, &deps, &mut visited, &mut in_progress) {
-                    return Err(serde_json::json!({
-                        "valid": false,
-                        "error": { "code": "circular_computed", "message": format!("Circular dependency in computed field '{}'", name) }
-                    }));
-                }
-            }
-        } else if computed_fields.len() == 1 {
-            // Check self-reference for single computed field
-            let (name, expr) = computed_fields[0];
-            if expression_references_field(expr, name) {
-                return Err(serde_json::json!({
-                    "valid": false,
-                    "error": { "code": "circular_computed", "message": format!("Computed field '{}' references itself", name) }
-                }));
-            }
-        }
-
-        // Check that match rules don't reference computed fields (§6.4)
-        if !computed_fields.is_empty() {
-            if let Some(ref match_rules) = type_def.match_rules {
-                // Check where clause field names
-                if let Some(ref where_clause) = match_rules.where_clause {
-                    if let Some(obj) = where_clause.as_object() {
-                        for field_name in obj.keys() {
-                            if computed_fields.iter().any(|(name, _)| *name == field_name) {
-                                return Err(serde_json::json!({
-                                    "valid": false,
-                                    "error": { "code": "invalid_type_definition", "message": format!("Match rule 'where' cannot reference computed field '{}'", field_name) }
-                                }));
-                            }
-                        }
-                    }
-                }
-                // Check fields_present
-                if let Some(ref fields_present) = match_rules.fields_present {
-                    for field_name in fields_present {
-                        if computed_fields.iter().any(|(name, _)| *name == field_name) {
-                            return Err(serde_json::json!({
-                                "valid": false,
-                                "error": { "code": "invalid_type_definition", "message": format!("Match rule 'fields_present' cannot reference computed field '{}'", field_name) }
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     pub(crate) fn config_strict_mode(&self) -> StrictMode {
