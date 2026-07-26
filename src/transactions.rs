@@ -498,10 +498,21 @@ fn current_revision(path: &Path) -> Result<Option<String>, TransactionError> {
     }
 }
 
+#[cfg(not(windows))]
 fn sync_dir(path: &Path) -> Result<(), TransactionError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| io_error(path.to_path_buf(), source))
+}
+
+#[cfg(windows)]
+fn sync_dir(_path: &Path) -> Result<(), TransactionError> {
+    // std::fs cannot open directory handles with FILE_FLAG_BACKUP_SEMANTICS,
+    // so the portable directory-fsync pattern fails with AccessDenied on
+    // Windows. Every transaction payload and journal file is still synced
+    // before its atomic rename; only the additional directory metadata flush
+    // is unavailable through Rust's standard library.
+    Ok(())
 }
 
 fn cleanup_transaction(directory: &Path) {
