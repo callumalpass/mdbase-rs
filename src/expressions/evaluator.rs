@@ -866,7 +866,25 @@ fn eval_binop(
             compare_values(&lval, &rval),
             Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
         ))),
+        BinOp::In => eval_membership(&lval, &rval),
         BinOp::And | BinOp::Or => unreachable!(),
+    }
+}
+
+fn eval_membership(needle: &Value, haystack: &Value) -> Result<Value, EvalError> {
+    match haystack {
+        Value::Array(values) => Ok(Value::Bool(
+            values.iter().any(|value| values_equal(needle, value)),
+        )),
+        Value::Object(values) => {
+            let key = needle
+                .as_str()
+                .ok_or_else(|| EvalError::type_error("Map membership requires a string key"))?;
+            Ok(Value::Bool(values.contains_key(key)))
+        }
+        _ => Err(EvalError::type_error(
+            "Right operand of 'in' must be a list or map",
+        )),
     }
 }
 
@@ -1075,6 +1093,24 @@ fn eval_call(func_expr: &Expr, args: &[Expr], ctx: &EvalContext) -> Result<Value
 
 fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, EvalError> {
     match name {
+        "has" => {
+            if args.len() != 1 {
+                return Err(EvalError::wrong_argument_count("has() requires 1 argument"));
+            }
+            let Expr::Dot(object, field) = &args[0] else {
+                return Err(EvalError::invalid_expression(
+                    "has() requires a field selection",
+                ));
+            };
+            match evaluate(object, ctx)? {
+                Value::Object(map) => Ok(Value::Bool(map.contains_key(field))),
+                Value::Null => Ok(Value::Bool(false)),
+                value => Err(EvalError::type_error(&format!(
+                    "has() cannot select a field from {}",
+                    type_name(&value)
+                ))),
+            }
+        }
         "exists" => {
             if args.len() != 1 {
                 return Err(EvalError::wrong_argument_count(
@@ -1843,76 +1879,90 @@ fn eval_array_method(
             }
             Ok(Value::Bool(false))
         }
+        "all" | "exists" | "exists_one" => {
+            if args.len() != 2 {
+                return Err(EvalError::wrong_argument_count(&format!(
+                    "{method}() requires a variable and predicate"
+                )));
+            }
+            let variable = comprehension_variable(&args[0], method)?;
+            let mut matches = 0usize;
+            for (i, item) in arr.iter().enumerate() {
+                let item_ctx = iteration_context(ctx, item, i, Some(variable));
+                if is_truthy(&evaluate(&args[1], &item_ctx)?) {
+                    matches += 1;
+                    if method == "exists" {
+                        return Ok(Value::Bool(true));
+                    }
+                    if method == "exists_one" && matches > 1 {
+                        return Ok(Value::Bool(false));
+                    }
+                } else if method == "all" {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            Ok(Value::Bool(match method {
+                "all" => true,
+                "exists" => false,
+                "exists_one" => matches == 1,
+                _ => unreachable!(),
+            }))
+        }
         "filter" => {
-            if args.len() != 1 {
+            if args.len() != 1 && args.len() != 2 {
                 return Err(EvalError::wrong_argument_count(
-                    "filter() requires 1 argument",
+                    "filter() requires a predicate, optionally preceded by a variable",
                 ));
             }
             let mut result = Vec::new();
+            let (variable, predicate) = if args.len() == 2 {
+                (Some(comprehension_variable(&args[0], "filter")?), &args[1])
+            } else {
+                (None, &args[0])
+            };
             for (i, item) in arr.iter().enumerate() {
-                // Create context where "value" is the current item and "index" is the index
-                let mut item_fm = ctx.frontmatter.clone();
-                if let Value::Object(ref mut map) = item_fm {
-                    map.insert("value".to_string(), item.clone());
-                    map.insert("index".to_string(), Value::Number(i.into()));
-                }
-                let item_ctx = EvalContext {
-                    frontmatter: item_fm,
-                    raw_frontmatter: ctx.raw_frontmatter.clone(),
-                    file_path: ctx.file_path.clone(),
-                    body: ctx.body.clone(),
-                    file_size: ctx.file_size,
-                    file_mtime: ctx.file_mtime.clone(),
-                    file_ctime: ctx.file_ctime.clone(),
-                    this_context: ctx.this_context.clone(),
-                    all_files: ctx.all_files.clone(),
-                    traversal_depth: ctx.traversal_depth.clone(),
-                    backlinks_index: ctx.backlinks_index.clone(),
-                    type_names: ctx.type_names.clone(),
-                    types: ctx.types.clone(),
-                    note_namespace_source: ctx.note_namespace_source,
-                    string_concat: ctx.string_concat,
-                };
-                if let Ok(val) = evaluate(&args[0], &item_ctx) {
-                    if is_truthy(&val) {
-                        result.push(item.clone());
-                    }
+                let item_ctx = iteration_context(ctx, item, i, variable);
+                match evaluate(predicate, &item_ctx) {
+                    Ok(value) if is_truthy(&value) => result.push(item.clone()),
+                    Ok(_) => {}
+                    Err(_) if variable.is_none() => {}
+                    Err(error) => return Err(error),
                 }
             }
             Ok(Value::Array(result))
         }
         "map" => {
-            if args.len() != 1 {
-                return Err(EvalError::wrong_argument_count("map() requires 1 argument"));
+            if args.is_empty() || args.len() > 3 {
+                return Err(EvalError::wrong_argument_count(
+                    "map() requires a transform, optionally preceded by a variable and predicate",
+                ));
             }
+            let (variable, predicate, transform) = match args.len() {
+                1 => (None, None, &args[0]),
+                2 => (
+                    Some(comprehension_variable(&args[0], "map")?),
+                    None,
+                    &args[1],
+                ),
+                3 => (
+                    Some(comprehension_variable(&args[0], "map")?),
+                    Some(&args[1]),
+                    &args[2],
+                ),
+                _ => unreachable!(),
+            };
             let mut result = Vec::new();
             for (i, item) in arr.iter().enumerate() {
-                let mut item_fm = ctx.frontmatter.clone();
-                if let Value::Object(ref mut map) = item_fm {
-                    map.insert("value".to_string(), item.clone());
-                    map.insert("index".to_string(), Value::Number(i.into()));
+                let item_ctx = iteration_context(ctx, item, i, variable);
+                if let Some(predicate) = predicate {
+                    if !is_truthy(&evaluate(predicate, &item_ctx)?) {
+                        continue;
+                    }
                 }
-                let item_ctx = EvalContext {
-                    frontmatter: item_fm,
-                    raw_frontmatter: ctx.raw_frontmatter.clone(),
-                    file_path: ctx.file_path.clone(),
-                    body: ctx.body.clone(),
-                    file_size: ctx.file_size,
-                    file_mtime: ctx.file_mtime.clone(),
-                    file_ctime: ctx.file_ctime.clone(),
-                    this_context: ctx.this_context.clone(),
-                    all_files: ctx.all_files.clone(),
-                    traversal_depth: ctx.traversal_depth.clone(),
-                    backlinks_index: ctx.backlinks_index.clone(),
-                    type_names: ctx.type_names.clone(),
-                    types: ctx.types.clone(),
-                    note_namespace_source: ctx.note_namespace_source,
-                    string_concat: ctx.string_concat,
-                };
-                match evaluate(&args[0], &item_ctx) {
-                    Ok(val) => result.push(val),
-                    Err(_) => result.push(Value::Null),
+                match evaluate(transform, &item_ctx) {
+                    Ok(value) => result.push(value),
+                    Err(_) if variable.is_none() => result.push(Value::Null),
+                    Err(error) => return Err(error),
                 }
             }
             Ok(Value::Array(result))
@@ -1960,6 +2010,33 @@ fn eval_array_method(
             method
         ))),
     }
+}
+
+fn comprehension_variable<'a>(expression: &'a Expr, method: &str) -> Result<&'a str, EvalError> {
+    if let Expr::Ident(name) = expression {
+        Ok(name)
+    } else {
+        Err(EvalError::invalid_expression(&format!(
+            "{method}() variable must be an identifier"
+        )))
+    }
+}
+
+fn iteration_context(
+    ctx: &EvalContext,
+    item: &Value,
+    index: usize,
+    variable: Option<&str>,
+) -> EvalContext {
+    let mut item_ctx = ctx.clone();
+    let mut bindings = ctx.frontmatter.as_object().cloned().unwrap_or_default();
+    bindings.insert("value".to_string(), item.clone());
+    bindings.insert("index".to_string(), Value::Number(index.into()));
+    if let Some(variable) = variable {
+        bindings.insert(variable.to_string(), item.clone());
+    }
+    item_ctx.frontmatter = Value::Object(bindings);
+    item_ctx
 }
 
 fn eval_object_method(

@@ -130,6 +130,25 @@ async fn executes_variables_conditions_and_for_each_deterministically() {
 }
 
 #[tokio::test]
+async fn trigger_admits_portable_record_type_membership_expression() {
+    let mut registry = registry(true);
+    registry
+        .workflows
+        .get_mut("test.workflow")
+        .unwrap()
+        .contract["triggers"][0]["if"]["$expr"] =
+        json!(r#""pickle_request" in event.payload.types"#);
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let (runtime, _) = runtime(store, Arc::new(RecordingProvider::default()));
+    let mut event = changed_event("evt_pickle_request", json!(["request.md"]));
+    event["payload"]["types"] = json!(["pickle_request"]);
+
+    let delivery = runtime.deliver_event(&registry, event).await.unwrap();
+
+    assert_eq!(delivery.admitted_run_ids.len(), 1);
+}
+
+#[tokio::test]
 async fn reconciles_a_timer_prefix_without_rescheduling_unchanged_or_fired_timers() {
     let store = Arc::new(InMemoryRuntimeStore::new());
     let provider = Arc::new(RecordingProvider::default());

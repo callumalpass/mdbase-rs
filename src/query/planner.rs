@@ -121,6 +121,7 @@ impl Collection {
             | AstExpr::BinOp(left, BinOp::Gt, right)
             | AstExpr::BinOp(left, BinOp::Lte, right)
             | AstExpr::BinOp(left, BinOp::Gte, right)
+            | AstExpr::BinOp(left, BinOp::In, right)
             | AstExpr::BinOp(left, BinOp::And, right)
             | AstExpr::BinOp(left, BinOp::Or, right) => {
                 Self::extract_formula_refs_into(left, refs);

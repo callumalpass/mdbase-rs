@@ -508,6 +508,106 @@ mod tests {
     }
 
     #[test]
+    fn runtime_membership_supports_notification_criteria_and_maps() {
+        let now = "2026-07-26T00:00:00Z".parse().unwrap();
+        let bindings = json!({
+            "event": {
+                "payload": {
+                    "types": ["pickle_request"],
+                    "path": "requests/test.md"
+                }
+            },
+            "metadata": {
+                "status": "pending"
+            }
+        });
+
+        assert_eq!(
+            evaluate_runtime_expression(
+                r#""pickle_request" in event.payload.types"#,
+                &bindings,
+                now,
+                Some("UTC"),
+            )
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            evaluate_runtime_expression(
+                r#""missing_type" in event.payload.types"#,
+                &bindings,
+                now,
+                Some("UTC"),
+            )
+            .unwrap(),
+            false
+        );
+        assert_eq!(
+            evaluate_runtime_expression(
+                r#""status" in metadata && event.payload.path == "requests/test.md""#,
+                &bindings,
+                now,
+                Some("UTC"),
+            )
+            .unwrap(),
+            true
+        );
+    }
+
+    #[test]
+    fn runtime_membership_rejects_an_invalid_right_operand() {
+        let error = evaluate_runtime_expression(
+            r#""pickle_request" in "pickle_request""#,
+            &json!({}),
+            "2026-07-26T00:00:00Z".parse().unwrap(),
+            Some("UTC"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "type_error");
+        assert_eq!(error.message, "Right operand of 'in' must be a list or map");
+    }
+
+    #[test]
+    fn runtime_cel_supports_presence_and_comprehension_macros() {
+        let now = "2026-07-26T00:00:00Z".parse().unwrap();
+        let bindings = json!({
+            "event": {
+                "payload": {
+                    "nullable": null,
+                    "types": ["pickle_request", "urgent"]
+                }
+            }
+        });
+
+        assert_eq!(
+            evaluate_runtime_expression(
+                "has(event.payload.nullable) && !has(event.payload.missing)",
+                &bindings,
+                now,
+                Some("UTC"),
+            )
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            evaluate_runtime_expression(
+                r#"event.payload.types.exists(t, t == "pickle_request")
+                    && event.payload.types.all(t, t != "")
+                    && event.payload.types.exists_one(t, t == "urgent")
+                    && event.payload.types.filter(t, t == "urgent").size() == 1
+                    && event.payload.types.map(t, t).size() == 2
+                    && event.payload.types.map(t, t == "urgent", t)[0] == "urgent""#,
+                &bindings,
+                now,
+                Some("UTC"),
+            )
+            .unwrap(),
+            true
+        );
+    }
+
+    #[test]
     fn v03_note_namespace_does_not_change_legacy_note_resolution() {
         let known = BTreeSet::from(["title".to_string()]);
         let mut v03 = EvalContext::empty();
