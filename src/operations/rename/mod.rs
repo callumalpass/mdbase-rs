@@ -52,6 +52,14 @@ impl Collection {
                 return error;
             }
         }
+        let _write_lock = if dry_run {
+            None
+        } else {
+            match crate::transactions::WriteLock::acquire(self) {
+                Ok(write_lock) => Some(write_lock),
+                Err(error) => return op_error(error.code(), &error.to_string()),
+            }
+        };
 
         let from_path = self.root.join(&from);
         let to_path = self.root.join(&to);

@@ -19,6 +19,7 @@ pub mod query;
 pub mod runtime;
 pub mod runtime_contracts;
 pub(crate) mod snapshot;
+pub(crate) mod transactions;
 pub mod types;
 pub mod v03;
 pub mod validation;
@@ -291,14 +292,26 @@ impl Collection {
             Self::validate_computed_fields(type_def)?;
         }
 
-        Ok(Collection {
+        let collection = Collection {
             root: root.to_path_buf(),
             spec_profile,
             settings,
             config_extensions,
             types,
             type_warnings,
-        })
+        };
+        if collection.spec_profile == SpecProfile::V03 {
+            crate::transactions::recover_pending(&collection).map_err(|error| {
+                serde_json::json!({
+                    "valid": false,
+                    "error": {
+                        "code": error.code(),
+                        "message": error.to_string(),
+                    }
+                })
+            })?;
+        }
+        Ok(collection)
     }
 
     /// Validate computed field constraints (§5.12).
