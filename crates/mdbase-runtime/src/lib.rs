@@ -4,6 +4,7 @@
 //! admission, workflow planning, durable runs, action dispatch, recovery, and
 //! one-shot timers. Embedding hosts remain the final authorization boundary.
 
+mod activity;
 mod clock;
 mod engine;
 mod error;
@@ -19,6 +20,7 @@ mod timer;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
+pub use activity::{watch_event_envelope, StatusTransitionActivity};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use engine::{DeliveryOutcome, Runtime, RuntimeBuilder, RuntimeConfig, WorkerOutcome};
 pub use error::{RuntimeError, RuntimeResult};
