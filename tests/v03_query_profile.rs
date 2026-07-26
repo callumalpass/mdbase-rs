@@ -175,7 +175,7 @@ fn ordering_pagination_frontmatter_and_body_modes_are_deterministic() {
             "order_by": [{"field": "estimate", "direction": "desc"}],
             "offset": 1,
             "limit": 1,
-            "frontmatter": "both",
+            "frontmatter_mode": "both",
             "include_body": true
         }),
     );
@@ -184,8 +184,11 @@ fn ordering_pagination_frontmatter_and_body_modes_are_deterministic() {
     assert_eq!(result.result["meta"]["total_count"], 2);
     assert!(!result.result["meta"]["has_more"].as_bool().unwrap());
     assert_eq!(result.result["results"][0]["file"]["path"], "tasks/a.md");
-    assert_eq!(result.result["results"][0]["frontmatter"]["status"], "open");
-    assert!(result.result["results"][0]["raw_frontmatter"]
+    assert_eq!(
+        result.result["results"][0]["effective_frontmatter"]["status"],
+        "open"
+    );
+    assert!(result.result["results"][0]["frontmatter"]
         .get("status")
         .is_none());
     assert!(result.result["results"][0]["body"]
@@ -387,7 +390,7 @@ fn corrupt_cache_rows_fall_back_to_authoritative_markdown() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|record| record["frontmatter"]["title"] == "A"
+        .any(|record| record["effective_frontmatter"]["title"] == "A"
             && record["file"]["path"] == "tasks/a.md"));
 }
 

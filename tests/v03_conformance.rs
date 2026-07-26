@@ -118,13 +118,7 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
             }
             result
         }
-        "read" => {
-            let mut result = flatten_envelope(operations.read(&input));
-            if input.get("effective") == Some(&Value::Bool(false)) {
-                result["frontmatter"] = result["raw_frontmatter"].clone();
-            }
-            result
-        }
+        "read" => flatten_envelope(operations.read(&input)),
         "query" => {
             let mut result = flatten_envelope(operations.query(&input));
             let body_returned = result
@@ -216,7 +210,7 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
             let before = operations.read(&serde_json::json!({"path": path}));
             let before = before
                 .result
-                .get("raw_frontmatter")
+                .get("frontmatter")
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();

@@ -267,10 +267,10 @@ fn opens_v03_and_keeps_read_defaults_out_of_required_validation() {
 
     let read = collection.read(&serde_json::json!({ "path": "tasks/valid.md" }));
     assert_eq!(
-        read.pointer("/frontmatter/status"),
+        read.pointer("/effective_frontmatter/status"),
         Some(&serde_json::json!("open"))
     );
-    assert_eq!(read.pointer("/raw_frontmatter/status"), None);
+    assert_eq!(read.pointer("/frontmatter/status"), None);
 
     let validation = collection.validate_op(&serde_json::json!({
         "path": "tasks/missing-title.md"
@@ -442,14 +442,14 @@ fn v03_operation_facade_returns_canonical_envelopes_and_revisions() {
     assert!(read.valid, "{:#?}", read.diagnostics);
     assert!(read.diagnostics.is_empty());
     assert_eq!(
-        read.result.pointer("/frontmatter/status"),
+        read.result.pointer("/effective_frontmatter/status"),
         Some(&serde_json::json!("open"))
     );
     assert_eq!(
         read.result.pointer("/frontmatter/title"),
         Some(&serde_json::json!("Valid"))
     );
-    assert_eq!(read.result.pointer("/raw_frontmatter/status"), None);
+    assert_eq!(read.result.pointer("/frontmatter/status"), None);
     assert!(read
         .result
         .get("revision")

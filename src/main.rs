@@ -4,9 +4,9 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use mdbase::api::{
-    BatchRequest, CollectionPath, CreateRequest, DeleteRequest, MdbaseError, MdbaseResult,
-    OperationOutcome, QueryDirection, QueryRequest, ReadRequest, RenameRequest, Revision,
-    UpdateRequest, V02MigrationRequest,
+    BatchOperation, BatchRequest, CollectionPath, CreateRequest, DeleteRequest, MdbaseError,
+    MdbaseResult, OperationOutcome, QueryDirection, QueryRequest, ReadRequest, RenameRequest,
+    Revision, UpdateRequest, V02MigrationRequest,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -377,7 +377,7 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             dry_run,
         } => {
             let fields_value = parse_fields_or_stdin(fields.as_deref());
-            let result = collection.typed().and_then(|api| {
+            let request: MdbaseResult<CreateRequest> = (|| {
                 let mut request = match path {
                     Some(path) => CreateRequest::new(CollectionPath::new(path)?, fields_value),
                     None => CreateRequest::derived(fields_value),
@@ -386,10 +386,17 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
                     request = request.with_type(file_type);
                 }
                 request.if_revision = parse_optional_revision(if_revision)?;
-                request.dry_run = dry_run;
-                api.create(request)
-            });
-            typed_result(result)
+                Ok(request)
+            })();
+            if dry_run {
+                typed_result(request.and_then(|request| {
+                    let mut batch = BatchRequest::new(vec![BatchOperation::Create(request)])?;
+                    batch.dry_run = true;
+                    collection.typed()?.batch(batch)
+                }))
+            } else {
+                typed_result(request.and_then(|request| collection.typed()?.create(request)))
+            }
         }
 
         Command::Update {
@@ -399,13 +406,20 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             dry_run,
         } => {
             let fields_value = parse_fields_or_stdin(fields.as_deref());
-            let result = collection.typed().and_then(|api| {
+            let request: MdbaseResult<UpdateRequest> = (|| {
                 let mut request = UpdateRequest::new(CollectionPath::new(path)?, fields_value);
                 request.if_revision = parse_optional_revision(if_revision)?;
-                request.dry_run = dry_run;
-                api.update(request)
-            });
-            typed_result(result)
+                Ok(request)
+            })();
+            if dry_run {
+                typed_result(request.and_then(|request| {
+                    let mut batch = BatchRequest::new(vec![BatchOperation::Update(request)])?;
+                    batch.dry_run = true;
+                    collection.typed()?.batch(batch)
+                }))
+            } else {
+                typed_result(request.and_then(|request| collection.typed()?.update(request)))
+            }
         }
 
         Command::Delete {
@@ -414,14 +428,19 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             if_revision,
             dry_run,
         } => {
-            let result = collection.typed().and_then(|api| {
+            let request: MdbaseResult<DeleteRequest> = (|| {
                 let mut request = DeleteRequest::new(CollectionPath::new(path)?);
                 request.check_backlinks = check_backlinks;
                 request.if_revision = parse_optional_revision(if_revision)?;
-                request.dry_run = dry_run;
-                api.delete(request)
-            });
-            typed_result(result)
+                Ok(request)
+            })();
+            if dry_run {
+                typed_result(
+                    request.and_then(|request| collection.typed()?.preflight_delete(request)),
+                )
+            } else {
+                typed_result(request.and_then(|request| collection.typed()?.delete(request)))
+            }
         }
 
         Command::Rename {
@@ -432,15 +451,20 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             if_revision,
             dry_run,
         } => {
-            let result = collection.typed().and_then(|api| {
+            let request: MdbaseResult<RenameRequest> = (|| {
                 let mut request =
                     RenameRequest::new(CollectionPath::new(from)?, CollectionPath::new(to)?);
                 request.update_refs = update_refs || !no_update_refs;
                 request.if_revision = parse_optional_revision(if_revision)?;
-                request.dry_run = dry_run;
-                api.rename(request)
-            });
-            typed_result(result)
+                Ok(request)
+            })();
+            if dry_run {
+                typed_result(
+                    request.and_then(|request| collection.typed()?.preflight_rename(request)),
+                )
+            } else {
+                typed_result(request.and_then(|request| collection.typed()?.rename(request)))
+            }
         }
 
         Command::Query {

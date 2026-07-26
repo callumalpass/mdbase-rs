@@ -48,7 +48,7 @@ impl Collection {
 
         // Get frontmatter as JSON
         let mut warnings: Vec<serde_json::Value> = Vec::new();
-        let raw_frontmatter = match &doc.frontmatter {
+        let persisted_frontmatter = match &doc.frontmatter {
             Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
             Some(serde_yaml::Value::Null) => {
                 let validation_level = &self.settings.default_validation;
@@ -79,10 +79,10 @@ impl Collection {
         };
 
         // Determine types (using path for match rule evaluation)
-        let type_names = self.determine_types_for_path(&raw_frontmatter, Some(&input.path));
+        let type_names = self.determine_types_for_path(&persisted_frontmatter, Some(&input.path));
 
         // Apply defaults for effective frontmatter
-        let effective = self.apply_defaults(&raw_frontmatter, &type_names);
+        let effective = self.apply_defaults(&persisted_frontmatter, &type_names);
 
         // Apply type coercion (§7.16)
         let effective = self.coerce_types(&effective, &type_names);
@@ -124,7 +124,7 @@ impl Collection {
         } else {
             self.validate(
                 if self.spec_profile == crate::SpecProfile::V03 {
-                    &raw_frontmatter
+                    &persisted_frontmatter
                 } else {
                     &effective
                 },
@@ -146,8 +146,8 @@ impl Collection {
             "path": input.path,
             "revision": crate::v03::revision(content.as_bytes()),
             "types": type_names,
-            "frontmatter": effective,
-            "raw_frontmatter": raw_frontmatter,
+            "frontmatter": persisted_frontmatter,
+            "effective_frontmatter": effective,
             "body": doc.body,
             "file": {
                 "name": file_name,

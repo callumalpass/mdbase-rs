@@ -7,9 +7,10 @@ mod typed;
 
 pub use collection_path::{CollectionPath, CollectionPathError};
 pub use typed::{
-    BatchItemResult, BatchOperation, BatchRequest, BatchResult, CreateRequest, DeleteRequest,
-    DeleteResult, Diagnostic, DiagnosticCode, FrontmatterMode, MdbaseError, MdbaseResult,
-    MutationResult, OperationOutcome, QueryDirection, QueryOrder, QueryRequest, QueryResult,
-    ReadRequest, ReadResult, RecordFile, RenameRequest, RenameResult, Revision, Severity,
-    TypedCollection, UpdateRequest, V02MigrationChange, V02MigrationRequest, V02MigrationResult,
+    BatchItemResult, BatchOperation, BatchRequest, BatchResult, CreateRequest,
+    DeletePreflightResult, DeleteRequest, DeleteResult, Diagnostic, DiagnosticCode,
+    FrontmatterMode, MdbaseError, MdbaseResult, OperationOutcome, QueryDirection, QueryOrder,
+    QueryRequest, QueryResult, ReadRequest, RecordDocument, RecordFile, RenamePreflightResult,
+    RenameRequest, RenameResult, Revision, Severity, TypedCollection, UpdateRequest,
+    V02MigrationChange, V02MigrationRequest, V02MigrationResult,
 };

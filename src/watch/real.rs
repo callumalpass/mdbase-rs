@@ -763,12 +763,12 @@ fn load_record(collection: &Collection, path: &str) -> Result<Option<RecordState
         None => return Err(WatchError::Collection(collection_error(&read))),
     };
     let raw_frontmatter = read
-        .get("raw_frontmatter")
+        .get("frontmatter")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
     let effective_frontmatter = read
-        .get("frontmatter")
+        .get("effective_frontmatter")
         .cloned()
         .unwrap_or_else(|| Value::Object(raw_frontmatter.clone()));
     let types = read.get("types").cloned().unwrap_or_else(|| json!([]));

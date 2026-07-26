@@ -69,8 +69,8 @@ fields:
 
     let collection = Collection::open(root.path()).unwrap();
     let read = collection.read(&serde_json::json!({"path": "record.md"}));
-    assert_eq!(read["frontmatter"]["identity"], "id");
-    assert_eq!(read["frontmatter"]["id"], "identity");
-    assert_eq!(read["frontmatter"]["first"], "HELLO");
-    assert_eq!(read["frontmatter"]["second"], "HELLO-SECOND");
+    assert_eq!(read["effective_frontmatter"]["identity"], "id");
+    assert_eq!(read["effective_frontmatter"]["id"], "identity");
+    assert_eq!(read["effective_frontmatter"]["first"], "HELLO");
+    assert_eq!(read["effective_frontmatter"]["second"], "HELLO-SECOND");
 }
