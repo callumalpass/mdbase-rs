@@ -257,6 +257,7 @@ fn preflight_workflow(
         workflow_id,
         &mut diagnostics,
     );
+    validate_workflow_expressions(entry, workflow_id, &mut diagnostics);
     resolve_requires(
         registry,
         workflow.get("requires"),
@@ -383,6 +384,116 @@ fn preflight_workflow(
         .iter()
         .any(|diagnostic| diagnostic.severity == "error");
     (resolution, diagnostics)
+}
+
+fn validate_workflow_expressions(
+    entry: &ContractEntry,
+    workflow_id: &str,
+    diagnostics: &mut Vec<RuntimeDiagnostic>,
+) {
+    let workflow = &entry.contract;
+    for (path, value) in [
+        ("/vars", workflow.get("vars")),
+        ("/if", workflow.get("if")),
+        (
+            "/run/idempotency/key",
+            workflow.pointer("/run/idempotency/key"),
+        ),
+        (
+            "/run/concurrency/group",
+            workflow.pointer("/run/concurrency/group"),
+        ),
+    ] {
+        if let Some(value) = value {
+            validate_expression_value(entry, workflow_id, value, path, diagnostics);
+        }
+    }
+    for (index, trigger) in array(workflow.get("triggers")).enumerate() {
+        if let Some(value) = trigger.get("if") {
+            validate_expression_value(
+                entry,
+                workflow_id,
+                value,
+                &format!("/triggers/{index}/if"),
+                diagnostics,
+            );
+        }
+    }
+    for (index, step) in array(workflow.get("steps")).enumerate() {
+        for (suffix, value) in [
+            ("/if", step.get("if")),
+            ("/input", step.get("input")),
+            ("/for_each/items", step.pointer("/for_each/items")),
+        ] {
+            if let Some(value) = value {
+                validate_expression_value(
+                    entry,
+                    workflow_id,
+                    value,
+                    &format!("/steps/{index}{suffix}"),
+                    diagnostics,
+                );
+            }
+        }
+    }
+}
+
+fn validate_expression_value(
+    entry: &ContractEntry,
+    workflow_id: &str,
+    value: &Value,
+    path: &str,
+    diagnostics: &mut Vec<RuntimeDiagnostic>,
+) {
+    match value {
+        Value::Object(object) if object.len() == 1 && object.contains_key("$expr") => {
+            let Some(source) = object.get("$expr").and_then(Value::as_str) else {
+                return;
+            };
+            if let Err(error) = crate::v03::validate_runtime_expression(source) {
+                let expression_path = format!("{path}/$expr");
+                let source_path = entry
+                    .origins
+                    .first()
+                    .map(|origin| format!("{}#{expression_path}", origin.location))
+                    .unwrap_or_else(|| expression_path.clone());
+                diagnostics.push(
+                    RuntimeDiagnostic::error(
+                        error.code,
+                        format!(
+                            "Workflow {workflow_id} expression at {expression_path} failed to compile: {}",
+                            error.message
+                        ),
+                    )
+                    .for_id(workflow_id)
+                    .at_path(source_path),
+                );
+            }
+        }
+        Value::Object(object) => {
+            for (key, nested) in object {
+                validate_expression_value(
+                    entry,
+                    workflow_id,
+                    nested,
+                    &format!("{path}/{}", escape_pointer(key)),
+                    diagnostics,
+                );
+            }
+        }
+        Value::Array(values) => {
+            for (index, nested) in values.iter().enumerate() {
+                validate_expression_value(
+                    entry,
+                    workflow_id,
+                    nested,
+                    &format!("{path}/{index}"),
+                    diagnostics,
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 fn validate_provider_listings(registry: &RuntimeRegistry) -> Vec<RuntimeDiagnostic> {

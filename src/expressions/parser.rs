@@ -23,6 +23,7 @@ enum Token {
     Gt,
     Lte,
     Gte,
+    In,
     And,
     Or,
     Not,
@@ -283,6 +284,7 @@ impl Lexer {
                         "true" => tokens.push(Token::Bool(true)),
                         "false" => tokens.push(Token::Bool(false)),
                         "null" => tokens.push(Token::Null),
+                        "in" => tokens.push(Token::In),
                         _ => tokens.push(Token::Ident(ident)),
                     }
                 }
@@ -392,7 +394,7 @@ impl Parser {
     // || (logical or)
     // && (logical and)
     // ==, != (equality)
-    // <, >, <=, >= (comparison)
+    // <, >, <=, >=, in (comparison)
     // +, - (additive)
     // *, /, % (multiplicative)
     // !, - (unary)
@@ -469,6 +471,7 @@ impl Parser {
                 Token::Gt => BinOp::Gt,
                 Token::Lte => BinOp::Lte,
                 Token::Gte => BinOp::Gte,
+                Token::In => BinOp::In,
                 _ => break,
             };
             self.advance();

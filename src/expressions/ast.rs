@@ -41,6 +41,7 @@ pub enum BinOp {
     Gt,
     Lte,
     Gte,
+    In,
     And,
     Or,
 }

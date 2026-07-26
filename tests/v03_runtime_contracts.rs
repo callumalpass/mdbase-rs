@@ -356,6 +356,60 @@ fn workflow_preflight_reports_references_versions_duplicates_policy_and_executor
 }
 
 #[test]
+fn workflow_preflight_compiles_trigger_and_nested_input_expressions() {
+    let runtime = RuntimeContracts::new().unwrap();
+    let documents = vec![
+        provider("timer", "1.4.0", &["timer.fired"], &["task.patch"]),
+        event("timer.fired", "timer"),
+        action("task.patch", "timer", &[]),
+        json!({
+            "type": "workflow",
+            "id": "invalid.expressions",
+            "version": 1,
+            "name": "Invalid expressions",
+            "enabled": true,
+            "triggers": [{
+                "id": "tick",
+                "event": "timer.fired",
+                "if": {"$expr": "event.payload.types in"}
+            }],
+            "steps": [{
+                "id": "patch",
+                "action": "task.patch",
+                "input": {
+                    "nested": [{"$expr": "event.payload =="}]
+                }
+            }]
+        }),
+    ]
+    .into_iter()
+    .map(ContractDocument::virtual_contract)
+    .collect();
+    let registry = runtime.compose(
+        vec![ContractSource::collection(documents)],
+        &ComposeOptions::default(),
+    );
+
+    let report = runtime.preflight(&registry);
+    let expression_diagnostics = report
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "expression_compile_error")
+        .collect::<Vec<_>>();
+
+    assert!(!report.valid);
+    assert_eq!(expression_diagnostics.len(), 2);
+    assert!(expression_diagnostics.iter().any(|diagnostic| diagnostic
+        .path
+        .as_deref()
+        .is_some_and(|path| path.ends_with("#/triggers/0/if/$expr"))));
+    assert!(expression_diagnostics.iter().any(|diagnostic| diagnostic
+        .path
+        .as_deref()
+        .is_some_and(|path| path.ends_with("#/steps/0/input/nested/0/$expr"))));
+}
+
+#[test]
 fn dispatch_preflight_never_substitutes_for_host_authorization() {
     let runtime = RuntimeContracts::new().unwrap();
     let documents = vec![
