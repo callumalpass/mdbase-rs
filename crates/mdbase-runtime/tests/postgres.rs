@@ -68,6 +68,11 @@ fn prepared_run_event(id: &str, run: PlannedRun) -> PreparedEvent {
 #[tokio::test]
 async fn postgres_store_preserves_dedupe_retention_timers_and_namespace_fencing() {
     let Ok(database_url) = std::env::var("MDBASE_RUNTIME_TEST_DATABASE_URL") else {
+        assert_ne!(
+            std::env::var("MDBASE_RUNTIME_REQUIRE_POSTGRES").as_deref(),
+            Ok("1"),
+            "live PostgreSQL is required but MDBASE_RUNTIME_TEST_DATABASE_URL is missing"
+        );
         eprintln!("skipping live PostgreSQL runtime test: no database URL configured");
         return;
     };

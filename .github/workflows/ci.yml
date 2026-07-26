@@ -7,34 +7,94 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  MDBASE_SPEC_REVISION: 2c5e1bbc8736d71b95fcaea1b593dc2eeaec739b
+
 jobs:
-  check:
-    name: Rust (${{ matrix.os }})
+  quality:
+    name: Format, lint, docs, and features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked -p mdbase-runtime --no-default-features
+      - run: cargo test --locked -p mdbase-runtime --no-default-features --features sqlite
+      - run: cargo check --locked -p mdbase-runtime --no-default-features --features postgres
+      - run: cargo doc --locked --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Checkout mdbase spec
+      - uses: actions/checkout@v4
+      - name: Checkout pinned mdbase spec
         uses: actions/checkout@v4
         with:
-          repository: callumalpass/mdbase-spec
+          repository: mdbase-dev/mdbase-spec
+          ref: ${{ env.MDBASE_SPEC_REVISION }}
           path: mdbase-spec
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Lint
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --all-targets --all-features
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --workspace --all-features
         env:
           MDBASE_SPEC_REPO_DIR: ${{ github.workspace }}/mdbase-spec
           MDBASE_SPEC_TESTS_DIR: ${{ github.workspace }}/mdbase-spec/tests
-      - name: Verify crate package
-        run: cargo package
+
+  postgres:
+    name: Live PostgreSQL 17
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: mdbase-test
+          POSTGRES_DB: mdbase_runtime_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d mdbase_runtime_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Run mandatory PostgreSQL contracts
+        run: cargo test --locked -p mdbase-runtime --all-features --test postgres --test store_contract
+        env:
+          MDBASE_RUNTIME_REQUIRE_POSTGRES: "1"
+          MDBASE_RUNTIME_TEST_DATABASE_URL: postgres://postgres:mdbase-test@127.0.0.1:5432/mdbase_runtime_test
+
+  package:
+    name: Package publishable crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo package --locked --workspace
+
+  dependencies:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

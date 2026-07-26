@@ -23,23 +23,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+const EXPECTED_TEST_FILES: usize = 78;
+const EXPECTED_TEST_CASES: usize = 1_794;
+
 /// Path to the spec's test files.
 fn spec_tests_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("MDBASE_SPEC_TESTS_DIR") {
         return PathBuf::from(path);
     }
 
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .or_else(|| {
-            let drive = std::env::var_os("HOMEDRIVE")?;
-            let path = std::env::var_os("HOMEPATH")?;
-            let mut home = PathBuf::from(drive);
-            home.push(path);
-            Some(home.into_os_string())
-        })
-        .expect("home directory not set; provide MDBASE_SPEC_TESTS_DIR");
-    PathBuf::from(home).join("projects/mdbase-spec/tests")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../mdbase-spec/tests")
 }
 
 // ---------------------------------------------------------------------------
@@ -354,14 +347,19 @@ fn discover_tests() -> Vec<(PathBuf, TestFile)> {
     let tests_dir = spec_tests_dir();
     let mut test_files = Vec::new();
 
-    if !tests_dir.exists() {
-        return test_files;
-    }
+    assert!(
+        tests_dir.is_dir(),
+        "pinned conformance fixtures are missing at '{}'; set MDBASE_SPEC_TESTS_DIR",
+        tests_dir.display()
+    );
 
     let mut level_dirs: Vec<_> = fs::read_dir(&tests_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| {
+            e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && e.file_name().to_string_lossy().starts_with("level-")
+        })
         .collect();
     level_dirs.sort_by_key(|e| e.file_name());
 
@@ -379,12 +377,9 @@ fn discover_tests() -> Vec<(PathBuf, TestFile)> {
 
         for file in files {
             let content = fs::read_to_string(file.path()).unwrap();
-            match serde_yaml::from_str::<TestFile>(&content) {
-                Ok(test_file) => test_files.push((file.path(), test_file)),
-                Err(err) => {
-                    eprintln!("Failed to parse {:?}: {}", file.path(), err);
-                }
-            }
+            let test_file = serde_yaml::from_str::<TestFile>(&content)
+                .unwrap_or_else(|error| panic!("failed to parse {:?}: {error}", file.path()));
+            test_files.push((file.path(), test_file));
         }
     }
 
@@ -399,13 +394,11 @@ fn discover_tests() -> Vec<(PathBuf, TestFile)> {
 fn conformance_tests() {
     let test_files = discover_tests();
 
-    if test_files.is_empty() {
-        println!(
-            "No test files found in {:?}. Run the test-writing Ralph Loop first.",
-            spec_tests_dir()
-        );
-        return;
-    }
+    assert_eq!(
+        test_files.len(),
+        EXPECTED_TEST_FILES,
+        "pinned historical conformance file count changed"
+    );
 
     let mut total = 0;
     let mut passed = 0;
@@ -873,6 +866,11 @@ fn conformance_tests() {
         }
     }
 
+    assert_eq!(
+        total, EXPECTED_TEST_CASES,
+        "pinned historical conformance case count changed"
+    );
+    assert_eq!(passed, total, "not every conformance case passed");
     assert_eq!(failed, 0, "{} conformance test(s) failed", failed);
 }
 

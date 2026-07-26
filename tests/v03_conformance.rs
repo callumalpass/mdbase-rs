@@ -398,33 +398,31 @@ fn is_subset(actual: &Value, expected: &Value) -> bool {
 
 #[test]
 fn shared_v03_core_collection_fixture_passes() {
-    run_suite("core/core-collection.yaml", "core_collection");
+    run_suite("core/core-collection.yaml", "core_collection", 23);
 }
 
 #[test]
 fn shared_v03_lifecycle_fixture_passes() {
-    run_suite("lifecycle/lifecycle.yaml", "lifecycle");
+    run_suite("lifecycle/lifecycle.yaml", "lifecycle", 7);
 }
 
 #[test]
 fn shared_v03_cel_fixture_passes() {
-    run_suite("cel/cel-profile.yaml", "cel");
+    run_suite("cel/cel-profile.yaml", "cel", 13);
 }
 
 #[test]
 fn shared_v03_saved_views_fixture_passes() {
-    run_suite("views/view-records.yaml", "views");
+    run_suite("views/view-records.yaml", "views", 17);
 }
 
-fn run_suite(relative_path: &str, fixture_set: &str) {
+fn run_suite(relative_path: &str, fixture_set: &str, expected_cases: usize) {
     let path = fixture_path(relative_path);
-    if !path.exists() && std::env::var_os("MDBASE_REQUIRE_V03_CONFORMANCE").is_none() {
-        return;
-    }
     let fixture = fs::read_to_string(path).expect("read shared v0.3 fixture");
     let suite: Suite = serde_yaml::from_str(&fixture).expect("parse shared v0.3 fixture");
     assert_eq!(suite.fixture_set, fixture_set);
 
+    let mut executed = 0;
     for group in suite.groups {
         for case in group.tests {
             let directory = materialize(&group.setup);
@@ -433,6 +431,11 @@ fn run_suite(relative_path: &str, fixture_set: &str) {
             let expected = yaml_to_json(&case.expect);
             let actual = execute(&collection, &group.setup, &case, &expected);
             assert_expectation(&actual, &expected, &case.name);
+            executed += 1;
         }
     }
+    assert_eq!(
+        executed, expected_cases,
+        "pinned v0.3 fixture case count changed for {fixture_set}"
+    );
 }

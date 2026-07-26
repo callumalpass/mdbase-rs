@@ -287,6 +287,11 @@ async fn sqlite_store_satisfies_the_shared_contract() {
 #[tokio::test]
 async fn postgres_store_satisfies_the_shared_contract() {
     let Ok(database_url) = std::env::var("MDBASE_RUNTIME_TEST_DATABASE_URL") else {
+        assert_ne!(
+            std::env::var("MDBASE_RUNTIME_REQUIRE_POSTGRES").as_deref(),
+            Ok("1"),
+            "shared PostgreSQL contract is required but its database URL is missing"
+        );
         eprintln!("skipping shared PostgreSQL contract: no database URL configured");
         return;
     };

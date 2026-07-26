@@ -82,10 +82,7 @@ fn shared_runtime_contract_fixture_passes_every_pure_operation() {
         execution_cases, 1,
         "fixture dispatch case should remain explicit"
     );
-    assert!(
-        executed >= 15,
-        "unexpectedly few pure fixture cases: {executed}"
-    );
+    assert_eq!(executed, 19, "pinned pure runtime fixture count changed");
 }
 
 fn execute(
