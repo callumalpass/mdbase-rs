@@ -18,6 +18,7 @@ pub mod operations;
 pub mod query;
 pub mod runtime;
 pub mod runtime_contracts;
+pub(crate) mod snapshot;
 pub mod types;
 pub mod v03;
 pub mod validation;
@@ -399,29 +400,50 @@ impl Collection {
         }
     }
 
-    /// Scan all markdown files in the collection.
-    pub(crate) fn scan_collection_files(&self) -> Vec<PathBuf> {
+    /// Scan all Markdown files in the collection.
+    ///
+    /// Discovery failures are explicit so callers cannot confuse an
+    /// incomplete collection with an empty or smaller one.
+    pub(crate) fn scan_collection_files_checked(
+        &self,
+    ) -> Result<Vec<PathBuf>, crate::snapshot::CollectionScanError> {
         let mut files = Vec::new();
-        self.scan_dir_recursive(&self.root, &mut files);
-        files
+        self.scan_dir_recursive_checked(&self.root, &mut files)?;
+        files.sort();
+        Ok(files)
     }
 
-    fn scan_dir_recursive(&self, dir: &Path, files: &mut Vec<PathBuf>) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
+    /// Transitional wrapper for legacy operations that have not yet adopted
+    /// the typed snapshot boundary.
+    pub(crate) fn scan_collection_files(&self) -> Vec<PathBuf> {
+        self.scan_collection_files_checked().unwrap_or_default()
+    }
 
+    fn scan_dir_recursive_checked(
+        &self,
+        dir: &Path,
+        files: &mut Vec<PathBuf>,
+    ) -> Result<(), crate::snapshot::CollectionScanError> {
+        use crate::snapshot::CollectionScanError;
+
+        let entries =
+            std::fs::read_dir(dir).map_err(|source| CollectionScanError::ReadDirectory {
+                path: dir.to_path_buf(),
+                source,
+            })?;
         for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            let entry = entry.map_err(|source| CollectionScanError::ReadEntry {
+                directory: dir.to_path_buf(),
+                source,
+            })?;
             let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
+            let file_type =
+                entry
+                    .file_type()
+                    .map_err(|source| CollectionScanError::InspectEntry {
+                        path: path.clone(),
+                        source,
+                    })?;
 
             // Never follow links while discovering collection resources. A
             // symlink below the authorized root can otherwise expose an
@@ -434,22 +456,25 @@ impl Collection {
                 if self.settings.include_subfolders {
                     let rel = path
                         .strip_prefix(&self.root)
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default();
+                        .map_err(|_| CollectionScanError::OutsideRoot { path: path.clone() })?
+                        .to_string_lossy()
+                        .to_string();
                     if !self.is_excluded(&rel) {
-                        self.scan_dir_recursive(&path, files);
+                        self.scan_dir_recursive_checked(&path, files)?;
                     }
                 }
             } else if file_type.is_file() {
                 let rel = path
                     .strip_prefix(&self.root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
+                    .map_err(|_| CollectionScanError::OutsideRoot { path: path.clone() })?
+                    .to_string_lossy()
+                    .to_string();
                 if !self.is_excluded(&rel) && self.is_valid_extension(&rel) {
                     files.push(path);
                 }
             }
         }
+        Ok(())
     }
 }
 

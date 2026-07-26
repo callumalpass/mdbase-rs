@@ -208,7 +208,7 @@ pub(crate) fn reindex_all(
     conn: &mut Connection,
     collection: &Collection,
 ) -> Result<(), CacheError> {
-    let files = collection.scan_collection_files();
+    let files = collection.scan_collection_files_checked()?;
     let transaction = conn.transaction()?;
     transaction.execute_batch(
         "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_values; DELETE FROM files; DELETE FROM meta;",

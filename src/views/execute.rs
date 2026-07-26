@@ -63,8 +63,15 @@ fn canonical_documents(
     collection: &Collection,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<ViewDocumentDescriptor> {
-    let ((records, _, _), _) = collection.load_query_data_profiled(false, false);
-    records
+    let snapshot = match collection.load_query_data_profiled(false, false) {
+        Ok((snapshot, _)) => snapshot,
+        Err(error) => {
+            diagnostics.push(snapshot_diagnostic(collection, &error));
+            return Vec::new();
+        }
+    };
+    snapshot
+        .records
         .iter()
         .filter(|record| {
             record.type_names.iter().any(|name| name == "view")
@@ -624,8 +631,18 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
         Err(error) => return failed("invalid_config", error, Some("mdbase.yaml".to_string())),
     };
     let include_backlinks = base_uses_backlinks(&document, view);
-    let ((records, _, backlinks), _) =
-        collection.load_query_data_profiled(false, include_backlinks);
+    let snapshot = match collection.load_query_data_profiled(false, include_backlinks) {
+        Ok((snapshot, _)) => snapshot,
+        Err(error) => {
+            return OperationResult {
+                valid: false,
+                result: json!({}),
+                diagnostics: vec![snapshot_diagnostic(collection, &error)],
+            }
+        }
+    };
+    let records = snapshot.records;
+    let backlinks = snapshot.backlinks;
     let all_files = Arc::new(records.iter().map(record_file).collect::<Vec<_>>());
     let link_resolutions = Arc::new(link_resolutions(&all_files));
     let formulas = Arc::new(document.formulas.clone());
@@ -756,6 +773,19 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
         result: json!({"results": results, "meta": meta}),
         diagnostics,
     }
+}
+
+fn snapshot_diagnostic(
+    collection: &Collection,
+    error: &crate::snapshot::SnapshotError,
+) -> Diagnostic {
+    let path = error.path().map(|path| {
+        path.strip_prefix(&collection.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    });
+    Diagnostic::error("collection_snapshot_failed", error.to_string(), path)
 }
 
 struct BaseRow<'a> {

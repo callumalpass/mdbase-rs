@@ -10,6 +10,7 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use crate::cache::{indexer, sqlite, staleness, CacheError};
 use crate::expressions::evaluator::ResolvedFileData;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
+use crate::snapshot::{CollectionSnapshot, SnapshotError};
 use crate::Collection;
 
 pub(crate) struct MetadataPage {
@@ -35,12 +36,6 @@ pub(crate) struct FileRecord {
     pub file_mtime_iso: Option<String>,
     pub file_ctime_iso: Option<String>,
 }
-
-type QueryData = (
-    Vec<FileRecord>,
-    Option<Arc<Vec<ResolvedFileData>>>,
-    Option<Arc<HashMap<String, Vec<String>>>>,
-);
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LoadQueryPerf {
@@ -118,7 +113,7 @@ impl Collection {
     /// what changed. Returns the full list of disk files (used for fallback and
     /// to know which paths exist).
     fn refresh_cache(&self, conn: &mut Connection) -> Result<Vec<PathBuf>, CacheError> {
-        let disk_files = self.scan_collection_files();
+        let disk_files = self.scan_collection_files_checked()?;
 
         let changes = staleness::find_changes(conn, &self.root, &disk_files)?;
 
@@ -388,19 +383,26 @@ impl Collection {
     }
 
     /// Load FileRecords by reading every file from disk (fallback path).
-    fn load_file_records_from_disk(&self, files: &[PathBuf]) -> Vec<FileRecord> {
+    fn load_file_records_from_disk(
+        &self,
+        files: &[PathBuf],
+    ) -> Result<Vec<FileRecord>, SnapshotError> {
         let mut records = Vec::new();
 
         for file_path in files {
-            let rel_path = match file_path.strip_prefix(&self.root) {
-                Ok(p) => p.to_string_lossy().replace('\\', "/"),
-                Err(_) => continue,
-            };
+            let rel_path = file_path
+                .strip_prefix(&self.root)
+                .map_err(|_| SnapshotError::OutsideRoot {
+                    path: file_path.clone(),
+                })?
+                .to_string_lossy()
+                .replace('\\', "/");
 
-            let content = match std::fs::read_to_string(file_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
+            let content =
+                std::fs::read_to_string(file_path).map_err(|source| SnapshotError::ReadFile {
+                    path: file_path.clone(),
+                    source,
+                })?;
 
             let doc = parse_document(&content);
             let raw_frontmatter = match &doc.frontmatter {
@@ -412,13 +414,24 @@ impl Collection {
             let effective = self.apply_defaults(&raw_frontmatter, &type_names);
             let effective = self.coerce_types(&effective, &type_names);
 
-            let metadata = std::fs::metadata(file_path).ok();
-            let file_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-            let file_mtime_iso = metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
-                let dt: chrono::DateTime<chrono::Utc> = t.into();
+            let metadata =
+                std::fs::metadata(file_path).map_err(|source| SnapshotError::InspectFile {
+                    path: file_path.clone(),
+                    source,
+                })?;
+            let file_size = metadata.len();
+            let modified =
+                metadata
+                    .modified()
+                    .map_err(|source| SnapshotError::ReadModifiedTime {
+                        path: file_path.clone(),
+                        source,
+                    })?;
+            let file_mtime_iso = Some({
+                let dt: chrono::DateTime<chrono::Utc> = modified.into();
                 dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
             });
-            let file_ctime_iso = metadata.as_ref().and_then(|m| m.created().ok()).map(|t| {
+            let file_ctime_iso = metadata.created().ok().map(|t| {
                 let dt: chrono::DateTime<chrono::Utc> = t.into();
                 dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
             });
@@ -435,22 +448,16 @@ impl Collection {
             });
         }
 
-        records
+        Ok(records)
     }
 
-    /// Load all query data: tries cache first, falls back to disk.
-    /// Returns (file_records, all_files_data arc, backlinks_index arc).
-    #[allow(dead_code)]
-    pub(crate) fn load_query_data(&self) -> QueryData {
-        self.load_query_data_profiled(false, true).0
-    }
-
-    /// Load query data with optional detailed timing.
+    /// Load one operation-scoped snapshot, using the derived cache only when it
+    /// can be refreshed and decoded completely.
     pub(crate) fn load_query_data_profiled(
         &self,
         profile: bool,
         include_link_graph: bool,
-    ) -> (QueryData, Option<LoadQueryPerf>) {
+    ) -> Result<(CollectionSnapshot, Option<LoadQueryPerf>), SnapshotError> {
         let total_start = Instant::now();
         let mut perf = LoadQueryPerf {
             built_link_graph: include_link_graph,
@@ -487,16 +494,18 @@ impl Collection {
             Err(_) => perf.cache_fallback = true,
         }
 
-        let file_records = cached_records.unwrap_or_else(|| {
+        let file_records = if let Some(records) = cached_records {
+            records
+        } else {
             let scan_start = Instant::now();
-            let files = self.scan_collection_files();
+            let files = self.scan_collection_files_checked()?;
             perf.scan_files_ms = elapsed_ms(scan_start);
 
             let load_start = Instant::now();
-            let records = self.load_file_records_from_disk(&files);
+            let records = self.load_file_records_from_disk(&files)?;
             perf.load_records_ms = elapsed_ms(load_start);
             records
-        });
+        };
 
         perf.file_records = file_records.len();
 
@@ -535,11 +544,15 @@ impl Collection {
 
         perf.total_ms = elapsed_ms(total_start);
 
-        let data = (file_records, all_files_arc, backlinks_arc);
+        let snapshot = CollectionSnapshot {
+            records: file_records,
+            all_files: all_files_arc,
+            backlinks: backlinks_arc,
+        };
         if profile {
-            (data, Some(perf))
+            Ok((snapshot, Some(perf)))
         } else {
-            (data, None)
+            Ok((snapshot, None))
         }
     }
 }
