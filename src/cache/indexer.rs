@@ -3,6 +3,7 @@
 use rusqlite::Connection;
 use std::path::Path;
 
+use crate::cache::CacheError;
 use crate::expressions::evaluator::{
     extract_embeds_from_body, extract_links_from_body, extract_links_from_fm_value,
 };
@@ -19,33 +20,25 @@ pub(crate) fn reindex_file(
     collection: &Collection,
     abs_path: &Path,
     rel_path: &str,
-) {
+) -> Result<(), CacheError> {
     // 1. Read file contents
-    let content = match std::fs::read_to_string(abs_path) {
-        Ok(c) => c,
-        Err(_) => return, // skip unreadable files
-    };
+    let content = std::fs::read_to_string(abs_path)?;
 
     // 2. Get filesystem metadata
-    let (mtime_ns, ctime_ns, size) = match std::fs::metadata(abs_path) {
-        Ok(meta) => {
-            use std::time::UNIX_EPOCH;
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0);
-            let ctime = meta
-                .created()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64);
-            let size = meta.len() as i64;
-            (mtime, ctime, size)
-        }
-        Err(_) => (0i64, None, 0i64),
-    };
+    let metadata = std::fs::metadata(abs_path)?;
+    use std::time::UNIX_EPOCH;
+    let mtime_ns = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos() as i64)
+        .unwrap_or(0);
+    let ctime_ns = metadata
+        .created()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i64);
+    let size = metadata.len() as i64;
 
     // 3. Parse document
     let doc = parse_document(&content);
@@ -77,62 +70,62 @@ pub(crate) fn reindex_file(
     let effective = collection.apply_defaults(&frontmatter_json, &type_names);
     let effective = collection.coerce_types(&effective, &type_names);
 
-    let fm_str = serde_json::to_string(&frontmatter_json).unwrap_or_else(|_| "{}".into());
-    let eff_str = serde_json::to_string(&effective).unwrap_or_else(|_| "null".into());
+    let fm_str = serde_json::to_string(&frontmatter_json)?;
+    let eff_str = serde_json::to_string(&effective)?;
 
     // 7. Delete old rows for this path (cascade would handle child tables if we
     //    had FK ON DELETE CASCADE, but our schema doesn't have it on all tables,
     //    so delete explicitly).
-    remove_file(conn, rel_path);
+    remove_file(conn, rel_path)?;
 
     // 8. Insert into `files`
-    let _ = conn.execute(
+    conn.execute(
         "INSERT INTO files (path, mtime_ns, ctime_ns, size, frontmatter_json, body, effective_json, parse_error) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![rel_path, mtime_ns, ctime_ns, size, fm_str, body, eff_str, parse_error],
-    );
+    )?;
 
     // 9. Insert into `file_types`
     for type_name in &type_names {
-        let _ = conn.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO file_types (path, type_name) VALUES (?1, ?2)",
             rusqlite::params![rel_path, type_name],
-        );
+        )?;
     }
 
     // 10. Extract and insert links
-    insert_links(conn, collection, rel_path, &effective, &body);
+    insert_links(conn, rel_path, &effective, &body)?;
 
     // 11. Insert unique values
-    insert_unique_values(conn, collection, rel_path, &effective, &type_names);
+    insert_unique_values(conn, collection, rel_path, &effective, &type_names)?;
+    Ok(())
 }
 
 /// Extract links from body and frontmatter and insert into the `links` table.
 fn insert_links(
     conn: &Connection,
-    _collection: &Collection,
     rel_path: &str,
     frontmatter: &serde_json::Value,
     body: &str,
-) {
+) -> Result<(), CacheError> {
     // Body links
     let body_links = extract_links_from_body(body);
     for raw in &body_links {
-        let _ = conn.execute(
+        conn.execute(
             "INSERT INTO links (source_path, target_path, location, field, raw_target) \
              VALUES (?1, ?2, ?3, NULL, ?4)",
             rusqlite::params![rel_path, raw, "body", raw],
-        );
+        )?;
     }
 
     // Body embeds
     let body_embeds = extract_embeds_from_body(body);
     for raw in &body_embeds {
-        let _ = conn.execute(
+        conn.execute(
             "INSERT INTO links (source_path, target_path, location, field, raw_target) \
              VALUES (?1, ?2, ?3, NULL, ?4)",
             rusqlite::params![rel_path, raw, "body", raw],
-        );
+        )?;
     }
 
     // Frontmatter links (iterate over each field)
@@ -141,14 +134,15 @@ fn insert_links(
             let mut targets = Vec::new();
             extract_links_from_fm_value(val, &mut targets);
             for raw in &targets {
-                let _ = conn.execute(
+                conn.execute(
                     "INSERT INTO links (source_path, target_path, location, field, raw_target) \
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     rusqlite::params![rel_path, raw, "frontmatter", field_name, raw],
-                );
+                )?;
             }
         }
     }
+    Ok(())
 }
 
 /// Insert unique field values into the `unique_values` table.
@@ -158,7 +152,7 @@ fn insert_unique_values(
     rel_path: &str,
     effective: &serde_json::Value,
     type_names: &[String],
-) {
+) -> Result<(), CacheError> {
     for type_name in type_names {
         if let Some(type_def) = collection.types.get(type_name) {
             for (field_name, field_def) in &type_def.fields {
@@ -172,61 +166,67 @@ fn insert_unique_values(
                             _ => serde_json::to_string(val).unwrap_or_default(),
                         };
                         if !val_str.is_empty() {
-                            let _ = conn.execute(
+                            conn.execute(
                                 "INSERT OR REPLACE INTO unique_values (type_name, field_name, value, path) \
                                  VALUES (?1, ?2, ?3, ?4)",
                                 rusqlite::params![type_name, field_name, val_str, rel_path],
-                            );
+                            )?;
                         }
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Remove a file (by relative path) from all cache tables.
 #[allow(dead_code)]
-pub(crate) fn remove_file(conn: &Connection, rel_path: &str) {
-    let _ = conn.execute(
+pub(crate) fn remove_file(conn: &Connection, rel_path: &str) -> Result<(), CacheError> {
+    conn.execute(
         "DELETE FROM links WHERE source_path = ?1",
         rusqlite::params![rel_path],
-    );
-    let _ = conn.execute(
+    )?;
+    conn.execute(
         "DELETE FROM file_types WHERE path = ?1",
         rusqlite::params![rel_path],
-    );
-    let _ = conn.execute(
+    )?;
+    conn.execute(
         "DELETE FROM unique_values WHERE path = ?1",
         rusqlite::params![rel_path],
-    );
-    let _ = conn.execute(
+    )?;
+    conn.execute(
         "DELETE FROM files WHERE path = ?1",
         rusqlite::params![rel_path],
-    );
+    )?;
+    Ok(())
 }
 
 /// Full rebuild: delete everything and reindex all files.
 #[allow(dead_code)]
-pub(crate) fn reindex_all(conn: &Connection, collection: &Collection) {
-    // Clear all tables
-    let _ = conn.execute_batch(
+pub(crate) fn reindex_all(
+    conn: &mut Connection,
+    collection: &Collection,
+) -> Result<(), CacheError> {
+    let files = collection.scan_collection_files_checked()?;
+    let transaction = conn.transaction()?;
+    transaction.execute_batch(
         "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_values; DELETE FROM files; DELETE FROM meta;",
-    );
-
-    // Scan collection files
-    let files = collection.scan_collection_files();
-
-    // Use a transaction for performance
-    let _ = conn.execute_batch("BEGIN TRANSACTION;");
+    )?;
 
     for abs_path in &files {
-        let rel_path = match abs_path.strip_prefix(&collection.root) {
-            Ok(p) => p.to_string_lossy().replace('\\', "/"),
-            Err(_) => continue,
-        };
-        reindex_file(conn, collection, abs_path, &rel_path);
+        let rel_path = abs_path
+            .strip_prefix(&collection.root)
+            .map_err(|_| CacheError::OutsideRoot(abs_path.display().to_string()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        reindex_file(&transaction, collection, abs_path, &rel_path)?;
     }
 
-    let _ = conn.execute_batch("COMMIT;");
+    transaction.execute(
+        "INSERT INTO meta (key, value) VALUES ('query_snapshot', ?1)",
+        [uuid::Uuid::new_v4().simple().to_string()],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }

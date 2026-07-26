@@ -5,9 +5,10 @@ use std::collections::{BTreeSet, HashMap};
 use serde_json::{json, Map, Value};
 
 use super::{
-    cel::{compile, enrich_record_bindings, evaluate_compiled, operation_clock},
+    cel::{enrich_record_bindings, evaluate_compiled, operation_clock},
     Diagnostic,
 };
+use crate::expressions::ast::Expr;
 use crate::expressions::evaluator::{EvalContext, EvaluationClock, NoteNamespaceSource};
 use crate::generated::slugify;
 use crate::Collection;
@@ -91,7 +92,26 @@ impl Collection {
 
             for (action_index, action) in actions.into_iter().enumerate() {
                 if let Some(source) = action.get("if").and_then(Value::as_str) {
-                    match evaluate_guard(source, &draft, old, &known_fields, path, event, &clock) {
+                    let Some(expression) = self
+                        .type_plans
+                        .get(type_name)
+                        .and_then(|plan| plan.lifecycle_guard(event.key(), action_index))
+                    else {
+                        return Err(vec![Diagnostic::error(
+                            "invalid_type_definition",
+                            format!("Compiled lifecycle guard is missing for type '{type_name}'."),
+                            Some(path.to_string()),
+                        )]);
+                    };
+                    match evaluate_guard_compiled(
+                        expression,
+                        &draft,
+                        old,
+                        &known_fields,
+                        path,
+                        event,
+                        &clock,
+                    ) {
                         Ok(true) => {}
                         Ok(false) => continue,
                         Err(message) => {
@@ -163,8 +183,8 @@ impl Collection {
     }
 }
 
-fn evaluate_guard(
-    source: &str,
+fn evaluate_guard_compiled(
+    expression: &Expr,
     draft: &Map<String, Value>,
     old: Option<&Map<String, Value>>,
     known_fields: &BTreeSet<String>,
@@ -172,8 +192,6 @@ fn evaluate_guard(
     event: LifecycleEvent,
     clock: &EvaluationClock,
 ) -> Result<bool, String> {
-    let expression = compile(source)
-        .map_err(|error| format!("Lifecycle guard did not compile: {}", error.message))?;
     let draft_value = Value::Object(draft.clone());
     let old_value = old.cloned().map(Value::Object).unwrap_or(Value::Null);
     let mut bindings = enrich_record_bindings(&draft_value, &draft_value, known_fields.iter())
@@ -192,7 +210,7 @@ fn evaluate_guard(
     context.note_namespace_source = NoteNamespaceSource::Effective;
     context.string_concat = false;
 
-    let result = evaluate_compiled(&expression, &context, clock)
+    let result = evaluate_compiled(expression, &context, clock)
         .map_err(|error| format!("Lifecycle guard evaluation failed: {}", error.message))?;
     Ok(result == Value::Bool(true))
 }
@@ -282,8 +300,12 @@ mod tests {
         let old = serde_json::from_value::<Map<String, Value>>(json!({"status": "open"})).unwrap();
         let known = BTreeSet::from(["status".to_string(), "missing".to_string()]);
         let clock = EvaluationClock::capture(Some("UTC")).unwrap();
-        assert!(evaluate_guard(
+        let expression = super::super::cel::compile(
             "note.status == 'done' && record.status == 'done' && !present.raw.missing && old.status == 'open' && operation.name == 'update'",
+        )
+        .unwrap();
+        assert!(evaluate_guard_compiled(
+            &expression,
             &draft,
             Some(&old),
             &known,

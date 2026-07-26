@@ -6,7 +6,7 @@ use mdbase::v03::QueryPerformance;
 use mdbase::Collection;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
@@ -159,6 +159,10 @@ struct Args {
     #[arg(long)]
     output: Option<PathBuf>,
 
+    /// JSON file containing release performance budgets
+    #[arg(long)]
+    thresholds: Option<PathBuf>,
+
     /// Print the full JSON report instead of the concise local table
     #[arg(long)]
     json: bool,
@@ -235,6 +239,21 @@ struct ProfileReport {
     config: ProfileConfig,
     fixture: FixtureSummary,
     operations: Vec<OperationSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PerformanceThresholds {
+    schema_version: u32,
+    scenario: String,
+    files: usize,
+    operations: BTreeMap<String, OperationThreshold>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationThreshold {
+    max_p95_ms: f64,
 }
 
 struct FixtureData {
@@ -405,7 +424,8 @@ fn run() -> Result<(), String> {
         operations,
     };
 
-    emit_report(&args, &report)
+    emit_report(&args, &report)?;
+    validate_thresholds(&args, &report)
 }
 
 fn run_existing_collection(args: &Args, root: &Path) -> Result<(), String> {
@@ -465,7 +485,8 @@ fn run_existing_collection(args: &Args, root: &Path) -> Result<(), String> {
         },
         operations,
     };
-    emit_report(args, &report)
+    emit_report(args, &report)?;
+    validate_thresholds(args, &report)
 }
 
 fn emit_report(args: &Args, report: &ProfileReport) -> Result<(), String> {
@@ -495,7 +516,79 @@ fn validate_args(args: &Args) -> Result<(), String> {
     if args.projects == 0 {
         return Err("--projects must be greater than 0".to_string());
     }
+    if args.collection.is_some() && args.thresholds.is_some() {
+        return Err(
+            "--thresholds is only supported for deterministic synthetic fixtures".to_string(),
+        );
+    }
     Ok(())
+}
+
+fn validate_thresholds(args: &Args, report: &ProfileReport) -> Result<(), String> {
+    let Some(path) = &args.thresholds else {
+        return Ok(());
+    };
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read thresholds at {}: {error}", path.display()))?;
+    let thresholds: PerformanceThresholds = serde_json::from_str(&content)
+        .map_err(|error| format!("Failed to parse thresholds at {}: {error}", path.display()))?;
+    if thresholds.schema_version != 1 {
+        return Err(format!(
+            "Unsupported performance threshold schema version {}",
+            thresholds.schema_version
+        ));
+    }
+    if thresholds.scenario != report.config.scenario {
+        return Err(format!(
+            "Threshold scenario '{}' does not match report scenario '{}'",
+            thresholds.scenario, report.config.scenario
+        ));
+    }
+    if thresholds.files != report.config.files {
+        return Err(format!(
+            "Threshold fixture size {} does not match report fixture size {}",
+            thresholds.files, report.config.files
+        ));
+    }
+    if thresholds.operations.is_empty() {
+        return Err("Performance threshold file contains no operations".to_string());
+    }
+
+    let summaries = report
+        .operations
+        .iter()
+        .map(|summary| (summary.name.as_str(), summary))
+        .collect::<BTreeMap<_, _>>();
+    let mut failures = Vec::new();
+    for (name, threshold) in &thresholds.operations {
+        if !threshold.max_p95_ms.is_finite() || threshold.max_p95_ms <= 0.0 {
+            return Err(format!(
+                "Performance threshold '{name}' must have a finite, positive max_p95_ms"
+            ));
+        }
+        let Some(summary) = summaries.get(name.as_str()) else {
+            failures.push(format!("{name}: operation was not executed"));
+            continue;
+        };
+        if summary.p95_ms > threshold.max_p95_ms {
+            failures.push(format!(
+                "{name}: p95 {:.3} ms exceeded {:.3} ms",
+                summary.p95_ms, threshold.max_p95_ms
+            ));
+        }
+    }
+    if failures.is_empty() {
+        println!(
+            "Performance budgets passed for {} operations.",
+            thresholds.operations.len()
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "Performance budget failure:\n- {}",
+            failures.join("\n- ")
+        ))
+    }
 }
 
 fn determine_fixture_root(args: &Args) -> PathBuf {
@@ -836,6 +929,14 @@ fn summarize_query_counters(profiles: &[QueryPerformance]) -> BTreeMap<String, f
                 / count,
         ),
         (
+            "cache_fallback",
+            profiles
+                .iter()
+                .filter(|profile| profile.cache_fallback)
+                .count() as f64
+                / count,
+        ),
+        (
             "snapshot_reused",
             profiles
                 .iter()
@@ -869,6 +970,7 @@ fn merge_query_performance(target: &mut QueryPerformance, value: QueryPerformanc
     target.candidates += value.candidates;
     target.results += value.results;
     target.cache_used |= value.cache_used;
+    target.cache_fallback |= value.cache_fallback;
     target.link_graph_built |= value.link_graph_built;
     target.snapshot_reused |= value.snapshot_reused;
 }

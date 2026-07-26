@@ -120,7 +120,7 @@ settings:
     );
 
     let collection = Collection::open(directory.path()).expect("open collection");
-    assert!(collection.settings.explicit_type_keys.is_empty());
+    assert!(collection.settings().explicit_type_keys.is_empty());
 }
 
 #[test]
@@ -153,7 +153,7 @@ fn init_defaults_to_a_minimal_v03_collection() {
     assert_eq!(
         Collection::open(directory.path())
             .expect("open initialized collection")
-            .spec_profile,
+            .spec_profile(),
         SpecProfile::V03
     );
 }
@@ -174,7 +174,7 @@ fn init_retains_explicit_v02_meta_type_generation() {
     assert_eq!(
         Collection::open(directory.path())
             .expect("open legacy collection")
-            .spec_profile,
+            .spec_profile(),
         SpecProfile::V02
     );
 }
@@ -263,7 +263,7 @@ fn opens_v03_and_keeps_read_defaults_out_of_required_validation() {
     );
 
     let collection = Collection::open(directory.path()).expect("open v0.3 collection");
-    assert_eq!(collection.spec_profile, SpecProfile::V03);
+    assert_eq!(collection.spec_profile(), SpecProfile::V03);
 
     let read = collection.read(&serde_json::json!({ "path": "tasks/valid.md" }));
     assert_eq!(
@@ -393,8 +393,8 @@ fn legacy_v02_collections_still_open() {
         "---\nname: task\nfields:\n  title:\n    type: string\n    required: true\n---\n",
     );
     let collection = Collection::open(directory.path()).expect("open v0.2 collection");
-    assert_eq!(collection.spec_profile, SpecProfile::V02);
-    assert!(collection.types.contains_key("task"));
+    assert_eq!(collection.spec_profile(), SpecProfile::V02);
+    assert!(collection.types().contains_key("task"));
     assert_eq!(
         collection
             .v03_operations()
@@ -424,7 +424,7 @@ fn alpha_v03_collections_still_open() {
             .is_some_and(|message| message.contains("compatible v0.3 prerelease")))));
 
     let collection = Collection::open(directory.path()).expect("open alpha v0.3 collection");
-    assert_eq!(collection.spec_profile, SpecProfile::V03);
+    assert_eq!(collection.spec_profile(), SpecProfile::V03);
 }
 
 #[test]

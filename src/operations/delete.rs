@@ -22,6 +22,14 @@ impl Collection {
         let path = input.path;
         let check_backlinks = input.check_backlinks;
         let dry_run = input.dry_run;
+        let _write_lock = if dry_run {
+            None
+        } else {
+            match crate::transactions::WriteLock::acquire(self) {
+                Ok(write_lock) => Some(write_lock),
+                Err(error) => return op_error(error.code(), &error.to_string()),
+            }
+        };
 
         let full_path = self.root.join(&path);
         if !full_path.exists() {

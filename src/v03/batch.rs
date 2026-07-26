@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -36,6 +37,35 @@ pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult
         if dry_run || !preview.valid {
             return batch_result(preview, true, dry_run);
         }
+        let desired = match collect_collection_files(&shadow.collection) {
+            Ok(desired) => desired,
+            Err(diagnostic) => return failed(vec![*diagnostic]),
+        };
+        let commit =
+            match crate::transactions::commit_shadow(collection, &shadow.baseline, &desired) {
+                Ok(commit) => commit,
+                Err(error) => {
+                    return failed(vec![Diagnostic::error(
+                        error.code(),
+                        error.to_string(),
+                        None,
+                    )])
+                }
+            };
+        let mut result = batch_result(preview, false, false);
+        if commit.cleanup_deferred {
+            result.diagnostics.push(Diagnostic {
+                severity: "warning".to_string(),
+                code: "transaction_cleanup_deferred".to_string(),
+                message: "The batch committed, but transaction cleanup was deferred.".to_string(),
+                path: None,
+                field: None,
+                type_name: None,
+                schema_location: None,
+                details: None,
+            });
+        }
+        return result;
     }
 
     let operations = match collection.v03_operations() {
@@ -52,6 +82,7 @@ pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult
 struct ShadowCollection {
     _directory: tempfile::TempDir,
     collection: Collection,
+    baseline: crate::transactions::FileBaseline,
 }
 
 fn shadow_collection(collection: &Collection) -> Result<ShadowCollection, Box<Diagnostic>> {
@@ -62,7 +93,7 @@ fn shadow_collection(collection: &Collection) -> Result<ShadowCollection, Box<Di
             None,
         ))
     })?;
-    copy_collection(collection, directory.path())?;
+    let baseline = copy_collection(collection, directory.path())?;
     let shadow = Collection::open(directory.path()).map_err(|error| {
         Box::new(Diagnostic::error(
             "batch_preflight_failed",
@@ -73,11 +104,16 @@ fn shadow_collection(collection: &Collection) -> Result<ShadowCollection, Box<Di
     Ok(ShadowCollection {
         _directory: directory,
         collection: shadow,
+        baseline,
     })
 }
 
-fn copy_collection(collection: &Collection, destination: &Path) -> Result<(), Box<Diagnostic>> {
+fn copy_collection(
+    collection: &Collection,
+    destination: &Path,
+) -> Result<crate::transactions::FileBaseline, Box<Diagnostic>> {
     let source = &collection.root;
+    let mut baseline = BTreeMap::new();
     for entry in WalkDir::new(source)
         .follow_links(false)
         .into_iter()
@@ -108,11 +144,46 @@ fn copy_collection(collection: &Collection, destination: &Path) -> Result<(), Bo
                 fs::create_dir_all(parent)
                     .map_err(|error| Box::new(copy_error(relative, error)))?;
             }
-            fs::copy(entry.path(), &target)
-                .map_err(|error| Box::new(copy_error(relative, error)))?;
+            let bytes =
+                fs::read(entry.path()).map_err(|error| Box::new(copy_error(relative, error)))?;
+            fs::write(&target, &bytes).map_err(|error| Box::new(copy_error(relative, error)))?;
+            baseline.insert(portable_path(relative), bytes);
         }
     }
-    Ok(())
+    Ok(baseline)
+}
+
+fn collect_collection_files(
+    collection: &Collection,
+) -> Result<crate::transactions::FileBaseline, Box<Diagnostic>> {
+    let mut files = BTreeMap::new();
+    let source = &collection.root;
+    for entry in WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| should_descend(collection, entry.path()))
+    {
+        let entry = entry.map_err(|error| {
+            Box::new(Diagnostic::error(
+                "batch_preflight_failed",
+                format!("Could not inspect preflight result: {error}"),
+                None,
+            ))
+        })?;
+        let relative = entry.path().strip_prefix(source).map_err(|error| {
+            Box::new(Diagnostic::error(
+                "batch_preflight_failed",
+                error.to_string(),
+                None,
+            ))
+        })?;
+        if entry.file_type().is_file() && should_copy_file(collection, relative) {
+            let bytes =
+                fs::read(entry.path()).map_err(|error| Box::new(copy_error(relative, error)))?;
+            files.insert(portable_path(relative), bytes);
+        }
+    }
+    Ok(files)
 }
 
 fn should_descend(collection: &Collection, path: &Path) -> bool {

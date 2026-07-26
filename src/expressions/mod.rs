@@ -5,19 +5,6 @@ pub mod compiler;
 pub mod evaluator;
 pub mod parser;
 
-use crate::expressions::parser::Parser as ExprParser;
-
-/// Check if an expression string references a given field name as an identifier.
-pub(crate) fn expression_references_field(expr_str: &str, field_name: &str) -> bool {
-    // Parse the expression and walk the AST looking for Ident nodes
-    if let Ok(expr) = ExprParser::parse(expr_str) {
-        expr_contains_ident(&expr, field_name)
-    } else {
-        // If parsing fails, do a simple string check as fallback
-        expr_str.contains(field_name)
-    }
-}
-
 /// Check if an expression AST contains a reference to the given identifier name.
 pub(crate) fn expr_contains_ident(expr: &crate::expressions::ast::Expr, name: &str) -> bool {
     use crate::expressions::ast::Expr;
@@ -54,8 +41,9 @@ pub(crate) fn is_truthy_value(val: &serde_json::Value) -> bool {
 }
 
 use crate::expressions::evaluator::{evaluate as eval_expr, EvalContext};
+use crate::types::compiled::CompiledComputed;
 use crate::Collection;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 impl Collection {
     /// Evaluate computed fields for a read result (§5.12).
@@ -66,17 +54,16 @@ impl Collection {
         path: &str,
         body: Option<&str>,
     ) -> serde_json::Value {
-        // Collect all computed fields from matched types
-        let mut computed: Vec<(String, String)> = Vec::new(); // (name, expression)
-        for type_name in type_names {
-            if let Some(type_def) = self.types.get(type_name) {
-                for (field_name, field_def) in &type_def.fields {
-                    if let Some(ref expr) = field_def.computed {
-                        // Don't add duplicates
-                        if !computed.iter().any(|(n, _)| n == field_name) {
-                            computed.push((field_name.clone(), expr.clone()));
-                        }
-                    }
+        let mut ordered_types = type_names.to_vec();
+        ordered_types.sort();
+        ordered_types.dedup();
+        let mut computed = BTreeMap::<String, CompiledComputed>::new();
+        for type_name in &ordered_types {
+            if let Some(plan) = self.type_plans.get(type_name) {
+                for (field_name, field) in &plan.computed {
+                    computed
+                        .entry(field_name.clone())
+                        .or_insert_with(|| field.clone());
                 }
             }
         }
@@ -85,49 +72,18 @@ impl Collection {
             return frontmatter;
         }
 
-        // Topological sort to determine evaluation order
-        let computed_names: std::collections::HashSet<&str> =
-            computed.iter().map(|(n, _)| n.as_str()).collect();
-        let mut deps: HashMap<&str, Vec<&str>> = HashMap::new();
-        for (name, expr) in &computed {
-            let mut field_deps = Vec::new();
-            for dep_name in &computed_names {
-                if *dep_name != name.as_str() && expression_references_field(expr, dep_name) {
-                    field_deps.push(*dep_name);
-                }
-            }
-            deps.insert(name.as_str(), field_deps);
-        }
-
-        // Topological sort
-        let mut order: Vec<&str> = Vec::new();
-        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
-
-        fn topo_visit<'a>(
-            node: &'a str,
-            deps: &HashMap<&'a str, Vec<&'a str>>,
-            visited: &mut std::collections::HashSet<&'a str>,
-            order: &mut Vec<&'a str>,
-        ) {
-            if visited.contains(node) {
-                return;
-            }
-            visited.insert(node);
-            if let Some(node_deps) = deps.get(node) {
-                for dep in node_deps {
-                    topo_visit(dep, deps, visited, order);
-                }
-            }
-            order.push(node);
-        }
-
-        for (name, _) in &computed {
-            topo_visit(name, &deps, &mut visited, &mut order);
-        }
+        let order = if ordered_types.len() == 1 {
+            self.type_plans
+                .get(&ordered_types[0])
+                .map(|plan| plan.computed_order.clone())
+                .unwrap_or_default()
+        } else {
+            combined_computed_order(&computed)
+        };
 
         // Evaluate computed fields in dependency order
         for field_name in order {
-            if let Some((_, expr)) = computed.iter().find(|(n, _)| n == field_name) {
+            if let Some(field) = computed.get(&field_name) {
                 let ctx = EvalContext {
                     frontmatter: frontmatter.clone(),
                     raw_frontmatter: None,
@@ -145,18 +101,15 @@ impl Collection {
                     note_namespace_source: Default::default(),
                     string_concat: true,
                 };
-                if let Ok(parsed) = ExprParser::parse(expr) {
-                    match eval_expr(&parsed, &ctx) {
-                        Ok(value) => {
-                            if let Some(obj) = frontmatter.as_object_mut() {
-                                obj.insert(field_name.to_string(), value);
-                            }
+                match eval_expr(&field.expression, &ctx) {
+                    Ok(value) => {
+                        if let Some(obj) = frontmatter.as_object_mut() {
+                            obj.insert(field_name, value);
                         }
-                        Err(_) => {
-                            // On evaluation error, set to null
-                            if let Some(obj) = frontmatter.as_object_mut() {
-                                obj.insert(field_name.to_string(), serde_json::Value::Null);
-                            }
+                    }
+                    Err(_) => {
+                        if let Some(obj) = frontmatter.as_object_mut() {
+                            obj.insert(field_name, serde_json::Value::Null);
                         }
                     }
                 }
@@ -165,4 +118,46 @@ impl Collection {
 
         frontmatter
     }
+}
+
+fn combined_computed_order(computed: &BTreeMap<String, CompiledComputed>) -> Vec<String> {
+    fn visit(
+        name: &str,
+        dependencies: &BTreeMap<String, BTreeSet<String>>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+        order: &mut Vec<String>,
+    ) {
+        if visited.contains(name) || !visiting.insert(name.to_string()) {
+            return;
+        }
+        if let Some(fields) = dependencies.get(name) {
+            for dependency in fields {
+                visit(dependency, dependencies, visiting, visited, order);
+            }
+        }
+        visiting.remove(name);
+        visited.insert(name.to_string());
+        order.push(name.to_string());
+    }
+
+    let names = computed.keys().collect::<BTreeSet<_>>();
+    let dependencies = computed
+        .iter()
+        .map(|(name, field)| {
+            let dependencies = names
+                .iter()
+                .filter(|candidate| expr_contains_ident(&field.expression, candidate))
+                .map(|name| (*name).clone())
+                .collect();
+            (name.clone(), dependencies)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut order = Vec::new();
+    for name in computed.keys() {
+        visit(name, &dependencies, &mut visiting, &mut visited, &mut order);
+    }
+    order
 }

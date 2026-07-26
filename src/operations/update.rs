@@ -29,6 +29,10 @@ impl Collection {
         if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
             return error;
         }
+        let _write_lock = match crate::transactions::WriteLock::acquire(self) {
+            Ok(write_lock) => write_lock,
+            Err(error) => return op_error(error.code(), &error.to_string()),
+        };
 
         let new_body = new_body.as_deref();
         let full_path = self.root.join(&path);

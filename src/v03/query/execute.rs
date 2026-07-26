@@ -38,6 +38,7 @@ pub struct QueryPerformance {
     pub candidates: usize,
     pub results: usize,
     pub cache_used: bool,
+    pub cache_fallback: bool,
     pub link_graph_built: bool,
     pub snapshot_reused: bool,
 }
@@ -177,8 +178,26 @@ pub(crate) fn execute_profiled(
     let phase = Instant::now();
     let needs_link_graph = compiled.requires_link_graph();
     let needs_file_body_metadata = compiled.requires_file_body_metadata();
-    let ((records, all_files, backlinks), load_profile) =
-        collection.load_query_data_profiled(true, needs_link_graph);
+    let (snapshot, load_profile) = match collection.load_query_data_profiled(true, needs_link_graph)
+    {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let path = error.path().map(|path| {
+                path.strip_prefix(&collection.root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            });
+            finish!(diagnostics::failed(vec![Diagnostic::error(
+                "collection_snapshot_failed",
+                error.to_string(),
+                path,
+            )]));
+        }
+    };
+    let records = snapshot.records;
+    let all_files = snapshot.all_files;
+    let backlinks = snapshot.backlinks;
     performance.load_us = micros(phase.elapsed());
     if let Some(load) = load_profile {
         apply_load_performance(&mut performance, &load);
@@ -452,6 +471,7 @@ fn apply_load_performance(
     performance.link_graph_us = millis_to_micros(load.build_backlinks_ms);
     performance.records_loaded = load.file_records;
     performance.cache_used = load.cache_used;
+    performance.cache_fallback = load.cache_fallback;
     performance.link_graph_built = load.built_link_graph;
 }
 

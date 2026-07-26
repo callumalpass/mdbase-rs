@@ -224,8 +224,17 @@ impl Collection {
 
         // Load file records from cache (with incremental refresh) or disk fallback
         let load_start = Instant::now();
-        let ((file_records, all_files_arc, backlinks_arc), load_query_perf) =
-            self.load_query_data_profiled(profile_query, needs_link_graph);
+        let (snapshot, load_query_perf) = match self
+            .load_query_data_profiled(profile_query, needs_link_graph)
+        {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return crate::errors::op_error("collection_snapshot_failed", &error.to_string())
+            }
+        };
+        let file_records = snapshot.records;
+        let all_files_arc = snapshot.all_files;
+        let backlinks_arc = snapshot.backlinks;
         let perf_load_query_data_ms = elapsed_ms(load_start);
 
         let mut candidates: Vec<serde_json::Value> = Vec::new();
@@ -599,6 +608,7 @@ impl Collection {
                         },
                         "file_records": p.file_records,
                         "cache_used": p.cache_used,
+                        "cache_fallback": p.cache_fallback,
                         "built_link_graph": p.built_link_graph,
                     })),
                 });
@@ -694,6 +704,7 @@ impl Collection {
                     },
                     "file_records": p.file_records,
                     "cache_used": p.cache_used,
+                    "cache_fallback": p.cache_fallback,
                     "built_link_graph": p.built_link_graph,
                 })),
             });

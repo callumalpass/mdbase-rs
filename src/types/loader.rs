@@ -381,18 +381,6 @@ fn v03_type_definition(type_file: crate::v03::TypeFile) -> Result<TypeDef, Strin
     }
 
     let mut match_rules = frontmatter.get("match").map(parse_v03_match_rules);
-    if let Some(expression) = match_rules
-        .as_ref()
-        .and_then(|rules| rules.match_expr.as_deref())
-    {
-        crate::v03::cel::compile(expression).map_err(|error| {
-            format!(
-                "Type '{}' has an invalid CEL match expression: {}",
-                type_file.name, error.message,
-            )
-        })?;
-    }
-    validate_v03_lifecycle_expressions(frontmatter, &type_file.name)?;
     if match_rules.as_ref().is_some_and(|rules| {
         rules.path_glob.is_none()
             && rules.path_globs.is_none()
@@ -495,39 +483,6 @@ fn v03_type_definition(type_file: crate::v03::TypeFile) -> Result<TypeDef, Strin
     })
 }
 
-fn validate_v03_lifecycle_expressions(
-    frontmatter: &serde_json::Map<String, serde_json::Value>,
-    type_name: &str,
-) -> Result<(), String> {
-    let Some(lifecycle) = frontmatter
-        .get("lifecycle")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return Ok(());
-    };
-    for event in ["on_create", "on_update"] {
-        let Some(policy) = lifecycle.get(event) else {
-            continue;
-        };
-        let actions: Vec<&serde_json::Value> = match policy {
-            serde_json::Value::Array(actions) => actions.iter().collect(),
-            action => vec![action],
-        };
-        for (index, action) in actions.into_iter().enumerate() {
-            let Some(expression) = action.get("if").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            crate::v03::cel::compile(expression).map_err(|error| {
-                format!(
-                    "Type '{type_name}' has an invalid lifecycle guard at lifecycle.{event}[{index}]: {}",
-                    error.message,
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
 fn field_from_json_schema(schema: &serde_json::Value) -> Result<FieldDef, String> {
     let Some(object) = schema.as_object() else {
         return Ok(FieldDef::default());
@@ -595,6 +550,38 @@ fn field_from_json_schema(schema: &serde_json::Value) -> Result<FieldDef, String
             }),
         ..FieldDef::default()
     };
+    if let Some(legacy) = object
+        .get("x-mdbase-v02-field")
+        .and_then(serde_json::Value::as_object)
+    {
+        if let Some(field_type) = legacy.get("type").and_then(serde_json::Value::as_str) {
+            field.field_type = field_type.to_string();
+        }
+        field.computed = legacy
+            .get("computed")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from);
+        field.deprecated = legacy
+            .get("deprecated_message")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+            .or(field.deprecated);
+        field.target = legacy
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from);
+        field.target_types = legacy
+            .get("target_types")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(String::from)
+            .collect();
+        field.validate_exists = legacy
+            .get("validate_exists")
+            .and_then(serde_json::Value::as_bool);
+    }
     if field.values.is_none() {
         field.values = object
             .get("const")
@@ -616,6 +603,16 @@ fn field_from_json_schema(schema: &serde_json::Value) -> Result<FieldDef, String
                 .collect::<Result<HashMap<_, _>, String>>()
         })
         .transpose()?;
+    if let (Some(fields), Some(required)) = (
+        field.fields.as_mut(),
+        object.get("required").and_then(serde_json::Value::as_array),
+    ) {
+        for name in required.iter().filter_map(serde_json::Value::as_str) {
+            if let Some(nested) = fields.get_mut(name) {
+                nested.required = true;
+            }
+        }
+    }
     Ok(field)
 }
 

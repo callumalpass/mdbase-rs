@@ -235,7 +235,7 @@ fn collection_metadata_never_loads_through_symlinks() {
     );
     symlink(outside.join("external.md"), root.join("_types/external.md")).unwrap();
     let collection = open_collection(&root);
-    assert!(!collection.types.contains_key("external"));
+    assert!(!collection.types().contains_key("external"));
 }
 
 #[test]
@@ -313,7 +313,7 @@ fn cli_update_refs_flag_is_honored() {
     let root = tmp.path();
     write_file(
         &root.join("mdbase.yaml"),
-        "spec_version: 0.2.0\nsettings:\n  rename_update_refs: false\n",
+        "spec_version: 0.3.0\nsettings:\n  rename_update_refs: false\n",
     );
     write_file(&root.join("a.md"), "---\nid: a\n---\n");
     write_file(&root.join("r.md"), "---\nref: \"[[a]]\"\n---\n");

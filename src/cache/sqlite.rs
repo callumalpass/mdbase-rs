@@ -29,7 +29,19 @@ pub(crate) fn open_cache_db_memory() -> Result<Connection> {
 
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(include_str!("schema.sql"))?;
-    // Migration: add ctime_ns if missing (idempotent for existing DBs)
-    let _ = conn.execute_batch("ALTER TABLE files ADD COLUMN ctime_ns INTEGER;");
+    if !table_has_column(conn, "files", "ctime_ns")? {
+        conn.execute_batch("ALTER TABLE files ADD COLUMN ctime_ns INTEGER;")?;
+    }
     Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for candidate in columns {
+        if candidate? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

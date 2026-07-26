@@ -180,6 +180,63 @@ fn batch_preflight_and_dry_run_never_partially_mutate_the_collection() {
 }
 
 #[test]
+fn non_partial_batch_commits_one_staged_multi_file_plan() {
+    let (root, collection) = collection();
+    for (path, title) in [
+        ("tasks/update.md", "Update"),
+        ("tasks/rename.md", "Rename"),
+        ("tasks/delete.md", "Delete"),
+    ] {
+        write_record(
+            &root,
+            path,
+            &format!("---\ntype: task\ntitle: {title}\nstatus: open\n---\n"),
+        );
+    }
+    let operations = collection.v03_operations().unwrap();
+    let committed = operations.batch(&json!({
+        "operations": [
+            {
+                "kind": "update",
+                "input": {"path": "tasks/update.md", "patch": {"status": "done"}}
+            },
+            {
+                "kind": "rename",
+                "input": {"from": "tasks/rename.md", "to": "archive/renamed.md"}
+            },
+            {
+                "kind": "create",
+                "input": {
+                    "path": "tasks/created.md",
+                    "type": "task",
+                    "frontmatter": {"title": "Created", "status": "open"}
+                }
+            },
+            {
+                "kind": "delete",
+                "input": {"path": "tasks/delete.md"}
+            }
+        ]
+    }));
+
+    assert!(committed.valid, "{committed:#?}");
+    assert_eq!(committed.result["succeeded"], 4);
+    assert!(fs::read_to_string(root.path().join("tasks/update.md"))
+        .unwrap()
+        .contains("status: done"));
+    assert!(root.path().join("archive/renamed.md").is_file());
+    assert!(!root.path().join("tasks/rename.md").exists());
+    assert!(root.path().join("tasks/created.md").is_file());
+    assert!(!root.path().join("tasks/delete.md").exists());
+    assert_eq!(
+        fs::read_dir(root.path().join(".mdbase/transactions"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn multi_target_links_validate_existence_and_any_allowed_target_type() {
     let (root, collection) = collection();
     write_record(

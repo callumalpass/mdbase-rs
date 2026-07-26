@@ -23,23 +23,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+const EXPECTED_TEST_FILES: usize = 78;
+const EXPECTED_TEST_CASES: usize = 1_794;
+
 /// Path to the spec's test files.
 fn spec_tests_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("MDBASE_SPEC_TESTS_DIR") {
         return PathBuf::from(path);
     }
 
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .or_else(|| {
-            let drive = std::env::var_os("HOMEDRIVE")?;
-            let path = std::env::var_os("HOMEPATH")?;
-            let mut home = PathBuf::from(drive);
-            home.push(path);
-            Some(home.into_os_string())
-        })
-        .expect("home directory not set; provide MDBASE_SPEC_TESTS_DIR");
-    PathBuf::from(home).join("projects/mdbase-spec/tests")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../mdbase-spec/tests")
 }
 
 // ---------------------------------------------------------------------------
@@ -354,14 +347,19 @@ fn discover_tests() -> Vec<(PathBuf, TestFile)> {
     let tests_dir = spec_tests_dir();
     let mut test_files = Vec::new();
 
-    if !tests_dir.exists() {
-        return test_files;
-    }
+    assert!(
+        tests_dir.is_dir(),
+        "pinned conformance fixtures are missing at '{}'; set MDBASE_SPEC_TESTS_DIR",
+        tests_dir.display()
+    );
 
     let mut level_dirs: Vec<_> = fs::read_dir(&tests_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| {
+            e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && e.file_name().to_string_lossy().starts_with("level-")
+        })
         .collect();
     level_dirs.sort_by_key(|e| e.file_name());
 
@@ -379,12 +377,9 @@ fn discover_tests() -> Vec<(PathBuf, TestFile)> {
 
         for file in files {
             let content = fs::read_to_string(file.path()).unwrap();
-            match serde_yaml::from_str::<TestFile>(&content) {
-                Ok(test_file) => test_files.push((file.path(), test_file)),
-                Err(err) => {
-                    eprintln!("Failed to parse {:?}: {}", file.path(), err);
-                }
-            }
+            let test_file = serde_yaml::from_str::<TestFile>(&content)
+                .unwrap_or_else(|error| panic!("failed to parse {:?}: {error}", file.path()));
+            test_files.push((file.path(), test_file));
         }
     }
 
@@ -399,13 +394,11 @@ fn discover_tests() -> Vec<(PathBuf, TestFile)> {
 fn conformance_tests() {
     let test_files = discover_tests();
 
-    if test_files.is_empty() {
-        println!(
-            "No test files found in {:?}. Run the test-writing Ralph Loop first.",
-            spec_tests_dir()
-        );
-        return;
-    }
+    assert_eq!(
+        test_files.len(),
+        EXPECTED_TEST_FILES,
+        "pinned historical conformance file count changed"
+    );
 
     let mut total = 0;
     let mut passed = 0;
@@ -873,6 +866,11 @@ fn conformance_tests() {
         }
     }
 
+    assert_eq!(
+        total, EXPECTED_TEST_CASES,
+        "pinned historical conformance case count changed"
+    );
+    assert_eq!(passed, total, "not every conformance case passed");
     assert_eq!(failed, 0, "{} conformance test(s) failed", failed);
 }
 
@@ -974,7 +972,7 @@ fn execute_operation(
                 "load_types" | "get_types" => {
                     // If a path is provided, determine types for that specific file
                     if let Some(path) = input_json.get("path").and_then(|v| v.as_str()) {
-                        let full_path = collection.root.join(path);
+                        let full_path = collection.root().join(path);
                         let frontmatter = if full_path.exists() {
                             let content = fs::read_to_string(&full_path).unwrap_or_default();
                             let doc = mdbase::frontmatter::parser::parse_document(&content);
@@ -995,9 +993,9 @@ fn execute_operation(
                         })
                     } else {
                         // Return list of all loaded type names
-                        let type_names: Vec<String> = collection.types.keys().cloned().collect();
+                        let type_names: Vec<String> = collection.types().keys().cloned().collect();
                         let types_detail: Vec<serde_json::Value> = collection
-                            .types
+                            .types()
                             .values()
                             .map(|t| {
                                 let mut obj = serde_json::json!({
@@ -1026,9 +1024,9 @@ fn execute_operation(
                             "names": type_names,
                             "count": type_names.len(),
                         });
-                        if !collection.type_warnings.is_empty() {
+                        if !collection.type_warnings().is_empty() {
                             let warnings: Vec<serde_json::Value> = collection
-                                .type_warnings
+                                .type_warnings()
                                 .iter()
                                 .map(|w| {
                                     serde_json::json!({
@@ -1048,7 +1046,7 @@ fn execute_operation(
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let name = raw_name.to_lowercase();
-                    match collection.types.get(&name) {
+                    match collection.types().get(&name) {
                         Some(t) => {
                             let mut fields = serde_json::Map::new();
                             for (k, v) in &t.fields {
@@ -1108,7 +1106,7 @@ fn execute_operation(
                     let fields_input = input_json.get("fields");
                     let parent_input = input_json.get("parent").and_then(|v| v.as_str());
                     let strict_input = input_json.get("strict").and_then(|v| v.as_bool());
-                    let types_dir = collection.root.join(&collection.settings.types_folder);
+                    let types_dir = collection.root().join(&collection.settings().types_folder);
                     let _ = std::fs::create_dir_all(&types_dir);
 
                     // Validate type name
@@ -1120,7 +1118,7 @@ fn execute_operation(
 
                     // Check for name conflicts (case-insensitive)
                     let name_lower = name.to_lowercase();
-                    if collection.types.contains_key(&name_lower) {
+                    if collection.types().contains_key(&name_lower) {
                         return Ok(serde_json::json!({
                             "error": { "code": "path_conflict", "message": format!("Type '{}' already exists", name) }
                         }));
@@ -1129,7 +1127,7 @@ fn execute_operation(
                     // Check parent exists
                     if let Some(parent) = parent_input {
                         let parent_lower = parent.to_lowercase();
-                        if !collection.types.contains_key(&parent_lower) {
+                        if !collection.types().contains_key(&parent_lower) {
                             return Ok(serde_json::json!({
                                 "error": { "code": "missing_parent_type", "message": format!("Parent type '{}' not found", parent) }
                             }));
@@ -1203,10 +1201,10 @@ fn execute_operation(
                             match reload_result {
                                 Ok(reloaded) => {
                                     let name_lower = name.to_lowercase();
-                                    let type_loaded = reloaded.types.contains_key(&name_lower);
+                                    let type_loaded = reloaded.types().contains_key(&name_lower);
                                     serde_json::json!({
                                         "name": name,
-                                        "path": format!("{}/{}.md", collection.settings.types_folder, name),
+                                        "path": format!("{}/{}.md", collection.settings().types_folder, name),
                                         "type_loaded": type_loaded,
                                     })
                                 }
@@ -1307,7 +1305,7 @@ fn execute_operation(
                 let backlinks_index = collection.build_backlinks_index(&all_files);
                 let all_files_arc = std::sync::Arc::new(all_files);
                 let backlinks_arc = std::sync::Arc::new(backlinks_index);
-                let types_arc = std::sync::Arc::new(collection.types.clone());
+                let types_arc = std::sync::Arc::new(collection.types().clone());
                 let type_names_for_file = collection.determine_types_for_path(
                     &read_result
                         .get("frontmatter")

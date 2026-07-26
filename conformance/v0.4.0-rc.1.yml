@@ -1,0 +1,134 @@
+kind: mdbase.conformance
+status: verified
+implementation:
+  id: mdbase-rs
+  name: mdbase Rust implementation
+  version: 0.4.0-rc.1
+  language: Rust
+  target: crate
+  url: https://github.com/callumalpass/mdbase-rs
+spec_version: 0.3.0
+runtime_profile_version: 0.1.0
+profiles:
+  - core_read
+  - collection_semantics
+  - cel
+  - cel_match
+  - cel_query
+  - links
+  - core_write
+  - lifecycle
+  - runtime_contracts/0.1
+  - watch
+optional_features:
+  - runtime_contract_materialization
+json_schema:
+  dialect: https://json-schema.org/draft/2020-12/schema
+  keywords:
+    - type
+    - required
+    - properties
+    - additionalProperties
+    - items
+    - enum
+    - const
+    - oneOf
+    - anyOf
+    - allOf
+    - if
+    - then
+    - else
+    - minimum
+    - maximum
+    - exclusiveMinimum
+    - exclusiveMaximum
+    - multipleOf
+    - minLength
+    - maxLength
+    - pattern
+    - minItems
+    - maxItems
+    - uniqueItems
+    - $defs
+    - $ref
+    - title
+    - description
+    - default
+    - examples
+  formats:
+    - date
+    - date-time
+    - time
+  remote_refs: false
+compatibility:
+  v0_2_read: true
+  v0_2_migrate: true
+limits:
+  external_schema_refs: false
+  schema_ref_roots:
+    - collection_root
+    - ancestor_pack_schemas/v0.3
+  operation_surface: typed_collection
+  cel_source_bytes: 65536
+  cel_ast_depth: 128
+  cel_evaluation_depth: 128
+  cel_evaluation_steps: 1000000
+  cel_as_file_hops: 10
+  cel_clock_scope: operation
+  watch_debounce: host_configurable
+  runtime_execution: false
+  runtime_external_schema_refs: false
+  runtime_source_order:
+    - built_in
+    - provider_id
+    - pack_id
+    - collection_path
+  runtime_authorization: embedding_host_final_boundary
+evidence:
+  - kind: historical_conformance
+    command: cargo test --locked --test conformance
+    result: pass
+    cases: 1794
+    fixture_revision: 2c5e1bbc8736d71b95fcaea1b593dc2eeaec739b
+    verified_at: "2026-07-26T11:50:55+10:00"
+    artifact: tests/conformance.rs
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: canonical_conformance
+    command: cargo test --locked --test v03_conformance --test v03_runtime_conformance
+    result: pass
+    verified_at: "2026-07-26T11:50:55+10:00"
+    artifact: tests/v03_conformance.rs and tests/v03_runtime_conformance.rs
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: test_suite
+    command: cargo test --locked --workspace --all-features
+    result: pass
+    verified_at: "2026-07-26T11:50:55+10:00"
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: live_backend_contract
+    command: cargo test --locked -p mdbase-runtime --all-features --test postgres --test store_contract
+    result: pass
+    verified_at: "2026-07-26T11:50:55+10:00"
+    environment: PostgreSQL 17, Linux x86_64, Rust 1.94.0
+  - kind: lint_and_docs
+    command: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+    result: pass
+    verified_at: "2026-07-26T11:50:55+10:00"
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: dependency_policy
+    command: cargo deny check
+    result: pass
+    verified_at: "2026-07-26T11:50:55+10:00"
+    artifact: deny.toml
+    environment: cargo-deny 0.19.7
+  - kind: performance_budget
+    command: ./scripts/benchmark-release.sh
+    result: pass
+    verified_at: "2026-07-26T11:50:55+10:00"
+    artifact: docs/performance/0.4.0-rc.1.md
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: package_smoke
+    command: cargo package --locked --workspace
+    result: pass
+    verified_at: "2026-07-26T11:50:55+10:00"
+    artifact: target/package/mdbase-0.4.0-rc.1.crate
+    environment: Linux x86_64, Rust 1.94.0

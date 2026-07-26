@@ -1,12 +1,16 @@
-//! mdbase - Rust implementation of the mdbase specification.
+//! Typed Rust implementation of the mdbase specification.
 //!
-//! Uses SQLite as a backing store for queries, compiling mdbase expressions
-//! to SQL WHERE clauses via json_extract().
+//! Markdown files remain authoritative. Canonical v0.3 operations are exposed
+//! through [`Collection::typed`]; the SQLite query index is a derived,
+//! fallible accelerator with authoritative disk fallback. Legacy v0.2
+//! collections open through an isolated read/query adapter and require an
+//! explicit migration before mutation.
 
 pub mod errors;
 
 pub mod api;
 pub mod cache;
+pub(crate) mod compat;
 pub mod config;
 pub mod expressions;
 pub mod frontmatter;
@@ -18,6 +22,8 @@ pub mod operations;
 pub mod query;
 pub mod runtime;
 pub mod runtime_contracts;
+pub(crate) mod snapshot;
+pub(crate) mod transactions;
 pub mod types;
 pub mod v03;
 pub mod validation;
@@ -27,7 +33,6 @@ pub mod watch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::expressions::expression_references_field;
 use crate::types::inheritance;
 use crate::types::loader;
 use crate::types::schema::*;
@@ -55,8 +60,19 @@ pub struct Settings {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecProfile {
+    /// Legacy v0.2 collection loaded through read-only compatibility.
     V02,
+    /// Canonical v0.3 collection.
     V03,
+}
+
+/// How a loaded collection relates to the canonical v0.3 data model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatibilityMode {
+    /// The collection is already canonical v0.3.
+    Canonical,
+    /// Legacy v0.2 data is translated for read-only compatibility.
+    V02ReadOnly,
 }
 
 impl Default for Settings {
@@ -84,16 +100,60 @@ impl Default for Settings {
 
 /// A loaded mdbase collection.
 pub struct Collection {
-    pub root: PathBuf,
-    pub spec_profile: SpecProfile,
-    pub settings: Settings,
+    pub(crate) root: PathBuf,
+    pub(crate) spec_profile: SpecProfile,
+    pub(crate) settings: Settings,
     /// Namespaced collection configuration retained for optional adapters.
-    pub config_extensions: serde_json::Map<String, serde_json::Value>,
-    pub types: HashMap<String, TypeDef>,
-    pub type_warnings: Vec<String>,
+    pub(crate) config_extensions: serde_json::Map<String, serde_json::Value>,
+    pub(crate) types: HashMap<String, TypeDef>,
+    pub(crate) type_plans: HashMap<String, crate::types::compiled::CompiledTypePlan>,
+    pub(crate) type_warnings: Vec<String>,
 }
 
 impl Collection {
+    /// Authorized collection root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Immutable runtime settings loaded with this collection.
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// Specification profile detected at open time.
+    pub fn spec_profile(&self) -> SpecProfile {
+        self.spec_profile
+    }
+
+    /// Canonical or legacy compatibility mode.
+    pub fn compatibility_mode(&self) -> CompatibilityMode {
+        match self.spec_profile {
+            SpecProfile::V03 => CompatibilityMode::Canonical,
+            SpecProfile::V02 => CompatibilityMode::V02ReadOnly,
+        }
+    }
+
+    /// Loaded type definitions keyed by canonical lowercase name.
+    pub fn types(&self) -> &HashMap<String, TypeDef> {
+        &self.types
+    }
+
+    /// Warnings produced while translating or loading type definitions.
+    pub fn type_warnings(&self) -> &[String] {
+        &self.type_warnings
+    }
+
+    /// Namespaced configuration values retained for optional adapters.
+    pub fn config_extensions(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.config_extensions
+    }
+
+    /// Borrow the typed canonical operation service.
+    pub fn typed(&self) -> api::MdbaseResult<api::TypedCollection<'_>> {
+        api::TypedCollection::new(self)
+    }
+
     /// Open a collection from a root directory.
     pub fn open(root: &Path) -> Result<Self, serde_json::Value> {
         let config_result = config::load_config_for_open(root);
@@ -179,7 +239,7 @@ impl Collection {
                 .unwrap_or(".mdbase")
                 .to_string(),
         };
-        let config_extensions = config
+        let config_extensions: serde_json::Map<String, serde_json::Value> = config
             .as_object()
             .into_iter()
             .flatten()
@@ -199,6 +259,34 @@ impl Collection {
                 )
             })?;
             crate::operations::ensure_no_symlink_components(root, path, spec_profile)?;
+        }
+
+        // Recovery must precede type loading. A system migration may have
+        // replaced or removed legacy type definitions before the config flip;
+        // loading types first could otherwise make the recovery journal
+        // unreachable. Re-open from scratch if recovery changed any files so
+        // config and settings are parsed from the completed transaction.
+        let recovery_collection = Collection {
+            root: root.to_path_buf(),
+            spec_profile,
+            settings: settings.clone(),
+            config_extensions: config_extensions.clone(),
+            types: HashMap::new(),
+            type_plans: HashMap::new(),
+            type_warnings: Vec::new(),
+        };
+        let recovered =
+            crate::transactions::recover_pending(&recovery_collection).map_err(|error| {
+                serde_json::json!({
+                    "valid": false,
+                    "error": {
+                        "code": error.code(),
+                        "message": error.to_string(),
+                    }
+                })
+            })?;
+        if recovered {
+            return Self::open(root);
         }
 
         // Load types
@@ -233,161 +321,26 @@ impl Collection {
             })
         })?;
 
-        // Validate computed fields (§5.12)
-        for type_def in types.values() {
-            Self::validate_computed_fields(type_def)?;
-        }
+        let type_plans = crate::types::compiled::compile_registry(&types).map_err(|error| {
+            serde_json::json!({
+                "valid": false,
+                "error": {
+                    "code": error.code,
+                    "message": error.message,
+                }
+            })
+        })?;
 
-        Ok(Collection {
+        let collection = Collection {
             root: root.to_path_buf(),
             spec_profile,
             settings,
             config_extensions,
             types,
+            type_plans,
             type_warnings,
-        })
-    }
-
-    /// Validate computed field constraints (§5.12).
-    fn validate_computed_fields(type_def: &TypeDef) -> Result<(), serde_json::Value> {
-        let mut computed_fields: Vec<(&str, &str)> = Vec::new(); // (name, expression)
-
-        for (name, field) in &type_def.fields {
-            if let Some(ref expr) = field.computed {
-                // Computed fields MUST NOT be required
-                if field.required {
-                    return Err(serde_json::json!({
-                        "valid": false,
-                        "error": { "code": "invalid_type_definition", "message": format!("Computed field '{}' cannot be required", name) }
-                    }));
-                }
-                // Computed fields MUST NOT have default
-                if field.default.is_some() {
-                    return Err(serde_json::json!({
-                        "valid": false,
-                        "error": { "code": "invalid_type_definition", "message": format!("Computed field '{}' cannot have a default value", name) }
-                    }));
-                }
-                // Computed fields MUST NOT have generated
-                if field.generated.is_some() {
-                    return Err(serde_json::json!({
-                        "valid": false,
-                        "error": { "code": "invalid_type_definition", "message": format!("Computed field '{}' cannot have a generated strategy", name) }
-                    }));
-                }
-                computed_fields.push((name, expr));
-            }
-        }
-
-        // Check for circular dependencies
-        if computed_fields.len() > 1 {
-            // Build dependency graph: for each computed field, find which other
-            // computed fields its expression references
-            let computed_names: std::collections::HashSet<&str> =
-                computed_fields.iter().map(|(n, _)| *n).collect();
-
-            // Simple dependency detection: check if expression contains field name as identifier
-            for (name, expr) in &computed_fields {
-                // Check for self-reference
-                if expression_references_field(expr, name) {
-                    return Err(serde_json::json!({
-                        "valid": false,
-                        "error": { "code": "circular_computed", "message": format!("Computed field '{}' references itself", name) }
-                    }));
-                }
-            }
-
-            // Check for cycles using topological sort
-            let mut deps: HashMap<&str, Vec<&str>> = HashMap::new();
-            for (name, expr) in &computed_fields {
-                let mut field_deps = Vec::new();
-                for dep_name in &computed_names {
-                    if dep_name != name && expression_references_field(expr, dep_name) {
-                        field_deps.push(*dep_name);
-                    }
-                }
-                deps.insert(name, field_deps);
-            }
-
-            // Topological sort to detect cycles
-            let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            let mut in_progress: std::collections::HashSet<&str> = std::collections::HashSet::new();
-
-            fn has_cycle<'a>(
-                node: &'a str,
-                deps: &HashMap<&'a str, Vec<&'a str>>,
-                visited: &mut std::collections::HashSet<&'a str>,
-                in_progress: &mut std::collections::HashSet<&'a str>,
-            ) -> bool {
-                if in_progress.contains(node) {
-                    return true;
-                }
-                if visited.contains(node) {
-                    return false;
-                }
-                in_progress.insert(node);
-                if let Some(node_deps) = deps.get(node) {
-                    for dep in node_deps {
-                        if has_cycle(dep, deps, visited, in_progress) {
-                            return true;
-                        }
-                    }
-                }
-                in_progress.remove(node);
-                visited.insert(node);
-                false
-            }
-
-            for (name, _) in &computed_fields {
-                if has_cycle(name, &deps, &mut visited, &mut in_progress) {
-                    return Err(serde_json::json!({
-                        "valid": false,
-                        "error": { "code": "circular_computed", "message": format!("Circular dependency in computed field '{}'", name) }
-                    }));
-                }
-            }
-        } else if computed_fields.len() == 1 {
-            // Check self-reference for single computed field
-            let (name, expr) = computed_fields[0];
-            if expression_references_field(expr, name) {
-                return Err(serde_json::json!({
-                    "valid": false,
-                    "error": { "code": "circular_computed", "message": format!("Computed field '{}' references itself", name) }
-                }));
-            }
-        }
-
-        // Check that match rules don't reference computed fields (§6.4)
-        if !computed_fields.is_empty() {
-            if let Some(ref match_rules) = type_def.match_rules {
-                // Check where clause field names
-                if let Some(ref where_clause) = match_rules.where_clause {
-                    if let Some(obj) = where_clause.as_object() {
-                        for field_name in obj.keys() {
-                            if computed_fields.iter().any(|(name, _)| *name == field_name) {
-                                return Err(serde_json::json!({
-                                    "valid": false,
-                                    "error": { "code": "invalid_type_definition", "message": format!("Match rule 'where' cannot reference computed field '{}'", field_name) }
-                                }));
-                            }
-                        }
-                    }
-                }
-                // Check fields_present
-                if let Some(ref fields_present) = match_rules.fields_present {
-                    for field_name in fields_present {
-                        if computed_fields.iter().any(|(name, _)| *name == field_name) {
-                            return Err(serde_json::json!({
-                                "valid": false,
-                                "error": { "code": "invalid_type_definition", "message": format!("Match rule 'fields_present' cannot reference computed field '{}'", field_name) }
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        };
+        Ok(collection)
     }
 
     pub(crate) fn config_strict_mode(&self) -> StrictMode {
@@ -399,29 +352,50 @@ impl Collection {
         }
     }
 
-    /// Scan all markdown files in the collection.
-    pub(crate) fn scan_collection_files(&self) -> Vec<PathBuf> {
+    /// Scan all Markdown files in the collection.
+    ///
+    /// Discovery failures are explicit so callers cannot confuse an
+    /// incomplete collection with an empty or smaller one.
+    pub(crate) fn scan_collection_files_checked(
+        &self,
+    ) -> Result<Vec<PathBuf>, crate::snapshot::CollectionScanError> {
         let mut files = Vec::new();
-        self.scan_dir_recursive(&self.root, &mut files);
-        files
+        self.scan_dir_recursive_checked(&self.root, &mut files)?;
+        files.sort();
+        Ok(files)
     }
 
-    fn scan_dir_recursive(&self, dir: &Path, files: &mut Vec<PathBuf>) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
+    /// Transitional wrapper for legacy operations that have not yet adopted
+    /// the typed snapshot boundary.
+    pub(crate) fn scan_collection_files(&self) -> Vec<PathBuf> {
+        self.scan_collection_files_checked().unwrap_or_default()
+    }
 
+    fn scan_dir_recursive_checked(
+        &self,
+        dir: &Path,
+        files: &mut Vec<PathBuf>,
+    ) -> Result<(), crate::snapshot::CollectionScanError> {
+        use crate::snapshot::CollectionScanError;
+
+        let entries =
+            std::fs::read_dir(dir).map_err(|source| CollectionScanError::ReadDirectory {
+                path: dir.to_path_buf(),
+                source,
+            })?;
         for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            let entry = entry.map_err(|source| CollectionScanError::ReadEntry {
+                directory: dir.to_path_buf(),
+                source,
+            })?;
             let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
+            let file_type =
+                entry
+                    .file_type()
+                    .map_err(|source| CollectionScanError::InspectEntry {
+                        path: path.clone(),
+                        source,
+                    })?;
 
             // Never follow links while discovering collection resources. A
             // symlink below the authorized root can otherwise expose an
@@ -434,22 +408,25 @@ impl Collection {
                 if self.settings.include_subfolders {
                     let rel = path
                         .strip_prefix(&self.root)
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default();
+                        .map_err(|_| CollectionScanError::OutsideRoot { path: path.clone() })?
+                        .to_string_lossy()
+                        .to_string();
                     if !self.is_excluded(&rel) {
-                        self.scan_dir_recursive(&path, files);
+                        self.scan_dir_recursive_checked(&path, files)?;
                     }
                 }
             } else if file_type.is_file() {
                 let rel = path
                     .strip_prefix(&self.root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
+                    .map_err(|_| CollectionScanError::OutsideRoot { path: path.clone() })?
+                    .to_string_lossy()
+                    .to_string();
                 if !self.is_excluded(&rel) && self.is_valid_extension(&rel) {
                     files.push(path);
                 }
             }
         }
+        Ok(())
     }
 }
 
