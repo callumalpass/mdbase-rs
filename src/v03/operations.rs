@@ -57,13 +57,13 @@ impl<'a> Operations<'a> {
                 Some(path.to_string()),
             )]);
         }
-        let raw = read
-            .get("raw_frontmatter")
+        let persisted = read
+            .get("frontmatter")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
         let (types, failures) = self
             .collection
-            .determine_types_for_path_checked(&raw, Some(path));
+            .determine_types_for_path_checked(&persisted, Some(path));
         OperationResult {
             valid: true,
             result: serde_json::json!({"types": types}),
@@ -220,12 +220,7 @@ impl<'a> Operations<'a> {
         {
             let persisted_path = persisted_path(operation, input, &result);
             if let Some(persisted_path) = persisted_path {
-                self.hydrate_persisted_result(
-                    &persisted_path,
-                    operation != "read",
-                    &mut result,
-                    &mut diagnostics,
-                );
+                self.hydrate_persisted_result(&persisted_path, &mut result, &mut diagnostics);
             }
         }
 
@@ -243,7 +238,6 @@ impl<'a> Operations<'a> {
     fn hydrate_persisted_result(
         &self,
         path: &str,
-        replace_frontmatter: bool,
         result: &mut Map<String, Value>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
@@ -259,34 +253,24 @@ impl<'a> Operations<'a> {
             ));
             return;
         }
-        let full_path = self.collection.root.join(path);
-        match std::fs::read(&full_path) {
-            Ok(bytes) => {
-                result.insert(
-                    "revision".to_string(),
-                    Value::String(super::revision(&bytes)),
-                );
-            }
-            Err(error) => {
-                diagnostics.push(Diagnostic::error(
-                    "file_not_found",
-                    format!("Failed to read persisted record: {error}"),
-                    Some(path.to_string()),
-                ));
-                return;
-            }
-        }
-
         let read = self.collection.read(&serde_json::json!({"path": path}));
-        if replace_frontmatter {
-            if let Some(raw_frontmatter) = read.get("raw_frontmatter") {
-                result.insert("frontmatter".to_string(), raw_frontmatter.clone());
+        if let Some(error) = read.get("error") {
+            diagnostics.push(diagnostic_from_value(error, "error", Some(path)));
+            return;
+        }
+        for key in [
+            "path",
+            "revision",
+            "types",
+            "frontmatter",
+            "effective_frontmatter",
+            "body",
+            "file",
+        ] {
+            if let Some(value) = read.get(key) {
+                result.insert(key.to_string(), value.clone());
             }
         }
-        if let Some(types) = read.get("types") {
-            result.insert("types".to_string(), types.clone());
-        }
-        result.insert("path".to_string(), Value::String(path.to_string()));
     }
 
     fn prepare_create(&self, input: &Value) -> Result<Value, Vec<Diagnostic>> {
@@ -325,7 +309,7 @@ impl<'a> Operations<'a> {
             return Ok(input.clone());
         }
         let old = read
-            .get("raw_frontmatter")
+            .get("frontmatter")
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
@@ -364,12 +348,12 @@ impl<'a> Operations<'a> {
         let Some(path) = result.result.get("path").and_then(Value::as_str) else {
             return;
         };
-        let Some(raw) = result.result.get("raw_frontmatter") else {
+        let Some(persisted) = result.result.get("frontmatter") else {
             return;
         };
         let (_, failures) = self
             .collection
-            .determine_types_for_path_checked(raw, Some(path));
+            .determine_types_for_path_checked(persisted, Some(path));
         result
             .diagnostics
             .extend(match_failure_diagnostics(path, failures));

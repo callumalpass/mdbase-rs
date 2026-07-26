@@ -3,18 +3,16 @@ use serde_json::{json, Value};
 
 use crate::api::{
     Diagnostic, DiagnosticCode, MdbaseError, MdbaseResult, OperationOutcome, QueryRequest,
-    QueryResult, ReadRequest, ReadResult, Severity,
+    QueryResult, ReadRequest, RecordDocument, Severity,
 };
 use crate::Collection;
 
 pub(crate) fn read(
     collection: &Collection,
     request: ReadRequest,
-) -> MdbaseResult<OperationOutcome<ReadResult>> {
-    decode_legacy(
-        collection.read(&json!({"path": request.path})),
-        Some(request.path.as_str()),
-    )
+) -> MdbaseResult<OperationOutcome<RecordDocument>> {
+    let result = collection.read(&json!({"path": request.path}));
+    decode_legacy(result, Some(request.path.as_str()))
 }
 
 pub(crate) fn query(

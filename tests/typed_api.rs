@@ -61,7 +61,11 @@ fn typed_crud_query_and_revision_failures_are_structured() {
         .unwrap();
     assert!(created.diagnostics.is_empty(), "{created:#?}");
     assert_eq!(created.value.path, original_path);
-    let initial_revision = created.value.revision.unwrap();
+    assert_eq!(created.value.frontmatter["title"], "First");
+    assert_eq!(created.value.effective_frontmatter["title"], "First");
+    assert_eq!(created.value.body, "Body\n");
+    assert_eq!(created.value.file.name, "first.md");
+    let initial_revision = created.value.revision;
 
     let read = api
         .read(ReadRequest::new("tasks/first.md").unwrap())
@@ -76,7 +80,9 @@ fn typed_crud_query_and_revision_failures_are_structured() {
     );
     update.if_revision = Some(initial_revision.clone());
     let updated = api.update(update).unwrap();
-    let updated_revision = updated.value.revision.unwrap();
+    assert_eq!(updated.value.frontmatter["status"], "done");
+    assert_eq!(updated.value.effective_frontmatter["status"], "done");
+    let updated_revision = updated.value.revision;
     assert_ne!(updated_revision, initial_revision);
 
     let query = api
@@ -106,10 +112,25 @@ fn typed_crud_query_and_revision_failures_are_structured() {
     let renamed_path = CollectionPath::new("archive/first.md").unwrap();
     let mut rename = RenameRequest::new(original_path, renamed_path.clone());
     rename.if_revision = Some(updated_revision);
+    let rename_preview = api.preflight_rename(rename.clone()).unwrap();
+    assert!(rename_preview.value.would_rename);
+    assert_eq!(rename_preview.value.to, renamed_path);
+    assert!(api
+        .read(ReadRequest::new("tasks/first.md").unwrap())
+        .is_ok());
     let renamed = api.rename(rename).unwrap();
     assert_eq!(renamed.value.to, renamed_path);
+    assert_eq!(renamed.value.document.path, renamed_path);
+    assert_eq!(renamed.value.document.frontmatter["status"], "done");
+    assert_eq!(renamed.value.document.file.name, "first.md");
 
-    let deleted = api.delete(DeleteRequest::new(renamed_path)).unwrap();
+    let delete_request = DeleteRequest::new(renamed_path.clone());
+    let delete_preview = api.preflight_delete(delete_request.clone()).unwrap();
+    assert!(delete_preview.value.would_delete);
+    assert!(api
+        .read(ReadRequest::new("archive/first.md").unwrap())
+        .is_ok());
+    let deleted = api.delete(delete_request).unwrap();
     assert!(deleted.value.deleted);
 }
 
@@ -172,7 +193,8 @@ fn typed_v02_adapter_is_read_only_until_migration() {
     let api = collection.typed().unwrap();
 
     let read = api.read(ReadRequest::new("legacy.md").unwrap()).unwrap();
-    assert_eq!(read.value.frontmatter["status"], "open");
+    assert!(read.value.frontmatter.get("status").is_none());
+    assert_eq!(read.value.effective_frontmatter["status"], "open");
     let query = api
         .query(QueryRequest::builder().type_name("task"))
         .unwrap();
@@ -263,8 +285,9 @@ fields:
     assert_eq!(canonical.compatibility_mode(), CompatibilityMode::Canonical);
     let api = canonical.typed().unwrap();
     let read = api.read(ReadRequest::new("legacy.md").unwrap()).unwrap();
-    assert_eq!(read.value.frontmatter["status"], "open");
-    assert_eq!(read.value.frontmatter["label"], "Legacy!");
+    assert!(read.value.frontmatter.get("status").is_none());
+    assert_eq!(read.value.effective_frontmatter["status"], "open");
+    assert_eq!(read.value.effective_frontmatter["label"], "Legacy!");
 
     let created = api
         .create(CreateRequest::new(

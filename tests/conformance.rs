@@ -1287,10 +1287,10 @@ fn execute_operation(
                     .map_err(|e| format!("Failed to open collection: {}", e))?;
                 let read_result = collection.read(&serde_json::json!({"path": path_val}));
                 let frontmatter = read_result
-                    .get("frontmatter")
+                    .get("effective_frontmatter")
                     .cloned()
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                let raw_frontmatter = read_result.get("raw_frontmatter").cloned();
+                let raw_frontmatter = read_result.get("frontmatter").cloned();
                 let body = read_result
                     .get("body")
                     .and_then(|v| v.as_str())
@@ -1743,10 +1743,11 @@ fn check_expectation(actual: &serde_json::Value, expected: &TestExpectation) -> 
     // Check frontmatter (partial match)
     if let Some(expected_fm) = &expected.frontmatter {
         let actual_fm = actual
-            .get("frontmatter")
-            .ok_or_else(|| "expected 'frontmatter' in result".to_string())?;
+            .get("effective_frontmatter")
+            .or_else(|| actual.get("frontmatter"))
+            .ok_or_else(|| "expected 'effective_frontmatter' in result".to_string())?;
         let expected_json = yaml_to_json(expected_fm);
-        check_partial_match(actual_fm, &expected_json, "frontmatter")?;
+        check_partial_match(actual_fm, &expected_json, "effective_frontmatter")?;
     }
 
     // Check validation (partial match)

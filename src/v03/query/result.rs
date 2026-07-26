@@ -102,16 +102,22 @@ pub(super) fn serialize_candidate(candidate: &Candidate, query: &Query) -> Value
             Value::Array(candidate.types.iter().cloned().map(Value::String).collect()),
         ),
     ]);
-    match query.frontmatter {
+    match query.frontmatter_mode {
         FrontmatterMode::Effective => {
-            result.insert("frontmatter".to_string(), candidate.effective.clone());
+            result.insert(
+                "effective_frontmatter".to_string(),
+                candidate.effective.clone(),
+            );
         }
-        FrontmatterMode::Raw => {
+        FrontmatterMode::Persisted => {
             result.insert("frontmatter".to_string(), candidate.raw.clone());
         }
         FrontmatterMode::Both => {
-            result.insert("frontmatter".to_string(), candidate.effective.clone());
-            result.insert("raw_frontmatter".to_string(), candidate.raw.clone());
+            result.insert("frontmatter".to_string(), candidate.raw.clone());
+            result.insert(
+                "effective_frontmatter".to_string(),
+                candidate.effective.clone(),
+            );
         }
     }
     if query.select.is_some() {

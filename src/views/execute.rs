@@ -361,7 +361,7 @@ fn execute_canonical(collection: &Collection, request: &ViewReferenceInput) -> O
         );
     }
     let document = read
-        .get("raw_frontmatter")
+        .get("frontmatter")
         .cloned()
         .unwrap_or_else(|| json!({}));
     let schema_diagnostics = validate_view(&document, &request.path);
@@ -417,7 +417,7 @@ fn execute_canonical(collection: &Collection, request: &ViewReferenceInput) -> O
         "limit",
         "offset",
         "include_body",
-        "frontmatter",
+        "frontmatter_mode",
     ] {
         if let Some(value) = view.get(key) {
             query.insert(key.to_string(), value.clone());
@@ -809,7 +809,7 @@ fn serialize_base_row(row: &BaseRow<'_>) -> Value {
             "ctime": row.file.ctime,
             "tags": row.file.tags,
         },
-        "frontmatter": row.record.effective_frontmatter,
+        "effective_frontmatter": row.record.effective_frontmatter,
         "types": row.record.type_names,
         "values": row.values,
     })

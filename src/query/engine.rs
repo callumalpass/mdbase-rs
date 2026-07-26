@@ -168,10 +168,10 @@ impl Collection {
                     return None;
                 }
                 let fm = read_result
-                    .get("frontmatter")
+                    .get("effective_frontmatter")
                     .cloned()
                     .unwrap_or(serde_json::json!({}));
-                let raw_fm = read_result.get("raw_frontmatter").cloned();
+                let raw_fm = read_result.get("frontmatter").cloned();
                 let body = read_result
                     .get("body")
                     .and_then(|v| v.as_str())

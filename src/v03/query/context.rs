@@ -35,11 +35,11 @@ pub(super) fn load_context(
         )));
     }
     let effective = read
-        .get("frontmatter")
+        .get("effective_frontmatter")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let raw = read
-        .get("raw_frontmatter")
+    let persisted = read
+        .get("frontmatter")
         .cloned()
         .unwrap_or_else(|| json!({}));
     let types = read
@@ -52,7 +52,7 @@ pub(super) fn load_context(
         .collect::<Vec<_>>();
     let mut bindings = cel::enrich_record_bindings(
         &effective,
-        &raw,
+        &persisted,
         cel::known_fields(collection, &types).iter(),
     );
     if let Some(object) = bindings.as_object_mut() {
@@ -63,7 +63,7 @@ pub(super) fn load_context(
     }
     Ok(Some(Box::new(EvalContext {
         frontmatter: bindings,
-        raw_frontmatter: Some(raw),
+        raw_frontmatter: Some(persisted),
         file_path: Some(path.clone()),
         body: read.get("body").and_then(Value::as_str).map(String::from),
         file_size: read.pointer("/file/size").and_then(Value::as_u64),

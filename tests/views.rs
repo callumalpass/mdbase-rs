@@ -184,7 +184,7 @@ fn project_relationship_view_filters_records_through_task_project_backlinks() {
     assert_eq!(executed.result["meta"]["total_count"], 1);
     assert_eq!(executed.result["results"][0]["path"], "Projects/mobile.md");
     assert_eq!(
-        executed.result["results"][0]["frontmatter"]["title"],
+        executed.result["results"][0]["effective_frontmatter"]["title"],
         "Mobile roadmap"
     );
     drop(collection);

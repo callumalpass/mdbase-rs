@@ -181,7 +181,7 @@ fn read_effective_frontmatter(
     collection: &crate::Collection,
 ) -> Option<(Value, Vec<String>)> {
     let result = collection.read(&json!({"path": rel_path}));
-    let frontmatter = result.get("frontmatter").cloned()?;
+    let frontmatter = result.get("effective_frontmatter").cloned()?;
     let types: Vec<String> = result
         .get("types")
         .and_then(|v| v.as_array())

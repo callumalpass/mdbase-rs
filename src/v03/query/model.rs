@@ -28,7 +28,7 @@ pub(crate) struct Query {
     #[serde(default)]
     pub include_body: bool,
     #[serde(default)]
-    pub frontmatter: FrontmatterMode,
+    pub frontmatter_mode: FrontmatterMode,
     #[serde(flatten)]
     pub _extensions: BTreeMap<String, Value>,
 }
@@ -126,6 +126,6 @@ impl Summary {
 pub(crate) enum FrontmatterMode {
     #[default]
     Effective,
-    Raw,
+    Persisted,
     Both,
 }

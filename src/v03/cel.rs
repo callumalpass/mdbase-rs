@@ -165,11 +165,11 @@ pub(crate) fn evaluate_record(collection: &Collection, input: &Value) -> Operati
     }
 
     let effective = read
-        .get("frontmatter")
+        .get("effective_frontmatter")
         .cloned()
         .unwrap_or_else(|| json!({}));
     let raw = read
-        .get("raw_frontmatter")
+        .get("frontmatter")
         .cloned()
         .unwrap_or_else(|| json!({}));
     let type_names = read

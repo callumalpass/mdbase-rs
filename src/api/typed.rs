@@ -212,9 +212,6 @@ pub struct CreateRequest {
     /// Optional optimistic-concurrency precondition.
     #[serde(default)]
     pub if_revision: Option<Revision>,
-    /// Validate and plan without mutating authoritative files.
-    #[serde(default)]
-    pub dry_run: bool,
 }
 
 impl CreateRequest {
@@ -226,7 +223,6 @@ impl CreateRequest {
             frontmatter,
             body: String::new(),
             if_revision: None,
-            dry_run: false,
         }
     }
 
@@ -238,7 +234,6 @@ impl CreateRequest {
             frontmatter,
             body: String::new(),
             if_revision: None,
-            dry_run: false,
         }
     }
 
@@ -258,7 +253,6 @@ impl CreateRequest {
         let mut input = json!({
             "frontmatter": self.frontmatter,
             "body": self.body,
-            "dry_run": self.dry_run,
         });
         set_optional(&mut input, "path", self.path.map(|path| json!(path)));
         set_optional(&mut input, "type", self.type_name.map(Value::String));
@@ -284,9 +278,6 @@ pub struct UpdateRequest {
     /// Optional optimistic-concurrency precondition.
     #[serde(default)]
     pub if_revision: Option<Revision>,
-    /// Validate and plan without mutating authoritative files.
-    #[serde(default)]
-    pub dry_run: bool,
 }
 
 impl UpdateRequest {
@@ -297,7 +288,6 @@ impl UpdateRequest {
             patch,
             body: None,
             if_revision: None,
-            dry_run: false,
         }
     }
 
@@ -305,7 +295,6 @@ impl UpdateRequest {
         let mut input = json!({
             "path": self.path,
             "patch": self.patch,
-            "dry_run": self.dry_run,
         });
         set_optional(&mut input, "body", self.body.map(Value::String));
         set_optional(
@@ -328,9 +317,6 @@ pub struct DeleteRequest {
     /// Optional optimistic-concurrency precondition.
     #[serde(default)]
     pub if_revision: Option<Revision>,
-    /// Validate and report without deleting the file.
-    #[serde(default)]
-    pub dry_run: bool,
 }
 
 impl DeleteRequest {
@@ -340,7 +326,6 @@ impl DeleteRequest {
             path,
             check_backlinks: false,
             if_revision: None,
-            dry_run: false,
         }
     }
 
@@ -348,7 +333,6 @@ impl DeleteRequest {
         let mut input = json!({
             "path": self.path,
             "check_backlinks": self.check_backlinks,
-            "dry_run": self.dry_run,
         });
         set_optional(
             &mut input,
@@ -372,9 +356,6 @@ pub struct RenameRequest {
     /// Optional optimistic-concurrency precondition.
     #[serde(default)]
     pub if_revision: Option<Revision>,
-    /// Validate and report without renaming files.
-    #[serde(default)]
-    pub dry_run: bool,
 }
 
 /// Options for translating a v0.2 collection to canonical v0.3 files.
@@ -422,7 +403,6 @@ impl RenameRequest {
             to,
             update_refs: true,
             if_revision: None,
-            dry_run: false,
         }
     }
 
@@ -431,7 +411,6 @@ impl RenameRequest {
             "from": self.from,
             "to": self.to,
             "update_refs": self.update_refs,
-            "dry_run": self.dry_run,
         });
         set_optional(
             &mut input,
@@ -537,7 +516,7 @@ pub enum FrontmatterMode {
     #[default]
     Effective,
     /// Include only persisted frontmatter.
-    Raw,
+    Persisted,
     /// Include both persisted and effective frontmatter.
     Both,
 }
@@ -580,7 +559,7 @@ pub struct QueryRequest {
     pub include_body: bool,
     /// Frontmatter representation to return.
     #[serde(default)]
-    pub frontmatter: FrontmatterMode,
+    pub frontmatter_mode: FrontmatterMode,
 }
 
 impl QueryRequest {
@@ -661,15 +640,15 @@ impl QueryRequest {
         if self.include_body {
             value.insert("include_body".to_string(), Value::Bool(true));
         }
-        let frontmatter = match self.frontmatter {
+        let frontmatter_mode = match self.frontmatter_mode {
             FrontmatterMode::Effective => None,
-            FrontmatterMode::Raw => Some("raw"),
+            FrontmatterMode::Persisted => Some("persisted"),
             FrontmatterMode::Both => Some("both"),
         };
-        if let Some(frontmatter) = frontmatter {
+        if let Some(frontmatter_mode) = frontmatter_mode {
             value.insert(
-                "frontmatter".to_string(),
-                Value::String(frontmatter.to_string()),
+                "frontmatter_mode".to_string(),
+                Value::String(frontmatter_mode.to_string()),
             );
         }
         Value::Object(value)
@@ -711,9 +690,9 @@ pub struct RecordFile {
     pub mtime: String,
 }
 
-/// Fully decoded record read.
+/// Complete authoritative record document.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ReadResult {
+pub struct RecordDocument {
     /// Canonical collection-relative path.
     pub path: CollectionPath,
     /// Opaque content revision.
@@ -721,33 +700,14 @@ pub struct ReadResult {
     /// Effective type memberships.
     #[serde(default)]
     pub types: Vec<String>,
-    /// Effective frontmatter.
+    /// Parsed frontmatter persisted in the Markdown file.
     pub frontmatter: Value,
-    /// Persisted frontmatter before defaults and computed values.
-    pub raw_frontmatter: Value,
+    /// Frontmatter after read defaults and computed values.
+    pub effective_frontmatter: Value,
     /// Markdown body.
     pub body: String,
     /// Filesystem metadata.
     pub file: RecordFile,
-}
-
-/// Result of a create or update mutation.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct MutationResult {
-    /// Mutated record path.
-    pub path: CollectionPath,
-    /// New revision, when the operation produced persisted content.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revision: Option<Revision>,
-    /// Effective type memberships.
-    #[serde(default)]
-    pub types: Vec<String>,
-    /// Resulting effective frontmatter.
-    #[serde(default)]
-    pub frontmatter: Value,
-    /// Resulting Markdown body.
-    #[serde(default)]
-    pub body: String,
 }
 
 /// Result of a delete request.
@@ -757,9 +717,18 @@ pub struct DeleteResult {
     pub path: CollectionPath,
     /// Whether the authoritative file was deleted.
     pub deleted: bool,
-    /// Whether the request was a non-mutating preview.
+    /// Inbound references that would become broken.
     #[serde(default)]
-    pub dry_run: bool,
+    pub broken_links: Vec<Value>,
+}
+
+/// Non-mutating preview of a delete request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeletePreflightResult {
+    /// Target record path.
+    pub path: CollectionPath,
+    /// Whether the record would be deleted.
+    pub would_delete: bool,
     /// Inbound references that would become broken.
     #[serde(default)]
     pub broken_links: Vec<Value>,
@@ -768,16 +737,33 @@ pub struct DeleteResult {
 /// Result of a rename request.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RenameResult {
+    /// Complete authoritative renamed record.
+    #[serde(flatten)]
+    pub document: RecordDocument,
     /// Original record path.
     pub from: CollectionPath,
     /// New record path.
     pub to: CollectionPath,
-    /// Revision of the renamed record.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revision: Option<Revision>,
     /// References rewritten as part of the rename.
     #[serde(default)]
     pub references_updated: Vec<Value>,
+}
+
+/// Non-mutating preview of a rename request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RenamePreflightResult {
+    /// Original record path.
+    pub from: CollectionPath,
+    /// Proposed record path.
+    pub to: CollectionPath,
+    /// Whether the record would be renamed.
+    pub would_rename: bool,
+    /// References that would be rewritten.
+    #[serde(default)]
+    pub references_affected: Vec<Value>,
+    /// Preflight warnings.
+    #[serde(default)]
+    pub warnings: Vec<Value>,
 }
 
 /// Result for one operation within a batch.
@@ -841,7 +827,7 @@ impl<'a> TypedCollection<'a> {
     }
 
     /// Read one record.
-    pub fn read(&self, request: ReadRequest) -> MdbaseResult<OperationOutcome<ReadResult>> {
+    pub fn read(&self, request: ReadRequest) -> MdbaseResult<OperationOutcome<RecordDocument>> {
         if self.collection.spec_profile == SpecProfile::V02 {
             return crate::compat::v02::read(self.collection, request);
         }
@@ -849,26 +835,16 @@ impl<'a> TypedCollection<'a> {
     }
 
     /// Create one canonical record.
-    pub fn create(&self, request: CreateRequest) -> MdbaseResult<OperationOutcome<MutationResult>> {
+    pub fn create(&self, request: CreateRequest) -> MdbaseResult<OperationOutcome<RecordDocument>> {
         self.require_canonical("create")?;
-        let dry_run = request.dry_run;
-        let mut input = request.into_wire();
-        if dry_run {
-            input["dry_run"] = Value::Bool(false);
-            return self.execute_dry_run("create", input);
-        }
+        let input = request.into_wire();
         self.execute(self.operations()?.create(&input))
     }
 
     /// Patch one canonical record.
-    pub fn update(&self, request: UpdateRequest) -> MdbaseResult<OperationOutcome<MutationResult>> {
+    pub fn update(&self, request: UpdateRequest) -> MdbaseResult<OperationOutcome<RecordDocument>> {
         self.require_canonical("update")?;
-        let dry_run = request.dry_run;
-        let mut input = request.into_wire();
-        if dry_run {
-            input["dry_run"] = Value::Bool(false);
-            return self.execute_dry_run("update", input);
-        }
+        let input = request.into_wire();
         self.execute(self.operations()?.update(&input))
     }
 
@@ -879,10 +855,32 @@ impl<'a> TypedCollection<'a> {
         self.execute(self.operations()?.delete(&input))
     }
 
+    /// Preview one delete without mutating authoritative state.
+    pub fn preflight_delete(
+        &self,
+        request: DeleteRequest,
+    ) -> MdbaseResult<OperationOutcome<DeletePreflightResult>> {
+        self.require_canonical("delete")?;
+        let mut input = request.into_wire();
+        input["dry_run"] = Value::Bool(true);
+        self.execute(self.operations()?.delete(&input))
+    }
+
     /// Rename one canonical record and optionally rewrite references.
     pub fn rename(&self, request: RenameRequest) -> MdbaseResult<OperationOutcome<RenameResult>> {
         self.require_canonical("rename")?;
         let input = request.into_wire();
+        self.execute(self.operations()?.rename(&input))
+    }
+
+    /// Preview one rename without mutating authoritative state.
+    pub fn preflight_rename(
+        &self,
+        request: RenameRequest,
+    ) -> MdbaseResult<OperationOutcome<RenamePreflightResult>> {
+        self.require_canonical("rename")?;
+        let mut input = request.into_wire();
+        input["dry_run"] = Value::Bool(true);
         self.execute(self.operations()?.rename(&input))
     }
 
@@ -982,38 +980,6 @@ impl<'a> TypedCollection<'a> {
         let value =
             serde_json::from_value(result.result).map_err(|error| MdbaseError::InvalidResult {
                 message: error.to_string(),
-            })?;
-        Ok(OperationOutcome { value, diagnostics })
-    }
-
-    fn execute_dry_run<T: DeserializeOwned>(
-        &self,
-        kind: &'static str,
-        input: Value,
-    ) -> MdbaseResult<OperationOutcome<T>> {
-        let result = self.operations()?.batch(&json!({
-            "dry_run": true,
-            "operations": [{"kind": kind, "input": input}],
-        }));
-        let diagnostics = result
-            .diagnostics
-            .into_iter()
-            .map(Diagnostic::from)
-            .collect::<Vec<_>>();
-        if !result.valid {
-            return Err(MdbaseError::Operation { diagnostics });
-        }
-        let value = result
-            .result
-            .pointer("/operations/0/result")
-            .cloned()
-            .ok_or_else(|| MdbaseError::InvalidResult {
-                message: "dry-run batch did not return its operation result".to_string(),
-            })
-            .and_then(|value| {
-                serde_json::from_value(value).map_err(|error| MdbaseError::InvalidResult {
-                    message: error.to_string(),
-                })
             })?;
         Ok(OperationOutcome { value, diagnostics })
     }

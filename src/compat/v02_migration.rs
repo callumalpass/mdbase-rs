@@ -616,7 +616,7 @@ fn verify_equivalent_reads(collection: &Collection, desired: &FileBaseline) -> M
         let legacy = legacy_api.read(request.clone())?.value;
         let canonical = canonical_api.read(request)?.value;
         if legacy.frontmatter != canonical.frontmatter
-            || legacy.raw_frontmatter != canonical.raw_frontmatter
+            || legacy.effective_frontmatter != canonical.effective_frontmatter
             || legacy.types != canonical.types
             || legacy.body != canonical.body
         {
