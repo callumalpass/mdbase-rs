@@ -622,7 +622,10 @@ mod tests {
             Some(1),
         )
         .unwrap_err();
-        assert!(matches!(error, TransactionError::SimulatedCrash));
+        assert!(
+            matches!(&error, TransactionError::SimulatedCrash),
+            "unexpected transaction error: {error:?}"
+        );
         assert_eq!(fs::read(root.path().join("a.md")).unwrap(), b"new-a\n");
         assert_eq!(fs::read(root.path().join("b.md")).unwrap(), b"old-b\n");
 
@@ -642,7 +645,7 @@ mod tests {
     fn recovery_fails_closed_after_an_unrelated_external_edit() {
         let (root, collection) = collection();
         let (before, after) = versions();
-        commit_shadow_controlled(
+        let error = commit_shadow_controlled(
             &collection,
             &before,
             &after,
@@ -650,6 +653,10 @@ mod tests {
             Some(1),
         )
         .unwrap_err();
+        assert!(
+            matches!(&error, TransactionError::SimulatedCrash),
+            "unexpected transaction error: {error:?}"
+        );
         fs::write(root.path().join("b.md"), "external\n").unwrap();
 
         drop(collection);
@@ -675,10 +682,13 @@ mod tests {
         fs::write(root.path().join("b.md"), "external\n").unwrap();
 
         let error = commit_shadow(&collection, &before, &after).unwrap_err();
-        assert!(matches!(
-            error,
-            TransactionError::ConcurrentModification(path) if path == "b.md"
-        ));
+        assert!(
+            matches!(
+                &error,
+                TransactionError::ConcurrentModification(ref path) if path == "b.md"
+            ),
+            "unexpected transaction error: {error:?}"
+        );
         assert_eq!(fs::read(root.path().join("a.md")).unwrap(), b"old-a\n");
         assert_eq!(fs::read(root.path().join("b.md")).unwrap(), b"external\n");
         assert_eq!(
@@ -720,7 +730,10 @@ schema:
             Some(1),
         )
         .unwrap_err();
-        assert!(matches!(error, TransactionError::SimulatedCrash));
+        assert!(
+            matches!(&error, TransactionError::SimulatedCrash),
+            "unexpected transaction error: {error:?}"
+        );
         assert!(root.path().join("_types/task.md").is_file());
         assert!(fs::read_to_string(root.path().join("mdbase.yaml"))
             .unwrap()
