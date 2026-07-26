@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "scenario": "all",
+  "files": 5000,
+  "operations": {
+    "open": {
+      "max_p95_ms": 15.0
+    },
+    "read": {
+      "max_p95_ms": 1.0
+    },
+    "cache_rebuild": {
+      "max_p95_ms": 450.0
+    },
+    "v03_query_basic": {
+      "max_p95_ms": 250.0
+    },
+    "v03_query_projection": {
+      "max_p95_ms": 420.0
+    },
+    "editor_two_pass_index": {
+      "max_p95_ms": 500.0
+    },
+    "view_list": {
+      "max_p95_ms": 150.0
+    },
+    "view_execute_canonical": {
+      "max_p95_ms": 400.0
+    },
+    "view_execute_obsidian": {
+      "max_p95_ms": 350.0
+    },
+    "update": {
+      "max_p95_ms": 200.0
+    },
+    "rename_update_refs": {
+      "max_p95_ms": 300.0
+    },
+    "create": {
+      "max_p95_ms": 2.0
+    },
+    "delete": {
+      "max_p95_ms": 1.0
+    },
+    "runtime_open_with_snapshot": {
+      "max_p95_ms": 1250.0
+    },
+    "runtime_update_and_watch": {
+      "max_p95_ms": 300.0
+    }
+  }
+}
