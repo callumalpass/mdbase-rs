@@ -92,6 +92,78 @@ fn provider_snapshot_is_canonical_stable_and_observes_external_changes() {
 }
 
 #[test]
+fn provider_snapshot_includes_configured_saved_view_sources() {
+    let directory = collection();
+    fs::write(
+        directory.path().join("mdbase.yaml"),
+        "spec_version: 0.3.0\nsettings:\n  default_validation: error\nx-obsidian:\n  bases:\n    include:\n      - views/**/*.base\n",
+    )
+    .unwrap();
+    fs::create_dir(directory.path().join("views")).unwrap();
+    fs::write(
+        directory.path().join("views/tasks.base"),
+        "views:\n  - type: table\n    name: Tasks\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("ignored.base"),
+        "views:\n  - type: table\n    name: Ignored\n",
+    )
+    .unwrap();
+    let provider = FilesystemProvider::open(directory.path()).unwrap();
+
+    let first = provider.snapshot().unwrap();
+    assert_eq!(first.resources.len(), 2);
+    assert_eq!(first.resources[1].path, "views/tasks.base");
+    assert_eq!(
+        first.resources[1].kind,
+        CollectionSnapshotResourceKind::View
+    );
+    assert!(first.resources[1].document.contains("name: Tasks"));
+    assert!(first.records.is_empty());
+
+    fs::write(
+        directory.path().join("views/tasks.base"),
+        "views:\n  - type: table\n    name: Changed\n",
+    )
+    .unwrap();
+    let changed = provider.snapshot().unwrap();
+    assert_ne!(changed.resource_revision, first.resource_revision);
+    assert_ne!(changed.revision, first.revision);
+}
+
+#[test]
+fn provider_snapshot_matches_the_portable_sdk_digest_fixture() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("mdbase.yaml"),
+        "spec_version: 0.3.0\nx-obsidian:\n  bases:\n    include:\n      - views/**/*.base\n",
+    )
+    .unwrap();
+    fs::create_dir(directory.path().join("views")).unwrap();
+    fs::write(directory.path().join("views/tasks.base"), "views: []\n").unwrap();
+    fs::create_dir(directory.path().join("notes")).unwrap();
+    fs::write(
+        directory.path().join("notes/one.md"),
+        "---\ntitle: One\n---\nBody\n",
+    )
+    .unwrap();
+
+    let snapshot = FilesystemProvider::open(directory.path())
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    assert_eq!(
+        snapshot.resource_revision,
+        "sha256:09367b66bc7e29a90ee2cafa992f3477dd523d09558f542fb9fe4418312984a8"
+    );
+    assert_eq!(
+        snapshot.revision,
+        "sha256:b01ab663203cd44b2a837e0a2fcf73f06bd0cae8787efb3148c3821f255e4806"
+    );
+}
+
+#[test]
 fn provider_serializes_conditional_writers() {
     let directory = collection();
     fs::write(
