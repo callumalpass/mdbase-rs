@@ -9,6 +9,7 @@ mod filesystem;
 mod observer;
 mod operation;
 mod provider;
+mod snapshot;
 
 pub use filesystem::FilesystemRuntime;
 #[cfg(feature = "tracing")]
@@ -18,6 +19,10 @@ pub use observer::{
 };
 pub use operation::{invalid_operation_result, OperationKind, OperationRequest};
 pub use provider::{CollectionProvider, FilesystemProvider};
+pub use snapshot::{
+    CollectionSnapshot, CollectionSnapshotRecord, CollectionSnapshotResource,
+    CollectionSnapshotResourceKind,
+};
 
 use crate::watch::WatchError;
 use thiserror::Error;

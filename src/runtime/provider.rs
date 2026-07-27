@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::observer::NoopObserver;
+use super::CollectionSnapshot;
 use super::{
     ErrorReporting, ObserverOptions, OperationError, OperationKind, OperationPerformance,
     OperationRequest, ProviderError, RuntimeObserver,
@@ -83,6 +84,15 @@ impl FilesystemProvider {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Capture collection resources and canonical records at one read boundary.
+    ///
+    /// The provider gate prevents an mdbase mutation from interleaving with
+    /// the capture. External filesystem writers are detected by the ordinary
+    /// opaque revisions and by a subsequent capture before cutover.
+    pub fn snapshot(&self) -> Result<CollectionSnapshot, ProviderError> {
+        self.with_collection_read(Collection::snapshot)
     }
 
     /// Execute a compound provider operation against one freshly loaded

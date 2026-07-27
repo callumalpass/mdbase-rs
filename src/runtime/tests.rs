@@ -53,6 +53,45 @@ fn provider_observes_external_changes_between_requests() {
 }
 
 #[test]
+fn provider_snapshot_is_canonical_stable_and_observes_external_changes() {
+    let directory = collection();
+    fs::create_dir(directory.path().join("_types")).unwrap();
+    fs::write(
+        directory.path().join("_types/task.md"),
+        "---\nkind: mdbase.type\nname: task\nversion: 1\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("task.md"),
+        "---\ntitle: Original\n---\nBody\n",
+    )
+    .unwrap();
+    let provider = FilesystemProvider::open(directory.path()).unwrap();
+
+    let first = provider.snapshot().unwrap();
+    let repeated = provider.snapshot().unwrap();
+    assert_eq!(first, repeated);
+    assert_eq!(first.resources.len(), 2);
+    assert_eq!(first.resources[0].path, "mdbase.yaml");
+    assert_eq!(first.records.len(), 1);
+    assert_eq!(first.records[0].path, "task.md");
+    assert_eq!(first.records[0].body, "Body\n");
+    assert_eq!(
+        first.records[0].document,
+        "---\ntitle: Original\n---\nBody\n"
+    );
+
+    fs::write(
+        directory.path().join("task.md"),
+        "---\ntitle: Changed\n---\nBody\n",
+    )
+    .unwrap();
+    let changed = provider.snapshot().unwrap();
+    assert_ne!(changed.revision, first.revision);
+    assert_eq!(changed.records[0].frontmatter["title"], "Changed");
+}
+
+#[test]
 fn provider_serializes_conditional_writers() {
     let directory = collection();
     fs::write(
