@@ -573,15 +573,17 @@ impl Collection {
     ) -> Vec<Issue> {
         let mut issues = Vec::new();
 
-        // Extract target from [[...]] wiki-link syntax
-        let target = if link_str.starts_with("[[") && link_str.ends_with("]]") {
-            &link_str[2..link_str.len() - 2]
-        } else {
-            link_str
-        };
-
-        // Remove display text after | if present
-        let target = target.split('|').next().unwrap_or(target).trim();
+        // Keep validation aligned with the public parser so every supported
+        // representation resolves the same target. In particular, anchors are
+        // not part of a filename and Markdown links resolve their URL rather
+        // than their complete display syntax.
+        let parsed = self.parse_link(&serde_json::json!({"value": link_str}));
+        let target = parsed
+            .get("link")
+            .and_then(|link| link.get("target"))
+            .and_then(|target| target.as_str())
+            .unwrap_or("")
+            .trim();
 
         if target.is_empty() {
             return issues;
@@ -767,7 +769,7 @@ impl Collection {
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
 
-            if stem.eq_ignore_ascii_case(original) {
+            if stem.to_lowercase() == original.to_lowercase() {
                 matches.push(rel_path);
                 continue;
             }

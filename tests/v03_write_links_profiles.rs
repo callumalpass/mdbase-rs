@@ -271,6 +271,61 @@ fn multi_target_links_validate_existence_and_any_allowed_target_type() {
 }
 
 #[test]
+fn link_validation_uses_canonical_targets_and_unicode_case_matching() {
+    let (root, collection) = collection();
+    write_record(
+        &root,
+        "projects/Über.md",
+        "---\ntype: project\ntitle: Über\n---\n\n# Details\n",
+    );
+    write_record(
+        &root,
+        "tasks/links.md",
+        "---\ntype: task\ntitle: Links\nstatus: open\nrelated: '[[alpha|Project]]'\n---\n",
+    );
+    let operations = collection.v03_operations().unwrap();
+
+    for link in [
+        "[[alpha|Project]]",
+        "[[alpha#Details]]",
+        "[Project](../projects/alpha.md#Details)",
+        "[[über]]",
+    ] {
+        fs::write(
+            root.path().join("tasks/links.md"),
+            format!("---\ntype: task\ntitle: Links\nstatus: open\nrelated: {link:?}\n---\n"),
+        )
+        .unwrap();
+        let result = operations.validate(&json!({"path": "tasks/links.md"}));
+        assert!(result.valid, "{link} should resolve: {result:#?}");
+    }
+
+    fs::write(
+        root.path().join("tasks/links.md"),
+        "---\ntype: task\ntitle: Links\nstatus: open\nrelated: '[Missing](../projects/missing.md#Details)'\n---\n",
+    )
+    .unwrap();
+    let missing = operations.validate(&json!({"path": "tasks/links.md"}));
+    assert!(!missing.valid);
+    assert!(missing
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "link_not_found"));
+
+    fs::write(
+        root.path().join("tasks/links.md"),
+        "---\ntype: task\ntitle: Links\nstatus: open\nrelated: '[Escape](../../outside.md#Details)'\n---\n",
+    )
+    .unwrap();
+    let traversal = operations.validate(&json!({"path": "tasks/links.md"}));
+    assert!(!traversal.valid);
+    assert!(traversal
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "path_traversal"));
+}
+
+#[test]
 fn query_cel_exposes_link_tag_and_embed_helpers_without_returning_body() {
     let (root, collection) = collection();
     write_record(
