@@ -1,8 +1,8 @@
 use std::fs;
 
 use mdbase::api::{
-    BatchOperation, BatchRequest, CollectionPath, CreateRequest, DeleteRequest, MdbaseError,
-    QueryDirection, QueryRequest, ReadRequest, RenameRequest, Revision, UpdateRequest,
+    BatchOperation, BatchRequest, CollectionPath, CreateRequest, DeleteRequest, FrontmatterMode,
+    MdbaseError, QueryDirection, QueryRequest, ReadRequest, RenameRequest, Revision, UpdateRequest,
     V02MigrationRequest,
 };
 use mdbase::{Collection, CompatibilityMode};
@@ -52,12 +52,10 @@ fn typed_crud_query_and_revision_failures_are_structured() {
 
     let created = api
         .create(
-            CreateRequest::new(
-                original_path.clone(),
-                json!({"type": "task", "title": "First"}),
-            )
-            .with_body("Body")
-            .with_document(),
+            CreateRequest::new(original_path.clone())
+                .with_frontmatter(json!({"type": "task", "title": "First"}))
+                .with_body("Body")
+                .with_document(),
         )
         .unwrap();
     assert!(created.diagnostics.is_empty(), "{created:#?}");
@@ -177,6 +175,97 @@ fn exact_record_documents_round_trip_without_reformatting() {
 }
 
 #[test]
+fn body_only_records_are_created_queried_and_updated_without_synthetic_frontmatter() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("mdbase.yaml"),
+        "spec_version: 0.3.0\nsettings:\n  validation: error\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("_types")).unwrap();
+    fs::write(
+        root.path().join("_types/note.md"),
+        r#"---
+kind: mdbase.type
+name: note
+match:
+  path_glob: "notes/**/*.md"
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    properties:
+      title: { type: string }
+collection:
+  read_defaults:
+    title: Untitled
+---
+"#,
+    )
+    .unwrap();
+    let collection = Collection::open(root.path()).unwrap();
+    let api = collection.typed().unwrap();
+    let path = CollectionPath::new("notes/plain.md").unwrap();
+    let body = "---\nThis is body text, not a complete frontmatter block.";
+
+    let created = api
+        .create(
+            CreateRequest::new(path.clone())
+                .with_body(body)
+                .with_document(),
+        )
+        .unwrap();
+    assert_eq!(created.value.frontmatter, json!({}));
+    assert_eq!(created.value.effective_frontmatter["title"], "Untitled");
+    assert_eq!(created.value.types, ["note"]);
+    assert_eq!(created.value.body, body);
+    assert_eq!(created.value.document.as_deref(), Some(body));
+    assert_eq!(
+        fs::read_to_string(root.path().join("notes/plain.md")).unwrap(),
+        body
+    );
+
+    let mut query_request = QueryRequest::builder().type_name("note");
+    query_request.frontmatter_mode = FrontmatterMode::Both;
+    let query = api.query(query_request).unwrap();
+    assert_eq!(query.value.total_count, 1);
+    assert_eq!(query.value.records[0]["frontmatter"], json!({}));
+
+    let mut body_update = UpdateRequest::new(path.clone(), json!({}));
+    body_update.body = Some("# Revised\n".to_string());
+    body_update = body_update.with_document();
+    let updated = api.update(body_update).unwrap();
+    assert_eq!(updated.value.frontmatter, json!({}));
+    assert_eq!(updated.value.document.as_deref(), Some("# Revised\n"));
+
+    let structured = api
+        .update(UpdateRequest::new(path.clone(), json!({"title": "Named"})))
+        .unwrap();
+    assert_eq!(structured.value.frontmatter["title"], "Named");
+    assert!(fs::read_to_string(root.path().join("notes/plain.md"))
+        .unwrap()
+        .starts_with("---\ntitle: Named\n---\n"));
+
+    let replacement = "# Plain again";
+    let plain = api
+        .update(UpdateRequest::replace_document(path, replacement))
+        .unwrap();
+    assert_eq!(plain.value.frontmatter, json!({}));
+    assert_eq!(plain.value.document.as_deref(), Some(replacement));
+    assert_eq!(
+        fs::read_to_string(root.path().join("notes/plain.md")).unwrap(),
+        replacement
+    );
+
+    let deserialized: CreateRequest = serde_json::from_value(json!({
+        "path": "notes/from-json.md",
+        "body": "No frontmatter"
+    }))
+    .unwrap();
+    assert_eq!(deserialized.frontmatter, json!({}));
+}
+
+#[test]
 fn document_updates_reject_invalid_or_ambiguous_candidates_without_writing() {
     let (root, collection) = typed_collection();
     fs::create_dir_all(root.path().join("tasks")).unwrap();
@@ -230,10 +319,10 @@ fn typed_non_partial_batch_commits_all_mutations_together() {
             CollectionPath::new("tasks/existing.md").unwrap(),
             json!({"status": "done"}),
         )),
-        BatchOperation::Create(CreateRequest::new(
-            CollectionPath::new("tasks/created.md").unwrap(),
-            json!({"type": "task", "title": "Created"}),
-        )),
+        BatchOperation::Create(
+            CreateRequest::new(CollectionPath::new("tasks/created.md").unwrap())
+                .with_frontmatter(json!({"type": "task", "title": "Created"})),
+        ),
     ])
     .unwrap();
 
@@ -322,6 +411,8 @@ fields:
     .unwrap();
     let record = "---\ntype: task\ntitle: Legacy\n---\nBody\n";
     fs::write(root.path().join("legacy.md"), record).unwrap();
+    let body_only = "# Body-only legacy note\n";
+    fs::write(root.path().join("plain.md"), body_only).unwrap();
     let collection = Collection::open(root.path()).unwrap();
     let api = collection.typed().unwrap();
 
@@ -332,7 +423,7 @@ fields:
         })
         .unwrap();
     assert!(!plan.applied);
-    assert_eq!(plan.verified_records, 1);
+    assert_eq!(plan.verified_records, 2);
     assert!(plan.changes.iter().any(|change| {
         change.path == "_types/task.yaml"
             && change.before_revision.is_some()
@@ -360,6 +451,10 @@ fields:
         fs::read_to_string(root.path().join("legacy.md")).unwrap(),
         record
     );
+    assert_eq!(
+        fs::read_to_string(root.path().join("plain.md")).unwrap(),
+        body_only
+    );
 
     drop(collection);
     let canonical = Collection::open(root.path()).unwrap();
@@ -369,12 +464,17 @@ fields:
     assert!(read.value.frontmatter.get("status").is_none());
     assert_eq!(read.value.effective_frontmatter["status"], "open");
     assert_eq!(read.value.effective_frontmatter["label"], "Legacy!");
+    let plain = api
+        .read(ReadRequest::new("plain.md").unwrap().with_document())
+        .unwrap();
+    assert_eq!(plain.value.frontmatter, json!({}));
+    assert_eq!(plain.value.document.as_deref(), Some(body_only));
 
     let created = api
-        .create(CreateRequest::new(
-            CollectionPath::new("new.md").unwrap(),
-            json!({"type": "task", "title": "New"}),
-        ))
+        .create(
+            CreateRequest::new(CollectionPath::new("new.md").unwrap())
+                .with_frontmatter(json!({"type": "task", "title": "New"})),
+        )
         .unwrap();
     assert!(created.value.frontmatter["uid"]
         .as_str()
