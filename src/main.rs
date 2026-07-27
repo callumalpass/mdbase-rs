@@ -379,8 +379,9 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             let fields_value = parse_fields_or_stdin(fields.as_deref());
             let request: MdbaseResult<CreateRequest> = (|| {
                 let mut request = match path {
-                    Some(path) => CreateRequest::new(CollectionPath::new(path)?, fields_value),
-                    None => CreateRequest::derived(fields_value),
+                    Some(path) => CreateRequest::new(CollectionPath::new(path)?)
+                        .with_frontmatter(fields_value),
+                    None => CreateRequest::derived().with_frontmatter(fields_value),
                 };
                 if let Some(file_type) = file_type {
                     request = request.with_type(file_type);

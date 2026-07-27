@@ -2,8 +2,15 @@
 
 use serde_yaml::Value as YamlValue;
 
-/// Serialize a YAML mapping to a frontmatter string (with --- delimiters).
+/// Serialize a record document.
+///
+/// Records with no persisted fields are ordinary body-only Markdown files.
+/// Frontmatter delimiters are only emitted when the mapping contains fields.
 pub fn serialize_document(frontmatter: &serde_yaml::Mapping, body: &str) -> String {
+    if frontmatter.is_empty() {
+        return body.to_string();
+    }
+
     let yaml_str =
         serde_yaml::to_string(&YamlValue::Mapping(frontmatter.clone())).unwrap_or_default();
     let mut result = String::from("---\n");
@@ -19,6 +26,35 @@ pub fn serialize_document(frontmatter: &serde_yaml::Mapping, body: &str) -> Stri
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serialize_document;
+    use serde_yaml::{Mapping, Value};
+
+    #[test]
+    fn empty_frontmatter_preserves_body_only_markdown_exactly() {
+        for body in [
+            "",
+            "# Note",
+            "# Note\n",
+            "---\nA horizontal rule without a closing fence",
+        ] {
+            assert_eq!(serialize_document(&Mapping::new(), body), body);
+        }
+    }
+
+    #[test]
+    fn non_empty_frontmatter_uses_yaml_delimiters() {
+        let mut frontmatter = Mapping::new();
+        frontmatter.insert(Value::String("title".into()), Value::String("Note".into()));
+
+        assert_eq!(
+            serialize_document(&frontmatter, "# Body"),
+            "---\ntitle: Note\n---\n# Body\n"
+        );
+    }
 }
 
 /// Merge updated fields into an existing YAML mapping.

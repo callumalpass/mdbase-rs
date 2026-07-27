@@ -10,6 +10,10 @@ use super::{CollectionPath, CollectionPathError};
 use crate::v03;
 use crate::{Collection, SpecProfile};
 
+fn empty_json_object() -> Value {
+    Value::Object(Map::new())
+}
+
 /// Result type used by the typed Rust API.
 pub type MdbaseResult<T> = Result<T, MdbaseError>;
 
@@ -215,6 +219,7 @@ pub struct CreateRequest {
     #[serde(default, rename = "type")]
     pub type_name: Option<String>,
     /// Persisted frontmatter object.
+    #[serde(default = "empty_json_object")]
     pub frontmatter: Value,
     /// Markdown body.
     #[serde(default)]
@@ -228,28 +233,34 @@ pub struct CreateRequest {
 }
 
 impl CreateRequest {
-    /// Construct a create request with an explicit path.
-    pub fn new(path: CollectionPath, frontmatter: Value) -> Self {
+    /// Construct a body-only create request with an explicit path.
+    pub fn new(path: CollectionPath) -> Self {
         Self {
             path: Some(path),
             type_name: None,
-            frontmatter,
+            frontmatter: empty_json_object(),
             body: String::new(),
             if_revision: None,
             include_document: false,
         }
     }
 
-    /// Construct a create request whose path is derived from its type.
-    pub fn derived(frontmatter: Value) -> Self {
+    /// Construct a body-only create request whose path is derived from its type.
+    pub fn derived() -> Self {
         Self {
             path: None,
             type_name: None,
-            frontmatter,
+            frontmatter: empty_json_object(),
             body: String::new(),
             if_revision: None,
             include_document: false,
         }
+    }
+
+    /// Set persisted frontmatter fields.
+    pub fn with_frontmatter(mut self, frontmatter: Value) -> Self {
+        self.frontmatter = frontmatter;
+        self
     }
 
     /// Set the explicit type name.
