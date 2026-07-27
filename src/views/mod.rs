@@ -10,6 +10,7 @@ pub use model::{
 };
 
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::v03::OperationResult;
 use crate::Collection;
@@ -36,4 +37,8 @@ pub(crate) fn update_source(collection: &Collection, input: &Value) -> Operation
 
 pub(crate) fn delete_source(collection: &Collection, input: &Value) -> OperationResult {
     source::delete(collection, input)
+}
+
+pub(crate) fn compatibility_source_paths(collection: &Collection) -> Vec<PathBuf> {
+    execute::obsidian_source_paths(collection)
 }

@@ -15,7 +15,7 @@ use super::ProviderError;
 pub struct CollectionSnapshot {
     /// Digest of collection resources and records at this capture boundary.
     pub revision: String,
-    /// Digest of configuration and type resources only.
+    /// Digest of configuration, type, and saved-view resources.
     pub resource_revision: String,
     pub spec_version: String,
     pub resources: Vec<CollectionSnapshotResource>,
@@ -27,6 +27,7 @@ pub struct CollectionSnapshot {
 pub enum CollectionSnapshotResourceKind {
     Configuration,
     Type,
+    View,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,6 +82,18 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
             root.join(&type_file.path),
             type_file.path,
             CollectionSnapshotResourceKind::Type,
+        )?);
+    }
+    for view_file in crate::views::compatibility_source_paths(collection) {
+        let path = view_file
+            .strip_prefix(root)
+            .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        resources.push(read_resource(
+            view_file,
+            path,
+            CollectionSnapshotResourceKind::View,
         )?);
     }
     resources[1..].sort_by(|left, right| left.path.cmp(&right.path));
