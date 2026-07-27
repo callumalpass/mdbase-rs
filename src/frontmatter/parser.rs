@@ -110,6 +110,13 @@ pub fn parse_document(content: &str) -> ParsedDocument {
             };
         }
     };
+    // Obsidian permits an explicit but empty frontmatter block. It has the
+    // same persisted fields as a body-only record, not scalar frontmatter.
+    let yaml_value = if yaml_str.trim().is_empty() {
+        YamlValue::Mapping(serde_yaml::Mapping::new())
+    } else {
+        yaml_value
+    };
 
     ParsedDocument {
         frontmatter: Some(yaml_value),
@@ -245,6 +252,25 @@ pub fn json_to_yaml(json: &serde_json::Value) -> YamlValue {
 #[cfg(test)]
 mod tests {
     use super::parse_document;
+
+    #[test]
+    fn empty_explicit_frontmatter_is_an_empty_mapping() {
+        for source in ["---\n---\nBody", "---\n \n---\nBody"] {
+            let parsed = parse_document(source);
+            assert!(parsed.has_frontmatter);
+            assert!(parsed.frontmatter.is_some_and(|value| value.is_mapping()));
+            assert_eq!(parsed.body, "Body");
+        }
+    }
+
+    #[test]
+    fn an_unclosed_opening_fence_is_body_only_markdown() {
+        let source = "---\nThis is a horizontal rule followed by ordinary Markdown.";
+        let parsed = parse_document(source);
+        assert!(!parsed.has_frontmatter);
+        assert!(parsed.frontmatter.is_none());
+        assert_eq!(parsed.body, source);
+    }
 
     #[test]
     fn parses_crlf_frontmatter_without_shifting_the_closing_delimiter() {
