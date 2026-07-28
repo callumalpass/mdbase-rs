@@ -90,7 +90,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo package --locked --workspace
+      - name: Package crates whose registry dependencies are available
+        run: cargo package --locked -p mdbase -p mdbase-command
+      - name: Verify runtime package contents before dependency publication
+        run: cargo package --locked --list -p mdbase-runtime
 
   dependencies:
     name: Dependency policy
