@@ -10,7 +10,7 @@ description = "Transport-neutral command model and profiling workloads for mdbas
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
-mdbase = { path = "../.." }
+mdbase = { version = "0.4.0-rc.1", path = "../.." }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
