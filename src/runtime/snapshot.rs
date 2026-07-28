@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
+use walkdir::WalkDir;
 
 use super::ProviderError;
 
@@ -15,7 +16,7 @@ use super::ProviderError;
 pub struct CollectionSnapshot {
     /// Digest of collection resources and records at this capture boundary.
     pub revision: String,
-    /// Digest of configuration, type, and saved-view resources.
+    /// Digest of configuration, contract, schema, type, and saved-view resources.
     pub resource_revision: String,
     pub spec_version: String,
     pub resources: Vec<CollectionSnapshotResource>,
@@ -26,6 +27,8 @@ pub struct CollectionSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum CollectionSnapshotResourceKind {
     Configuration,
+    Contract,
+    Schema,
     Type,
     View,
 }
@@ -82,6 +85,49 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
             root.join(&type_file.path),
             type_file.path,
             CollectionSnapshotResourceKind::Type,
+        )?);
+    }
+    let contracts_root = root.join(&collection.settings().contracts_folder);
+    if contracts_root.exists() {
+        for entry in WalkDir::new(&contracts_root)
+            .follow_links(false)
+            .sort_by_file_name()
+        {
+            let entry = entry.map_err(|error| {
+                ProviderError::CollectionOpen(format!(
+                    "failed to inspect contracts folder: {error}"
+                ))
+            })?;
+            if !entry.file_type().is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("md")
+            {
+                continue;
+            }
+            let path = relative_resource_path(root, entry.path())?;
+            resources.push(read_resource(
+                entry.path().to_path_buf(),
+                path,
+                CollectionSnapshotResourceKind::Contract,
+            )?);
+        }
+    }
+    for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
+        let entry = entry.map_err(|error| {
+            ProviderError::CollectionOpen(format!("failed to inspect schema resources: {error}"))
+        })?;
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let path = relative_resource_path(root, entry.path())?;
+        if path == ".mdbase" || path.starts_with(".mdbase/") {
+            continue;
+        }
+        resources.push(read_resource(
+            entry.path().to_path_buf(),
+            path,
+            CollectionSnapshotResourceKind::Schema,
         )?);
     }
     for view_file in crate::views::compatibility_source_paths(collection) {
@@ -201,6 +247,16 @@ fn read_resource(
         revision: crate::v03::revision(&bytes),
         document,
     })
+}
+
+fn relative_resource_path(
+    root: &std::path::Path,
+    absolute: &std::path::Path,
+) -> Result<String, ProviderError> {
+    absolute
+        .strip_prefix(root)
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))
 }
 
 fn snapshot_revision(

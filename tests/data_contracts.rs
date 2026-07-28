@@ -175,11 +175,11 @@ fn canonical_tasknotes_digests_match_the_spec_fixture() {
     let definitions = collection.list_data_contracts();
     assert_eq!(
         definitions[0].digest,
-        "sha256:7174b83651f68fd061b37f7fdf0c90f3a5e54ec87ed7c5e709fd7e3b9415c5c7"
+        "sha256:7111c47ba7b1abed8c9823500c30ce0b80d3b3950a982d0acbc29523b5cb4d1c"
     );
     let implementations = collection.get_data_contract_implementations("tasknotes.task", "0.2.0");
     assert_eq!(
         implementations[0].implementation_digest,
-        "sha256:69e4f95ca2785c59756ab80bd4cc2f1f1498449221ed3d18de37f43f6972fcc8"
+        "sha256:2d3a40ba07e03e20a6bd1eae2f44c267a5bb14c3e693f09629f28b7a69277601"
     );
 }

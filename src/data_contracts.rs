@@ -316,11 +316,11 @@ impl DataContractRegistry {
             "kind": "mdbase.contract",
             "id": id,
             "version": version,
-            "schema": schema_wrapper,
+            "schema": record_schema,
         });
         let mut portable = portable.as_object().cloned().unwrap_or_default();
-        if let Some(binding_wrapper) = &binding_wrapper {
-            portable.insert("binding_schema".to_string(), binding_wrapper.clone());
+        if let Some(binding_schema) = &binding_schema {
+            portable.insert("binding_schema".to_string(), binding_schema.clone());
         }
         let digest = digest_value(&Value::Object(portable));
         let identity = (id.clone(), version.clone());
@@ -353,8 +353,8 @@ impl DataContractRegistry {
                         .get("description")
                         .and_then(Value::as_str)
                         .map(str::to_string),
-                    schema: schema_wrapper,
-                    binding_schema: binding_wrapper,
+                    schema: record_schema.clone(),
+                    binding_schema: binding_schema.clone(),
                     source_paths: vec![relative],
                     digest,
                 },
@@ -716,10 +716,28 @@ fn implementation_digest(
 
 pub fn data_contract_digest(frontmatter: &Value) -> String {
     let mut portable = Map::new();
-    for key in ["kind", "id", "version", "schema", "binding_schema"] {
+    for key in ["kind", "id", "version"] {
         if let Some(value) = frontmatter.get(key) {
             portable.insert(key.to_string(), value.clone());
         }
+    }
+    if let Some(schema) = frontmatter.get("schema") {
+        portable.insert(
+            "schema".to_string(),
+            schema
+                .get("value")
+                .cloned()
+                .unwrap_or_else(|| schema.clone()),
+        );
+    }
+    if let Some(schema) = frontmatter.get("binding_schema") {
+        portable.insert(
+            "binding_schema".to_string(),
+            schema
+                .get("value")
+                .cloned()
+                .unwrap_or_else(|| schema.clone()),
+        );
     }
     digest_value(&Value::Object(portable))
 }

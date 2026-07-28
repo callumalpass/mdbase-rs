@@ -19,6 +19,7 @@ pub(crate) mod cel;
 mod lifecycle;
 mod operations;
 mod query;
+mod type_pack;
 
 pub use cel::{
     evaluate_runtime_expression, evaluate_runtime_template, validate_runtime_expression,
@@ -26,6 +27,7 @@ pub use cel::{
 };
 pub use operations::{OperationResult, Operations};
 pub use query::QueryPerformance;
+pub use type_pack::TypePackResource;
 
 pub const SPEC_VERSION: &str = "0.3.0";
 pub const PRERELEASE_SPEC_VERSIONS: &[&str] = &["0.3.0-alpha.1"];
@@ -158,6 +160,16 @@ pub fn validate_data_contract(value: &Value, path: &str) -> Vec<Diagnostic> {
         value,
         path,
         DATA_CONTRACT_SCHEMA_ID,
+        None,
+    )
+}
+
+pub fn validate_type_pack(value: &Value, path: &str) -> Vec<Diagnostic> {
+    validate_canonical_value(
+        TYPE_PACK_SCHEMA,
+        value,
+        path,
+        "https://mdbase.dev/schemas/v0.3/type-pack.schema.json",
         None,
     )
 }
