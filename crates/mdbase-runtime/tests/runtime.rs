@@ -811,6 +811,20 @@ async fn overdue_one_shot_timer_fires_once_with_a_stable_generation() {
     );
     let snapshot = store.snapshot().await.unwrap();
     assert_eq!(snapshot.events.len(), 1);
+    let timer_event = &snapshot.events[0].envelope;
+    assert_eq!(
+        timer_event["type"],
+        Value::String("mdbase.runtime.timer.fired".to_string())
+    );
+    assert_eq!(
+        timer_event["data"]["scheduled_for"],
+        Value::String(scheduled.fire_at.to_rfc3339())
+    );
+    assert_eq!(timer_event["data"]["data"], json!({"items": ["timer"]}));
+    assert_eq!(
+        timer_event["data"]["late_by_ms"],
+        Value::Number((TimeDelta::minutes(55).num_milliseconds()).into())
+    );
     assert_eq!(
         snapshot.timers[0].status,
         mdbase_runtime::TimerStatus::Fired
@@ -980,18 +994,19 @@ fn registry_with(idempotent: bool, mutate: impl FnOnce(&mut Value)) -> Admission
         }),
     );
     let timer = event_contract(
-        "timer.fired",
+        "mdbase.runtime.timer.fired",
         json!({
             "type": "object",
-            "required": ["timer_id", "generation", "scheduled_at", "fired_at", "late_by_ms", "data"],
+            "required": ["timer_id", "generation", "scheduled_for", "fired_at", "late_by_ms", "data"],
             "properties": {
                 "timer_id": {"type": "string"},
                 "generation": {"type": "integer"},
-                "scheduled_at": {"type": "string", "format": "date-time"},
+                "scheduled_for": {"type": "string", "format": "date-time"},
                 "fired_at": {"type": "string", "format": "date-time"},
-                "late_by_ms": {"type": "integer"},
-                "data": {"type": "object"}
-            }
+                "late_by_ms": {"type": "integer", "minimum": 0},
+                "data": true
+            },
+            "additionalProperties": false
         }),
     );
     let echo = action_contract("test.echo");
@@ -1077,18 +1092,19 @@ fn action_contract(id: &str) -> Value {
 
 fn timer_contract_reference() -> ExactContractReference {
     exact(&event_contract(
-        "timer.fired",
+        "mdbase.runtime.timer.fired",
         json!({
             "type": "object",
-            "required": ["timer_id", "generation", "scheduled_at", "fired_at", "late_by_ms", "data"],
+            "required": ["timer_id", "generation", "scheduled_for", "fired_at", "late_by_ms", "data"],
             "properties": {
                 "timer_id": {"type": "string"},
                 "generation": {"type": "integer"},
-                "scheduled_at": {"type": "string", "format": "date-time"},
+                "scheduled_for": {"type": "string", "format": "date-time"},
                 "fired_at": {"type": "string", "format": "date-time"},
-                "late_by_ms": {"type": "integer"},
-                "data": {"type": "object"}
-            }
+                "late_by_ms": {"type": "integer", "minimum": 0},
+                "data": true
+            },
+            "additionalProperties": false
         }),
     ))
 }

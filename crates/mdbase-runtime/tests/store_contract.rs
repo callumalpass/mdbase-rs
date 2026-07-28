@@ -71,7 +71,7 @@ fn timer(id: &str, at: chrono::DateTime<Utc>) -> TimerRecord {
         generation: 0,
         status: TimerStatus::Scheduled,
         fire_at: at,
-        event_contract: contract("timer.fired"),
+        event_contract: contract("mdbase.runtime.timer.fired"),
         event_source: identity(),
         source_uri: "urn:test:timer".to_string(),
         subject: None,

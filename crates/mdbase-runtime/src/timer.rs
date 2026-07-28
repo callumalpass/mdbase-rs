@@ -160,7 +160,7 @@ impl Runtime {
             "data": {
                 "timer_id": claim.timer.id,
                 "generation": claim.timer.generation,
-                "scheduled_at": claim.timer.fire_at.to_rfc3339(),
+                "scheduled_for": claim.timer.fire_at.to_rfc3339(),
                 "fired_at": now.to_rfc3339(),
                 "late_by_ms": late_by_ms,
                 "data": claim.timer.data
