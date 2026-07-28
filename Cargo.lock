@@ -1251,7 +1251,6 @@ version = "0.4.0-rc.1"
 dependencies = [
  "chrono",
  "chrono-tz",
- "clap",
  "fancy-regex 0.14.0",
  "fs2",
  "insta",
@@ -1271,6 +1270,19 @@ dependencies = [
  "ulid",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "mdbase-command"
+version = "0.1.0-beta.1"
+dependencies = [
+ "chrono",
+ "clap",
+ "mdbase",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

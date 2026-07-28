@@ -14,14 +14,14 @@ right boundary for approving semantic changes.
 Run the read-only checks you depend on:
 
 ```bash
-mdb -C ./notes validate
-mdb -C ./notes query --types task --limit 10
+mdbase --root ./notes validate
+mdbase --root ./notes query --types task --limit 10
 ```
 
 ## 1. Inspect the verified plan
 
 ```bash
-mdb -C ./notes migrate-v02 --dry-run --pretty
+mdbase --root ./notes migrate-v02 --dry-run --pretty
 ```
 
 The plan reports:
@@ -44,8 +44,8 @@ The apply command refuses lossy plans by default. Do not use `--allow-lossy`
 until each diagnostic has been reviewed:
 
 ```bash
-mdb -C ./notes migrate-v02 --dry-run --pretty
-mdb -C ./notes migrate-v02 --allow-lossy
+mdbase --root ./notes migrate-v02 --dry-run --pretty
+mdbase --root ./notes migrate-v02 --allow-lossy
 ```
 
 Existing record Markdown is not rewritten merely to change the type format.
@@ -57,8 +57,8 @@ canonical v0.3 collection and rejects the plan if effective reads differ.
 For a lossless plan:
 
 ```bash
-mdb -C ./notes migrate-v02
-mdb -C ./notes validate
+mdbase --root ./notes migrate-v02
+mdbase --root ./notes validate
 ```
 
 The apply step:

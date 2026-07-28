@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Args as ClapArgs, ValueEnum};
 use mdbase::frontmatter::parser::json_to_yaml_mapping;
 use mdbase::frontmatter::serializer::serialize_document;
 use mdbase::runtime::{FilesystemRuntime, OperationKind, OperationRequest};
@@ -75,18 +75,8 @@ schema:
 
 const STATUS_CYCLE: [&str; 3] = ["open", "in-progress", "done"];
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "mdb-profile",
-    version,
-    about = "Run repeatable performance profiling for core mdbase operations"
-)]
-struct Args {
-    /// Profile an existing collection without mutating records. Existing mode
-    /// runs only metadata-page and editor query workloads.
-    #[arg(long)]
-    collection: Option<PathBuf>,
-
+#[derive(Debug, ClapArgs)]
+pub struct Args {
     /// Workload to run; queries is the fastest feedback loop
     #[arg(long, value_enum, default_value_t = Scenario::Queries)]
     scenario: Scenario,
@@ -162,10 +152,6 @@ struct Args {
     /// JSON file containing release performance budgets
     #[arg(long)]
     thresholds: Option<PathBuf>,
-
-    /// Print the full JSON report instead of the concise local table
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -197,7 +183,6 @@ struct ProfileConfig {
 
 #[derive(Debug, Serialize)]
 struct FixtureSummary {
-    root: String,
     kept: bool,
     task_files: usize,
     project_files: usize,
@@ -277,18 +262,14 @@ impl Drop for FixtureCleanup {
     }
 }
 
-fn main() {
-    if let Err(err) = run() {
-        eprintln!("{err}");
-        std::process::exit(1);
-    }
-}
-
-fn run() -> Result<(), String> {
-    let args = Args::parse();
-    validate_args(&args)?;
-    if let Some(root) = &args.collection {
-        return run_existing_collection(&args, root);
+/// Run the deterministic engine profile selected by the unified CLI.
+///
+/// When `collection_root` is present, records are never modified and only the
+/// metadata-page and editor query workloads run.
+pub fn run(args: Args, collection_root: Option<&Path>, output_json: bool) -> Result<(), String> {
+    validate_args(&args, collection_root.is_some())?;
+    if let Some(root) = collection_root {
+        return run_existing_collection(&args, root, output_json);
     }
 
     let fixture_root = determine_fixture_root(&args);
@@ -388,7 +369,7 @@ fn run() -> Result<(), String> {
     }
 
     let report = ProfileReport {
-        tool: "mdbase-profiler",
+        tool: "mdbase-profile-engine",
         version: env!("CARGO_PKG_VERSION"),
         generated_at,
         total_runtime_ms: run_start.elapsed().as_secs_f64() * 1000.0,
@@ -415,7 +396,6 @@ fn run() -> Result<(), String> {
             seed: args.seed,
         },
         fixture: FixtureSummary {
-            root: fixture.root.to_string_lossy().to_string(),
             kept: args.keep_fixture,
             task_files: args.files + 1,
             project_files: args.projects,
@@ -424,18 +404,19 @@ fn run() -> Result<(), String> {
         operations,
     };
 
-    emit_report(&args, &report)?;
+    emit_report(&args, &report, output_json)?;
     validate_thresholds(&args, &report)
 }
 
-fn run_existing_collection(args: &Args, root: &Path) -> Result<(), String> {
+fn run_existing_collection(args: &Args, root: &Path, output_json: bool) -> Result<(), String> {
     if !matches!(args.scenario, Scenario::Queries) {
-        return Err("--collection is read-only and supports only --scenario queries".to_string());
+        return Err(
+            "profiling an existing --root collection is read-only and supports only --scenario queries"
+                .to_string(),
+        );
     }
     if args.fixture_root.is_some() || args.keep_fixture {
-        return Err(
-            "--fixture-root and --keep-fixture cannot be used with --collection".to_string(),
-        );
+        return Err("--fixture-root and --keep-fixture cannot be used with --root".to_string());
     }
     let root = root
         .canonicalize()
@@ -455,7 +436,7 @@ fn run_existing_collection(args: &Args, root: &Path) -> Result<(), String> {
         .copied()
         .unwrap_or(0.0) as usize;
     let report = ProfileReport {
-        tool: "mdbase-profiler",
+        tool: "mdbase-profile-engine",
         version: env!("CARGO_PKG_VERSION"),
         generated_at: chrono::Utc::now().to_rfc3339(),
         total_runtime_ms: run_start.elapsed().as_secs_f64() * 1_000.0,
@@ -477,7 +458,6 @@ fn run_existing_collection(args: &Args, root: &Path) -> Result<(), String> {
             seed: args.seed,
         },
         fixture: FixtureSummary {
-            root: "<existing collection>".to_string(),
             kept: true,
             task_files: records,
             project_files: 0,
@@ -485,11 +465,11 @@ fn run_existing_collection(args: &Args, root: &Path) -> Result<(), String> {
         },
         operations,
     };
-    emit_report(args, &report)?;
+    emit_report(args, &report, output_json)?;
     validate_thresholds(args, &report)
 }
 
-fn emit_report(args: &Args, report: &ProfileReport) -> Result<(), String> {
+fn emit_report(args: &Args, report: &ProfileReport, output_json: bool) -> Result<(), String> {
     let report_json = serde_json::to_string_pretty(report)
         .map_err(|error| format!("Failed to serialize report JSON: {error}"))?;
     if let Some(output) = &args.output {
@@ -501,7 +481,7 @@ fn emit_report(args: &Args, report: &ProfileReport) -> Result<(), String> {
         fs::write(output, format!("{report_json}\n"))
             .map_err(|error| format!("Failed to write report to {}: {error}", output.display()))?;
     }
-    if args.json {
+    if output_json {
         println!("{report_json}");
     } else {
         print_report(report);
@@ -509,14 +489,14 @@ fn emit_report(args: &Args, report: &ProfileReport) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_args(args: &Args) -> Result<(), String> {
+fn validate_args(args: &Args, existing_collection: bool) -> Result<(), String> {
     if args.files == 0 {
         return Err("--files must be greater than 0".to_string());
     }
     if args.projects == 0 {
         return Err("--projects must be greater than 0".to_string());
     }
-    if args.collection.is_some() && args.thresholds.is_some() {
+    if existing_collection && args.thresholds.is_some() {
         return Err(
             "--thresholds is only supported for deterministic synthetic fixtures".to_string(),
         );

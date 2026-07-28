@@ -6,6 +6,9 @@
 //! collections open through an isolated read/query adapter and require an
 //! explicit migration before mutation.
 
+/// Version of the collection engine embedded by a host.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod errors;
 
 pub mod api;
