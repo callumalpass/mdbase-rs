@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use crate::field_references;
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_to_json};
 use crate::types::schema::{DataContractImplementation, TypeDef};
 use crate::{Collection, Settings};
@@ -211,27 +212,45 @@ impl DataContractRegistry {
         };
 
         let mut view = Value::Object(Map::new());
+        let mut diagnostics = Vec::new();
         for (contract_field, record_field) in &implementation.fields {
-            if let Some(value) = get_field_path(effective_frontmatter, record_field) {
-                set_field_path(&mut view, contract_field, value.clone());
+            if let Some(value) = field_references::get_value(effective_frontmatter, record_field) {
+                if let Err(message) = field_references::set_value_with_schema(
+                    &mut view,
+                    contract_field,
+                    value.clone(),
+                    Some(&registered.record_schema),
+                    true,
+                ) {
+                    diagnostics.push(ContractViewDiagnostic {
+                        code: "data_contract_record_invalid".to_string(),
+                        message,
+                        severity: "error".to_string(),
+                        field: Some(contract_field.clone()),
+                        path: None,
+                    });
+                }
             }
         }
-        let diagnostics = registered
-            .record_validator
-            .validate(&view)
-            .err()
-            .into_iter()
-            .flatten()
-            .map(|error| ContractViewDiagnostic {
-                code: "data_contract_record_invalid".to_string(),
-                message: format!(
-                    "record projected through '{type_name}' does not satisfy '{contract}' {version}: {error}"
-                ),
-                severity: "error".to_string(),
-                field: json_pointer_to_field_path(&error.instance_path.to_string()),
-                path: None,
-            })
-            .collect::<Vec<_>>();
+        if diagnostics.is_empty() {
+            diagnostics.extend(
+                registered
+                    .record_validator
+                    .validate(&view)
+                    .err()
+                    .into_iter()
+                    .flatten()
+                    .map(|error| ContractViewDiagnostic {
+                        code: "data_contract_record_invalid".to_string(),
+                        message: format!(
+                            "record projected through '{type_name}' does not satisfy '{contract}' {version}: {error}"
+                        ),
+                        severity: "error".to_string(),
+                        field: json_pointer_to_field_path(&error.instance_path.to_string()),
+                        path: None,
+                    }),
+            );
+        }
         ContractViewResult {
             valid: diagnostics.is_empty(),
             contract: contract.to_string(),
@@ -392,7 +411,11 @@ impl DataContractRegistry {
             .flatten()
             .filter_map(Value::as_str)
         {
-            if !implementation.fields.contains_key(required) {
+            if !implementation
+                .fields
+                .keys()
+                .any(|reference| field_references::targets_top_level(reference, required))
+            {
                 return Err(load_error(
                     "data_contract_field_invalid",
                     format!(
@@ -403,7 +426,7 @@ impl DataContractRegistry {
             }
         }
         for (contract_field, record_field) in &implementation.fields {
-            if !schema_declares_field(&contract.record_schema, contract_field) {
+            if !field_references::schema_declares(&contract.record_schema, contract_field) {
                 return Err(load_error(
                     "data_contract_field_invalid",
                     format!(
@@ -415,7 +438,7 @@ impl DataContractRegistry {
             if !type_definition
                 .json_schema
                 .as_ref()
-                .is_some_and(|schema| schema_declares_field(schema, record_field))
+                .is_some_and(|schema| field_references::schema_declares(schema, record_field))
             {
                 return Err(load_error(
                     "data_contract_field_invalid",
@@ -660,31 +683,6 @@ fn compile_schema(schema: &Value, label: &str) -> Result<JSONSchema, DataContrac
         })
 }
 
-fn schema_declares_field(schema: &Value, field_path: &str) -> bool {
-    let mut current = schema;
-    for raw_segment in field_path.split('.') {
-        let (segment, array) = raw_segment
-            .strip_suffix("[]")
-            .map(|segment| (segment, true))
-            .unwrap_or((raw_segment, false));
-        let Some(next) = current
-            .get("properties")
-            .and_then(Value::as_object)
-            .and_then(|properties| properties.get(segment))
-        else {
-            return false;
-        };
-        current = next;
-        if array {
-            let Some(items) = current.get("items") else {
-                return false;
-            };
-            current = items;
-        }
-    }
-    true
-}
-
 fn implementation_digest(
     contract_digest: &str,
     type_definition: &TypeDef,
@@ -745,38 +743,6 @@ pub fn data_contract_digest(frontmatter: &Value) -> String {
 fn digest_value(value: &Value) -> String {
     let bytes = serde_json::to_vec(value).expect("JSON values always serialize");
     format!("sha256:{:x}", Sha256::digest(bytes))
-}
-
-fn get_field_path<'a>(source: &'a Value, field_path: &str) -> Option<&'a Value> {
-    let mut value = source;
-    for raw_segment in field_path.split('.') {
-        let (segment, array) = raw_segment
-            .strip_suffix("[]")
-            .map(|segment| (segment, true))
-            .unwrap_or((raw_segment, false));
-        value = value.get(segment)?;
-        if array && !value.is_array() {
-            return None;
-        }
-    }
-    Some(value)
-}
-
-fn set_field_path(target: &mut Value, field_path: &str, value: Value) {
-    let segments = field_path
-        .split('.')
-        .map(|segment| segment.strip_suffix("[]").unwrap_or(segment))
-        .collect::<Vec<_>>();
-    let mut current = target;
-    for segment in &segments[..segments.len().saturating_sub(1)] {
-        if current.get(*segment).and_then(Value::as_object).is_none() {
-            current[*segment] = json!({});
-        }
-        current = &mut current[*segment];
-    }
-    if let Some(last) = segments.last() {
-        current[*last] = value;
-    }
 }
 
 fn json_pointer_to_field_path(pointer: &str) -> Option<String> {

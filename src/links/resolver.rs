@@ -557,6 +557,67 @@ impl Collection {
                     issues.extend(link_issues);
                 }
             }
+
+            let link_rules = type_def
+                .v03_frontmatter
+                .as_ref()
+                .and_then(|value| value.pointer("/collection/links"))
+                .and_then(serde_json::Value::as_object);
+            for (field_reference, rule) in link_rules.into_iter().flatten() {
+                if type_def.fields.iter().any(|(field_name, field)| {
+                    crate::field_references::targets_top_level(field_reference, field_name)
+                        && (field.validate_exists.is_some()
+                            || field.target.is_some()
+                            || !field.target_types.is_empty())
+                }) {
+                    continue;
+                }
+
+                let mut link_field = FieldDef {
+                    field_type: "link".to_string(),
+                    validate_exists: rule
+                        .get("validate_exists")
+                        .and_then(serde_json::Value::as_bool),
+                    ..FieldDef::default()
+                };
+                match rule.get("target_type") {
+                    Some(serde_json::Value::String(target)) if target != "any" => {
+                        link_field.target = Some(target.clone());
+                        link_field.target_types = vec![target.clone()];
+                    }
+                    Some(serde_json::Value::Array(targets)) => {
+                        link_field.target_types = targets
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect();
+                    }
+                    _ => {}
+                }
+
+                for selected in crate::field_references::get_values(frontmatter, field_reference) {
+                    let values: Vec<&serde_json::Value> = if field_reference.starts_with('/') {
+                        selected
+                            .as_array()
+                            .map(|array| array.iter().collect())
+                            .unwrap_or_else(|| vec![selected])
+                    } else {
+                        vec![selected]
+                    };
+                    for value in values {
+                        let Some(link_str) = value.as_str() else {
+                            continue;
+                        };
+                        issues.extend(self.validate_single_link(
+                            link_str,
+                            field_reference,
+                            &link_field,
+                            type_name,
+                            path,
+                        ));
+                    }
+                }
+            }
         }
 
         issues

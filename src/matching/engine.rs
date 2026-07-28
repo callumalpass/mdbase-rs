@@ -1,5 +1,6 @@
 //! Match rule evaluation engine (§6).
 
+use crate::field_references;
 use crate::types::schema::MatchRules;
 
 /// Check if a file matches the given match rules.
@@ -178,13 +179,8 @@ fn segment_match_chars(seg: &[u8], pat: &[u8]) -> bool {
 
 /// Check that all listed fields are present and non-null in frontmatter.
 fn check_fields_present(frontmatter: &serde_json::Value, fields: &[String]) -> bool {
-    let obj = match frontmatter.as_object() {
-        Some(o) => o,
-        None => return false,
-    };
-
     for field in fields {
-        match obj.get(field) {
+        match field_references::get_value(frontmatter, field) {
             None => return false,
             Some(v) if v.is_null() => return false,
             _ => {} // present and non-null
@@ -202,13 +198,8 @@ fn evaluate_where(frontmatter: &serde_json::Value, where_clause: &serde_json::Va
         None => return false,
     };
 
-    let fm_obj = match frontmatter.as_object() {
-        Some(obj) => obj,
-        None => return false,
-    };
-
     for (field, condition) in conditions {
-        let field_value = fm_obj.get(field);
+        let field_value = field_references::get_value(frontmatter, field);
 
         if let Some(cond_obj) = condition.as_object() {
             // Operator-based condition

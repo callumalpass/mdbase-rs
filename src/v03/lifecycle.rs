@@ -10,6 +10,7 @@ use super::{
 };
 use crate::expressions::ast::Expr;
 use crate::expressions::evaluator::{EvalContext, EvaluationClock, NoteNamespaceSource};
+use crate::field_references;
 use crate::generated::slugify;
 use crate::Collection;
 
@@ -166,7 +167,18 @@ impl Collection {
                     }
 
                     let value = resolve_provider(provider, &draft, &now_value, &today_value);
-                    set_path(&mut draft, field, value);
+                    if let Err(message) =
+                        field_references::set_object_value(&mut draft, field, value)
+                    {
+                        let mut diagnostic = Diagnostic::error(
+                            "invalid_lifecycle_path",
+                            message,
+                            Some(path.to_string()),
+                        );
+                        diagnostic.field = Some(field.clone());
+                        diagnostic.type_name = Some(type_name.clone());
+                        return Err(vec![diagnostic]);
+                    }
                     assignments.insert(
                         field.clone(),
                         AppliedAssignment {
@@ -234,7 +246,7 @@ fn resolve_provider(
         return Value::String(ulid::Ulid::new().to_string());
     }
     if let Some(path) = provider.get("slugify").and_then(Value::as_str) {
-        return value_at_path(draft, path)
+        return field_references::get_value_from_object(draft, path)
             .map(|value| match value {
                 Value::String(value) => Value::String(slugify(value)),
                 value => Value::String(slugify(&value.to_string())),
@@ -242,37 +254,11 @@ fn resolve_provider(
             .unwrap_or(Value::Null);
     }
     if let Some(path) = provider.get("copy").and_then(Value::as_str) {
-        return value_at_path(draft, path).cloned().unwrap_or(Value::Null);
+        return field_references::get_value_from_object(draft, path)
+            .cloned()
+            .unwrap_or(Value::Null);
     }
     provider.get("literal").cloned().unwrap_or(Value::Null)
-}
-
-fn value_at_path<'a>(object: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
-    let mut segments = path.split('.');
-    let first = segments.next()?;
-    let mut value = object.get(first)?;
-    for segment in segments {
-        value = value.as_object()?.get(segment)?;
-    }
-    Some(value)
-}
-
-fn set_path(object: &mut Map<String, Value>, path: &str, value: Value) {
-    let segments = path.split('.').collect::<Vec<_>>();
-    let Some((last, parents)) = segments.split_last() else {
-        return;
-    };
-    let mut current = object;
-    for segment in parents {
-        let entry = current
-            .entry((*segment).to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if !entry.is_object() {
-            *entry = Value::Object(Map::new());
-        }
-        current = entry.as_object_mut().expect("object inserted above");
-    }
-    current.insert((*last).to_string(), value);
 }
 
 #[cfg(test)]
@@ -286,11 +272,14 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            value_at_path(&object, "source.name"),
+            field_references::get_value_from_object(&object, "source.name"),
             Some(&json!("Hello World"))
         );
-        set_path(&mut object, "metadata.slug", json!("hello-world"));
+        field_references::set_object_value(&mut object, "metadata.slug", json!("hello-world"))
+            .unwrap();
         assert_eq!(object["metadata"]["slug"], "hello-world");
+        field_references::set_object_value(&mut object, "/@type", json!("Contact")).unwrap();
+        assert_eq!(object["@type"], "Contact");
     }
 
     #[test]

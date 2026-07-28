@@ -17,6 +17,8 @@ pub(crate) mod compat;
 pub mod config;
 pub mod data_contracts;
 pub mod expressions;
+pub mod field_reference;
+pub(crate) mod field_references;
 pub mod frontmatter;
 pub mod generated;
 pub mod init;

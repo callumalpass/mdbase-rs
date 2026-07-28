@@ -1,6 +1,7 @@
 //! File -> cache indexing.
 
 use rusqlite::Connection;
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::cache::CacheError;
@@ -155,23 +156,39 @@ fn insert_unique_values(
 ) -> Result<(), CacheError> {
     for type_name in type_names {
         if let Some(type_def) = collection.types.get(type_name) {
-            for (field_name, field_def) in &type_def.fields {
-                if field_def.unique {
-                    if let Some(val) = effective.get(field_name) {
-                        let val_str = match val {
-                            serde_json::Value::String(s) => s.clone(),
-                            serde_json::Value::Number(n) => n.to_string(),
-                            serde_json::Value::Bool(b) => b.to_string(),
-                            serde_json::Value::Null => continue,
-                            _ => serde_json::to_string(val).unwrap_or_default(),
-                        };
-                        if !val_str.is_empty() {
-                            conn.execute(
-                                "INSERT OR REPLACE INTO unique_values (type_name, field_name, value, path) \
-                                 VALUES (?1, ?2, ?3, ?4)",
-                                rusqlite::params![type_name, field_name, val_str, rel_path],
-                            )?;
-                        }
+            let mut field_references = type_def
+                .fields
+                .iter()
+                .filter(|(_, field)| field.unique)
+                .map(|(name, _)| name.clone())
+                .collect::<HashSet<_>>();
+            field_references.extend(
+                type_def
+                    .v03_frontmatter
+                    .as_ref()
+                    .and_then(|value| value.pointer("/collection/unique"))
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|rule| rule.get("field"))
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string),
+            );
+            for field_reference in field_references {
+                if let Some(val) = crate::field_references::get_value(effective, &field_reference) {
+                    let val_str = match val {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Null => continue,
+                        _ => serde_json::to_string(val).unwrap_or_default(),
+                    };
+                    if !val_str.is_empty() {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO unique_values (type_name, field_name, value, path) \
+                             VALUES (?1, ?2, ?3, ?4)",
+                            rusqlite::params![type_name, field_reference, val_str, rel_path],
+                        )?;
                     }
                 }
             }
