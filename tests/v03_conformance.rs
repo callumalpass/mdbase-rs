@@ -129,6 +129,7 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
         | "data_contract_registry_validate" => {
             execute_standalone_data_contract_case(&case.operation, &input)
         }
+        "install_type_pack" => execute_type_pack_case(collection, &input),
         "validate" => {
             let envelope = operations.validate(&input);
             let mut result = flatten_envelope(envelope);
@@ -306,6 +307,98 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
         }
         operation => panic!("unsupported v0.3 fixture operation: {operation}"),
     }
+}
+
+fn execute_type_pack_case(collection: &Collection, input: &Value) -> Value {
+    let manifest_path = spec_root().join(
+        input
+            .get("pack")
+            .and_then(Value::as_str)
+            .expect("install_type_pack requires input.pack"),
+    );
+    let manifest_yaml = fs::read_to_string(&manifest_path).expect("read shared type pack manifest");
+    let manifest_yaml: serde_yaml::Value =
+        serde_yaml::from_str(&manifest_yaml).expect("parse shared type pack manifest");
+    let mut manifest = yaml_to_json(&manifest_yaml);
+    let resources = manifest["resources"]
+        .as_array()
+        .expect("type pack resources must be an array")
+        .iter()
+        .map(|resource| {
+            let source = resource["source"]
+                .as_str()
+                .expect("type pack resource source")
+                .to_string();
+            let document = fs::read_to_string(
+                manifest_path
+                    .parent()
+                    .expect("type pack manifest parent")
+                    .join(&source),
+            )
+            .expect("read shared type pack resource");
+            mdbase::v03::TypePackResource { source, document }
+        })
+        .collect::<Vec<_>>();
+    if input.get("corrupt_digest").and_then(Value::as_bool) == Some(true) {
+        manifest["resources"][0]["digest"] = Value::String(format!("sha256:{}", "0".repeat(64)));
+    }
+
+    let repeat = input.get("repeat").and_then(Value::as_u64).unwrap_or(1);
+    let mut runs = Vec::new();
+    for _ in 0..repeat {
+        let result = collection.install_type_pack(&manifest, &resources, false);
+        let actions = result
+            .result
+            .get("resources")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|resource| resource.get("action").cloned())
+            .collect::<Vec<_>>();
+        let error = result.diagnostics.first().map(|diagnostic| {
+            serde_json::json!({
+                "code": diagnostic.code,
+                "message": diagnostic.message,
+            })
+        });
+        runs.push(serde_json::json!({
+            "valid": result.valid,
+            "actions": actions,
+            "error": error,
+        }));
+        if !result.valid {
+            break;
+        }
+    }
+
+    let last = runs.last().expect("type pack executes at least once");
+    let reopened = Collection::open(collection.root()).expect("reopen type pack collection");
+    let implementations = reopened
+        .get_data_contract_implementations("tasknotes.task", "0.2.0")
+        .len();
+    let targets_exist = manifest["resources"]
+        .as_array()
+        .expect("type pack resources")
+        .iter()
+        .map(|resource| {
+            Value::Bool(
+                resource["target"]
+                    .as_str()
+                    .map(|target| collection.root().join(target).exists())
+                    .unwrap_or(false),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut output = serde_json::json!({
+        "valid": last["valid"],
+        "runs": runs,
+        "implementations": implementations,
+        "targets_exist": targets_exist,
+    });
+    if !last["error"].is_null() {
+        output["error"] = last["error"].clone();
+    }
+    output
 }
 
 fn execute_standalone_data_contract_case(operation: &str, input: &Value) -> Value {
@@ -595,6 +688,11 @@ fn shared_v03_saved_views_fixture_passes() {
 #[test]
 fn shared_v03_data_contract_fixture_passes() {
     run_suite("data-contracts/data-contracts.yaml", "data_contracts", 12);
+}
+
+#[test]
+fn shared_v03_type_pack_fixture_passes() {
+    run_suite("type-packs/type-packs.yaml", "type_packs", 3);
 }
 
 fn run_suite(relative_path: &str, fixture_set: &str, expected_cases: usize) {
