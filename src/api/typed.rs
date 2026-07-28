@@ -633,9 +633,6 @@ pub struct QueryRequest {
     /// Number of ordered records skipped before returning results.
     #[serde(default)]
     pub offset: u64,
-    /// Optional pagination snapshot expected from an earlier page.
-    #[serde(default)]
-    pub snapshot: Option<String>,
     /// Whether returned records include their Markdown body.
     #[serde(default)]
     pub include_body: bool,
@@ -717,9 +714,6 @@ impl QueryRequest {
         }
         if self.offset != 0 {
             value.insert("offset".to_string(), json!(self.offset));
-        }
-        if let Some(snapshot) = &self.snapshot {
-            value.insert("snapshot".to_string(), Value::String(snapshot.clone()));
         }
         if self.include_body {
             value.insert("include_body".to_string(), Value::Bool(true));
@@ -896,9 +890,6 @@ pub struct QueryResult {
     /// Whether another page is available.
     #[serde(skip_serializing)]
     pub has_more: bool,
-    /// Opaque snapshot token for consistent pagination.
-    #[serde(skip_serializing)]
-    pub snapshot: Option<String>,
     /// Canonical query metadata.
     pub meta: Value,
 }
@@ -1019,16 +1010,11 @@ impl<'a> TypedCollection<'a> {
             .get("has_more")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let snapshot = meta
-            .get("snapshot")
-            .and_then(Value::as_str)
-            .map(str::to_string);
         Ok(OperationOutcome {
             value: QueryResult {
                 records,
                 total_count,
                 has_more,
-                snapshot,
                 meta,
             },
             diagnostics,

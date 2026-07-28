@@ -1,0 +1,69 @@
+kind: mdbase.conformance
+status: verified
+implementation:
+  id: mdbase-runtime-rs
+  name: mdbase durable Runtime implementation for Rust
+  version: 0.3.0-rc.1
+  language: Rust
+  target: crate
+  url: https://github.com/callumalpass/mdbase-rs
+spec_version: 0.3.0
+runtime_profile_version: "0.2"
+interop_profile_version: "0.1"
+profiles:
+  - core_read
+  - cel
+  - event_action_interop/0.1
+  - runtime/0.2
+json_schema:
+  dialect: https://json-schema.org/draft/2020-12/schema
+  keywords:
+    - type
+    - required
+    - properties
+    - additionalProperties
+    - items
+    - enum
+    - const
+    - oneOf
+    - anyOf
+    - allOf
+    - if
+    - then
+    - else
+    - minimum
+    - minLength
+    - pattern
+    - minItems
+    - uniqueItems
+    - $defs
+    - $ref
+  formats:
+    - date-time
+  remote_refs: false
+limits:
+  event_delivery: atomic
+  admitted_plan: exact_immutable_bindings
+  action_provider_selection: explicit_or_unambiguous
+  action_authorization: host_final_boundary
+  recovery: lease_and_idempotency_evidence
+  timer_missed_run_policy:
+    - fire_once
+evidence:
+  - kind: conformance_suite
+    command: MDBASE_REQUIRE_V03_CONFORMANCE=1 cargo test --workspace --all-features
+    result: pass
+    verified_at: "2026-07-29T00:30:00+10:00"
+    artifact: crates/mdbase-runtime/tests
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: test_suite
+    command: cargo test -p mdbase-runtime --no-default-features
+    result: pass
+    verified_at: "2026-07-29T00:30:00+10:00"
+    artifact: crates/mdbase-runtime/tests
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: test_suite
+    command: cargo clippy --workspace --all-targets --all-features -- -D warnings
+    result: pass
+    verified_at: "2026-07-29T00:30:00+10:00"
+    environment: Linux x86_64, Rust 1.94.0

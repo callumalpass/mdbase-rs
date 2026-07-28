@@ -1,21 +1,25 @@
 # mdbase-runtime
 
-`mdbase-runtime` 0.2 is the durable workflow engine for mdbase Runtime profile
-0.1. It is independently versioned from the `mdbase` collection crate.
+`mdbase-runtime` 0.3 is the durable workflow engine for mdbase Runtime
+companion profile 0.2. It is independently versioned from the `mdbase`
+collection crate.
 
 The crate provides:
 
+- admission from ordinary core contracts and projected workflow/policy records
+- exact event-source/action-provider pinning through `mdbase-interop`
 - deterministic event-to-workflow planning using canonical mdbase CEL
 - durable event journalling and deduplication
 - idempotency, concurrency groups, leases, cancellation, and crash recovery
 - stable action invocation IDs and explicit indeterminate outcomes
-- provider-neutral dispatch with host-owned final authorization
+- shared action invocation/outcome envelopes with host-owned final authorization
 - in-memory, SQLite, and namespace-fenced PostgreSQL runtime stores
 - generation-safe one-shot timers with `fire_once` missed-run behaviour
 - cursor-based journal consumption and bounded retention with dedupe tombstones
 
-It deliberately does not contain Connect routing, Web Push credentials, local
-filesystem grants, or application-specific actions.
+It deliberately does not contain a second contract registry, Connect routing,
+Web Push credentials, local filesystem grants, or application-specific
+actions. Installing Markdown never registers executable code.
 
 ## Minimal host
 
@@ -34,9 +38,16 @@ let runtime = Runtime::builder(store).build()?;
 # }
 ```
 
-Register action handlers through `ProviderRegistry`, then call
-`Runtime::deliver_event` and run one or more workers with `Runtime::work_once`.
-Use `ManualClock` for deterministic scheduling and recovery tests.
+Build an `AdmissionCatalog` from core-verified contract artifacts, projected
+`runtime_workflow`/`runtime_policy` values, and verified interop declarations.
+Register live handlers through `ProviderRegistry` with the exact
+`ProviderBinding { provider_declaration_digest, handler_id }`. Then call
+`Runtime::deliver_event(&catalog, cloud_event)` and run workers with
+`Runtime::work_once()`.
+
+An alternative authority such as Connect may prepare the exact immutable plan
+and call `Runtime::deliver_prepared_event`. Neither path consults a live
+registry during worker execution.
 
 ## Timers
 
@@ -90,18 +101,18 @@ selection, migration behavior, and the mandatory live PostgreSQL test.
 
 ## Safety model
 
-Preflight is advisory. Immediately before every provider call, the runtime
-checks canonical policy and calls the embedding host's `DispatchAuthorizer`.
-For mdbase Connect, that authorizer must enforce the locally cached exact grant.
+Admission validates contract/source/provider compatibility and policy.
+Immediately before every provider call, the runtime calls the embedding host's
+`DispatchAuthorizer`; for Connect, that authorizer must enforce the current
+locally cached exact grant.
 
-Providers that declare invocation-ID idempotency receive the same
-`invocation_id` after an ambiguous crash. Unsafe providers are never replayed
-automatically; the run becomes `indeterminate`.
+Providers that declare request idempotency receive the same request,
+invocation, and attempt evidence after an ambiguous crash. Unsafe providers
+are never replayed automatically; the run becomes `indeterminate`.
 
-Admitted plans contain canonical action snapshots. Later registry changes can
-tighten dispatch-time policy and hosts always re-authorize against current
-grants, but they cannot silently replace the schemas or effect declaration of
-an already admitted action.
+Admitted plans contain exact action artifacts, provider identities,
+declaration digests, and handler IDs. Later catalog changes cannot silently
+replace any admitted dependency.
 
 `Runtime::cancel_run` durably records intent first. Queued work becomes
 terminal immediately; an active cooperative provider receives a bounded

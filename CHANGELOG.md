@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## 0.4.0-rc.3 - 2026-07-28
+
+### Breaking
+
+- Removed the parallel `runtime_contracts` registry, runtime-specific schemas,
+  provider loader, and runtime-aware watcher mode.
+- Rebuilt `mdbase-runtime` as version `0.3.0-rc.1` for Runtime companion
+  profile 0.2.
+- Runtime admission now consumes ordinary core contract artifacts, projected
+  workflow/policy records, and verified interoperability declarations.
+- Provider registration now binds executable handlers to an exact provider
+  declaration digest and handler ID; action names and Markdown records cannot
+  activate code.
+- Workers execute immutable admitted plans and exchange the shared
+  interoperability action invocation/outcome envelopes.
+- Removed the non-standard query snapshot request/result API to match the
+  canonical v0.3 query schemas.
+
+### Changed
+
+- Watch events used by runtime adapters are structured CloudEvents with exact
+  contract and implementation evidence.
+- Timers pin an exact event contract and verified source identity.
+- Core conformance no longer claims a runtime profile; durable runtime
+  conformance is independently versioned.
+
 ## 0.4.0-rc.2 - 2026-07-28
 
 ### Breaking

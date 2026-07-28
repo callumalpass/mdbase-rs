@@ -46,16 +46,11 @@ pub(crate) fn query(
         .get("has_more")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let snapshot = meta
-        .get("snapshot")
-        .and_then(Value::as_str)
-        .map(str::to_string);
     Ok(OperationOutcome {
         value: QueryResult {
             records,
             total_count,
             has_more,
-            snapshot,
             meta,
         },
         diagnostics,

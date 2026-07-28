@@ -40,7 +40,6 @@ pub struct QueryPerformance {
     pub cache_used: bool,
     pub cache_fallback: bool,
     pub link_graph_built: bool,
-    pub snapshot_reused: bool,
 }
 
 pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult {
@@ -110,13 +109,6 @@ pub(crate) fn execute_profiled(
             .is_some_and(|rules| rules.match_expr.is_some())
     });
     let metadata_page_plan = compiled.supports_metadata_page_plan() && !has_diagnostic_matchers;
-    if compiled.query.snapshot.is_some() && !metadata_page_plan {
-        finish!(diagnostics::failed(vec![Diagnostic::error(
-            "query_snapshot_unsupported",
-            "Query snapshots are supported only for unfiltered metadata-page queries.",
-            None,
-        )]));
-    }
     if metadata_page_plan {
         let order_by = compiled
             .query
@@ -134,22 +126,10 @@ pub(crate) fn execute_profiled(
             &order_by,
             compiled.query.offset,
             compiled.query.limit,
-            compiled.query.snapshot.as_deref(),
         );
-        if matches!(
-            &loaded,
-            Err(crate::query::cache_source::MetadataPageError::SnapshotExpired)
-        ) {
-            finish!(diagnostics::failed(vec![Diagnostic::error(
-                "query_snapshot_expired",
-                "The query snapshot is no longer available; restart pagination.",
-                None,
-            )]));
-        }
-        if let Ok(Some(page)) = loaded {
+        if let Some(page) = loaded {
             performance.load_us = micros(phase.elapsed());
             apply_load_performance(&mut performance, &page.performance);
-            performance.snapshot_reused = compiled.query.snapshot.is_some();
             performance.candidates = page.total;
             let offset = usize::try_from(compiled.query.offset)
                 .unwrap_or(usize::MAX)
@@ -162,16 +142,9 @@ pub(crate) fn execute_profiled(
                 &records,
                 page.total,
                 has_more,
-                Some(&page.snapshot),
                 &mut performance,
             );
             finish!(result);
-        } else if compiled.query.snapshot.is_some() {
-            finish!(diagnostics::failed(vec![Diagnostic::error(
-                "query_snapshot_unsupported",
-                "This metadata order cannot be paginated from a query snapshot.",
-                None,
-            )]));
         }
     }
 
@@ -246,7 +219,6 @@ pub(crate) fn execute_profiled(
             &page,
             total_count,
             has_more,
-            None,
             &mut performance,
         );
         finish!(result);
@@ -481,7 +453,6 @@ fn build_metadata_page_result(
     records: &[&FileRecord],
     total_count: usize,
     has_more: bool,
-    snapshot: Option<&str>,
     performance: &mut QueryPerformance,
 ) -> OperationResult {
     let phase = Instant::now();
@@ -525,13 +496,10 @@ fn build_metadata_page_result(
     performance.results = results.len();
     let serialized_diagnostics =
         serde_json::to_value(&query_diagnostics).unwrap_or_else(|_| json!([]));
-    let mut meta = json!({
+    let meta = json!({
         "total_count": total_count,
         "has_more": has_more,
     });
-    if let Some(snapshot) = snapshot {
-        meta["snapshot"] = Value::String(snapshot.to_string());
-    }
     OperationResult {
         valid: true,
         result: json!({

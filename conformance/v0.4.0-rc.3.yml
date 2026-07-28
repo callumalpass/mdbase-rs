@@ -3,7 +3,7 @@ status: verified
 implementation:
   id: mdbase-rs
   name: mdbase Rust implementation
-  version: 0.4.0-rc.2
+  version: 0.4.0-rc.3
   language: Rust
   target: crate
   url: https://github.com/callumalpass/mdbase-rs
@@ -18,7 +18,7 @@ profiles:
   - core_write
   - lifecycle
   - watch
-optional_features:
+optional_features: []
 json_schema:
   dialect: https://json-schema.org/draft/2020-12/schema
   keywords:
@@ -95,5 +95,5 @@ evidence:
     command: cargo package --allow-dirty
     result: pass
     verified_at: "2026-07-28T21:00:00+10:00"
-    artifact: target/package/mdbase-0.4.0-rc.2.crate
+    artifact: target/package/mdbase-0.4.0-rc.3.crate
     environment: Linux x86_64, Rust 1.94.0

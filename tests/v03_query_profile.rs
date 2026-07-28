@@ -292,7 +292,7 @@ fn profiling_exposes_lazy_query_plans_without_payloads() {
 }
 
 #[test]
-fn query_snapshots_reuse_a_consistent_cache_and_expire_explicitly() {
+fn query_pagination_refreshes_against_the_current_collection() {
     let (root, collection) = query_collection();
     assert_eq!(collection.cache_rebuild()["success"], true);
     let operations = collection.v03_operations().unwrap();
@@ -300,38 +300,30 @@ fn query_snapshots_reuse_a_consistent_cache_and_expire_explicitly() {
         "order_by": [{"field": "file.path", "direction": "asc"}],
         "limit": 1,
     });
-    let (first, first_profile) = operations.query_profiled(&input);
+    let first = operations.query(&input);
     assert!(first.valid, "{first:#?}");
-    assert!(!first_profile.snapshot_reused);
-    let snapshot = first.result["meta"]["snapshot"].as_str().unwrap();
+    assert!(first.result["meta"].get("snapshot").is_none());
 
     write_record(
         &root,
         "tasks/added.md",
         "---\ntype: task\ntitle: Added\n---\n",
     );
-    let (continued, continued_profile) = operations.query_profiled(&json!({
+    let continued = operations.query(&json!({
         "order_by": [{"field": "file.path", "direction": "asc"}],
         "offset": 1,
         "limit": 1,
-        "snapshot": snapshot,
     }));
     assert!(continued.valid, "{continued:#?}");
-    assert!(continued_profile.snapshot_reused);
-    assert_eq!(continued.result["meta"]["total_count"], 4);
-    assert_eq!(continued_profile.cache_refresh_us, 0);
+    assert_eq!(continued.result["meta"]["total_count"], 5);
 
     let refreshed = operations.query(&input);
     assert!(refreshed.valid, "{refreshed:#?}");
     assert_eq!(refreshed.result["meta"]["total_count"], 5);
-    assert_ne!(refreshed.result["meta"]["snapshot"], snapshot);
 
-    let expired = operations.query(&json!({
-        "order_by": [{"field": "file.path", "direction": "asc"}],
-        "snapshot": snapshot,
-    }));
-    assert!(!expired.valid);
-    assert_eq!(expired.diagnostics[0].code, "query_snapshot_expired");
+    let legacy = operations.query(&json!({"snapshot": "legacy-token"}));
+    assert!(!legacy.valid);
+    assert_eq!(legacy.diagnostics[0].code, "invalid_query");
 }
 
 #[test]

@@ -4,18 +4,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{TimeDelta, TimeZone, Utc};
-use mdbase::runtime_contracts::{
-    ComposeOptions, ContractDocument, ContractSource, PolicySelector, RuntimeContracts,
-    RuntimeRegistry,
-};
+use mdbase_interop::{ExactContractReference, ImplementationIdentity};
 #[cfg(feature = "sqlite")]
 use mdbase_runtime::SqliteRuntimeStore;
 use mdbase_runtime::{
-    ActionDispatch, ActionProvider, ActionResponse, AdmitOutcome, AuthorizationDecision, Claim,
-    Clock, DispatchAuthorizer, DispatchFailure, DispatchOutcome, InMemoryRuntimeStore, ManualClock,
-    PreparedEvent, ProviderRegistry, RunStatus, Runtime, RuntimeConfig, RuntimeResult,
-    RuntimeStore, StoreSnapshot, TimerClaim, TimerFireOutcome, TimerReconcileOutcome,
-    TimerReconcileRequest, TimerRecord, TimerRequest,
+    canonical_digest, ActionCancellation, ActionDispatch, ActionInvocation, ActionOutcome,
+    ActionProvider, AdmissionCatalog, AdmitOutcome, AuthorizationDecision, Claim, Clock,
+    DispatchAuthorizer, DispatchFailure, DispatchOutcome, InMemoryRuntimeStore, ManualClock,
+    PreparedEvent, ProviderBinding, ProviderRegistry, RunStatus, Runtime, RuntimeConfig,
+    RuntimeResult, RuntimeStore, StoreSnapshot, TimerClaim, TimerFireOutcome,
+    TimerReconcileOutcome, TimerReconcileRequest, TimerRecord, TimerRequest,
 };
 use serde_json::{json, Value};
 #[cfg(feature = "sqlite")]
@@ -33,7 +31,7 @@ impl DispatchAuthorizer for AllowAuthorizer {
 
 #[derive(Default)]
 struct RecordingProvider {
-    requests: Mutex<Vec<ActionDispatch>>,
+    requests: Mutex<Vec<ActionInvocation>>,
     cancellations: Mutex<Vec<String>>,
     fail_unknown_once: Mutex<bool>,
     always_unknown: bool,
@@ -54,7 +52,7 @@ impl RecordingProvider {
         }
     }
 
-    fn requests(&self) -> Vec<ActionDispatch> {
+    fn requests(&self) -> Vec<ActionInvocation> {
         self.requests.lock().unwrap().clone()
     }
 
@@ -65,7 +63,7 @@ impl RecordingProvider {
 
 #[async_trait]
 impl ActionProvider for RecordingProvider {
-    async fn dispatch(&self, request: ActionDispatch) -> Result<ActionResponse, DispatchFailure> {
+    async fn dispatch(&self, request: ActionInvocation) -> Result<ActionOutcome, DispatchFailure> {
         self.requests.lock().unwrap().push(request.clone());
         let mut fail_once = self.fail_unknown_once.lock().unwrap();
         if self.always_unknown || *fail_once {
@@ -76,18 +74,25 @@ impl ActionProvider for RecordingProvider {
                 outcome: DispatchOutcome::Unknown,
             });
         }
-        Ok(ActionResponse {
-            output: request.input,
-            receipt: Some(json!({"invocation_id": request.invocation_id})),
-            emitted_events: Vec::new(),
+        Ok(ActionOutcome {
+            kind: "mdbase.action.outcome".to_string(),
+            profile_version: "0.1".to_string(),
+            outcome_id: format!("out_{}", request.attempt_id),
+            request_id: request.request_id,
+            invocation_id: request.invocation_id,
+            attempt_id: request.attempt_id,
+            contract: request.contract,
+            provider: request.provider,
+            provider_declaration_digest: request.provider_declaration_digest,
+            status: "succeeded".to_string(),
+            completed_at: "2026-07-24T00:00:00Z".to_string(),
+            output: Some(request.input),
+            error: None,
         })
     }
 
-    async fn cancel(&self, invocation_id: &str) -> Result<(), DispatchFailure> {
-        self.cancellations
-            .lock()
-            .unwrap()
-            .push(invocation_id.to_string());
+    async fn cancel(&self, request: ActionCancellation) -> Result<(), DispatchFailure> {
+        self.cancellations.lock().unwrap().push(request.request_id);
         Ok(())
     }
 }
@@ -104,7 +109,7 @@ async fn executes_variables_conditions_and_for_each_deterministically() {
         .await
         .unwrap();
     assert_eq!(delivery.admitted_run_ids.len(), 1);
-    let outcomes = runtime.drain(&registry, 10).await.unwrap();
+    let outcomes = runtime.drain(10).await.unwrap();
     assert_eq!(outcomes.len(), 1);
 
     let snapshot = store.snapshot().await.unwrap();
@@ -122,26 +127,41 @@ async fn executes_variables_conditions_and_for_each_deterministically() {
     assert_eq!(run.attempts.len(), 2);
     assert_ne!(run.attempts[0].invocation_id, run.attempts[1].invocation_id);
     assert_eq!(provider.requests().len(), 2);
-    let contracts = RuntimeContracts::new().unwrap();
-    let validation = contracts.validate_contract(&ContractDocument::virtual_contract(
-        run.materialized_contract(),
-    ));
-    assert!(validation.valid, "{:#?}", validation.diagnostics);
+    assert_eq!(provider.requests()[0].contract.id, "test.echo");
+    assert_eq!(provider.requests()[0].handler_id, "echo");
+    assert!(provider.requests()[0]
+        .provider_declaration_digest
+        .starts_with("sha256:"));
+    assert_eq!(
+        run.materialized_contract()["admitted_plan"]["profile_version"],
+        "0.2"
+    );
+    mdbase_runtime::validate_runtime_record(&run.materialized_contract()).unwrap();
+}
+
+#[tokio::test]
+async fn admission_rejects_ambiguous_action_providers() {
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let (runtime, _) = runtime(store, Arc::new(RecordingProvider::default()));
+    let error = runtime
+        .deliver_event(
+            &ambiguous_registry(),
+            changed_event("evt_ambiguous", json!(["a"])),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "ambiguous_provider");
 }
 
 #[tokio::test]
 async fn trigger_admits_portable_record_type_membership_expression() {
-    let mut registry = registry(true);
-    registry
-        .workflows
-        .get_mut("test.workflow")
-        .unwrap()
-        .contract["triggers"][0]["if"]["$expr"] =
-        json!(r#""pickle_request" in event.payload.types"#);
+    let registry = registry_with(true, |workflow| {
+        workflow["triggers"][0]["if"]["$expr"] = json!(r#""pickle_request" in event.data.types"#);
+    });
     let store = Arc::new(InMemoryRuntimeStore::new());
     let (runtime, _) = runtime(store, Arc::new(RecordingProvider::default()));
     let mut event = changed_event("evt_pickle_request", json!(["request.md"]));
-    event["payload"]["types"] = json!(["pickle_request"]);
+    event["data"]["types"] = json!(["pickle_request"]);
 
     let delivery = runtime.deliver_event(&registry, event).await.unwrap();
 
@@ -158,9 +178,11 @@ async fn reconciles_a_timer_prefix_without_rescheduling_unchanged_or_fired_timer
     let request = |id: &str, fire_at| TimerRequest {
         id: id.to_string(),
         fire_at,
-        event_type: "timer.fired".to_string(),
-        contract_version: 1,
-        payload: json!({"owner": "grant-a"}),
+        contract: timer_contract_reference(),
+        source: test_identity(),
+        source_uri: "urn:test:runtime".to_string(),
+        subject: None,
+        data: json!({"owner": "grant-a"}),
     };
 
     runtime
@@ -244,9 +266,11 @@ async fn rejects_timer_reconciliation_outside_its_prefix() {
             timers: vec![TimerRequest {
                 id: "grant-b:timer".to_string(),
                 fire_at: clock.now(),
-                event_type: "timer.fired".to_string(),
-                contract_version: 1,
-                payload: json!({}),
+                contract: timer_contract_reference(),
+                source: test_identity(),
+                source_uri: "urn:test:runtime".to_string(),
+                subject: None,
+                data: json!({}),
             }],
         })
         .await
@@ -276,12 +300,9 @@ async fn duplicate_delivery_returns_original_cursor_without_new_runs() {
 #[tokio::test]
 async fn skip_treats_queued_work_as_active_in_every_local_store() {
     for store in local_state_stores() {
-        let mut registry = registry(true);
-        registry
-            .workflows
-            .get_mut("test.workflow")
-            .unwrap()
-            .contract["run"]["concurrency"]["policy"] = json!("skip");
+        let registry = registry_with(true, |workflow| {
+            workflow["run"]["concurrency"]["policy"] = json!("skip");
+        });
         let (runtime, _) = runtime(store.clone(), Arc::new(RecordingProvider::default()));
 
         let first = runtime
@@ -303,12 +324,9 @@ async fn skip_treats_queued_work_as_active_in_every_local_store() {
 #[tokio::test]
 async fn queue_preserves_event_order_when_earlier_work_is_not_ready() {
     for store in local_state_stores() {
-        let mut delayed_registry = registry(true);
-        delayed_registry
-            .workflows
-            .get_mut("test.workflow")
-            .unwrap()
-            .contract["triggers"][0]["debounce"] = json!("1m");
+        let delayed_registry = registry_with(true, |workflow| {
+            workflow["triggers"][0]["debounce"] = json!("1m");
+        });
         let ready_registry = registry(true);
         let provider = Arc::new(RecordingProvider::default());
         let (runtime, clock) = runtime(store, provider.clone());
@@ -329,12 +347,12 @@ async fn queue_preserves_event_order_when_earlier_work_is_not_ready() {
             .unwrap();
 
         assert_eq!(
-            runtime.work_once(&ready_registry).await.unwrap(),
+            runtime.work_once().await.unwrap(),
             mdbase_runtime::WorkerOutcome::Idle
         );
         clock.advance(TimeDelta::minutes(1));
-        runtime.work_once(&ready_registry).await.unwrap();
-        runtime.work_once(&ready_registry).await.unwrap();
+        runtime.work_once().await.unwrap();
+        runtime.work_once().await.unwrap();
         let requests = provider.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].input["value"], json!("a"));
@@ -345,12 +363,9 @@ async fn queue_preserves_event_order_when_earlier_work_is_not_ready() {
 #[tokio::test]
 async fn replace_cancels_queued_work_before_admitting_its_successor() {
     for store in local_state_stores() {
-        let mut registry = registry(true);
-        registry
-            .workflows
-            .get_mut("test.workflow")
-            .unwrap()
-            .contract["run"]["concurrency"]["policy"] = json!("replace");
+        let registry = registry_with(true, |workflow| {
+            workflow["run"]["concurrency"]["policy"] = json!("replace");
+        });
         let provider = Arc::new(RecordingProvider::default());
         let (runtime, _) = runtime(store.clone(), provider.clone());
 
@@ -378,7 +393,7 @@ async fn replace_cancels_queued_work_before_admitting_its_successor() {
             mdbase_runtime::StepStatus::Cancelled
         );
 
-        let outcome = runtime.work_once(&registry).await.unwrap();
+        let outcome = runtime.work_once().await.unwrap();
         assert!(matches!(
             outcome,
             mdbase_runtime::WorkerOutcome::Completed {
@@ -402,10 +417,10 @@ async fn idempotent_unknown_dispatch_replays_the_same_invocation_after_lease_exp
         .await
         .unwrap();
 
-    let failure = runtime.work_once(&registry).await.unwrap_err();
+    let failure = runtime.work_once().await.unwrap_err();
     assert_eq!(failure.code(), "action_provider_error");
     clock.advance(TimeDelta::seconds(31));
-    let outcome = runtime.work_once(&registry).await.unwrap();
+    let outcome = runtime.work_once().await.unwrap();
     assert!(matches!(
         outcome,
         mdbase_runtime::WorkerOutcome::Completed {
@@ -417,7 +432,7 @@ async fn idempotent_unknown_dispatch_replays_the_same_invocation_after_lease_exp
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].invocation_id, requests[1].invocation_id);
-    assert_eq!(requests[0].attempt, requests[1].attempt);
+    assert_eq!(requests[0].attempt_id, requests[1].attempt_id);
 }
 
 #[tokio::test]
@@ -434,7 +449,7 @@ async fn cancelled_cooperative_dispatch_is_not_replayed_during_recovery() {
         .await
         .unwrap();
 
-    runtime.work_once(&registry).await.unwrap_err();
+    runtime.work_once().await.unwrap_err();
     let cancellation = runtime
         .cancel_run(&delivery.admitted_run_ids[0])
         .await
@@ -443,7 +458,7 @@ async fn cancelled_cooperative_dispatch_is_not_replayed_during_recovery() {
     assert!(cancellation.provider_notified);
     clock.advance(TimeDelta::seconds(31));
 
-    let recovered = runtime.work_once(&registry).await.unwrap();
+    let recovered = runtime.work_once().await.unwrap();
     assert!(matches!(
         recovered,
         mdbase_runtime::WorkerOutcome::Completed {
@@ -467,12 +482,9 @@ async fn cancelled_cooperative_dispatch_is_not_replayed_during_recovery() {
 
 #[tokio::test]
 async fn replacement_waits_when_cancelled_predecessor_is_indeterminate() {
-    let mut registry = registry(true);
-    registry
-        .workflows
-        .get_mut("test.workflow")
-        .unwrap()
-        .contract["run"]["concurrency"]["policy"] = json!("replace");
+    let registry = registry_with(true, |workflow| {
+        workflow["run"]["concurrency"]["policy"] = json!("replace");
+    });
     let store = Arc::new(InMemoryRuntimeStore::new());
     let provider = Arc::new(RecordingProvider::fail_unknown_once());
     let (runtime, clock) = runtime(store, provider.clone());
@@ -483,7 +495,7 @@ async fn replacement_waits_when_cancelled_predecessor_is_indeterminate() {
         )
         .await
         .unwrap();
-    runtime.work_once(&registry).await.unwrap_err();
+    runtime.work_once().await.unwrap_err();
 
     let replacement = runtime
         .deliver_event(
@@ -497,7 +509,7 @@ async fn replacement_waits_when_cancelled_predecessor_is_indeterminate() {
         first.admitted_run_ids
     );
     clock.advance(TimeDelta::seconds(31));
-    let predecessor = runtime.work_once(&registry).await.unwrap();
+    let predecessor = runtime.work_once().await.unwrap();
     assert!(matches!(
         predecessor,
         mdbase_runtime::WorkerOutcome::Completed {
@@ -507,7 +519,7 @@ async fn replacement_waits_when_cancelled_predecessor_is_indeterminate() {
     ));
 
     assert_eq!(
-        runtime.work_once(&registry).await.unwrap(),
+        runtime.work_once().await.unwrap(),
         mdbase_runtime::WorkerOutcome::Idle
     );
     let replacement = runtime
@@ -530,7 +542,7 @@ async fn unknown_non_idempotent_dispatch_is_indeterminate_and_never_replayed() {
         .await
         .unwrap();
 
-    let first = runtime.work_once(&registry).await.unwrap();
+    let first = runtime.work_once().await.unwrap();
     assert!(matches!(
         first,
         mdbase_runtime::WorkerOutcome::Completed {
@@ -540,7 +552,7 @@ async fn unknown_non_idempotent_dispatch_is_indeterminate_and_never_replayed() {
     ));
     clock.advance(TimeDelta::minutes(1));
     assert_eq!(
-        runtime.work_once(&registry).await.unwrap(),
+        runtime.work_once().await.unwrap(),
         mdbase_runtime::WorkerOutcome::Idle
     );
     assert_eq!(provider.requests().len(), 1);
@@ -548,12 +560,9 @@ async fn unknown_non_idempotent_dispatch_is_indeterminate_and_never_replayed() {
 
 #[tokio::test]
 async fn workflow_deadline_fails_before_a_new_effect_is_dispatched() {
-    let mut registry = registry(true);
-    registry
-        .workflows
-        .get_mut("test.workflow")
-        .unwrap()
-        .contract["run"]["limits"] = json!({"timeout": "1s", "max_items": 100});
+    let registry = registry_with(true, |workflow| {
+        workflow["run"]["limits"] = json!({"timeout": "1s", "max_items": 100});
+    });
     let store = Arc::new(InMemoryRuntimeStore::new());
     let provider = Arc::new(RecordingProvider::default());
     let (runtime, clock) = runtime(store.clone(), provider.clone());
@@ -563,7 +572,7 @@ async fn workflow_deadline_fails_before_a_new_effect_is_dispatched() {
         .unwrap();
     clock.advance(TimeDelta::seconds(2));
 
-    let outcome = runtime.work_once(&registry).await.unwrap();
+    let outcome = runtime.work_once().await.unwrap();
     assert!(matches!(
         outcome,
         mdbase_runtime::WorkerOutcome::Completed {
@@ -579,18 +588,14 @@ async fn workflow_deadline_fails_before_a_new_effect_is_dispatched() {
 
 #[tokio::test]
 async fn deterministic_expression_failures_are_committed_not_retried_by_lease() {
-    let mut registry = registry(true);
-    let workflow = &mut registry
-        .workflows
-        .get_mut("test.workflow")
-        .unwrap()
-        .contract;
-    workflow["steps"][0]["input"] = json!({"value": {"$expr": "event.payload.items["}});
-    workflow["steps"].as_array_mut().unwrap().push(json!({
-        "id": "must-not-run",
-        "action": "test.echo",
-        "input": {"value": "unexpected"}
-    }));
+    let registry = registry_with(true, |workflow| {
+        workflow["steps"][0]["input"] = json!({"value": {"$expr": "event.data.items["}});
+        workflow["steps"].as_array_mut().unwrap().push(json!({
+            "id": "must-not-run",
+            "action": {"id": "test.echo", "version": "^1.0.0"},
+            "input": {"value": "unexpected"}
+        }));
+    });
     let store = Arc::new(InMemoryRuntimeStore::new());
     let provider = Arc::new(RecordingProvider::default());
     let (runtime, clock) = runtime(store.clone(), provider.clone());
@@ -602,7 +607,7 @@ async fn deterministic_expression_failures_are_committed_not_retried_by_lease() 
         .await
         .unwrap();
 
-    let outcome = runtime.work_once(&registry).await.unwrap();
+    let outcome = runtime.work_once().await.unwrap();
     assert!(matches!(
         outcome,
         mdbase_runtime::WorkerOutcome::Completed {
@@ -612,7 +617,7 @@ async fn deterministic_expression_failures_are_committed_not_retried_by_lease() 
     ));
     clock.advance(TimeDelta::minutes(1));
     assert_eq!(
-        runtime.work_once(&registry).await.unwrap(),
+        runtime.work_once().await.unwrap(),
         mdbase_runtime::WorkerOutcome::Idle
     );
     assert!(provider.requests().is_empty());
@@ -636,7 +641,7 @@ async fn sqlite_store_survives_reopen_and_preserves_event_deduplication() {
             .deliver_event(&registry, event.clone())
             .await
             .unwrap();
-        runtime.drain(&registry, 10).await.unwrap();
+        runtime.drain(10).await.unwrap();
         assert_eq!(
             store.snapshot().await.unwrap().runs[0].status,
             RunStatus::Succeeded
@@ -662,9 +667,11 @@ async fn sqlite_timer_reconciliation_is_atomic_and_survives_reopen() {
     let timer = |id: &str| TimerRequest {
         id: id.to_string(),
         fire_at,
-        event_type: "timer.fired".to_string(),
-        contract_version: 1,
-        payload: json!({"private": id}),
+        contract: timer_contract_reference(),
+        source: test_identity(),
+        source_uri: "urn:test:runtime".to_string(),
+        subject: None,
+        data: json!({"private": id}),
     };
     {
         let store = Arc::new(SqliteRuntimeStore::open(&path).unwrap());
@@ -733,10 +740,8 @@ async fn admitted_runs_keep_their_pinned_action_when_the_registry_changes() {
         .await
         .unwrap();
 
-    let mut changed = registry(true);
-    changed.actions.get_mut("test.echo").unwrap().contract["name"] =
-        json!("Replacement echo definition");
-    let outcome = runtime.work_once(&changed).await.unwrap();
+    let _changed = registry(true);
+    let outcome = runtime.work_once().await.unwrap();
     assert!(matches!(
         outcome,
         mdbase_runtime::WorkerOutcome::Completed {
@@ -770,7 +775,7 @@ async fn cancelling_queued_work_is_immediately_durable_and_terminal() {
         RunStatus::Cancelled
     );
     assert_eq!(
-        runtime.work_once(&registry).await.unwrap(),
+        runtime.work_once().await.unwrap(),
         mdbase_runtime::WorkerOutcome::Idle
     );
 }
@@ -784,9 +789,11 @@ async fn overdue_one_shot_timer_fires_once_with_a_stable_generation() {
         .upsert_timer(TimerRequest {
             id: "timer_due".to_string(),
             fire_at: clock.now() + TimeDelta::minutes(5),
-            event_type: "timer.fired".to_string(),
-            contract_version: 1,
-            payload: json!({"items": ["timer"]}),
+            contract: timer_contract_reference(),
+            source: test_identity(),
+            source_uri: "urn:test:runtime".to_string(),
+            subject: None,
+            data: json!({"items": ["timer"]}),
         })
         .await
         .unwrap();
@@ -808,11 +815,11 @@ async fn overdue_one_shot_timer_fires_once_with_a_stable_generation() {
         snapshot.timers[0].status,
         mdbase_runtime::TimerStatus::Fired
     );
-    let contracts = RuntimeContracts::new().unwrap();
-    let validation = contracts.validate_contract(&ContractDocument::virtual_contract(
-        snapshot.timers[0].materialized_contract(),
-    ));
-    assert!(validation.valid, "{:#?}", validation.diagnostics);
+    assert_eq!(
+        snapshot.timers[0].materialized_contract()["event"]["contract"]["version"],
+        "1.0.0"
+    );
+    mdbase_runtime::validate_runtime_record(&snapshot.timers[0].materialized_contract()).unwrap();
 }
 
 #[tokio::test]
@@ -827,7 +834,7 @@ async fn crash_after_provider_success_replays_idempotently_with_the_same_invocat
         .await
         .unwrap();
 
-    let failure = runtime.work_once(&registry).await.unwrap_err();
+    let failure = runtime.work_once().await.unwrap_err();
     assert_eq!(failure.code(), "runtime_store_error");
     let interrupted = &inner.snapshot().await.unwrap().runs[0];
     assert_eq!(interrupted.attempts.len(), 1);
@@ -837,7 +844,7 @@ async fn crash_after_provider_success_replays_idempotently_with_the_same_invocat
     );
 
     clock.advance(TimeDelta::seconds(31));
-    let recovered = runtime.work_once(&registry).await.unwrap();
+    let recovered = runtime.work_once().await.unwrap();
     assert!(matches!(
         recovered,
         mdbase_runtime::WorkerOutcome::Completed {
@@ -856,7 +863,20 @@ fn runtime(
 ) -> (Runtime, ManualClock) {
     let clock = ManualClock::new(Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 0).single().unwrap());
     let providers = ProviderRegistry::default();
-    providers.register("test.echo", provider);
+    let action = exact(&action_contract("test.echo"));
+    for idempotent in [true, false] {
+        let declaration = provider_declaration(idempotent, action.clone());
+        providers.register(
+            ProviderBinding {
+                provider_declaration_digest: declaration["declaration_digest"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                handler_id: "echo".to_string(),
+            },
+            provider.clone(),
+        );
+    }
     let runtime = Runtime::new(
         store,
         providers,
@@ -868,6 +888,7 @@ fn runtime(
             worker_id: "worker_one".to_string(),
             actor_id: "test-user".to_string(),
             actor_kind: "user".to_string(),
+            identity: test_identity(),
             timezone: Some("UTC".to_string()),
             lease_duration: Duration::from_secs(30),
             max_items: 100,
@@ -891,161 +912,269 @@ fn local_state_stores() -> Vec<Arc<dyn RuntimeStore>> {
     }
 }
 
-fn registry(idempotent: bool) -> RuntimeRegistry {
-    let dispatch = if idempotent {
-        json!({"idempotency": "invocation_id", "cancellation": "cooperative"})
-    } else {
-        json!({"idempotency": "none", "cancellation": "none"})
-    };
-    let documents = vec![
-        contract(json!({
-            "type": "provider",
-            "id": "test",
-            "version": 1,
-            "name": "Test provider",
-            "provider_version": "1.0.0",
-            "contracts": {
-                "events": ["test.changed"],
-                "actions": ["test.echo"]
-            }
-        })),
-        contract(json!({
-            "type": "provider",
-            "id": "mdbase.timer",
-            "version": 1,
-            "name": "Timer provider",
-            "provider_version": "1.0.0",
-            "contracts": {
-                "events": ["timer.fired"]
-            }
-        })),
-        contract(json!({
-            "type": "event",
-            "id": "test.changed",
-            "version": 1,
-            "provider": "test",
-            "name": "Changed",
-            "schemas": {
-                "dialect": "json-schema-2020-12",
-                "payload": {
-                    "type": "object",
-                    "required": ["items"],
-                    "properties": {
-                        "items": {"type": "array"}
-                    }
-                }
-            }
-        })),
-        contract(json!({
-            "type": "event",
-            "id": "timer.fired",
-            "version": 1,
-            "provider": "mdbase.timer",
-            "name": "Timer fired",
-            "schemas": {
-                "dialect": "json-schema-2020-12",
-                "payload": {
-                    "type": "object",
-                    "required": ["timer_id", "generation", "scheduled_at", "fired_at", "late_by_ms", "data"],
-                    "properties": {
-                        "timer_id": {"type": "string"},
-                        "generation": {"type": "integer"},
-                        "scheduled_at": {"type": "string", "format": "date-time"},
-                        "fired_at": {"type": "string", "format": "date-time"},
-                        "late_by_ms": {"type": "integer"},
-                        "data": {"type": "object"}
-                    }
-                }
-            }
-        })),
-        contract(json!({
-            "type": "action",
-            "id": "test.echo",
-            "version": 1,
-            "provider": "test",
-            "name": "Echo",
-            "schemas": {
-                "dialect": "json-schema-2020-12",
-                "input": {"type": "object"},
-                "output": {"type": "object"}
-            },
-            "dispatch": dispatch
-        })),
-        contract(json!({
-            "type": "runtime_policy",
-            "id": "local.policy",
-            "version": 1,
-            "name": "Local policy",
-            "executors": {"default": "local"}
-        })),
-        contract(json!({
-            "type": "workflow",
-            "id": "test.workflow",
-            "version": 1,
-            "name": "Test workflow",
-            "enabled": true,
-            "vars": {
-                "second": {"$expr": "vars.first"},
-                "first": {"$expr": "event.payload.items[0]"}
-            },
-            "triggers": [
-                {
-                    "id": "changed",
-                    "event": "test.changed",
-                    "if": {"$expr": "event.payload.items.length > 0"}
-                }
-            ],
-            "steps": [
-                {
-                    "id": "echo",
-                    "action": "test.echo",
-                    "for_each": {
-                        "items": {"$expr": "event.payload.items"},
-                        "as": "entry"
-                    },
-                    "input": {
-                        "value": {"$expr": "entry"},
-                        "from_var": {"$expr": "vars.second"}
-                    }
-                }
-            ],
-            "run": {
-                "execution": {"mode": "single_executor"},
-                "concurrency": {"policy": "queue"},
-                "on_error": "stop"
-            }
-        })),
-    ];
-    let runtime = RuntimeContracts::new().unwrap();
-    let registry = runtime.compose(
-        vec![ContractSource::built_in(documents)],
-        &ComposeOptions {
-            selected_policies: vec![PolicySelector::Id("local.policy".to_string())],
-        },
-    );
-    assert!(registry.valid(), "{:#?}", registry.diagnostics);
-    let preflight = runtime.preflight(&registry);
-    assert!(preflight.valid, "{:#?}", preflight.diagnostics);
-    registry
+fn registry(idempotent: bool) -> AdmissionCatalog {
+    registry_with(idempotent, |_| {})
 }
 
-fn contract(value: Value) -> ContractDocument {
-    ContractDocument::virtual_contract(value)
+fn ambiguous_registry() -> AdmissionCatalog {
+    let changed = event_contract(
+        "test.changed",
+        json!({
+            "type": "object",
+            "required": ["items"],
+            "properties": {
+                "items": {"type": "array"},
+                "types": {"type": "array", "items": {"type": "string"}}
+            }
+        }),
+    );
+    let echo = action_contract("test.echo");
+    let resolved = exact(&echo);
+    let first = provider_declaration(true, resolved.clone());
+    let mut second = provider_declaration(true, resolved);
+    second["provider"]["implementation"] = json!("another-provider");
+    second.as_object_mut().unwrap().remove("declaration_digest");
+    second = declaration(second);
+    AdmissionCatalog::new(
+        vec![changed.clone(), echo],
+        vec![source_declaration(test_identity(), vec![exact(&changed)])],
+        vec![first, second],
+        vec![json!({
+            "type": "runtime_workflow",
+            "id": "test.ambiguous",
+            "version": "1.0.0",
+            "name": "Ambiguous provider",
+            "enabled": true,
+            "triggers": [{
+                "id": "changed",
+                "event": {"id": "test.changed", "version": "^1.0.0"}
+            }],
+            "steps": [{
+                "id": "echo",
+                "action": {"id": "test.echo", "version": "^1.0.0"},
+                "input": {}
+            }]
+        })],
+        json!({
+            "type": "runtime_policy",
+            "id": "local.policy",
+            "version": "1.0.0",
+            "enabled": true,
+            "executors": {"default": "local"},
+            "grants": []
+        }),
+    )
+    .unwrap()
+}
+
+fn registry_with(idempotent: bool, mutate: impl FnOnce(&mut Value)) -> AdmissionCatalog {
+    let changed = event_contract(
+        "test.changed",
+        json!({
+            "type": "object",
+            "required": ["items"],
+            "properties": {
+                "items": {"type": "array"},
+                "types": {"type": "array", "items": {"type": "string"}}
+            }
+        }),
+    );
+    let timer = event_contract(
+        "timer.fired",
+        json!({
+            "type": "object",
+            "required": ["timer_id", "generation", "scheduled_at", "fired_at", "late_by_ms", "data"],
+            "properties": {
+                "timer_id": {"type": "string"},
+                "generation": {"type": "integer"},
+                "scheduled_at": {"type": "string", "format": "date-time"},
+                "fired_at": {"type": "string", "format": "date-time"},
+                "late_by_ms": {"type": "integer"},
+                "data": {"type": "object"}
+            }
+        }),
+    );
+    let echo = action_contract("test.echo");
+    let source = source_declaration(test_identity(), vec![exact(&changed), exact(&timer)]);
+    let provider = provider_declaration(idempotent, exact(&echo));
+    let mut workflow = json!({
+        "type": "runtime_workflow",
+        "id": "test.workflow",
+        "version": "1.0.0",
+        "name": "Test workflow",
+        "enabled": true,
+        "vars": {
+            "second": {"$expr": "vars.first"},
+            "first": {"$expr": "event.data.items[0]"}
+        },
+        "triggers": [{
+            "id": "changed",
+            "event": {"id": "test.changed", "version": "^1.0.0"},
+            "if": {"$expr": "event.data.items.length > 0"}
+        }],
+        "steps": [{
+            "id": "echo",
+            "action": {"id": "test.echo", "version": "^1.0.0"},
+            "for_each": {
+                "items": {"$expr": "event.data.items"},
+                "as": "entry"
+            },
+            "input": {
+                "value": {"$expr": "entry"},
+                "from_var": {"$expr": "vars.second"}
+            }
+        }],
+        "run": {
+            "concurrency": {"policy": "queue"},
+            "on_error": "stop"
+        }
+    });
+    mutate(&mut workflow);
+    AdmissionCatalog::new(
+        vec![changed, timer, echo],
+        vec![source],
+        vec![provider],
+        vec![workflow],
+        json!({
+            "type": "runtime_policy",
+            "id": "local.policy",
+            "version": "1.0.0",
+            "name": "Local policy",
+            "enabled": true,
+            "executors": {"default": "local"},
+            "grants": []
+        }),
+    )
+    .unwrap()
+}
+
+fn event_contract(id: &str, schema: Value) -> Value {
+    json!({
+        "kind": "mdbase.contract",
+        "contract_type": "event",
+        "id": id,
+        "version": "1.0.0",
+        "data_schema": {"dialect": "json-schema-2020-12", "value": schema}
+    })
+}
+
+fn action_contract(id: &str) -> Value {
+    json!({
+        "kind": "mdbase.contract",
+        "contract_type": "action",
+        "id": id,
+        "version": "1.0.0",
+        "input_schema": {
+            "dialect": "json-schema-2020-12",
+            "value": {"type": "object"}
+        },
+        "output_schema": {
+            "dialect": "json-schema-2020-12",
+            "value": {"type": "object"}
+        }
+    })
+}
+
+fn timer_contract_reference() -> ExactContractReference {
+    exact(&event_contract(
+        "timer.fired",
+        json!({
+            "type": "object",
+            "required": ["timer_id", "generation", "scheduled_at", "fired_at", "late_by_ms", "data"],
+            "properties": {
+                "timer_id": {"type": "string"},
+                "generation": {"type": "integer"},
+                "scheduled_at": {"type": "string", "format": "date-time"},
+                "fired_at": {"type": "string", "format": "date-time"},
+                "late_by_ms": {"type": "integer"},
+                "data": {"type": "object"}
+            }
+        }),
+    ))
+}
+
+fn exact(contract: &Value) -> ExactContractReference {
+    ExactContractReference {
+        id: contract["id"].as_str().unwrap().to_string(),
+        version: contract["version"].as_str().unwrap().to_string(),
+        digest: mdbase_interop::contract_digest(contract).unwrap(),
+    }
+}
+
+fn test_identity() -> ImplementationIdentity {
+    ImplementationIdentity {
+        application: "test".to_string(),
+        implementation: "runtime-test".to_string(),
+        version: "1.0.0".to_string(),
+        instance_id: Some("local".to_string()),
+    }
+}
+
+fn source_declaration(
+    source: ImplementationIdentity,
+    contracts: Vec<ExactContractReference>,
+) -> Value {
+    declaration(json!({
+        "kind": "mdbase.event-source",
+        "profile_version": "0.1",
+        "declaration_id": "test.events",
+        "source": source,
+        "contracts": contracts.into_iter().map(|resolved| json!({
+            "requirement": {"id": resolved.id, "version": resolved.version},
+            "resolved": resolved
+        })).collect::<Vec<_>>()
+    }))
+}
+
+fn provider_declaration(idempotent: bool, resolved: ExactContractReference) -> Value {
+    declaration(json!({
+        "kind": "mdbase.action-provider",
+        "profile_version": "0.1",
+        "declaration_id": if idempotent { "test.actions.idempotent" } else { "test.actions.direct" },
+        "provider": test_identity(),
+        "handlers": [{
+            "handler_id": "echo",
+            "requirement": {"id": resolved.id, "version": resolved.version},
+            "resolved": resolved,
+            "idempotency": {"mode": if idempotent { "request" } else { "none" }},
+            "cancellation": if idempotent { "cooperative" } else { "none" }
+        }]
+    }))
+}
+
+fn declaration(mut value: Value) -> Value {
+    value["declaration_digest"] = Value::String(canonical_digest(&value).unwrap());
+    value
 }
 
 fn changed_event(id: &str, items: Value) -> Value {
+    let contract = exact(&event_contract(
+        "test.changed",
+        json!({
+            "type": "object",
+            "required": ["items"],
+            "properties": {
+                "items": {"type": "array"},
+                "types": {"type": "array", "items": {"type": "string"}}
+            }
+        }),
+    ));
     json!({
-        "type": "test.changed",
-        "contract_version": 1,
+        "specversion": "1.0",
         "id": id,
-        "occurred_at": "2026-07-24T00:00:00Z",
-        "source": {
-            "runtime": "test-runtime",
-            "provider": "test"
-        },
-        "payload": {
-            "items": items
-        }
+        "source": "urn:test:runtime",
+        "type": "test.changed",
+        "time": "2026-07-24T00:00:00Z",
+        "datacontenttype": "application/json",
+        "dataschema": format!("urn:mdbase:contract:{}:{}:{}", contract.id, contract.version, contract.digest),
+        "data": {"items": items},
+        "mdbaseprofile": "0.1",
+        "mdbasecontractversion": contract.version,
+        "mdbasecontractdigest": contract.digest,
+        "mdbaseapplication": "test",
+        "mdbaseimplementation": "runtime-test",
+        "mdbaseimplementationversion": "1.0.0",
+        "mdbaseinstanceid": "local"
     })
 }
 

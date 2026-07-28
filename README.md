@@ -1,7 +1,7 @@
 # mdbase-rs
 
 Typed Rust implementation of the [mdbase specification](https://mdbase.dev).
-The `0.4.0-rc.1` release is a deliberate breaking API release: canonical v0.3
+The `0.4.0-rc.3` release is a deliberate breaking API release: canonical v0.3
 collection semantics now sit behind typed requests, results, paths, revisions,
 diagnostics, and errors.
 
@@ -11,8 +11,8 @@ It includes:
 - Query execution (filters, formulas, grouping, summaries)
 - Link parsing/resolution/traversal
 - Typed CRUD, crash-recoverable batch, backfill, and migration operations
-- Runtime Contracts 0.1 registry composition and preflight
-- Independently versioned durable workflow execution
+- One core contract/type implementation model for record, event, and action contracts
+- Independently versioned durable Runtime companion profile 0.2
 - Fail-safe SQLite query caching with authoritative disk fallback
 - Debounced filesystem watching with normalized collection events
 
@@ -81,40 +81,34 @@ mdbase --collection <uuid> query --request query.json
 Use `--dry-run` on mutations. Rename updates references by default; pass
 `--no-update-refs` to opt out.
 
-## Runtime Contracts
+## Contracts and durable runtime
 
-`mdbase::runtime_contracts::RuntimeContracts` is a pure registry and preflight
-engine. It loads materialized contract records from normal collection scope and
-composes them with built-in, provider, or pack contracts supplied in memory.
-`ContractDocument::virtual_contract` is the first-class representation for a
-non-materialized contract.
+The core `mdbase` crate owns the single contract identity, SemVer, digest,
+schema, type-implementation, projection, and pack model. Event and action
+contracts use that same registry. Core collection loading remains passive: a
+type, contract, pack, workflow, or provider-registration record can never
+activate executable code.
 
-The contract engine validates strict provider, action, event, capability, policy, and
-workflow shapes; compiles embedded schemas once; validates event and action
-values; resolves workflow requirements; and renders contracts as Markdown when
-materialization is requested. It grants no filesystem authority.
+The independently versioned `mdbase-runtime` workspace crate implements
+durable Runtime companion profile 0.2. `AdmissionCatalog` consumes verified
+core contract artifacts, ordinary projected workflow/policy records, and live
+event-source/action-provider declarations from `mdbase-interop`. Admission
+pins exact contract digests, implementation identities, declaration digests,
+and handler IDs. Workers execute that immutable plan through ordinary
+interoperability action invocations; they never re-resolve a live registry.
 
-The independently versioned `mdbase-runtime` workspace crate adds durable event
-admission, deterministic workflow planning, stable action invocation IDs,
-leases, cancellation, crash recovery, cursor retention, and one-shot timers. It
-supports in-memory and SQLite stores by default and a horizontally safe
-PostgreSQL store behind the `postgres` feature. Provider calls remain neutral:
-an embedding host such as mdbase-connect is the final authorization boundary
-immediately before every dispatch. See
+The crate adds atomic event/run admission, leases, concurrency, cancellation,
+crash recovery, cursor retention, and generation-safe timers. It supports
+in-memory and SQLite stores by default and PostgreSQL behind the `postgres`
+feature. The embedding host remains the final authorization boundary. See
 [`crates/mdbase-runtime/README.md`](crates/mdbase-runtime/README.md).
-
-`FilesystemProvider::load_runtime_contracts` performs loading under the same
-serialization gate as collection requests. A watcher opened with
-`CollectionWatcher::open_with_runtime_contracts` recomposes the effective
-registry and emits `runtime_registry_changed` only when its stable registry
-revision changes; virtual sources never need to be written to the collection.
 
 ## Runtime Observability
 
 `FilesystemProvider::open_observed` and `FilesystemRuntime::open_observed`
-accept a `RuntimeObserver`. Every dispatched operation and Runtime Contracts
-load reports payload-free timing for queue, collection open, execution,
-synchronization, and total duration, including provider-level failures. Error
+accept a `RuntimeObserver`. Every dispatched collection operation reports
+payload-free timing for queue, collection open, execution, synchronization,
+and total duration, including provider-level failures. Error
 observations are disabled by default and can opt into stable codes or local
 messages with `ErrorReporting`.
 
@@ -131,7 +125,7 @@ path for fixture-driven watch tests.
 ## Packages
 
 - Library crate: `mdbase`
-- Workflow crate: `mdbase-runtime` (Runtime profile 0.1)
+- Workflow crate: `mdbase-runtime` (Runtime companion profile 0.2)
 - Command adapter crate: `mdbase-command` (embedded by the unified CLI)
 
 ## Build

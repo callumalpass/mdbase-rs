@@ -11,9 +11,4 @@ for schema in config data-contract diagnostic operation-result query query-resul
 	cp "$source_dir/$schema.schema.json" "$target_dir/$schema.schema.json"
 done
 
-mkdir -p "$target_dir/runtime"
-for schema in action capability checkpoint diagnostic event-envelope event provider run runtime-policy timer workflow; do
-	cp "$source_dir/runtime/$schema.schema.json" "$target_dir/runtime/$schema.schema.json"
-done
-
 echo "Synced mdbase v0.3 schemas from $source_dir"

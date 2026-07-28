@@ -20,9 +20,6 @@ fn v03_collection() -> TempDir {
 settings:
   validation: error
   types_folder: _types
-runtime:
-  profile_version: "0.1.0"
-  enabled: true
 "#,
     );
     write(
@@ -244,10 +241,11 @@ fn inspects_the_canonical_canvas_collection() {
         .types
         .iter()
         .any(|type_file| type_file.name == "task"));
-    assert!(report
-        .types
-        .iter()
-        .any(|type_file| type_file.name == "workflow"));
+    assert_eq!(
+        report.types.len(),
+        1,
+        "runtime contracts are first-class artifacts, not local record types"
+    );
 }
 
 #[test]

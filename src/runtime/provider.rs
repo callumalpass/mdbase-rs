@@ -1,6 +1,6 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -11,7 +11,6 @@ use super::{
     ErrorReporting, ObserverOptions, OperationError, OperationKind, OperationPerformance,
     OperationRequest, ProviderError, RuntimeObserver,
 };
-use crate::runtime_contracts::{ContractSource, LoadOptions, RuntimeContracts, RuntimeLoadResult};
 use crate::v03::OperationResult;
 use crate::Collection;
 use walkdir::WalkDir;
@@ -36,7 +35,6 @@ pub struct FilesystemProvider {
     operation_gate: RwLock<()>,
     observer: Arc<dyn RuntimeObserver>,
     observer_options: ObserverOptions,
-    runtime_contracts: OnceLock<Result<RuntimeContracts, String>>,
     collection_cache: RwLock<CachedCollection>,
 }
 
@@ -78,7 +76,6 @@ impl FilesystemProvider {
             operation_gate: RwLock::new(()),
             observer,
             observer_options,
-            runtime_contracts: OnceLock::new(),
             collection_cache: RwLock::new(CachedCollection {
                 collection: Arc::new(collection),
                 stamp,
@@ -128,90 +125,6 @@ impl FilesystemProvider {
         let _guard = self.read_lock().map_err(E::from)?;
         let collection = self.current_collection().map_err(E::from)?;
         operation(collection.as_ref())
-    }
-
-    /// Load and preflight the effective Runtime Contracts registry while
-    /// holding the same local serialization gate as collection operations.
-    pub fn load_runtime_contracts(
-        &self,
-        implicit_sources: Vec<ContractSource>,
-        options: &LoadOptions,
-    ) -> Result<RuntimeLoadResult, ProviderError> {
-        let started = Instant::now();
-        let mut timings = OperationTimings::default();
-        let queue_started = Instant::now();
-        let _guard = match self.read_lock() {
-            Ok(guard) => guard,
-            Err(error) => {
-                timings.queue = queue_started.elapsed();
-                return Err(self.finish_provider_error(
-                    "runtime_contracts.load",
-                    "queue",
-                    started,
-                    timings,
-                    error,
-                ));
-            }
-        };
-        timings.queue = queue_started.elapsed();
-        let open_started = Instant::now();
-        let collection = match self.current_collection() {
-            Ok(collection) => collection,
-            Err(error) => {
-                timings.open = open_started.elapsed();
-                return Err(self.finish_provider_error(
-                    "runtime_contracts.load",
-                    "open",
-                    started,
-                    timings,
-                    error,
-                ));
-            }
-        };
-        timings.open = open_started.elapsed();
-        let execute_started = Instant::now();
-        let engine = match self.runtime_contracts.get_or_init(RuntimeContracts::new) {
-            Ok(engine) => engine,
-            Err(message) => {
-                timings.execute = execute_started.elapsed();
-                let error = ProviderError::RuntimeContracts(message.clone());
-                return Err(self.finish_provider_error(
-                    "runtime_contracts.load",
-                    "execute",
-                    started,
-                    timings,
-                    error,
-                ));
-            }
-        };
-        let result = engine.load(collection.as_ref(), implicit_sources, options);
-        timings.execute = execute_started.elapsed();
-        self.observe_performance(
-            "runtime_contracts.load",
-            started,
-            timings,
-            result.valid(),
-            result.preflight.diagnostics.len(),
-            diagnostic_codes(
-                result
-                    .preflight
-                    .diagnostics
-                    .iter()
-                    .map(|diagnostic| diagnostic.code.as_str()),
-            ),
-        );
-        if !result.valid() {
-            self.report_diagnostic_error(
-                "runtime_contracts.load",
-                result
-                    .preflight
-                    .diagnostics
-                    .iter()
-                    .find(|diagnostic| diagnostic.severity == "error")
-                    .map(|diagnostic| (diagnostic.code.as_str(), diagnostic.message.as_str())),
-            );
-        }
-        Ok(result)
     }
 
     pub(super) fn execute_with_post(

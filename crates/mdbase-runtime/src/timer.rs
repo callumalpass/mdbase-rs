@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
-use mdbase::runtime_contracts::RuntimeRegistry;
+use mdbase_interop::{ExactContractReference, ImplementationIdentity};
 use serde_json::{json, Value};
 
+use crate::admission::AdmissionCatalog;
 use crate::engine::{DeliveryOutcome, Runtime};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::model::{TimerRecord, TimerStatus};
@@ -12,9 +13,11 @@ use crate::store::TimerReconcileOutcome;
 pub struct TimerRequest {
     pub id: String,
     pub fire_at: DateTime<Utc>,
-    pub event_type: String,
-    pub contract_version: u64,
-    pub payload: Value,
+    pub contract: ExactContractReference,
+    pub source: ImplementationIdentity,
+    pub source_uri: String,
+    pub subject: Option<String>,
+    pub data: Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,9 +45,11 @@ impl Runtime {
                 generation: 0,
                 status: TimerStatus::Scheduled,
                 fire_at: request.fire_at,
-                event_type: request.event_type,
-                contract_version: request.contract_version,
-                payload: request.payload,
+                event_contract: request.contract,
+                event_source: request.source,
+                source_uri: request.source_uri,
+                subject: request.subject,
+                data: request.data,
                 created_at: now,
                 updated_at: now,
                 fired_at: None,
@@ -92,9 +97,11 @@ impl Runtime {
                 generation: 0,
                 status: TimerStatus::Scheduled,
                 fire_at: timer.fire_at,
-                event_type: timer.event_type,
-                contract_version: timer.contract_version,
-                payload: timer.payload,
+                event_contract: timer.contract,
+                event_source: timer.source,
+                source_uri: timer.source_uri,
+                subject: timer.subject,
+                data: timer.data,
                 created_at: now,
                 updated_at: now,
                 fired_at: None,
@@ -119,7 +126,7 @@ impl Runtime {
 
     pub async fn fire_due_timer(
         &self,
-        registry: &RuntimeRegistry,
+        catalog: &AdmissionCatalog,
     ) -> RuntimeResult<TimerFireOutcome> {
         let now = self.clock.now();
         let Some(claim) = self
@@ -138,30 +145,45 @@ impl Runtime {
             .num_milliseconds()
             .max(0);
         let event = json!({
-            "type": claim.timer.event_type,
-            "contract_version": claim.timer.contract_version,
+            "specversion": "1.0",
             "id": event_id,
-            "occurred_at": claim.timer.fire_at.to_rfc3339(),
-            "source": {
-                "runtime": self.config.runtime_id,
-                "provider": "mdbase.timer"
-            },
-            "payload": {
+            "source": claim.timer.source_uri,
+            "type": claim.timer.event_contract.id,
+            "time": claim.timer.fire_at.to_rfc3339(),
+            "datacontenttype": "application/json",
+            "dataschema": format!(
+                "urn:mdbase:contract:{}:{}:{}",
+                claim.timer.event_contract.id,
+                claim.timer.event_contract.version,
+                claim.timer.event_contract.digest,
+            ),
+            "data": {
                 "timer_id": claim.timer.id,
                 "generation": claim.timer.generation,
                 "scheduled_at": claim.timer.fire_at.to_rfc3339(),
                 "fired_at": now.to_rfc3339(),
                 "late_by_ms": late_by_ms,
-                "data": claim.timer.payload
+                "data": claim.timer.data
             },
-            "trace": {
-                "correlation_id": stable_id(
-                    "corr",
-                    &format!("timer:{}:{}", claim.timer.id, claim.timer.generation)
-                )
-            }
+            "mdbaseprofile": "0.1",
+            "mdbasecontractversion": claim.timer.event_contract.version,
+            "mdbasecontractdigest": claim.timer.event_contract.digest,
+            "mdbaseapplication": claim.timer.event_source.application,
+            "mdbaseimplementation": claim.timer.event_source.implementation,
+            "mdbaseimplementationversion": claim.timer.event_source.version,
+            "correlationid": stable_id(
+                "corr",
+                &format!("timer:{}:{}", claim.timer.id, claim.timer.generation)
+            )
         });
-        let prepared = self.prepare_event(registry, event, now)?;
+        let mut event = event;
+        if let Some(instance_id) = &claim.timer.event_source.instance_id {
+            event["mdbaseinstanceid"] = Value::String(instance_id.clone());
+        }
+        if let Some(subject) = &claim.timer.subject {
+            event["subject"] = Value::String(subject.clone());
+        }
+        let prepared = self.prepare_event(catalog, event, now)?;
         let mut fired = claim.timer.clone();
         fired.status = TimerStatus::Fired;
         fired.updated_at = now;
@@ -180,9 +202,11 @@ impl Runtime {
 pub(crate) fn timer_matches(current: &TimerRecord, desired: &TimerRecord) -> bool {
     !matches!(current.status, TimerStatus::Cancelled)
         && current.fire_at == desired.fire_at
-        && current.event_type == desired.event_type
-        && current.contract_version == desired.contract_version
-        && current.payload == desired.payload
+        && current.event_contract == desired.event_contract
+        && current.event_source == desired.event_source
+        && current.source_uri == desired.source_uri
+        && current.subject == desired.subject
+        && current.data == desired.data
 }
 
 pub(crate) fn next_timer_generation(

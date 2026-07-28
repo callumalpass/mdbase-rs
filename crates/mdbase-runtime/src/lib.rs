@@ -1,10 +1,12 @@
-//! Durable, provider-neutral execution for mdbase Runtime profile 0.1.
+//! Durable, provider-neutral execution for mdbase Runtime profile 0.2.
 //!
-//! The collection crate owns contract and CEL semantics. This crate owns event
-//! admission, workflow planning, durable runs, action dispatch, recovery, and
-//! one-shot timers. Embedding hosts remain the final authorization boundary.
+//! Core mdbase owns contract identity and record projection; the interoperability
+//! profile owns CloudEvents and action/source/provider declarations. This crate
+//! consumes that verified evidence and owns admission, durable runs, recovery,
+//! and one-shot timers. Embedding hosts remain the final authorization boundary.
 
 mod activity;
+mod admission;
 mod clock;
 mod engine;
 mod error;
@@ -14,6 +16,7 @@ mod planner;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod provider;
+mod schemas;
 mod store;
 mod timer;
 
@@ -24,18 +27,23 @@ pub use activity::{watch_event_envelope, StatusTransitionActivity};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use engine::{DeliveryOutcome, Runtime, RuntimeBuilder, RuntimeConfig, WorkerOutcome};
 pub use error::{RuntimeError, RuntimeResult};
+pub use mdbase_interop::{
+    ActionCancellation, ActionInvocation, ActionOutcome, ExactContractReference,
+    ImplementationIdentity, PortableError,
+};
 pub use memory::InMemoryRuntimeStore;
 pub use model::{
-    ActionAttempt, ActionAttemptStatus, ActionDispatch, ActionResponse, CancellationOutcome,
-    ConcurrencyPolicy, DispatchFailure, DispatchOutcome, EventJournalEntry, OnError, PlannedRun,
-    PlannedStep, RunRecord, RunStatus, RuntimeFailure, StepRecord, StepStatus, TimerRecord,
-    TimerStatus,
+    ActionAttempt, ActionAttemptStatus, ActionDispatch, CancellationOutcome, ConcurrencyPolicy,
+    DispatchFailure, DispatchOutcome, EventJournalEntry, OnError, PlannedRun, PlannedStep,
+    RunRecord, RunStatus, RuntimeFailure, StepRecord, StepStatus, TimerRecord, TimerStatus,
 };
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresRuntimeStore, POSTGRES_SCHEMA_VERSION};
 pub use provider::{
-    ActionProvider, AuthorizationDecision, DenyAllAuthorizer, DispatchAuthorizer, ProviderRegistry,
+    ActionProvider, AuthorizationDecision, DenyAllAuthorizer, DispatchAuthorizer, ProviderBinding,
+    ProviderRegistry,
 };
+pub use schemas::validate_runtime_record;
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteRuntimeStore, SQLITE_SCHEMA_VERSION};
 pub use store::{
@@ -48,4 +56,5 @@ pub use timer::{TimerFireOutcome, TimerReconcileRequest, TimerRequest};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Runtime profile implemented by this crate.
-pub const PROFILE_VERSION: &str = mdbase::runtime_contracts::RUNTIME_PROFILE_VERSION;
+pub const PROFILE_VERSION: &str = "0.2";
+pub use admission::{canonical_digest, AdmissionCatalog};

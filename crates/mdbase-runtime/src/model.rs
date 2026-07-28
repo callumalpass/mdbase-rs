@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use mdbase_interop::{ActionInvocation, ExactContractReference, ImplementationIdentity};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::{json, Map};
@@ -16,13 +17,17 @@ pub struct EventJournalEntry {
 pub struct PlannedRun {
     pub id: String,
     pub workflow: String,
-    pub workflow_version: u64,
+    pub workflow_version: String,
     pub workflow_revision: String,
-    pub registry_revision: String,
-    pub policy_revision: Option<String>,
+    pub catalog_revision: String,
+    pub policy_id: String,
+    pub policy_revision: String,
     pub trigger: String,
     pub event_id: String,
     pub event_type: String,
+    pub event_contract: ExactContractReference,
+    pub event_source: ImplementationIdentity,
+    pub source_declaration_digest: String,
     pub event_cursor: u64,
     pub event: Value,
     pub executor: String,
@@ -50,13 +55,13 @@ pub struct PlannedRun {
 pub struct PlannedStep {
     pub id: String,
     pub action: String,
-    pub action_version: u64,
-    pub action_revision: String,
-    /// Canonical action contract used to validate and authorize this admitted
-    /// plan. Older persisted runs may omit it and use the matching live
-    /// registry entry as a compatibility fallback.
-    #[serde(default)]
+    pub action_version: String,
+    pub action_digest: String,
+    /// Canonical action artifact pinned during admission.
     pub action_contract: Value,
+    pub provider: ImplementationIdentity,
+    pub provider_declaration_digest: String,
+    pub handler_id: String,
     pub condition: Option<String>,
     pub input: Value,
     pub for_each: Option<PlannedForEach>,
@@ -139,7 +144,7 @@ pub struct ActionAttempt {
     pub item_index: Option<usize>,
     pub invocation_id: String,
     pub action: String,
-    pub action_version: u64,
+    pub action_version: String,
     pub attempt: u32,
     pub status: ActionAttemptStatus,
     pub idempotent: bool,
@@ -218,7 +223,7 @@ impl RunRecord {
         let mut value = Map::from_iter([
             ("type".to_string(), json!("runtime_run")),
             ("id".to_string(), json!(self.plan.id)),
-            ("workflow".to_string(), json!(self.plan.workflow)),
+            ("workflow_id".to_string(), json!(self.plan.workflow)),
             (
                 "workflow_version".to_string(),
                 json!(self.plan.workflow_version),
@@ -228,13 +233,17 @@ impl RunRecord {
                 json!(self.plan.workflow_revision),
             ),
             (
-                "registry_revision".to_string(),
-                json!(self.plan.registry_revision),
+                "event_contract".to_string(),
+                json!(self.plan.event_contract),
             ),
-            ("trigger".to_string(), json!(self.plan.trigger)),
+            ("event_source".to_string(), json!(self.plan.event_source)),
+            ("trigger_id".to_string(), json!(self.plan.trigger)),
             ("event_id".to_string(), json!(self.plan.event_id)),
-            ("event_type".to_string(), json!(self.plan.event_type)),
-            ("event_cursor".to_string(), json!(self.plan.event_cursor)),
+            ("policy_id".to_string(), json!(self.plan.policy_id)),
+            (
+                "policy_revision".to_string(),
+                json!(self.plan.policy_revision),
+            ),
             ("executor".to_string(), json!(self.plan.executor)),
             (
                 "idempotency_key".to_string(),
@@ -248,10 +257,31 @@ impl RunRecord {
             ("created_at".to_string(), json!(self.created_at)),
             ("updated_at".to_string(), json!(self.updated_at)),
         ]);
-        insert_option(
-            &mut value,
-            "policy_revision",
-            self.plan.policy_revision.clone().map(Value::String),
+        if self.plan.event_cursor > 0 {
+            value.insert("event_cursor".to_string(), json!(self.plan.event_cursor));
+        }
+        value.insert(
+            "admitted_plan".to_string(),
+            json!({
+                "profile_version": "0.2",
+                "workflow_revision": self.plan.workflow_revision,
+                "event": {
+                    "contract": self.plan.event_contract,
+                    "source": self.plan.event_source,
+                    "source_declaration_digest": self.plan.source_declaration_digest,
+                },
+                "steps": self.plan.steps.iter().map(|step| json!({
+                    "id": step.id,
+                    "contract": {
+                        "id": step.action,
+                        "version": step.action_version,
+                        "digest": step.action_digest,
+                    },
+                    "provider": step.provider,
+                    "provider_declaration_digest": step.provider_declaration_digest,
+                    "handler_id": step.handler_id,
+                })).collect::<Vec<_>>(),
+            }),
         );
         insert_option(
             &mut value,
@@ -267,59 +297,6 @@ impl RunRecord {
             &mut value,
             "finished_at",
             self.finished_at.map(|at| json!(at)),
-        );
-        insert_option(
-            &mut value,
-            "cancel_requested_at",
-            self.cancel_requested_at.map(|at| json!(at)),
-        );
-        value.insert(
-            "steps".to_string(),
-            Value::Array(
-                self.steps
-                    .iter()
-                    .zip(&self.plan.steps)
-                    .map(|(step, planned)| {
-                        let attempts = self
-                            .attempts
-                            .iter()
-                            .filter(|attempt| attempt.step_id == step.id)
-                            .collect::<Vec<_>>();
-                        let latest = attempts.last().copied();
-                        let mut item = Map::from_iter([
-                            ("id".to_string(), json!(step.id)),
-                            ("action".to_string(), json!(step.action)),
-                            ("action_version".to_string(), json!(planned.action_version)),
-                            ("status".to_string(), json!(step.status)),
-                        ]);
-                        if attempts.len() == 1 {
-                            let attempt = latest.expect("one attempt is present");
-                            item.insert("invocation_id".to_string(), json!(attempt.invocation_id));
-                            item.insert("attempt".to_string(), json!(attempt.attempt));
-                            item.insert("input".to_string(), attempt.input.clone());
-                            insert_option(&mut item, "receipt", attempt.receipt.clone());
-                        }
-                        let output = match step.outputs.as_slice() {
-                            [] => None,
-                            [output] if planned.for_each.is_none() => Some(output.clone()),
-                            outputs => Some(Value::Array(outputs.to_vec())),
-                        };
-                        insert_option(&mut item, "output", output);
-                        insert_option(
-                            &mut item,
-                            "error",
-                            step.error.as_ref().map(|error| json!(error)),
-                        );
-                        insert_option(&mut item, "started_at", step.started_at.map(|at| json!(at)));
-                        insert_option(
-                            &mut item,
-                            "finished_at",
-                            step.finished_at.map(|at| json!(at)),
-                        );
-                        Value::Object(item)
-                    })
-                    .collect(),
-            ),
         );
         Value::Object(value)
     }
@@ -367,6 +344,9 @@ impl RuntimeFailure {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionDispatch {
+    /// Exact portable interoperability invocation sent to the selected live
+    /// handler. Remaining fields are host authorization context.
+    pub invocation: ActionInvocation,
     pub run_id: String,
     pub workflow: String,
     pub step_id: String,
@@ -374,21 +354,16 @@ pub struct ActionDispatch {
     pub invocation_id: String,
     pub attempt: u32,
     pub action: String,
+    pub contract: ExactContractReference,
+    pub provider: ImplementationIdentity,
+    pub provider_declaration_digest: String,
+    pub handler_id: String,
     pub input: Value,
     pub event: Value,
     pub executor: String,
     pub correlation_id: String,
     pub causation_id: String,
     pub deadline: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ActionResponse {
-    pub output: Value,
-    #[serde(default)]
-    pub receipt: Option<Value>,
-    #[serde(default)]
-    pub emitted_events: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -429,9 +404,11 @@ pub struct TimerRecord {
     pub generation: u64,
     pub status: TimerStatus,
     pub fire_at: DateTime<Utc>,
-    pub event_type: String,
-    pub contract_version: u64,
-    pub payload: Value,
+    pub event_contract: ExactContractReference,
+    pub event_source: ImplementationIdentity,
+    pub source_uri: String,
+    pub subject: Option<String>,
+    pub data: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub fired_at: Option<DateTime<Utc>>,
@@ -439,20 +416,22 @@ pub struct TimerRecord {
 
 impl TimerRecord {
     pub fn materialized_contract(&self) -> Value {
+        let mut event = Map::from_iter([
+            ("contract".to_string(), json!(self.event_contract)),
+            ("data".to_string(), self.data.clone()),
+        ]);
+        insert_option(
+            &mut event,
+            "subject",
+            self.subject.clone().map(Value::String),
+        );
         let mut value = Map::from_iter([
             ("type".to_string(), json!("runtime_timer")),
             ("id".to_string(), json!(self.id)),
             ("generation".to_string(), json!(self.generation)),
             ("status".to_string(), json!(self.status)),
             ("fire_at".to_string(), json!(self.fire_at)),
-            (
-                "event".to_string(),
-                json!({
-                    "type": self.event_type,
-                    "contract_version": self.contract_version,
-                    "payload": self.payload
-                }),
-            ),
+            ("event".to_string(), Value::Object(event)),
             ("missed_run_policy".to_string(), json!("fire_once")),
             ("created_at".to_string(), json!(self.created_at)),
             ("updated_at".to_string(), json!(self.updated_at)),

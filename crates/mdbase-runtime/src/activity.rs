@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use mdbase::runtime_contracts::RuntimeRegistry;
 use mdbase::watch::WatchEvent;
+use mdbase_interop::{ExactContractReference, ImplementationIdentity};
 use serde_json::{json, Value};
 use ulid::Ulid;
 
-use crate::{DeliveryOutcome, Runtime, RuntimeError, RuntimeResult};
+use crate::{AdmissionCatalog, DeliveryOutcome, Runtime, RuntimeError, RuntimeResult};
 
 /// Configuration for a durable workflow that reacts to a record entering one
 /// status and invokes an application-owned action after a quiet period.
@@ -25,7 +25,7 @@ pub struct StatusTransitionActivity {
 }
 
 impl StatusTransitionActivity {
-    /// Build a canonical Runtime Contracts workflow value.
+    /// Build a canonical `runtime_workflow` record value.
     pub fn workflow_contract(&self) -> RuntimeResult<Value> {
         for (label, value) in [
             ("activity id", self.id.as_str()),
@@ -64,22 +64,22 @@ impl StatusTransitionActivity {
         let status_value = serde_json::to_string(&self.status_value)
             .expect("serializing a string literal cannot fail");
         let condition = format!(
-            "event.payload.types.exists(record_type, record_type == {record_type}) \
-             && event.payload.after[{status_field}] == {status_value}"
+            "event.data.types.exists(record_type, record_type == {record_type}) \
+             && event.data.after[{status_field}] == {status_value}"
         );
         let trigger = |id: &str, event: &str| {
             json!({
                 "id": id,
-                "event": event,
+                "event": {"id": event, "version": "^1.0.0"},
                 "if": {"$expr": condition},
                 "debounce": format!("{delay_ms}ms")
             })
         };
 
         Ok(json!({
-            "type": "workflow",
+            "type": "runtime_workflow",
             "id": self.id,
-            "version": 1,
+            "version": "1.0.0",
             "name": self.name,
             "description": "Run an application action after a record remains in a configured status.",
             "enabled": true,
@@ -90,18 +90,17 @@ impl StatusTransitionActivity {
             ],
             "steps": [{
                 "id": "apply",
-                "action": self.action,
+                "action": {"id": self.action, "version": "^1.0.0"},
                 "input": {
-                    "path": {"$expr": "event.payload.path"},
-                    "if_revision": {"$expr": "event.payload.revision"},
+                    "path": {"$expr": "event.data.path"},
+                    "if_revision": {"$expr": "event.data.revision"},
                     "status_field": self.status_field,
                     "status_value": self.status_value
                 }
             }],
             "run": {
-                "execution": {"mode": "single_executor"},
                 "concurrency": {
-                    "group": {"$expr": "event.payload.path"},
+                    "group": {"$expr": "event.data.path"},
                     "policy": "replace"
                 },
                 "on_error": "stop"
@@ -113,52 +112,77 @@ impl StatusTransitionActivity {
 /// Convert one mdbase Watch event into a Runtime event envelope without
 /// discarding its before/after values, revision, types, or changed fields.
 ///
-/// Rename events receive the destination as `payload.path` so record-oriented
+/// Rename events receive the destination as `data.path` so record-oriented
 /// workflows can use one expression for create, modify, and rename events.
 pub fn watch_event_envelope(
     event: WatchEvent,
-    source_runtime: &str,
-    collection: Option<&str>,
+    contract: &ExactContractReference,
+    source: &ImplementationIdentity,
+    source_uri: &str,
+    subject: Option<&str>,
 ) -> RuntimeResult<Value> {
-    if !runtime_identifier(source_runtime) {
+    if !source_uri.contains(':') {
         return Err(RuntimeError::diagnostic(
             "invalid_runtime_event",
-            format!("Source runtime {source_runtime:?} is not a runtime identifier."),
+            format!("CloudEvent source {source_uri:?} must be an absolute URI-reference."),
         ));
     }
-    let mut payload = event.payload;
-    if event.event_type == "mdbase.record.renamed" && payload.get("path").is_none() {
-        if let Some(path) = payload.get("to").cloned() {
-            payload["path"] = path;
+    if event.event_type != contract.id {
+        return Err(RuntimeError::diagnostic(
+            "event_contract_mismatch",
+            format!(
+                "Watch event {} does not match contract {}.",
+                event.event_type, contract.id
+            ),
+        ));
+    }
+    let mut data = event.payload;
+    if event.event_type == "mdbase.record.renamed" && data.get("path").is_none() {
+        if let Some(path) = data.get("to").cloned() {
+            data["path"] = path;
         }
     }
-    let mut source = json!({
-        "runtime": source_runtime,
-        "provider": "mdbase.watch"
-    });
-    if let Some(collection) = collection {
-        source["collection"] = Value::String(collection.to_string());
-    }
-    Ok(json!({
-        "type": event.event_type,
-        "contract_version": 1,
+    let mut envelope = json!({
+        "specversion": "1.0",
         "id": format!("watch_{}", Ulid::new()),
-        "occurred_at": event.occurred_at,
-        "source": source,
-        "payload": payload
-    }))
+        "source": source_uri,
+        "type": event.event_type,
+        "time": event.occurred_at,
+        "datacontenttype": "application/json",
+        "dataschema": format!(
+            "urn:mdbase:contract:{}:{}:{}",
+            contract.id, contract.version, contract.digest
+        ),
+        "data": data,
+        "mdbaseprofile": "0.1",
+        "mdbasecontractversion": contract.version,
+        "mdbasecontractdigest": contract.digest,
+        "mdbaseapplication": source.application,
+        "mdbaseimplementation": source.implementation,
+        "mdbaseimplementationversion": source.version,
+    });
+    if let Some(instance_id) = &source.instance_id {
+        envelope["mdbaseinstanceid"] = Value::String(instance_id.clone());
+    }
+    if let Some(subject) = subject {
+        envelope["subject"] = Value::String(subject.to_string());
+    }
+    Ok(envelope)
 }
 
 impl Runtime {
     /// Admit one Watch event directly into the durable workflow runtime.
     pub async fn deliver_watch_event(
         &self,
-        registry: &RuntimeRegistry,
+        catalog: &AdmissionCatalog,
         event: WatchEvent,
-        collection: Option<&str>,
+        contract: &ExactContractReference,
+        source: &ImplementationIdentity,
+        source_uri: &str,
+        subject: Option<&str>,
     ) -> RuntimeResult<DeliveryOutcome> {
-        let envelope = watch_event_envelope(event, &self.config().runtime_id, collection)?;
-        self.deliver_event(registry, envelope).await
+        let envelope = watch_event_envelope(event, contract, source, source_uri, subject)?;
+        self.deliver_event(catalog, envelope).await
     }
 }
 
@@ -191,13 +215,24 @@ mod tests {
                     "types": ["task"]
                 }),
             },
-            "local",
+            &ExactContractReference {
+                id: "mdbase.record.renamed".to_string(),
+                version: "1.0.0".to_string(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+            },
+            &ImplementationIdentity {
+                application: "mdbase".to_string(),
+                implementation: "mdbase-rs".to_string(),
+                version: "0.4.0".to_string(),
+                instance_id: None,
+            },
+            "urn:mdbase:watch:collection-one",
             Some("collection-one"),
         )
         .unwrap();
 
-        assert_eq!(envelope["payload"]["path"], "tasks/new.md");
-        assert_eq!(envelope["source"]["collection"], "collection-one");
+        assert_eq!(envelope["data"]["path"], "tasks/new.md");
+        assert_eq!(envelope["subject"], "collection-one");
         assert!(envelope["id"]
             .as_str()
             .is_some_and(|id| id.starts_with("watch_")));
@@ -212,10 +247,36 @@ mod tests {
                 occurred_at: "2026-07-26T10:00:00Z".to_string(),
                 payload: json!({}),
             },
+            &ExactContractReference {
+                id: "mdbase.record.modified".to_string(),
+                version: "1.0.0".to_string(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+            },
+            &ImplementationIdentity {
+                application: "mdbase".to_string(),
+                implementation: "mdbase-rs".to_string(),
+                version: "0.4.0".to_string(),
+                instance_id: None,
+            },
             "not valid",
             None,
         )
         .unwrap_err();
         assert_eq!(error.code(), "invalid_runtime_event");
+    }
+
+    #[test]
+    fn produces_a_standard_runtime_workflow_record() {
+        let activity = StatusTransitionActivity {
+            id: "tasknotes.archive".to_string(),
+            name: "Archive completed tasks".to_string(),
+            record_type: "task".to_string(),
+            status_field: "status".to_string(),
+            status_value: "done".to_string(),
+            action: "tasknotes.task.archive".to_string(),
+            delay: Duration::from_secs(60),
+        };
+
+        crate::validate_runtime_record(&activity.workflow_contract().unwrap()).unwrap();
     }
 }
