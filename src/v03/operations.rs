@@ -197,6 +197,102 @@ impl<'a> Operations<'a> {
         }
     }
 
+    pub fn get_data_contracts(&self, input: &Value) -> OperationResult {
+        let contracts = self
+            .collection
+            .list_data_contracts()
+            .into_iter()
+            .filter(|definition| {
+                input
+                    .get("contract")
+                    .and_then(Value::as_str)
+                    .is_none_or(|contract| definition.id == contract)
+                    && input
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .is_none_or(|version| definition.version == version)
+            })
+            .collect::<Vec<_>>();
+        let implementations = if let (Some(contract), Some(version)) = (
+            input.get("contract").and_then(Value::as_str),
+            input.get("version").and_then(Value::as_str),
+        ) {
+            self.collection
+                .get_data_contract_implementations(contract, version)
+        } else {
+            contracts
+                .iter()
+                .flat_map(|definition| {
+                    self.collection
+                        .get_data_contract_implementations(&definition.id, &definition.version)
+                })
+                .collect()
+        };
+        OperationResult {
+            valid: true,
+            result: serde_json::json!({
+                "contracts": contracts,
+                "implementations": implementations,
+            }),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn get_contract_view(&self, input: &Value) -> OperationResult {
+        let Some(path) = input.get("path").and_then(Value::as_str) else {
+            return failed_result(vec![Diagnostic::error(
+                "invalid_request",
+                "Contract projection requires path.",
+                None,
+            )]);
+        };
+        let Some(contract) = input.get("contract").and_then(Value::as_str) else {
+            return failed_result(vec![Diagnostic::error(
+                "invalid_request",
+                "Contract projection requires contract.",
+                None,
+            )]);
+        };
+        let Some(version) = input.get("version").and_then(Value::as_str) else {
+            return failed_result(vec![Diagnostic::error(
+                "invalid_request",
+                "Contract projection requires exact version.",
+                None,
+            )]);
+        };
+        let projected = self.collection.get_contract_view(
+            path,
+            contract,
+            version,
+            input.get("type").and_then(Value::as_str),
+        );
+        OperationResult {
+            valid: projected.valid,
+            result: serde_json::json!({
+                "contract": projected.contract,
+                "version": projected.version,
+                "contract_digest": projected.contract_digest,
+                "type": projected.type_name,
+                "implementation_digest": projected.implementation_digest,
+                "view": projected.view,
+            }),
+            diagnostics: projected
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| Diagnostic {
+                    severity: diagnostic.severity,
+                    code: diagnostic.code,
+                    message: diagnostic.message,
+                    path: diagnostic.path,
+                    field: diagnostic.field,
+                    type_name: None,
+                    schema_location: None,
+                    details: None,
+                })
+                .collect(),
+        }
+    }
+
     pub fn read_type(&self, input: &Value) -> OperationResult {
         self.collection.read_type_file(input)
     }

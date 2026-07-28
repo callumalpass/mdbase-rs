@@ -79,13 +79,15 @@ pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult
     )
 }
 
-struct ShadowCollection {
-    _directory: tempfile::TempDir,
-    collection: Collection,
-    baseline: crate::transactions::FileBaseline,
+pub(crate) struct ShadowCollection {
+    pub(crate) directory: tempfile::TempDir,
+    pub(crate) collection: Collection,
+    pub(crate) baseline: crate::transactions::FileBaseline,
 }
 
-fn shadow_collection(collection: &Collection) -> Result<ShadowCollection, Box<Diagnostic>> {
+pub(crate) fn shadow_collection(
+    collection: &Collection,
+) -> Result<ShadowCollection, Box<Diagnostic>> {
     let directory = tempfile::tempdir().map_err(|error| {
         Box::new(Diagnostic::error(
             "batch_preflight_failed",
@@ -102,7 +104,7 @@ fn shadow_collection(collection: &Collection) -> Result<ShadowCollection, Box<Di
         ))
     })?;
     Ok(ShadowCollection {
-        _directory: directory,
+        directory,
         collection: shadow,
         baseline,
     })
@@ -153,7 +155,7 @@ fn copy_collection(
     Ok(baseline)
 }
 
-fn collect_collection_files(
+pub(crate) fn collect_collection_files(
     collection: &Collection,
 ) -> Result<crate::transactions::FileBaseline, Box<Diagnostic>> {
     let mut files = BTreeMap::new();
@@ -220,6 +222,7 @@ fn should_copy_file(collection: &Collection, relative: &Path) -> bool {
 
 fn is_system_definition_path(collection: &Collection, relative: &Path) -> bool {
     relative.starts_with(Path::new(&collection.settings.types_folder))
+        || relative.starts_with(Path::new(&collection.settings.contracts_folder))
         || relative.starts_with(Path::new(&collection.settings.migrations_folder))
 }
 

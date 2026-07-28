@@ -133,6 +133,38 @@ fn provider_snapshot_includes_configured_saved_view_sources() {
 }
 
 #[test]
+fn provider_snapshot_includes_contract_and_schema_resources() {
+    let directory = collection();
+    fs::create_dir(directory.path().join("_contracts")).unwrap();
+    fs::create_dir(directory.path().join("_schemas")).unwrap();
+    fs::write(
+        directory.path().join("_contracts/task.md"),
+        "---\nkind: mdbase.contract\nid: example.task\nversion: 1.0.0\nschema:\n  dialect: json-schema-2020-12\n  ref: ../_schemas/task.json\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("_schemas/task.json"),
+        "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\"}\n",
+    )
+    .unwrap();
+    let provider = FilesystemProvider::open(directory.path()).unwrap();
+
+    let snapshot = provider.snapshot().unwrap();
+    assert_eq!(snapshot.resources.len(), 3);
+    assert_eq!(snapshot.records.len(), 0);
+    assert_eq!(snapshot.resources[1].path, "_contracts/task.md");
+    assert_eq!(
+        snapshot.resources[1].kind,
+        CollectionSnapshotResourceKind::Contract
+    );
+    assert_eq!(snapshot.resources[2].path, "_schemas/task.json");
+    assert_eq!(
+        snapshot.resources[2].kind,
+        CollectionSnapshotResourceKind::Schema
+    );
+}
+
+#[test]
 fn provider_snapshot_matches_the_portable_sdk_digest_fixture() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(

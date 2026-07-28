@@ -58,7 +58,7 @@ pub(crate) fn validate_event(
     if actual_version != expected_version {
         diagnostics.push(
             RuntimeDiagnostic::error(
-                "contract_version_mismatch",
+                "runtime_contract_version_mismatch",
                 format!(
                     "Event {event_id} declares contract version {}, but the registry provides {}.",
                     display_optional(actual_version),

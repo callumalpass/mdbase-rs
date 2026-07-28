@@ -412,6 +412,7 @@ struct Snapshot {
     records: BTreeMap<String, RecordState>,
     runtime: Option<RuntimeRegistryState>,
     types_folder: String,
+    contracts_folder: String,
     cache_folder: String,
     record_extensions: BTreeSet<String>,
 }
@@ -483,6 +484,7 @@ impl Snapshot {
             records,
             runtime,
             types_folder: collection.settings.types_folder.clone(),
+            contracts_folder: collection.settings.contracts_folder.clone(),
             cache_folder: collection.settings.cache_folder.clone(),
             record_extensions: std::iter::once("md".to_string())
                 .chain(
@@ -511,6 +513,8 @@ impl Snapshot {
             if normalized == "mdbase.yaml"
                 || normalized == self.types_folder
                 || normalized.starts_with(&format!("{}/", self.types_folder))
+                || normalized == self.contracts_folder
+                || normalized.starts_with(&format!("{}/", self.contracts_folder))
             {
                 return None;
             }

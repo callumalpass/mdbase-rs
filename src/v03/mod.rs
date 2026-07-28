@@ -19,6 +19,7 @@ pub(crate) mod cel;
 mod lifecycle;
 mod operations;
 mod query;
+mod type_pack;
 
 pub use cel::{
     evaluate_runtime_expression, evaluate_runtime_template, validate_runtime_expression,
@@ -26,6 +27,7 @@ pub use cel::{
 };
 pub use operations::{OperationResult, Operations};
 pub use query::QueryPerformance;
+pub use type_pack::TypePackResource;
 
 pub const SPEC_VERSION: &str = "0.3.0";
 pub const PRERELEASE_SPEC_VERSIONS: &[&str] = &["0.3.0-alpha.1"];
@@ -40,16 +42,19 @@ pub fn is_supported_spec_version(version: &str) -> bool {
 }
 
 const CONFIG_SCHEMA_ID: &str = "https://mdbase.dev/schemas/v0.3/config.schema.json";
+const DATA_CONTRACT_SCHEMA_ID: &str = "https://mdbase.dev/schemas/v0.3/data-contract.schema.json";
 const DIAGNOSTIC_SCHEMA_ID: &str = "https://mdbase.dev/schemas/v0.3/diagnostic.schema.json";
 const TYPE_FILE_SCHEMA_ID: &str = "https://mdbase.dev/schemas/v0.3/type-file.schema.json";
 
 const CONFIG_SCHEMA: &str = include_str!("../../schemas/v0.3/config.schema.json");
+const DATA_CONTRACT_SCHEMA: &str = include_str!("../../schemas/v0.3/data-contract.schema.json");
 const DIAGNOSTIC_SCHEMA: &str = include_str!("../../schemas/v0.3/diagnostic.schema.json");
 const OPERATION_RESULT_SCHEMA: &str =
     include_str!("../../schemas/v0.3/operation-result.schema.json");
 const QUERY_SCHEMA: &str = include_str!("../../schemas/v0.3/query.schema.json");
 const QUERY_RESULT_SCHEMA: &str = include_str!("../../schemas/v0.3/query-result.schema.json");
 const TYPE_FILE_SCHEMA: &str = include_str!("../../schemas/v0.3/type-file.schema.json");
+const TYPE_PACK_SCHEMA: &str = include_str!("../../schemas/v0.3/type-pack.schema.json");
 const VIEW_SCHEMA: &str = include_str!("../../schemas/v0.3/view.schema.json");
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,11 +113,13 @@ pub struct CollectionReport {
 pub fn validate_canonical_schemas() -> Result<(), String> {
     for (name, source) in [
         ("config", CONFIG_SCHEMA),
+        ("data-contract", DATA_CONTRACT_SCHEMA),
         ("diagnostic", DIAGNOSTIC_SCHEMA),
         ("operation-result", OPERATION_RESULT_SCHEMA),
         ("query", QUERY_SCHEMA),
         ("query-result", QUERY_RESULT_SCHEMA),
         ("type-file", TYPE_FILE_SCHEMA),
+        ("type-pack", TYPE_PACK_SCHEMA),
         ("view", VIEW_SCHEMA),
     ] {
         let schema: Value = serde_json::from_str(source)
@@ -144,6 +151,26 @@ pub fn validate_type_file(value: &Value, path: &str) -> Vec<Diagnostic> {
         path,
         TYPE_FILE_SCHEMA_ID,
         type_name,
+    )
+}
+
+pub fn validate_data_contract(value: &Value, path: &str) -> Vec<Diagnostic> {
+    validate_canonical_value(
+        DATA_CONTRACT_SCHEMA,
+        value,
+        path,
+        DATA_CONTRACT_SCHEMA_ID,
+        None,
+    )
+}
+
+pub fn validate_type_pack(value: &Value, path: &str) -> Vec<Diagnostic> {
+    validate_canonical_value(
+        TYPE_PACK_SCHEMA,
+        value,
+        path,
+        "https://mdbase.dev/schemas/v0.3/type-pack.schema.json",
+        None,
     )
 }
 
@@ -407,6 +434,107 @@ pub fn parse_type_file(
     })
 }
 
+/// Parse and validate a standalone `mdbase.contract` Markdown document.
+///
+/// This is intentionally usable without opening the collection so editors can
+/// diagnose an in-memory contract while it is being changed.
+pub fn parse_data_contract_file(
+    text: &str,
+    absolute_path: &Path,
+    collection_root: &Path,
+    relative_path: &str,
+) -> Result<Value, Vec<Diagnostic>> {
+    let document = parse_document(text);
+    let yaml = match document.frontmatter {
+        Some(value) if is_parse_error(&value) => {
+            return Err(vec![Diagnostic::error(
+                "invalid_frontmatter",
+                "Failed to parse YAML frontmatter.",
+                Some(relative_path.to_string()),
+            )]);
+        }
+        Some(value) => value,
+        None => {
+            return Err(vec![Diagnostic::error(
+                "invalid_data_contract",
+                "Data contract file has no frontmatter.",
+                Some(relative_path.to_string()),
+            )]);
+        }
+    };
+    if !yaml.is_mapping() {
+        return Err(vec![Diagnostic::error(
+            "invalid_frontmatter",
+            "Data contract frontmatter must be a mapping.",
+            Some(relative_path.to_string()),
+        )]);
+    }
+
+    let frontmatter = yaml_to_json(&yaml);
+    let mut diagnostics = validate_data_contract(&frontmatter, relative_path);
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == "error")
+    {
+        return Err(diagnostics);
+    }
+
+    for field in ["schema", "binding_schema"] {
+        let Some(wrapper) = frontmatter.get(field) else {
+            continue;
+        };
+        let schema = if let Some(value) = wrapper.get("value") {
+            value.clone()
+        } else if let Some(reference) = wrapper.get("ref").and_then(Value::as_str) {
+            match resolve_schema_ref(reference, absolute_path, collection_root) {
+                Ok(value) => value,
+                Err(diagnostic) => {
+                    diagnostics.push(*diagnostic);
+                    continue;
+                }
+            }
+        } else {
+            continue;
+        };
+        if let Some((code, reference)) = unsupported_schema_reference(&schema) {
+            diagnostics.push(Diagnostic {
+                severity: "error".to_string(),
+                code: code.to_string(),
+                message: format!(
+                    "Data contract {field} contains unsupported JSON Schema reference '{reference}'."
+                ),
+                path: Some(relative_path.to_string()),
+                field: Some(field.to_string()),
+                type_name: None,
+                schema_location: None,
+                details: None,
+            });
+            continue;
+        }
+        if let Err(error) = compile_schema(&schema) {
+            diagnostics.push(Diagnostic {
+                severity: "error".to_string(),
+                code: "invalid_embedded_schema".to_string(),
+                message: error,
+                path: Some(relative_path.to_string()),
+                field: Some(field.to_string()),
+                type_name: None,
+                schema_location: None,
+                details: None,
+            });
+        }
+    }
+
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == "error")
+    {
+        Err(diagnostics)
+    } else {
+        Ok(frontmatter)
+    }
+}
+
 fn read_yaml_document(path: &Path, relative_path: &str) -> Result<Value, Box<Diagnostic>> {
     let text = fs::read_to_string(path).map_err(|error| {
         Box::new(Diagnostic::error(
@@ -598,7 +726,7 @@ fn compile_canonical_schema(schema: &Value) -> Result<JSONSchema, String> {
         .map_err(|error| error.to_string())
 }
 
-fn resolve_schema_ref(
+pub(crate) fn resolve_schema_ref(
     reference: &str,
     type_file_path: &Path,
     collection_root: &Path,
@@ -687,7 +815,7 @@ fn resolve_schema_ref(
     Ok(selected.clone())
 }
 
-fn unsupported_schema_reference(schema: &Value) -> Option<(&'static str, &str)> {
+pub(crate) fn unsupported_schema_reference(schema: &Value) -> Option<(&'static str, &str)> {
     match schema {
         Value::Array(values) => values.iter().find_map(unsupported_schema_reference),
         Value::Object(object) => {
@@ -760,11 +888,13 @@ fn relative_path(root: &Path, path: &Path) -> String {
 pub fn schema_path(name: &str) -> Option<PathBuf> {
     match name {
         "config" => Some(PathBuf::from("schemas/v0.3/config.schema.json")),
+        "data-contract" => Some(PathBuf::from("schemas/v0.3/data-contract.schema.json")),
         "diagnostic" => Some(PathBuf::from("schemas/v0.3/diagnostic.schema.json")),
         "operation-result" => Some(PathBuf::from("schemas/v0.3/operation-result.schema.json")),
         "query" => Some(PathBuf::from("schemas/v0.3/query.schema.json")),
         "query-result" => Some(PathBuf::from("schemas/v0.3/query-result.schema.json")),
         "type-file" => Some(PathBuf::from("schemas/v0.3/type-file.schema.json")),
+        "type-pack" => Some(PathBuf::from("schemas/v0.3/type-pack.schema.json")),
         "view" => Some(PathBuf::from("schemas/v0.3/view.schema.json")),
         _ => None,
     }

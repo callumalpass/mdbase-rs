@@ -46,6 +46,23 @@ pub fn init_collection(root: &Path, input: &serde_json::Value) -> serde_json::Va
             "settings.types_folder must be a non-empty relative path without traversal segments",
         );
     }
+    let contracts_folder = config
+        .pointer("/settings/contracts_folder")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("_contracts")
+        .to_string();
+    if !is_safe_relative_folder(&contracts_folder) {
+        return init_error(
+            "path_traversal",
+            "settings.contracts_folder must be a non-empty relative path without traversal segments",
+        );
+    }
+    if contracts_folder.replace('\\', "/") == types_folder.replace('\\', "/") {
+        return init_error(
+            "invalid_config",
+            "settings.contracts_folder must differ from settings.types_folder",
+        );
+    }
 
     // Check for existing collection
     let config_path = root.join("mdbase.yaml");
@@ -85,11 +102,21 @@ pub fn init_collection(root: &Path, input: &serde_json::Value) -> serde_json::Va
             }
         });
     }
+    let contracts_dir = root.join(&contracts_folder);
+    if let Err(e) = fs::create_dir_all(&contracts_dir) {
+        return serde_json::json!({
+            "error": {
+                "code": "invalid_path",
+                "message": format!("Failed to create contracts folder: {}", e)
+            }
+        });
+    }
 
     if !legacy_v02 {
         return serde_json::json!({
             "config_path": "mdbase.yaml",
             "types_folder": types_folder,
+            "contracts_folder": contracts_folder,
         });
     }
 
