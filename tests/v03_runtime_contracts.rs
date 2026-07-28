@@ -96,7 +96,7 @@ fn validates_event_action_and_materialization_contracts() {
         &runtime
             .validate_event(&loaded.registry, &wrong_version)
             .diagnostics,
-        "contract_version_mismatch",
+        "runtime_contract_version_mismatch",
     );
 
     assert!(
@@ -177,7 +177,7 @@ fn composes_virtual_sources_deterministically_and_keeps_origins() {
     );
     assert_eq!(first.events["timer.fired"].contract["version"], 1);
     assert_eq!(first.events["timer.fired"].origins.len(), 2);
-    assert_code(&first.diagnostics, "contract_conflict");
+    assert_code(&first.diagnostics, "runtime_contract_conflict");
     assert_eq!(first.diagnostics, second.diagnostics);
 }
 
@@ -557,5 +557,5 @@ fn registry_indexes_are_kind_scoped() {
     assert!(!registry
         .diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == "contract_conflict"));
+        .any(|diagnostic| diagnostic.code == "runtime_contract_conflict"));
 }

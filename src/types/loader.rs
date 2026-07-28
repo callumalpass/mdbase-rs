@@ -342,6 +342,8 @@ fn parse_type_file(content: &str, path: &Path, collection_root: &Path) -> Result
         json_schema: None,
         read_defaults: HashMap::new(),
         lifecycle: None,
+        implementations: Vec::new(),
+        v03_frontmatter: None,
         source_path: path
             .strip_prefix(collection_root)
             .ok()
@@ -459,7 +461,7 @@ fn v03_type_definition(type_file: crate::v03::TypeFile) -> Result<TypeDef, Strin
     }
 
     Ok(TypeDef {
-        name: type_file.name,
+        name: type_file.name.clone(),
         kind: Some("mdbase.type".to_string()),
         version: type_file.version,
         description: frontmatter
@@ -479,6 +481,19 @@ fn v03_type_definition(type_file: crate::v03::TypeFile) -> Result<TypeDef, Strin
         json_schema: Some(type_file.schema),
         read_defaults,
         lifecycle: frontmatter.get("lifecycle").cloned(),
+        implementations: frontmatter
+            .get("implements")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                format!(
+                    "Type '{}' has invalid implements entries: {error}",
+                    type_file.name
+                )
+            })?
+            .unwrap_or_default(),
+        v03_frontmatter: Some(type_file.frontmatter),
         source_path: Some(type_file.path),
     })
 }

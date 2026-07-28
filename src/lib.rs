@@ -15,6 +15,7 @@ pub mod api;
 pub mod cache;
 pub(crate) mod compat;
 pub mod config;
+pub mod data_contracts;
 pub mod expressions;
 pub mod frontmatter;
 pub mod generated;
@@ -47,6 +48,7 @@ pub struct Settings {
     pub exclude: Vec<String>,
     pub include_subfolders: bool,
     pub types_folder: String,
+    pub contracts_folder: String,
     pub migrations_folder: String,
     pub explicit_type_keys: Vec<String>,
     pub write_defaults: bool,
@@ -85,6 +87,7 @@ impl Default for Settings {
             exclude: vec![".git".into(), "node_modules".into(), ".mdbase".into()],
             include_subfolders: true,
             types_folder: "_types".into(),
+            contracts_folder: "_contracts".into(),
             migrations_folder: "_types/_migrations".into(),
             explicit_type_keys: vec!["type".into(), "types".into()],
             write_defaults: true,
@@ -111,6 +114,7 @@ pub struct Collection {
     pub(crate) types: HashMap<String, TypeDef>,
     pub(crate) type_plans: HashMap<String, crate::types::compiled::CompiledTypePlan>,
     pub(crate) type_warnings: Vec<String>,
+    pub(crate) data_contracts: data_contracts::DataContractRegistry,
 }
 
 impl Collection {
@@ -195,6 +199,10 @@ impl Collection {
                 .as_str()
                 .unwrap_or("_types")
                 .to_string(),
+            contracts_folder: settings_json["contracts_folder"]
+                .as_str()
+                .unwrap_or("_contracts")
+                .to_string(),
             migrations_folder: settings_json["migrations_folder"]
                 .as_str()
                 .unwrap_or("_types/_migrations")
@@ -252,6 +260,7 @@ impl Collection {
 
         for (label, path) in [
             ("types_folder", settings.types_folder.as_str()),
+            ("contracts_folder", settings.contracts_folder.as_str()),
             ("migrations_folder", settings.migrations_folder.as_str()),
             ("cache_folder", settings.cache_folder.as_str()),
         ] {
@@ -277,6 +286,7 @@ impl Collection {
             types: HashMap::new(),
             type_plans: HashMap::new(),
             type_warnings: Vec::new(),
+            data_contracts: data_contracts::DataContractRegistry::empty(),
         };
         let recovered =
             crate::transactions::recover_pending(&recovery_collection).map_err(|error| {
@@ -334,6 +344,17 @@ impl Collection {
             })
         })?;
 
+        let data_contracts = data_contracts::DataContractRegistry::load(root, &settings, &types)
+            .map_err(|error| {
+                serde_json::json!({
+                    "valid": false,
+                    "error": {
+                        "code": error.code,
+                        "message": error.message,
+                    }
+                })
+            })?;
+
         let collection = Collection {
             root: root.to_path_buf(),
             spec_profile,
@@ -342,6 +363,7 @@ impl Collection {
             types,
             type_plans,
             type_warnings,
+            data_contracts,
         };
         Ok(collection)
     }

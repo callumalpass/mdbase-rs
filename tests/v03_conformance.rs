@@ -16,6 +16,7 @@ struct Suite {
 #[derive(Debug, Deserialize)]
 struct Group {
     name: String,
+    #[serde(default)]
     setup: Setup,
     tests: Vec<Case>,
 }
@@ -27,6 +28,8 @@ struct Setup {
     #[serde(default)]
     types: HashMap<String, String>,
     #[serde(default)]
+    contracts: HashMap<String, String>,
+    #[serde(default)]
     files: HashMap<String, String>,
     #[serde(default)]
     event: Option<serde_yaml::Value>,
@@ -36,6 +39,19 @@ struct Setup {
 
 fn default_config() -> String {
     "spec_version: \"0.3.0\"\n".to_string()
+}
+
+impl Default for Setup {
+    fn default() -> Self {
+        Self {
+            config: default_config(),
+            types: HashMap::new(),
+            contracts: HashMap::new(),
+            files: HashMap::new(),
+            event: None,
+            steps: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,21 +65,39 @@ struct Case {
 }
 
 fn fixture_path(relative_path: &str) -> PathBuf {
+    spec_root().join("tests/v0.3").join(relative_path)
+}
+
+fn spec_root() -> PathBuf {
     std::env::var_os("MDBASE_SPEC_REPO_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../mdbase-spec"))
-        .join("tests/v0.3")
-        .join(relative_path)
 }
 
 fn materialize(setup: &Setup) -> TempDir {
     let directory = tempfile::tempdir().expect("create fixture collection");
     fs::write(directory.path().join("mdbase.yaml"), &setup.config).expect("write config");
 
-    let types_directory = directory.path().join("_types");
+    let config: serde_yaml::Value =
+        serde_yaml::from_str(&setup.config).expect("parse fixture config");
+    let config = yaml_to_json(&config);
+    let types_folder = config
+        .pointer("/settings/types_folder")
+        .and_then(Value::as_str)
+        .unwrap_or("_types");
+    let contracts_folder = config
+        .pointer("/settings/contracts_folder")
+        .and_then(Value::as_str)
+        .unwrap_or("_contracts");
+    let types_directory = directory.path().join(types_folder);
     fs::create_dir_all(&types_directory).expect("create types directory");
     for (relative_path, content) in &setup.types {
         write(&types_directory, relative_path, content);
+    }
+    let contracts_directory = directory.path().join(contracts_folder);
+    fs::create_dir_all(&contracts_directory).expect("create contracts directory");
+    for (relative_path, content) in &setup.contracts {
+        write(&contracts_directory, relative_path, content);
     }
     for (relative_path, content) in &setup.files {
         write(directory.path(), relative_path, content);
@@ -89,6 +123,12 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
         .v03_operations()
         .expect("shared v0.3 fixture requires v0.3 operations");
     match case.operation.as_str() {
+        "data_contract_implementation_validate"
+        | "data_contract_digest"
+        | "data_contract_implementation_digest"
+        | "data_contract_registry_validate" => {
+            execute_standalone_data_contract_case(&case.operation, &input)
+        }
         "validate" => {
             let envelope = operations.validate(&input);
             let mut result = flatten_envelope(envelope);
@@ -197,6 +237,40 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
                 }),
             }
         }
+        "get_data_contracts" => {
+            let contract = input
+                .get("contract")
+                .and_then(Value::as_str)
+                .expect("get_data_contracts requires input.contract");
+            let version = input
+                .get("version")
+                .and_then(Value::as_str)
+                .expect("get_data_contracts requires input.version");
+            serde_json::json!({
+                "implementations": collection.get_data_contract_implementations(contract, version)
+            })
+        }
+        "get_contract_view" => {
+            let path = input
+                .get("path")
+                .and_then(Value::as_str)
+                .expect("get_contract_view requires input.path");
+            let contract = input
+                .get("contract")
+                .and_then(Value::as_str)
+                .expect("get_contract_view requires input.contract");
+            let version = input
+                .get("version")
+                .and_then(Value::as_str)
+                .expect("get_contract_view requires input.version");
+            serde_json::to_value(collection.get_contract_view(
+                path,
+                contract,
+                version,
+                input.get("type").and_then(Value::as_str),
+            ))
+            .expect("serialize contract view")
+        }
         "create" => {
             let mut result = flatten_envelope(operations.create(&input));
             expose_operation_issues(&mut result);
@@ -231,6 +305,101 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
             result
         }
         operation => panic!("unsupported v0.3 fixture operation: {operation}"),
+    }
+}
+
+fn execute_standalone_data_contract_case(operation: &str, input: &Value) -> Value {
+    let directory = tempfile::tempdir().expect("create standalone contract fixture");
+    write(directory.path(), "mdbase.yaml", "spec_version: \"0.3.0\"\n");
+
+    let copy_fixture = |key: &str, destination: &str| {
+        let relative = input
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{operation} requires input.{key}"));
+        let content =
+            fs::read_to_string(spec_root().join(relative)).expect("read data contract fixture");
+        write(directory.path(), destination, &content);
+    };
+
+    match operation {
+        "data_contract_registry_validate" => {
+            for (index, relative) in input["paths"]
+                .as_array()
+                .expect("registry paths must be an array")
+                .iter()
+                .enumerate()
+            {
+                let relative = relative.as_str().expect("registry path must be a string");
+                let content = fs::read_to_string(spec_root().join(relative))
+                    .expect("read data contract registry fixture");
+                write(
+                    directory.path(),
+                    &format!("_contracts/{index}.md"),
+                    &content,
+                );
+            }
+        }
+        _ => {
+            copy_fixture("contract", "_contracts/contract.md");
+            if input.get("type").is_some() {
+                copy_fixture("type", "_types/type.md");
+            }
+        }
+    }
+
+    let collection = match Collection::open(directory.path()) {
+        Ok(collection) => collection,
+        Err(error) => {
+            return serde_json::json!({
+                "valid": false,
+                "error": error.to_string(),
+            });
+        }
+    };
+
+    match operation {
+        "data_contract_implementation_validate" => {
+            let implementations =
+                collection.get_data_contract_implementations("tasknotes.task", "0.2.0");
+            if implementations.len() != 1 {
+                return serde_json::json!({
+                    "valid": false,
+                    "error": format!(
+                        "expected exactly one implementation, found {}",
+                        implementations.len()
+                    ),
+                });
+            }
+            let Some(record_path) = input.get("record").and_then(Value::as_str) else {
+                return serde_json::json!({"valid": true});
+            };
+            let record: serde_yaml::Value = serde_yaml::from_str(
+                &fs::read_to_string(spec_root().join(record_path))
+                    .expect("read contract record fixture"),
+            )
+            .expect("parse contract record fixture");
+            let projected = collection.project_contract_type(
+                &implementations[0].type_name,
+                "tasknotes.task",
+                "0.2.0",
+                &yaml_to_json(&record),
+            );
+            serde_json::json!({
+                "valid": projected.valid,
+                "error": projected.diagnostics.first().map(|diagnostic| diagnostic.message.clone()),
+            })
+        }
+        "data_contract_digest" => serde_json::json!({
+            "digest": collection.list_data_contracts()[0].digest
+        }),
+        "data_contract_implementation_digest" => serde_json::json!({
+            "digest": collection
+                .get_data_contract_implementations("tasknotes.task", "0.2.0")[0]
+                .implementation_digest
+        }),
+        "data_contract_registry_validate" => serde_json::json!({"valid": true}),
+        _ => unreachable!("standalone operation was already matched"),
     }
 }
 
@@ -275,6 +444,19 @@ fn assert_expectation(actual: &Value, expected: &Value, case_name: &str) {
     let expected_object = expected.as_object().expect("expect must be a mapping");
     for (key, expected_value) in expected_object {
         match key.as_str() {
+            "error_contains" => {
+                let expected = expected_value
+                    .as_str()
+                    .expect("error_contains must be a string");
+                let error = actual
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("{case_name}: missing string error: {actual:#}"));
+                assert!(
+                    error.to_lowercase().contains(&expected.to_lowercase()),
+                    "{case_name}: error does not contain {expected:?}: {error:?}"
+                );
+            }
             "issues" => assert_array_contains(
                 actual.get("issues").and_then(Value::as_array),
                 expected_value.as_array(),
@@ -408,6 +590,11 @@ fn shared_v03_cel_fixture_passes() {
 #[test]
 fn shared_v03_saved_views_fixture_passes() {
     run_suite("views/view-records.yaml", "views", 17);
+}
+
+#[test]
+fn shared_v03_data_contract_fixture_passes() {
+    run_suite("data-contracts/data-contracts.yaml", "data_contracts", 12);
 }
 
 fn run_suite(relative_path: &str, fixture_set: &str, expected_cases: usize) {

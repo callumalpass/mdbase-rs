@@ -1,6 +1,18 @@
 //! Type definition schema types (§5).
 
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataContractImplementation {
+    pub contract: String,
+    pub version: String,
+    pub fields: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
+}
 
 /// A field type definition.
 #[derive(Debug, Clone)]
@@ -64,6 +76,8 @@ pub struct TypeDef {
     /// facade can apply the canonical mutation pipeline without leaking the
     /// policy into legacy v0.2 generated-field behavior.
     pub lifecycle: Option<serde_json::Value>,
+    pub implementations: Vec<DataContractImplementation>,
+    pub v03_frontmatter: Option<serde_json::Value>,
     pub source_path: Option<String>,
 }
 

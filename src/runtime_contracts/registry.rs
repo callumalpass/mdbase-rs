@@ -169,7 +169,7 @@ fn add_document(
         let existing_version = existing.contract.get("version").cloned();
         registry.diagnostics.push(
             RuntimeDiagnostic::error(
-                "contract_conflict",
+                "runtime_contract_conflict",
                 format!("Conflicting {} contract {id}.", kind.as_str()),
             )
             .for_id(&id)

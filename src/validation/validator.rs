@@ -235,6 +235,9 @@ impl Collection {
                 all_issues.extend(result.issues);
             }
         }
+        let effective = self.apply_defaults(frontmatter, type_names);
+        let effective = self.coerce_types(&effective, type_names);
+        all_issues.extend(self.data_contract_issues(type_names, &effective, path));
 
         let has_errors = all_issues.iter().any(|i| i.severity == Severity::Error);
         ValidationResult {
@@ -563,6 +566,7 @@ impl Collection {
                     }
                 }
             }
+            all_issues.extend(self.data_contract_issues(&type_names, &effective, path));
 
             // Cross-file uniqueness checking
             let uniqueness_issues = self.check_uniqueness(&effective, &type_names, path);
@@ -694,6 +698,7 @@ impl Collection {
                     }
                 }
             }
+            all_issues.extend(self.data_contract_issues(&type_names, &effective, &rel_path));
         }
 
         // Check for duplicate unique values

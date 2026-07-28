@@ -68,7 +68,11 @@ impl FilesystemProvider {
                 return Err(error);
             }
         };
-        let stamp = CollectionStamp::load(&root, &collection.settings.types_folder);
+        let stamp = CollectionStamp::load(
+            &root,
+            &collection.settings.types_folder,
+            &collection.settings.contracts_folder,
+        );
         Ok(Self {
             root,
             operation_gate: RwLock::new(()),
@@ -326,8 +330,11 @@ impl FilesystemProvider {
                 .collection_cache
                 .read()
                 .map_err(|_| ProviderError::LockPoisoned)?;
-            let current =
-                CollectionStamp::load(&self.root, &cached.collection.settings.types_folder);
+            let current = CollectionStamp::load(
+                &self.root,
+                &cached.collection.settings.types_folder,
+                &cached.collection.settings.contracts_folder,
+            );
             if current == cached.stamp {
                 return Ok(cached.collection.clone());
             }
@@ -337,12 +344,20 @@ impl FilesystemProvider {
             .collection_cache
             .write()
             .map_err(|_| ProviderError::LockPoisoned)?;
-        let current = CollectionStamp::load(&self.root, &cached.collection.settings.types_folder);
+        let current = CollectionStamp::load(
+            &self.root,
+            &cached.collection.settings.types_folder,
+            &cached.collection.settings.contracts_folder,
+        );
         if current == cached.stamp {
             return Ok(cached.collection.clone());
         }
         let collection = open_collection(&self.root)?;
-        let stamp = CollectionStamp::load(&self.root, &collection.settings.types_folder);
+        let stamp = CollectionStamp::load(
+            &self.root,
+            &collection.settings.types_folder,
+            &collection.settings.contracts_folder,
+        );
         cached.collection = Arc::new(collection);
         cached.stamp = stamp;
         Ok(cached.collection.clone())
@@ -350,7 +365,11 @@ impl FilesystemProvider {
 
     fn reload_collection(&self) -> Result<(), ProviderError> {
         let collection = open_collection(&self.root)?;
-        let stamp = CollectionStamp::load(&self.root, &collection.settings.types_folder);
+        let stamp = CollectionStamp::load(
+            &self.root,
+            &collection.settings.types_folder,
+            &collection.settings.contracts_folder,
+        );
         let mut cached = self
             .collection_cache
             .write()
@@ -463,32 +482,33 @@ struct CollectionStamp {
 }
 
 impl CollectionStamp {
-    fn load(root: &Path, types_folder: &str) -> Self {
+    fn load(root: &Path, types_folder: &str, contracts_folder: &str) -> Self {
         let config_revision = std::fs::read(root.join("mdbase.yaml"))
             .ok()
             .map(|bytes| crate::v03::revision(&bytes));
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        let types_root = root.join(types_folder);
-        for entry in WalkDir::new(&types_root)
-            .sort_by_file_name()
-            .follow_links(false)
-            .into_iter()
-            .flatten()
-            .filter(|entry| entry.file_type().is_file())
-        {
-            entry
-                .path()
-                .strip_prefix(root)
-                .unwrap_or(entry.path())
-                .hash(&mut hasher);
-            if let Ok(metadata) = entry.metadata() {
-                metadata.len().hash(&mut hasher);
-                metadata
-                    .modified()
-                    .ok()
-                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_nanos())
+        for control_root in [root.join(types_folder), root.join(contracts_folder)] {
+            for entry in WalkDir::new(&control_root)
+                .sort_by_file_name()
+                .follow_links(false)
+                .into_iter()
+                .flatten()
+                .filter(|entry| entry.file_type().is_file())
+            {
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap_or(entry.path())
                     .hash(&mut hasher);
+                if let Ok(metadata) = entry.metadata() {
+                    metadata.len().hash(&mut hasher);
+                    metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_nanos())
+                        .hash(&mut hasher);
+                }
             }
         }
         Self {

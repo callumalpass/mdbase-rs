@@ -432,6 +432,13 @@ impl Collection {
             return true;
         }
 
+        // Check data contracts folder
+        if rel_path.starts_with(&format!("{}/", self.settings.contracts_folder))
+            || rel_path == self.settings.contracts_folder
+        {
+            return true;
+        }
+
         // Check cache folder
         if rel_path.starts_with(&format!("{}/", self.settings.cache_folder))
             || rel_path == self.settings.cache_folder

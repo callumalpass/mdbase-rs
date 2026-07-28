@@ -168,6 +168,10 @@ fn get_setting_or_top<'a>(
     get_setting(settings_map, key).or_else(|| top_map.get(ykey(key)))
 }
 
+fn normalize_control_folder(value: &str) -> String {
+    value.replace('\\', "/")
+}
+
 fn validate_version(
     version: &str,
     warnings: &mut Vec<String>,
@@ -353,6 +357,24 @@ fn parse_settings(
         }
     };
 
+    // contracts_folder
+    let contracts_folder = match get_setting(settings_map, "contracts_folder") {
+        Some(serde_yaml::Value::String(s)) => s.clone(),
+        Some(serde_yaml::Value::Null) | None => "_contracts".to_string(),
+        Some(_) => {
+            return Err(error_json(
+                "invalid_config",
+                "settings.contracts_folder must be a string",
+            ))
+        }
+    };
+    if normalize_control_folder(&contracts_folder) == normalize_control_folder(&types_folder) {
+        return Err(error_json(
+            "invalid_config",
+            "settings.contracts_folder must differ from settings.types_folder",
+        ));
+    }
+
     // migrations_folder
     let migrations_folder = match get_setting(settings_map, "migrations_folder") {
         Some(serde_yaml::Value::String(s)) => s.clone(),
@@ -536,6 +558,7 @@ fn parse_settings(
             "exclude",
             "include_subfolders",
             "types_folder",
+            "contracts_folder",
             "migrations_folder",
             "explicit_type_keys",
             "write_defaults",
@@ -564,6 +587,7 @@ fn parse_settings(
         "exclude": exclude,
         "include_subfolders": include_subfolders,
         "types_folder": types_folder,
+        "contracts_folder": contracts_folder,
         "explicit_type_keys": explicit_type_keys,
         "migrations_folder": migrations_folder,
         "write_defaults": write_defaults,

@@ -141,10 +141,12 @@ fn init_defaults_to_a_minimal_v03_collection() {
         result,
         serde_json::json!({
             "config_path": "mdbase.yaml",
-            "types_folder": "schemas/types"
+            "types_folder": "schemas/types",
+            "contracts_folder": "_contracts"
         })
     );
     assert!(directory.path().join("schemas/types").is_dir());
+    assert!(directory.path().join("_contracts").is_dir());
     assert!(!directory.path().join("schemas/types/meta.md").exists());
     let config = fs::read_to_string(directory.path().join("mdbase.yaml")).expect("read config");
     assert!(config.contains("spec_version: 0.3.0"));
