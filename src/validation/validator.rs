@@ -183,7 +183,7 @@ use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to
 use crate::generated::derive_path;
 use crate::validation::merge::detect_type_conflicts;
 use crate::Collection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 impl Collection {
     /// Validate frontmatter against matched types.
@@ -283,21 +283,21 @@ impl Collection {
                 None => continue,
             };
 
-            let unique_checks: Vec<(String, String)> = type_def
-                .fields
-                .iter()
-                .filter(|(_, fd)| fd.unique)
-                .filter_map(|(fname, _)| {
-                    frontmatter.get(fname).and_then(|val| {
-                        if val.is_null() {
-                            return None;
-                        }
-                        let val_str = match val.as_str() {
-                            Some(s) => s.to_string(),
-                            None => val.to_string(),
-                        };
-                        Some((fname.clone(), val_str))
-                    })
+            let unique_checks: Vec<(String, String)> = unique_field_references(type_def)
+                .into_iter()
+                .filter_map(|field_reference| {
+                    crate::field_references::get_value(frontmatter, &field_reference).and_then(
+                        |val| {
+                            if val.is_null() {
+                                return None;
+                            }
+                            let val_str = match val.as_str() {
+                                Some(s) => s.to_string(),
+                                None => val.to_string(),
+                            };
+                            Some((field_reference, val_str))
+                        },
+                    )
                 })
                 .collect();
 
@@ -351,7 +351,9 @@ impl Collection {
 
                 // Check unique fields
                 for (field_name, our_val) in &unique_checks {
-                    if let Some(other_val) = other_fm.get(field_name.as_str()) {
+                    if let Some(other_val) =
+                        crate::field_references::get_value(other_fm, field_name)
+                    {
                         if !other_val.is_null() {
                             let other_str = match other_val.as_str() {
                                 Some(s) => s.to_string(),
@@ -659,24 +661,25 @@ impl Collection {
                     );
                     all_issues.extend(result.issues);
 
-                    // Track unique fields
-                    for (field_name, field_def) in &type_def.fields {
-                        if field_def.unique {
-                            if let Some(val) = effective.get(field_name) {
-                                if !val.is_null() {
-                                    let key = (tn.clone(), field_name.clone());
-                                    let val_str = match val.as_str() {
-                                        Some(s) => s.to_string(),
-                                        None => val.to_string(),
-                                    };
-                                    unique_values
-                                        .entry(key)
-                                        .or_default()
-                                        .entry(val_str)
-                                        .or_default()
-                                        .push(rel_path.clone());
-                                }
+                    // Track unique fields.
+                    for field_reference in unique_field_references(type_def) {
+                        if let Some(val) =
+                            crate::field_references::get_value(&effective, &field_reference)
+                        {
+                            if val.is_null() {
+                                continue;
                             }
+                            let key = (tn.clone(), field_reference);
+                            let val_str = match val.as_str() {
+                                Some(s) => s.to_string(),
+                                None => val.to_string(),
+                            };
+                            unique_values
+                                .entry(key)
+                                .or_default()
+                                .entry(val_str)
+                                .or_default()
+                                .push(rel_path.clone());
                         }
                     }
 
@@ -759,4 +762,28 @@ impl Collection {
             "issues": issues_json,
         })
     }
+}
+
+fn unique_field_references(type_def: &TypeDef) -> Vec<String> {
+    let mut references = type_def
+        .fields
+        .iter()
+        .filter(|(_, field)| field.unique)
+        .map(|(name, _)| name.clone())
+        .collect::<HashSet<_>>();
+    references.extend(
+        type_def
+            .v03_frontmatter
+            .as_ref()
+            .and_then(|value| value.pointer("/collection/unique"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|rule| rule.get("field"))
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string),
+    );
+    let mut references = references.into_iter().collect::<Vec<_>>();
+    references.sort();
+    references
 }

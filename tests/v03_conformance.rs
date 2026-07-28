@@ -453,8 +453,14 @@ fn execute_standalone_data_contract_case(operation: &str, input: &Value) -> Valu
 
     match operation {
         "data_contract_implementation_validate" => {
+            let Some(contract) = collection.list_data_contracts().into_iter().next() else {
+                return serde_json::json!({
+                    "valid": false,
+                    "error": "expected one data contract",
+                });
+            };
             let implementations =
-                collection.get_data_contract_implementations("tasknotes.task", "0.2.0");
+                collection.get_data_contract_implementations(&contract.id, &contract.version);
             if implementations.len() != 1 {
                 return serde_json::json!({
                     "valid": false,
@@ -474,8 +480,8 @@ fn execute_standalone_data_contract_case(operation: &str, input: &Value) -> Valu
             .expect("parse contract record fixture");
             let projected = collection.project_contract_type(
                 &implementations[0].type_name,
-                "tasknotes.task",
-                "0.2.0",
+                &contract.id,
+                &contract.version,
                 &yaml_to_json(&record),
             );
             serde_json::json!({
@@ -667,7 +673,7 @@ fn is_subset(actual: &Value, expected: &Value) -> bool {
 
 #[test]
 fn shared_v03_core_collection_fixture_passes() {
-    run_suite("core/core-collection.yaml", "core_collection", 23);
+    run_suite("core/core-collection.yaml", "core_collection", 24);
 }
 
 #[test]
@@ -687,7 +693,7 @@ fn shared_v03_saved_views_fixture_passes() {
 
 #[test]
 fn shared_v03_data_contract_fixture_passes() {
-    run_suite("data-contracts/data-contracts.yaml", "data_contracts", 12);
+    run_suite("data-contracts/data-contracts.yaml", "data_contracts", 13);
 }
 
 #[test]

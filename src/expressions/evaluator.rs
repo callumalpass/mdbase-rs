@@ -514,7 +514,9 @@ fn eval_file_property(field: &str, ctx: &EvalContext) -> Result<Value, EvalError
                     if let Some(ref types_map) = ctx.types {
                         if let Some(type_def) = types_map.get(tn) {
                             if let Some(ref key) = type_def.display_name_key {
-                                if let Some(val) = ctx.frontmatter.get(key) {
+                                if let Some(val) =
+                                    crate::field_references::get_value(&ctx.frontmatter, key)
+                                {
                                     if let Some(s) = val.as_str() {
                                         if !s.is_empty() {
                                             return Ok(Value::String(s.to_string()));
