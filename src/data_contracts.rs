@@ -24,15 +24,31 @@ pub struct DataContractLoadError {
 #[derive(Debug, Clone, Serialize)]
 pub struct DataContractDefinition {
     pub kind: String,
+    pub contract_type: String,
     pub id: String,
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behavior: Option<Value>,
     pub source_paths: Vec<String>,
     pub digest: String,
 }
@@ -79,8 +95,8 @@ pub struct ContractViewResult {
 
 struct RegisteredContract {
     definition: DataContractDefinition,
-    record_schema: Value,
-    record_validator: JSONSchema,
+    record_schema: Option<Value>,
+    record_validator: Option<JSONSchema>,
     binding_validator: Option<JSONSchema>,
 }
 
@@ -219,7 +235,7 @@ impl DataContractRegistry {
                     &mut view,
                     contract_field,
                     value.clone(),
-                    Some(&registered.record_schema),
+                    registered.record_schema.as_ref(),
                     true,
                 ) {
                     diagnostics.push(ContractViewDiagnostic {
@@ -236,6 +252,8 @@ impl DataContractRegistry {
             diagnostics.extend(
                 registered
                     .record_validator
+                    .as_ref()
+                    .expect("only record contracts have type implementations")
                     .validate(&view)
                     .err()
                     .into_iter()
@@ -307,41 +325,39 @@ impl DataContractRegistry {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        let schema_wrapper = frontmatter["schema"].clone();
-        let record_schema = resolve_schema_wrapper(
-            &schema_wrapper,
-            path,
-            collection_root,
-            &format!("{id} {version} schema"),
-        )?;
-        let binding_wrapper = frontmatter.get("binding_schema").cloned();
-        let binding_schema = binding_wrapper
+        let contract_type = frontmatter["contract_type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let mut resolved = HashMap::<String, Value>::new();
+        for field in schema_fields_for_contract_type(&contract_type) {
+            let Some(wrapper) = frontmatter.get(*field) else {
+                continue;
+            };
+            let schema = resolve_schema_wrapper(
+                wrapper,
+                path,
+                collection_root,
+                &format!("{id} {version} {field}"),
+            )?;
+            compile_schema(&schema, &format!("{id} {version} {field}"))?;
+            resolved.insert((*field).to_string(), schema);
+        }
+        let record_schema = resolved.get("record_schema").cloned();
+        let binding_schema = resolved.get("binding_schema").cloned();
+        let record_validator = record_schema
             .as_ref()
-            .map(|wrapper| {
-                resolve_schema_wrapper(
-                    wrapper,
-                    path,
-                    collection_root,
-                    &format!("{id} {version} binding_schema"),
-                )
-            })
+            .map(|schema| compile_schema(schema, &format!("{id} {version} record_schema")))
             .transpose()?;
-        let record_validator = compile_schema(&record_schema, &format!("{id} {version} schema"))?;
         let binding_validator = binding_schema
             .as_ref()
             .map(|schema| compile_schema(schema, &format!("{id} {version} binding_schema")))
             .transpose()?;
-        let portable = json!({
-            "kind": "mdbase.contract",
-            "id": id,
-            "version": version,
-            "schema": record_schema,
-        });
-        let mut portable = portable.as_object().cloned().unwrap_or_default();
-        if let Some(binding_schema) = &binding_schema {
-            portable.insert("binding_schema".to_string(), binding_schema.clone());
-        }
-        let digest = digest_value(&Value::Object(portable));
+        let digest = data_contract_digest(&frontmatter_with_resolved_schemas(
+            &frontmatter,
+            &contract_type,
+            &resolved,
+        ));
         let identity = (id.clone(), version.clone());
         if let Some(existing) = self.contracts.get_mut(&identity) {
             if existing.definition.digest != digest {
@@ -362,6 +378,7 @@ impl DataContractRegistry {
             RegisteredContract {
                 definition: DataContractDefinition {
                     kind: "mdbase.contract".to_string(),
+                    contract_type,
                     id,
                     version,
                     name: frontmatter
@@ -372,8 +389,15 @@ impl DataContractRegistry {
                         .get("description")
                         .and_then(Value::as_str)
                         .map(str::to_string),
-                    schema: record_schema.clone(),
+                    record_schema: record_schema.clone(),
                     binding_schema: binding_schema.clone(),
+                    data_schema: resolved.get("data_schema").cloned(),
+                    source_schema: resolved.get("source_schema").cloned(),
+                    input_schema: resolved.get("input_schema").cloned(),
+                    output_schema: resolved.get("output_schema").cloned(),
+                    error_schema: resolved.get("error_schema").cloned(),
+                    provider_schema: resolved.get("provider_schema").cloned(),
+                    behavior: frontmatter.get("behavior").cloned(),
                     source_paths: vec![relative],
                     digest,
                 },
@@ -403,8 +427,26 @@ impl DataContractRegistry {
                 ),
             ));
         };
+        if contract.definition.contract_type != "record" {
+            return Err(load_error(
+                "data_contract_field_invalid",
+                format!(
+                    "Type '{}' cannot implement {} contract '{}' {}",
+                    type_definition.name,
+                    contract.definition.contract_type,
+                    implementation.contract,
+                    implementation.version
+                ),
+            ));
+        }
+        let record_schema = contract
+            .record_schema
+            .as_ref()
+            .expect("record contracts have a record_schema");
         for required in contract
             .record_schema
+            .as_ref()
+            .expect("record contracts have a record_schema")
             .get("required")
             .and_then(Value::as_array)
             .into_iter()
@@ -426,7 +468,7 @@ impl DataContractRegistry {
             }
         }
         for (contract_field, record_field) in &implementation.fields {
-            if !field_references::schema_declares(&contract.record_schema, contract_field) {
+            if !field_references::schema_declares(record_schema, contract_field) {
                 return Err(load_error(
                     "data_contract_field_invalid",
                     format!(
@@ -714,30 +756,60 @@ fn implementation_digest(
 
 pub fn data_contract_digest(frontmatter: &Value) -> String {
     let mut portable = Map::new();
-    for key in ["kind", "id", "version"] {
+    for key in ["kind", "contract_type", "id", "version"] {
         if let Some(value) = frontmatter.get(key) {
             portable.insert(key.to_string(), value.clone());
         }
     }
-    if let Some(schema) = frontmatter.get("schema") {
-        portable.insert(
-            "schema".to_string(),
-            schema
-                .get("value")
-                .cloned()
-                .unwrap_or_else(|| schema.clone()),
-        );
+    let contract_type = frontmatter
+        .get("contract_type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    for field in schema_fields_for_contract_type(contract_type) {
+        if let Some(schema) = frontmatter.get(*field) {
+            portable.insert(
+                (*field).to_string(),
+                schema
+                    .get("value")
+                    .cloned()
+                    .unwrap_or_else(|| schema.clone()),
+            );
+        }
     }
-    if let Some(schema) = frontmatter.get("binding_schema") {
-        portable.insert(
-            "binding_schema".to_string(),
-            schema
-                .get("value")
-                .cloned()
-                .unwrap_or_else(|| schema.clone()),
-        );
+    if contract_type == "action" {
+        if let Some(behavior) = frontmatter.get("behavior") {
+            portable.insert("behavior".to_string(), behavior.clone());
+        }
     }
     digest_value(&Value::Object(portable))
+}
+
+fn schema_fields_for_contract_type(contract_type: &str) -> &'static [&'static str] {
+    match contract_type {
+        "record" => &["record_schema", "binding_schema"],
+        "event" => &["data_schema", "source_schema"],
+        "action" => &[
+            "input_schema",
+            "output_schema",
+            "error_schema",
+            "provider_schema",
+        ],
+        _ => &[],
+    }
+}
+
+fn frontmatter_with_resolved_schemas(
+    frontmatter: &Value,
+    contract_type: &str,
+    resolved: &HashMap<String, Value>,
+) -> Value {
+    let mut value = frontmatter.as_object().cloned().unwrap_or_default();
+    for field in schema_fields_for_contract_type(contract_type) {
+        if let Some(schema) = resolved.get(*field) {
+            value.insert((*field).to_string(), schema.clone());
+        }
+    }
+    Value::Object(value)
 }
 
 fn digest_value(value: &Value) -> String {

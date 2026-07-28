@@ -284,9 +284,10 @@ mod tests {
                 "_contracts/example.task.md",
                 r#"---
 kind: mdbase.contract
+contract_type: record
 id: example.task
 version: 1.0.0
-schema:
+record_schema:
   dialect: json-schema-2020-12
   ref: ../schemas/task-contract.schema.json
 ---
@@ -377,9 +378,10 @@ implements:
         let mut changed = task_resources();
         changed[1].3 = r#"---
 kind: mdbase.contract
+contract_type: record
 id: example.task
 version: 2.0.0
-schema:
+record_schema:
   dialect: json-schema-2020-12
   ref: ../schemas/task-contract.schema.json
 ---

@@ -15,9 +15,10 @@ fn write(root: &Path, relative: &str, content: &str) {
 fn contract() -> &'static str {
     r#"---
 kind: mdbase.contract
+contract_type: record
 id: example.note
 version: 1.0.0
-schema:
+record_schema:
   dialect: json-schema-2020-12
   value:
     type: object
@@ -165,6 +166,104 @@ fn conflicting_exact_contract_identity_fails_collection_open() {
 }
 
 #[test]
+fn event_and_action_contracts_register_without_record_implementations() {
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "mdbase.yaml", "spec_version: \"0.3.0\"\n");
+    write(
+        root.path(),
+        "_contracts/example.changed.md",
+        r#"---
+kind: mdbase.contract
+contract_type: event
+id: example.changed
+version: 1.0.0
+data_schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [value]
+    properties: { value: { type: string } }
+---
+"#,
+    );
+    write(
+        root.path(),
+        "_contracts/example.update.md",
+        r#"---
+kind: mdbase.contract
+contract_type: action
+id: example.update
+version: 1.0.0
+input_schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [value]
+    properties: { value: { type: string } }
+output_schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [updated]
+    properties: { updated: { type: boolean } }
+behavior:
+  idempotency: optional
+  cancellation: cooperative
+---
+"#,
+    );
+
+    let collection = Collection::open(root.path()).unwrap();
+    let definitions = collection.list_data_contracts();
+    assert_eq!(definitions.len(), 2);
+    assert_eq!(definitions[0].contract_type, "event");
+    assert!(definitions[0].data_schema.is_some());
+    assert_eq!(definitions[1].contract_type, "action");
+    assert!(definitions[1].input_schema.is_some());
+    assert!(definitions[1].output_schema.is_some());
+    assert!(collection
+        .get_data_contract_implementations("example.changed", "1.0.0")
+        .is_empty());
+}
+
+#[test]
+fn type_files_cannot_implement_event_contracts() {
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "mdbase.yaml", "spec_version: \"0.3.0\"\n");
+    write(
+        root.path(),
+        "_contracts/example.changed.md",
+        r#"---
+kind: mdbase.contract
+contract_type: event
+id: example.changed
+version: 1.0.0
+data_schema:
+  dialect: json-schema-2020-12
+  value: { type: object }
+---
+"#,
+    );
+    write(
+        root.path(),
+        "_types/note.md",
+        &implementing_type("note", "title", 1).replace("example.note", "example.changed"),
+    );
+    let error = match Collection::open(root.path()) {
+        Ok(_) => panic!("event implementation in a type file must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.pointer("/error/code"),
+        Some(&json!("data_contract_field_invalid"))
+    );
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("cannot implement event contract"));
+}
+
+#[test]
 fn canonical_tasknotes_digests_match_the_spec_fixture() {
     let spec_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mdbase-spec");
     let collection_root = spec_root.join("examples/v0.3/tasknotes-migration/v0.3");
@@ -175,11 +274,11 @@ fn canonical_tasknotes_digests_match_the_spec_fixture() {
     let definitions = collection.list_data_contracts();
     assert_eq!(
         definitions[0].digest,
-        "sha256:7111c47ba7b1abed8c9823500c30ce0b80d3b3950a982d0acbc29523b5cb4d1c"
+        "sha256:a49d25136bf3024e146017771d068cdf59abfddbcdd1bfbf8010018c7f13f476"
     );
     let implementations = collection.get_data_contract_implementations("tasknotes.task", "0.2.0");
     assert_eq!(
         implementations[0].implementation_digest,
-        "sha256:2d3a40ba07e03e20a6bd1eae2f44c267a5bb14c3e693f09629f28b7a69277601"
+        "sha256:54a839d00a740e29bca41e3440f56c84337ffc2f4b79e0c6c618a00455959902"
     );
 }

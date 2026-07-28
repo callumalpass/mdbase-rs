@@ -479,7 +479,16 @@ pub fn parse_data_contract_file(
         return Err(diagnostics);
     }
 
-    for field in ["schema", "binding_schema"] {
+    for field in [
+        "record_schema",
+        "binding_schema",
+        "data_schema",
+        "source_schema",
+        "input_schema",
+        "output_schema",
+        "error_schema",
+        "provider_schema",
+    ] {
         let Some(wrapper) = frontmatter.get(field) else {
             continue;
         };
