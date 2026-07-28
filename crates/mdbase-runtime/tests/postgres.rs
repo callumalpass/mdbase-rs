@@ -1,6 +1,7 @@
 #![cfg(feature = "postgres")]
 
 use chrono::{TimeDelta, Utc};
+use mdbase_interop::{ExactContractReference, ImplementationIdentity};
 use mdbase_runtime::{
     ConcurrencyPolicy, OnError, PlannedRun, PostgresRuntimeStore, PreparedEvent, RunStatus,
     RuntimeStore, TimerRecord, TimerStatus, POSTGRES_SCHEMA_VERSION,
@@ -30,13 +31,17 @@ fn planned_run(id: &str, event_id: &str, policy: ConcurrencyPolicy) -> PlannedRu
     PlannedRun {
         id: id.to_string(),
         workflow: "test.workflow".to_string(),
-        workflow_version: 1,
-        workflow_revision: "workflow-revision".to_string(),
-        registry_revision: "registry-revision".to_string(),
-        policy_revision: Some("policy-revision".to_string()),
+        workflow_version: "1.0.0".to_string(),
+        workflow_revision: digest('a'),
+        catalog_revision: digest('b'),
+        policy_id: "test.policy".to_string(),
+        policy_revision: digest('c'),
         trigger: "changed".to_string(),
         event_id: event_id.to_string(),
         event_type: "test.changed".to_string(),
+        event_contract: contract("test.changed"),
+        event_source: identity(),
+        source_declaration_digest: digest('d'),
         event_cursor: 0,
         event: json!({"id": event_id, "type": "test.changed"}),
         executor: "postgres-test".to_string(),
@@ -60,6 +65,27 @@ fn prepared_run_event(id: &str, run: PlannedRun) -> PreparedEvent {
     let mut event = prepared_event(id);
     event.runs.push(run);
     event
+}
+
+fn digest(character: char) -> String {
+    format!("sha256:{}", character.to_string().repeat(64))
+}
+
+fn contract(id: &str) -> ExactContractReference {
+    ExactContractReference {
+        id: id.to_string(),
+        version: "1.0.0".to_string(),
+        digest: digest('e'),
+    }
+}
+
+fn identity() -> ImplementationIdentity {
+    ImplementationIdentity {
+        application: "postgres-test".to_string(),
+        implementation: "mdbase-runtime".to_string(),
+        version: "1.0.0".to_string(),
+        instance_id: None,
+    }
 }
 
 /// Set `MDBASE_RUNTIME_TEST_DATABASE_URL` to run this against a disposable or
@@ -143,9 +169,11 @@ async fn postgres_store_preserves_dedupe_retention_timers_and_namespace_fencing(
                     generation: 0,
                     status: TimerStatus::Scheduled,
                     fire_at: later,
-                    event_type: "timer.fired".to_string(),
-                    contract_version: 1,
-                    payload: json!({"purpose": "notification"}),
+                    event_contract: contract("mdbase.runtime.timer.fired"),
+                    event_source: identity(),
+                    source_uri: "urn:test:timer".to_string(),
+                    subject: None,
+                    data: json!({"purpose": "notification"}),
                     created_at: now,
                     updated_at: now,
                     fired_at: None,
@@ -155,9 +183,11 @@ async fn postgres_store_preserves_dedupe_retention_timers_and_namespace_fencing(
                     generation: 0,
                     status: TimerStatus::Scheduled,
                     fire_at: later,
-                    event_type: "timer.fired".to_string(),
-                    contract_version: 1,
-                    payload: json!({"purpose": "notification"}),
+                    event_contract: contract("mdbase.runtime.timer.fired"),
+                    event_source: identity(),
+                    source_uri: "urn:test:timer".to_string(),
+                    subject: None,
+                    data: json!({"purpose": "notification"}),
                     created_at: now,
                     updated_at: now,
                     fired_at: None,
@@ -180,9 +210,11 @@ async fn postgres_store_preserves_dedupe_retention_timers_and_namespace_fencing(
             generation: 0,
             status: TimerStatus::Scheduled,
             fire_at: now,
-            event_type: "timer.fired".to_string(),
-            contract_version: 1,
-            payload: json!({"purpose": "notification"}),
+            event_contract: contract("mdbase.runtime.timer.fired"),
+            event_source: identity(),
+            source_uri: "urn:test:timer".to_string(),
+            subject: None,
+            data: json!({"purpose": "notification"}),
             created_at: now,
             updated_at: now,
             fired_at: None,

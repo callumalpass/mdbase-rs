@@ -1,19 +1,20 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use mdbase::runtime_contracts::{RuntimeContracts, RuntimeRegistry};
+use jsonschema::{Draft, JSONSchema};
 use mdbase::v03::{evaluate_runtime_expression, evaluate_runtime_template};
+use mdbase_interop::{ActionCancellation, ActionInvocation, ActionOutcome, ImplementationIdentity};
 use serde_json::{json, Map, Value};
 
+use crate::admission::AdmissionCatalog;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::model::{
     ActionAttempt, ActionAttemptStatus, ActionDispatch, CancellationOutcome, DispatchOutcome,
     OnError, RunStatus, RuntimeFailure, StepStatus,
 };
-use crate::planner::{plan_event, revision, stable_id};
+use crate::planner::{plan_event, stable_id};
 use crate::provider::{
     AuthorizationDecision, DenyAllAuthorizer, DispatchAuthorizer, ProviderRegistry,
 };
@@ -26,6 +27,7 @@ pub struct RuntimeConfig {
     pub worker_id: String,
     pub actor_id: String,
     pub actor_kind: String,
+    pub identity: ImplementationIdentity,
     pub timezone: Option<String>,
     pub lease_duration: Duration,
     pub max_items: usize,
@@ -39,6 +41,12 @@ impl Default for RuntimeConfig {
             worker_id: format!("worker_{}", ulid::Ulid::new()),
             actor_id: "local-user".to_string(),
             actor_kind: "user".to_string(),
+            identity: ImplementationIdentity {
+                application: "mdbase".to_string(),
+                implementation: "mdbase-runtime".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                instance_id: None,
+            },
             timezone: None,
             lease_duration: Duration::from_secs(30),
             max_items: 1_000,
@@ -81,15 +89,7 @@ pub struct Runtime {
     providers: ProviderRegistry,
     authorizer: Arc<dyn DispatchAuthorizer>,
     pub(crate) clock: Arc<dyn Clock>,
-    contracts: RuntimeContracts,
     pub(crate) config: RuntimeConfig,
-    workflow_index: Mutex<Option<WorkflowIndex>>,
-}
-
-#[derive(Debug)]
-struct WorkflowIndex {
-    registry_revision: String,
-    by_event: BTreeMap<String, Vec<String>>,
 }
 
 pub struct RuntimeBuilder {
@@ -154,17 +154,12 @@ impl Runtime {
         clock: Arc<dyn Clock>,
         config: RuntimeConfig,
     ) -> RuntimeResult<Self> {
-        let contracts = RuntimeContracts::new().map_err(|message| {
-            RuntimeError::diagnostic("runtime_contracts_unavailable", message)
-        })?;
         Ok(Self {
             store,
             providers,
             authorizer,
             clock,
-            contracts,
             config,
-            workflow_index: Mutex::new(None),
         })
     }
 
@@ -178,10 +173,22 @@ impl Runtime {
 
     pub async fn deliver_event(
         &self,
-        registry: &RuntimeRegistry,
+        catalog: &AdmissionCatalog,
         event: Value,
     ) -> RuntimeResult<DeliveryOutcome> {
-        let prepared = self.prepare_event(registry, event, self.clock.now())?;
+        let prepared = self.prepare_event(catalog, event, self.clock.now())?;
+        self.deliver_prepared_event(prepared).await
+    }
+
+    /// Admit a plan prepared by another conformant admission authority.
+    ///
+    /// This is the durable boundary used when Connect or a remote coordinator
+    /// owns contract resolution. The immutable plan must already contain exact
+    /// contract, source, provider, declaration, and handler evidence.
+    pub async fn deliver_prepared_event(
+        &self,
+        prepared: PreparedEvent,
+    ) -> RuntimeResult<DeliveryOutcome> {
         let admitted = self.store.admit_event(prepared).await?;
         for run_id in &admitted.cancellation_requested_run_ids {
             self.notify_cancellation_request(run_id).await;
@@ -189,7 +196,7 @@ impl Runtime {
         Ok(admitted.into())
     }
 
-    pub async fn work_once(&self, registry: &RuntimeRegistry) -> RuntimeResult<WorkerOutcome> {
+    pub async fn work_once(&self) -> RuntimeResult<WorkerOutcome> {
         let now = self.clock.now();
         let Some(claim) = self
             .store
@@ -203,17 +210,13 @@ impl Runtime {
         else {
             return Ok(WorkerOutcome::Idle);
         };
-        self.execute_claim(registry, claim).await
+        self.execute_claim(claim).await
     }
 
-    pub async fn drain(
-        &self,
-        registry: &RuntimeRegistry,
-        max_runs: usize,
-    ) -> RuntimeResult<Vec<WorkerOutcome>> {
+    pub async fn drain(&self, max_runs: usize) -> RuntimeResult<Vec<WorkerOutcome>> {
         let mut outcomes = Vec::new();
         for _ in 0..max_runs {
-            let outcome = self.work_once(registry).await?;
+            let outcome = self.work_once().await?;
             if outcome == WorkerOutcome::Idle {
                 break;
             }
@@ -294,7 +297,22 @@ impl Runtime {
                 provider_error: None,
             };
         }
-        let Some(provider) = self.providers.get(&active.action) else {
+        let Some(planned) = run.plan.steps.get(run.next_step) else {
+            return CancellationOutcome {
+                accepted: true,
+                terminal: false,
+                invocation_id: Some(active.invocation_id.clone()),
+                provider_notified: false,
+                provider_error: Some(RuntimeFailure::new(
+                    "invalid_run_state",
+                    "Active attempt has no corresponding admitted step.",
+                )),
+            };
+        };
+        let Some(provider) = self
+            .providers
+            .get(&planned.provider_declaration_digest, &planned.handler_id)
+        else {
             return CancellationOutcome {
                 accepted: true,
                 terminal: false,
@@ -302,13 +320,35 @@ impl Runtime {
                 provider_notified: false,
                 provider_error: Some(RuntimeFailure::new(
                     "unsupported_action_handler",
-                    format!("No provider is registered for {}.", active.action),
+                    format!(
+                        "No live handler is registered for declaration {} handler {}.",
+                        planned.provider_declaration_digest, planned.handler_id
+                    ),
                 )),
             };
         };
         let notification = tokio::time::timeout(
             self.config.lease_duration,
-            provider.cancel(&active.invocation_id),
+            provider.cancel(ActionCancellation {
+                kind: "mdbase.action.cancel".to_string(),
+                profile_version: "0.1".to_string(),
+                cancellation_id: stable_id(
+                    "cancel",
+                    &format!("{}:{}", run.plan.id, active.invocation_id),
+                ),
+                request_id: stable_id(
+                    "req",
+                    &format!(
+                        "{}:{}:{}",
+                        run.plan.id,
+                        active.step_id,
+                        active.item_index.unwrap_or(0)
+                    ),
+                ),
+                caller: self.config.identity.clone(),
+                requested_at: self.clock.now().to_rfc3339(),
+                reason: Some("runtime_run_cancelled".to_string()),
+            }),
         )
         .await;
         let provider_error = match notification {
@@ -330,24 +370,17 @@ impl Runtime {
 
     pub(crate) fn prepare_event(
         &self,
-        registry: &RuntimeRegistry,
+        catalog: &AdmissionCatalog,
         event: Value,
         received_at: DateTime<Utc>,
     ) -> RuntimeResult<PreparedEvent> {
-        let validation = self.contracts.validate_event(registry, &event);
-        if !validation.valid {
-            return Err(diagnostics_error(
-                "invalid_runtime_event",
-                &validation.diagnostics,
-            ));
-        }
         let source_runtime = event
-            .pointer("/source/runtime")
+            .get("source")
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 RuntimeError::diagnostic(
                     "invalid_runtime_event",
-                    "Event source.runtime is required.",
+                    "Structured CloudEvent source is required.",
                 )
             })?
             .to_string();
@@ -358,12 +391,7 @@ impl Runtime {
                 RuntimeError::diagnostic("invalid_runtime_event", "Event id is required.")
             })?
             .to_string();
-        let event_type = event
-            .get("type")
-            .and_then(Value::as_str)
-            .expect("validated runtime event has a string type");
-        let workflow_ids = self.workflow_candidates(registry, event_type)?;
-        let runs = plan_event(registry, &workflow_ids, &event, received_at, &self.config)?;
+        let runs = plan_event(catalog, &event, received_at, &self.config)?;
         Ok(PreparedEvent {
             source_runtime,
             event_id,
@@ -373,57 +401,7 @@ impl Runtime {
         })
     }
 
-    fn workflow_candidates(
-        &self,
-        registry: &RuntimeRegistry,
-        event_type: &str,
-    ) -> RuntimeResult<Vec<String>> {
-        let revision = registry.revision();
-        let mut index = self
-            .workflow_index
-            .lock()
-            .map_err(|_| RuntimeError::Store("workflow index lock poisoned".to_string()))?;
-        if index
-            .as_ref()
-            .is_none_or(|current| current.registry_revision != revision)
-        {
-            let mut by_event = BTreeMap::<String, Vec<String>>::new();
-            for (workflow_id, entry) in &registry.workflows {
-                for event in entry
-                    .contract
-                    .get("triggers")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|trigger| trigger.get("event").and_then(Value::as_str))
-                {
-                    by_event
-                        .entry(event.to_string())
-                        .or_default()
-                        .push(workflow_id.clone());
-                }
-            }
-            for workflows in by_event.values_mut() {
-                workflows.sort();
-                workflows.dedup();
-            }
-            *index = Some(WorkflowIndex {
-                registry_revision: revision,
-                by_event,
-            });
-        }
-        Ok(index
-            .as_ref()
-            .and_then(|index| index.by_event.get(event_type))
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    async fn execute_claim(
-        &self,
-        registry: &RuntimeRegistry,
-        mut claim: Claim,
-    ) -> RuntimeResult<WorkerOutcome> {
+    async fn execute_claim(&self, mut claim: Claim) -> RuntimeResult<WorkerOutcome> {
         if claim.run.cancel_requested_at.is_some() {
             if let Some(active) = claim.run.active_attempt {
                 let cooperative = claim
@@ -480,9 +458,7 @@ impl Runtime {
                         status: RunStatus::Indeterminate,
                     });
                 }
-                claim = self
-                    .dispatch_active_attempt(registry, claim, active)
-                    .await?;
+                claim = self.dispatch_active_attempt(claim, active).await?;
                 if claim.run.status.terminal() {
                     return Ok(WorkerOutcome::Completed {
                         run_id: claim.run.plan.id,
@@ -651,25 +627,16 @@ impl Runtime {
                     }
                 };
 
-                let pinned_action = match self.pinned_action(registry, &planned) {
+                let pinned_action = match self.pinned_action(&planned) {
                     Ok(action) => action,
                     Err(error) => {
                         claim = self.fail_step(claim, runtime_failure(error)).await?;
                         break;
                     }
                 };
-                let validation = self
-                    .contracts
-                    .validate_pinned_action_input(pinned_action, &input);
-                if !validation.valid {
+                if let Err(message) = validate_action_value(pinned_action, "input_schema", &input) {
                     claim = self
-                        .fail_step(
-                            claim,
-                            RuntimeFailure::new(
-                                "action_input_invalid",
-                                diagnostics_message(&validation.diagnostics),
-                            ),
-                        )
+                        .fail_step(claim, RuntimeFailure::new("action_input_invalid", message))
                         .await?;
                     break;
                 }
@@ -700,7 +667,7 @@ impl Runtime {
                     attempt_number,
                     input.clone(),
                 );
-                if let Err(error) = self.authorize(registry, pinned_action, &dispatch).await {
+                if let Err(error) = self.authorize(&dispatch).await {
                     claim = self.fail_step(claim, runtime_failure(error)).await?;
                     break;
                 }
@@ -710,7 +677,7 @@ impl Runtime {
                     item_index: item_index_value,
                     invocation_id,
                     action: planned.action.clone(),
-                    action_version: planned.action_version,
+                    action_version: planned.action_version.clone(),
                     attempt: attempt_number,
                     status: ActionAttemptStatus::Dispatching,
                     idempotent: planned.idempotent,
@@ -726,9 +693,7 @@ impl Runtime {
                 claim.run.active_attempt = Some(active);
                 claim.run.updated_at = self.clock.now();
                 claim = self.store.commit_run(claim, Vec::new()).await?;
-                claim = self
-                    .dispatch_active_attempt(registry, claim, active)
-                    .await?;
+                claim = self.dispatch_active_attempt(claim, active).await?;
                 if claim.run.status.terminal()
                     || claim.run.steps[step_index].status == StepStatus::Failed
                 {
@@ -779,7 +744,6 @@ impl Runtime {
 
     async fn dispatch_active_attempt(
         &self,
-        registry: &RuntimeRegistry,
         mut claim: Claim,
         active: usize,
     ) -> RuntimeResult<Claim> {
@@ -796,7 +760,7 @@ impl Runtime {
                     "Active attempt has no corresponding planned step.",
                 )
             })?;
-        let pinned_action = match self.pinned_action(registry, &planned) {
+        let pinned_action = match self.pinned_action(&planned) {
             Ok(action) => action,
             Err(error) => {
                 return self
@@ -812,19 +776,25 @@ impl Runtime {
             attempt.attempt,
             attempt.input.clone(),
         );
-        if let Err(error) = self.authorize(registry, pinned_action, &dispatch).await {
+        if let Err(error) = self.authorize(&dispatch).await {
             return self
                 .fail_active_attempt(claim, active, runtime_failure(error))
                 .await;
         }
-        let Some(provider) = self.providers.get(&attempt.action) else {
+        let Some(provider) = self
+            .providers
+            .get(&planned.provider_declaration_digest, &planned.handler_id)
+        else {
             return self
                 .fail_active_attempt(
                     claim,
                     active,
                     RuntimeFailure::new(
                         "unsupported_action_handler",
-                        format!("No provider is registered for {}.", attempt.action),
+                        format!(
+                            "No live handler is registered for declaration {} handler {}.",
+                            planned.provider_declaration_digest, planned.handler_id
+                        ),
                     ),
                 )
                 .await;
@@ -834,7 +804,9 @@ impl Runtime {
             let remaining = (deadline - self.clock.now())
                 .to_std()
                 .unwrap_or(Duration::ZERO);
-            match tokio::time::timeout(remaining, provider.dispatch(dispatch)).await {
+            match tokio::time::timeout(remaining, provider.dispatch(dispatch.invocation.clone()))
+                .await
+            {
                 Ok(result) => result,
                 Err(_) => Err(crate::model::DispatchFailure {
                     code: "action_dispatch_timed_out".to_string(),
@@ -844,62 +816,29 @@ impl Runtime {
                 }),
             }
         } else {
-            provider.dispatch(dispatch).await
-        };
+            provider.dispatch(dispatch.invocation.clone()).await
+        }
+        .and_then(|outcome| normalize_outcome(&dispatch.invocation, outcome));
 
         match provider_result {
-            Ok(response) => {
-                let output_validation = self
-                    .contracts
-                    .validate_pinned_action_output(pinned_action, &response.output);
-                if !output_validation.valid {
+            Ok((output, receipt)) => {
+                if let Err(message) = validate_action_value(pinned_action, "output_schema", &output)
+                {
                     claim.run.attempts[active].status = ActionAttemptStatus::Failed;
-                    claim.run.attempts[active].error = Some(RuntimeFailure::new(
-                        "action_output_invalid",
-                        diagnostics_message(&output_validation.diagnostics),
-                    ));
-                    claim.run.attempts[active].receipt = response.receipt;
+                    claim.run.attempts[active].error =
+                        Some(RuntimeFailure::new("action_output_invalid", &message));
+                    claim.run.attempts[active].receipt = Some(receipt);
                     claim.run.attempts[active].finished_at = Some(self.clock.now());
                     claim.run.active_attempt = None;
                     return self
-                        .fail_step(
-                            claim,
-                            RuntimeFailure::new(
-                                "action_output_invalid",
-                                diagnostics_message(&output_validation.diagnostics),
-                            ),
-                        )
+                        .fail_step(claim, RuntimeFailure::new("action_output_invalid", message))
                         .await;
                 }
 
-                let mut emitted = Vec::new();
-                for event in response.emitted_events {
-                    let event =
-                        self.apply_trace(event, &claim.run.plan.event, &attempt.invocation_id);
-                    match self.prepare_event(registry, event, self.clock.now()) {
-                        Ok(prepared) => emitted.push(prepared),
-                        Err(error) => {
-                            claim.run.attempts[active].status = ActionAttemptStatus::Failed;
-                            claim.run.attempts[active].error = Some(RuntimeFailure::new(
-                                "invalid_emitted_event",
-                                error.to_string(),
-                            ));
-                            claim.run.attempts[active].receipt = response.receipt;
-                            claim.run.attempts[active].finished_at = Some(self.clock.now());
-                            claim.run.active_attempt = None;
-                            return self
-                                .fail_step(
-                                    claim,
-                                    RuntimeFailure::new("invalid_emitted_event", error.to_string()),
-                                )
-                                .await;
-                        }
-                    }
-                }
                 let now = self.clock.now();
                 claim.run.attempts[active].status = ActionAttemptStatus::Succeeded;
-                claim.run.attempts[active].output = Some(response.output.clone());
-                claim.run.attempts[active].receipt = response.receipt;
+                claim.run.attempts[active].output = Some(output.clone());
+                claim.run.attempts[active].receipt = Some(receipt);
                 claim.run.attempts[active].finished_at = Some(now);
                 if self.deadline_elapsed(&claim.run) {
                     let step_index = claim.run.next_step;
@@ -915,14 +854,12 @@ impl Runtime {
                     claim.run.status = RunStatus::Failed;
                     claim.run.finished_at = Some(now);
                     claim.run.updated_at = now;
-                    return self.store.commit_run(claim, emitted).await;
+                    return self.store.commit_run(claim, Vec::new()).await;
                 }
-                claim.run.steps[claim.run.next_step]
-                    .outputs
-                    .push(response.output);
+                claim.run.steps[claim.run.next_step].outputs.push(output);
                 claim.run.active_attempt = None;
                 claim.run.updated_at = now;
-                self.store.commit_run(claim, emitted).await
+                self.store.commit_run(claim, Vec::new()).await
             }
             Err(failure) if failure.outcome == DispatchOutcome::NotApplied => {
                 claim.run.attempts[active].status = ActionAttemptStatus::Failed;
@@ -963,40 +900,7 @@ impl Runtime {
         }
     }
 
-    async fn authorize(
-        &self,
-        registry: &RuntimeRegistry,
-        pinned_action: &Value,
-        dispatch: &ActionDispatch,
-    ) -> RuntimeResult<()> {
-        let context = json!({
-            "actor": {
-                "id": self.config.actor_id,
-                "kind": self.config.actor_kind
-            },
-            "origin": {
-                "workflow": dispatch.workflow
-            },
-            "run_id": dispatch.run_id,
-            "invocation_id": dispatch.invocation_id,
-            "attempt": dispatch.attempt,
-            "correlation_id": dispatch.correlation_id,
-            "causation_id": dispatch.causation_id,
-            "executor": dispatch.executor,
-            "resource": {
-                "action": dispatch.action,
-                "input": dispatch.input
-            }
-        });
-        let preflight = self
-            .contracts
-            .preflight_pinned_action(registry, pinned_action, &context);
-        if !preflight.valid {
-            return Err(diagnostics_error(
-                "dispatch_not_authorized",
-                &preflight.diagnostics,
-            ));
-        }
+    async fn authorize(&self, dispatch: &ActionDispatch) -> RuntimeResult<()> {
         match self.authorizer.authorize(dispatch).await {
             AuthorizationDecision::Allow => Ok(()),
             AuthorizationDecision::Deny { code, message } => {
@@ -1007,29 +911,14 @@ impl Runtime {
 
     fn pinned_action<'a>(
         &self,
-        registry: &'a RuntimeRegistry,
         planned: &'a crate::model::PlannedStep,
     ) -> RuntimeResult<&'a Value> {
-        let action = if planned.action_contract.is_object() {
-            &planned.action_contract
-        } else {
-            &registry
-                .actions
-                .get(&planned.action)
-                .ok_or_else(|| {
-                    RuntimeError::diagnostic(
-                        "pinned_action_unavailable",
-                        format!(
-                            "Legacy run requires action {} revision {}, which is unavailable.",
-                            planned.action, planned.action_revision
-                        ),
-                    )
-                })?
-                .contract
-        };
+        let action = &planned.action_contract;
         if action.get("id").and_then(Value::as_str) != Some(planned.action.as_str())
-            || action.get("version").and_then(Value::as_u64) != Some(planned.action_version)
-            || revision(action) != planned.action_revision
+            || action.get("version").and_then(Value::as_str)
+                != Some(planned.action_version.as_str())
+            || mdbase_interop::contract_digest(action).as_deref()
+                != Ok(planned.action_digest.as_str())
         {
             return Err(RuntimeError::diagnostic(
                 "pinned_action_corrupt",
@@ -1055,11 +944,55 @@ impl Runtime {
             .run
             .plan
             .event
-            .pointer("/trace/correlation_id")
+            .get("correlationid")
             .and_then(Value::as_str)
             .unwrap_or(&claim.run.plan.event_id)
             .to_string();
+        let request_id = stable_id(
+            "req",
+            &format!(
+                "{}:{}:{}",
+                claim.run.plan.id,
+                planned.id,
+                item_index.unwrap_or(0)
+            ),
+        );
+        let attempt_id = stable_id("attempt", &format!("{request_id}:{attempt}"));
+        let contract = mdbase_interop::ExactContractReference {
+            id: planned.action.clone(),
+            version: planned.action_version.clone(),
+            digest: planned.action_digest.clone(),
+        };
+        let invocation = ActionInvocation {
+            kind: "mdbase.action.invocation".to_string(),
+            profile_version: "0.1".to_string(),
+            invocation_id: invocation_id.clone(),
+            attempt_id,
+            request_id,
+            contract: contract.clone(),
+            caller: self.config.identity.clone(),
+            provider: planned.provider.clone(),
+            provider_declaration_digest: planned.provider_declaration_digest.clone(),
+            handler_id: planned.handler_id.clone(),
+            admitted_at: self.clock.now().to_rfc3339(),
+            correlation_id: Some(correlation_id.clone()),
+            causation_id: Some(claim.run.plan.event_id.clone()),
+            subject: claim
+                .run
+                .plan
+                .event
+                .get("subject")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            idempotency_key: planned
+                .idempotent
+                .then(|| format!("{}:{item_index:?}", claim.run.plan.idempotency_key)),
+            deadline: claim.run.plan.timeout_at.map(|value| value.to_rfc3339()),
+            authorization_context: None,
+            input: input.clone(),
+        };
         ActionDispatch {
+            invocation,
             run_id: claim.run.plan.id.clone(),
             workflow: claim.run.plan.workflow.clone(),
             step_id: planned.id.clone(),
@@ -1067,6 +1000,10 @@ impl Runtime {
             invocation_id,
             attempt,
             action: planned.action.clone(),
+            contract,
+            provider: planned.provider.clone(),
+            provider_declaration_digest: planned.provider_declaration_digest.clone(),
+            handler_id: planned.handler_id.clone(),
             input,
             event: claim.run.plan.event.clone(),
             executor: self.config.executor_id.clone(),
@@ -1191,27 +1128,6 @@ impl Runtime {
         claim.run.updated_at = now;
         self.store.commit_run(claim, Vec::new()).await
     }
-
-    fn apply_trace(&self, mut event: Value, cause: &Value, invocation_id: &str) -> Value {
-        let correlation = cause
-            .pointer("/trace/correlation_id")
-            .and_then(Value::as_str)
-            .or_else(|| cause.get("id").and_then(Value::as_str))
-            .unwrap_or(invocation_id);
-        if !event.is_object() {
-            return event;
-        }
-        if event.get("trace").is_none() {
-            event["trace"] = json!({});
-        }
-        if event.pointer("/trace/correlation_id").is_none() {
-            event["trace"]["correlation_id"] = Value::String(correlation.to_string());
-        }
-        if event.pointer("/trace/causation_id").is_none() {
-            event["trace"]["causation_id"] = Value::String(invocation_id.to_string());
-        }
-        event
-    }
 }
 
 fn skip_remaining_steps(run: &mut crate::model::RunRecord, start: usize, now: DateTime<Utc>) {
@@ -1261,21 +1177,6 @@ fn bindings(run: &crate::model::RunRecord, item: Option<(&str, Value)>) -> Value
     value
 }
 
-fn diagnostics_error(
-    code: &str,
-    diagnostics: &[mdbase::runtime_contracts::RuntimeDiagnostic],
-) -> RuntimeError {
-    RuntimeError::diagnostic(code, diagnostics_message(diagnostics))
-}
-
-fn diagnostics_message(diagnostics: &[mdbase::runtime_contracts::RuntimeDiagnostic]) -> String {
-    diagnostics
-        .iter()
-        .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
 fn expression_errors(errors: Vec<mdbase::v03::WorkflowCelError>) -> RuntimeError {
     RuntimeError::diagnostic(
         "workflow_expression_error",
@@ -1289,4 +1190,81 @@ fn expression_errors(errors: Vec<mdbase::v03::WorkflowCelError>) -> RuntimeError
 
 fn runtime_failure(error: RuntimeError) -> RuntimeFailure {
     RuntimeFailure::new(error.code(), error.to_string())
+}
+
+fn validate_action_value(
+    artifact: &Value,
+    schema_field: &str,
+    value: &Value,
+) -> Result<(), String> {
+    let schema = artifact
+        .pointer(&format!("/{schema_field}/value"))
+        .ok_or_else(|| format!("Pinned action artifact has no inline {schema_field}."))?;
+    let compiled = JSONSchema::options()
+        .with_draft(Draft::Draft202012)
+        .compile(schema)
+        .map_err(|error| format!("Pinned {schema_field} does not compile: {error}"))?;
+    compiled.validate(value).map_err(|errors| {
+        errors
+            .map(|error| format!("{}: {error}", error.instance_path))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
+fn normalize_outcome(
+    invocation: &ActionInvocation,
+    outcome: ActionOutcome,
+) -> Result<(Value, Value), crate::model::DispatchFailure> {
+    let evidence_matches = outcome.kind == "mdbase.action.outcome"
+        && outcome.profile_version == "0.1"
+        && outcome.request_id == invocation.request_id
+        && outcome.invocation_id == invocation.invocation_id
+        && outcome.attempt_id == invocation.attempt_id
+        && outcome.contract == invocation.contract
+        && outcome.provider == invocation.provider
+        && outcome.provider_declaration_digest == invocation.provider_declaration_digest;
+    if !evidence_matches {
+        return Err(crate::model::DispatchFailure {
+            code: "action_outcome_evidence_mismatch".to_string(),
+            message: "Provider outcome does not match the admitted invocation evidence."
+                .to_string(),
+            outcome: DispatchOutcome::Unknown,
+        });
+    }
+    let receipt = serde_json::to_value(&outcome).expect("portable action outcome serializes");
+    match outcome.status.as_str() {
+        "succeeded" => outcome
+            .output
+            .map(|output| (output, receipt))
+            .ok_or_else(|| crate::model::DispatchFailure {
+                code: "action_output_missing".to_string(),
+                message: "Successful action outcome has no output.".to_string(),
+                outcome: DispatchOutcome::Unknown,
+            }),
+        "indeterminate" => Err(crate::model::DispatchFailure {
+            code: outcome
+                .error
+                .as_ref()
+                .map_or("action_outcome_indeterminate", |error| error.code.as_str())
+                .to_string(),
+            message: outcome.error.as_ref().map_or_else(
+                || "Provider reported an indeterminate outcome.".to_string(),
+                |error| error.message.clone(),
+            ),
+            outcome: DispatchOutcome::Unknown,
+        }),
+        status => Err(crate::model::DispatchFailure {
+            code: outcome
+                .error
+                .as_ref()
+                .map_or("action_failed", |error| error.code.as_str())
+                .to_string(),
+            message: outcome.error.as_ref().map_or_else(
+                || format!("Provider reported action status {status}."),
+                |error| error.message.clone(),
+            ),
+            outcome: DispatchOutcome::NotApplied,
+        }),
+    }
 }

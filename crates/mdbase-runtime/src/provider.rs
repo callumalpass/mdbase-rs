@@ -2,14 +2,18 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use mdbase_interop::{ActionCancellation, ActionInvocation, ActionOutcome};
 
-use crate::model::{ActionDispatch, ActionResponse, DispatchFailure};
+use crate::model::{ActionDispatch, DispatchFailure};
 
 #[async_trait]
 pub trait ActionProvider: Send + Sync {
-    async fn dispatch(&self, request: ActionDispatch) -> Result<ActionResponse, DispatchFailure>;
+    async fn dispatch(
+        &self,
+        invocation: ActionInvocation,
+    ) -> Result<ActionOutcome, DispatchFailure>;
 
-    async fn cancel(&self, _invocation_id: &str) -> Result<(), DispatchFailure> {
+    async fn cancel(&self, _request: ActionCancellation) -> Result<(), DispatchFailure> {
         Ok(())
     }
 }
@@ -41,51 +45,74 @@ impl DispatchAuthorizer for DenyAllAuthorizer {
 
 #[derive(Default, Clone)]
 pub struct ProviderRegistry {
-    providers: Arc<RwLock<BTreeMap<String, Arc<dyn ActionProvider>>>>,
+    providers: Arc<RwLock<BTreeMap<ProviderBinding, Arc<dyn ActionProvider>>>>,
+}
+
+/// Executable host binding for one exact, already-verified interoperability
+/// provider declaration and handler. Markdown records cannot create this key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProviderBinding {
+    pub provider_declaration_digest: String,
+    pub handler_id: String,
 }
 
 impl ProviderRegistry {
     pub fn register(
         &self,
-        action: impl Into<String>,
+        binding: ProviderBinding,
         provider: Arc<dyn ActionProvider>,
     ) -> Option<Arc<dyn ActionProvider>> {
         self.providers
             .write()
             .expect("provider registry lock poisoned")
-            .insert(action.into(), provider)
+            .insert(binding, provider)
     }
 
-    pub fn register_many(
+    pub fn register_handlers(
         &self,
-        actions: impl IntoIterator<Item = String>,
+        provider_declaration_digest: impl Into<String>,
+        handler_ids: impl IntoIterator<Item = String>,
         provider: Arc<dyn ActionProvider>,
     ) {
+        let provider_declaration_digest = provider_declaration_digest.into();
         let mut providers = self
             .providers
             .write()
             .expect("provider registry lock poisoned");
-        for action in actions {
-            providers.insert(action, provider.clone());
+        for handler_id in handler_ids {
+            providers.insert(
+                ProviderBinding {
+                    provider_declaration_digest: provider_declaration_digest.clone(),
+                    handler_id,
+                },
+                provider.clone(),
+            );
         }
     }
 
-    pub fn unregister(&self, action: &str) -> Option<Arc<dyn ActionProvider>> {
+    pub fn unregister(&self, binding: &ProviderBinding) -> Option<Arc<dyn ActionProvider>> {
         self.providers
             .write()
             .expect("provider registry lock poisoned")
-            .remove(action)
+            .remove(binding)
     }
 
-    pub fn get(&self, action: &str) -> Option<Arc<dyn ActionProvider>> {
+    pub fn get(
+        &self,
+        provider_declaration_digest: &str,
+        handler_id: &str,
+    ) -> Option<Arc<dyn ActionProvider>> {
         self.providers
             .read()
             .expect("provider registry lock poisoned")
-            .get(action)
+            .get(&ProviderBinding {
+                provider_declaration_digest: provider_declaration_digest.to_string(),
+                handler_id: handler_id.to_string(),
+            })
             .cloned()
     }
 
-    pub fn actions(&self) -> Vec<String> {
+    pub fn bindings(&self) -> Vec<ProviderBinding> {
         self.providers
             .read()
             .expect("provider registry lock poisoned")

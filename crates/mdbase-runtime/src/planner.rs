@@ -1,252 +1,199 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, TimeDelta, Utc};
-use mdbase::runtime_contracts::RuntimeRegistry;
 use mdbase::v03::{evaluate_runtime_expression, evaluate_runtime_template};
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::admission::{AdmissionCatalog, AdmittedWorkflow};
 use crate::engine::RuntimeConfig;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::model::{ConcurrencyPolicy, OnError, PlannedForEach, PlannedRun, PlannedStep};
 
 pub(crate) fn plan_event(
-    registry: &RuntimeRegistry,
-    workflow_ids: &[String],
+    catalog: &AdmissionCatalog,
     event: &Value,
     now: DateTime<Utc>,
     config: &RuntimeConfig,
 ) -> RuntimeResult<Vec<PlannedRun>> {
-    if !registry.valid() {
-        return Err(RuntimeError::diagnostic(
-            "runtime_registry_invalid",
-            "The effective runtime registry contains errors.",
-        ));
-    }
     let event_id = required_string(event, "id")?;
     let event_type = required_string(event, "type")?;
-    let registry_revision = registry.revision();
-    let selected_policy = registry.selected_policy();
-    let policy_revision = selected_policy.map(|entry| revision(&entry.contract));
-    let selected_policy_value = selected_policy.map(|entry| &entry.contract);
     let mut plans = Vec::new();
 
-    for workflow_id in workflow_ids {
-        let Some(entry) = registry.workflows.get(workflow_id) else {
+    for admitted in catalog.admit_event(event)? {
+        let workflow = &admitted.workflow;
+        let workflow_id = required_string(workflow, "id")?;
+        let workflow_version = required_string(workflow, "version")?.to_string();
+        if let Some(selected_executor) = catalog.selected_executor(workflow_id) {
+            if selected_executor != config.executor_id {
+                continue;
+            }
+        }
+        let trigger = &admitted.trigger;
+        let trigger_id = required_string(trigger, "id")?;
+        let mut bindings = json!({
+            "event": event,
+            "workflow": {
+                "id": workflow_id,
+                "version": workflow_version
+            },
+            "trigger": trigger,
+            "vars": {},
+            "steps": {}
+        });
+        let vars = evaluate_vars(
+            workflow.get("vars"),
+            &mut bindings,
+            now,
+            config.timezone.as_deref(),
+        )?;
+        bindings["vars"] = vars.clone();
+        if !condition_matches(
+            trigger.get("if"),
+            &bindings,
+            now,
+            config.timezone.as_deref(),
+        )? || !condition_matches(
+            workflow.get("if"),
+            &bindings,
+            now,
+            config.timezone.as_deref(),
+        )? {
             continue;
+        }
+
+        let idempotency_key = match workflow.pointer("/run/idempotency/key") {
+            Some(value) => evaluated_string(
+                value,
+                &bindings,
+                now,
+                config.timezone.as_deref(),
+                "idempotency key",
+            )?,
+            None => format!("{workflow_id}:{event_id}:{trigger_id}"),
         };
-        let workflow = &entry.contract;
-        if workflow.get("enabled") == Some(&Value::Bool(false)) {
-            continue;
-        }
-        let workflow_version =
-            workflow
-                .get("version")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    RuntimeError::diagnostic(
-                        "invalid_workflow",
-                        format!("Workflow {workflow_id} has no integer version."),
-                    )
-                })?;
-        let mode = workflow
-            .pointer("/run/execution/mode")
+        let idempotency_scope = format!("{}:{workflow_id}", config.executor_id);
+        let concurrency_group = match workflow.pointer("/run/concurrency/group") {
+            Some(value) => evaluated_string(
+                value,
+                &bindings,
+                now,
+                config.timezone.as_deref(),
+                "concurrency group",
+            )?,
+            None => workflow_id.to_string(),
+        };
+        let concurrency_policy = match workflow
+            .pointer("/run/concurrency/policy")
             .and_then(Value::as_str)
-            .unwrap_or("single_executor");
-        let selected_executor = selected_executor(selected_policy_value, workflow_id);
-        if mode == "single_executor"
-            && selected_executor.as_deref() != Some(config.executor_id.as_str())
+            .unwrap_or("allow")
         {
-            continue;
-        }
-
-        let triggers = workflow
-            .get("triggers")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for trigger in triggers {
-            if trigger.get("event").and_then(Value::as_str) != Some(event_type) {
-                continue;
+            "skip" => ConcurrencyPolicy::Skip,
+            "queue" => ConcurrencyPolicy::Queue,
+            "replace" => ConcurrencyPolicy::Replace,
+            "allow" => ConcurrencyPolicy::Allow,
+            value => {
+                return Err(RuntimeError::diagnostic(
+                    "invalid_workflow",
+                    format!("Unsupported concurrency policy {value}."),
+                ))
             }
-            let trigger_id = required_string(&trigger, "id")?;
-            let mut bindings = json!({
-                "event": event,
-                "workflow": {
-                    "id": workflow_id,
-                    "version": workflow_version
-                },
-                "trigger": trigger,
-                "vars": {},
-                "steps": {}
-            });
-            let vars = evaluate_vars(
-                workflow.get("vars"),
-                &mut bindings,
-                now,
-                config.timezone.as_deref(),
-            )?;
-            bindings["vars"] = vars.clone();
-            if !condition_matches(
-                trigger.get("if"),
-                &bindings,
-                now,
-                config.timezone.as_deref(),
-            )? || !condition_matches(
-                workflow.get("if"),
-                &bindings,
-                now,
-                config.timezone.as_deref(),
-            )? {
-                continue;
+        };
+        let on_error = match workflow
+            .pointer("/run/on_error")
+            .and_then(Value::as_str)
+            .unwrap_or("stop")
+        {
+            "stop" => OnError::Stop,
+            "continue" => OnError::Continue,
+            value => {
+                return Err(RuntimeError::diagnostic(
+                    "invalid_workflow",
+                    format!("Unsupported on_error policy {value}."),
+                ))
             }
-
-            let idempotency_key = match workflow.pointer("/run/idempotency/key") {
-                Some(value) => evaluated_string(
-                    value,
-                    &bindings,
-                    now,
-                    config.timezone.as_deref(),
-                    "idempotency key",
-                )?,
-                None => format!("{workflow_id}:{event_id}:{trigger_id}"),
-            };
-            let idempotency_scope = if mode == "broadcast" {
-                format!("{}:{}", config.executor_id, workflow_id)
-            } else {
-                config.executor_id.clone()
-            };
-            let concurrency_group = match workflow.pointer("/run/concurrency/group") {
-                Some(value) => evaluated_string(
-                    value,
-                    &bindings,
-                    now,
-                    config.timezone.as_deref(),
-                    "concurrency group",
-                )?,
-                None => workflow_id.clone(),
-            };
-            let concurrency_policy = match workflow
-                .pointer("/run/concurrency/policy")
-                .and_then(Value::as_str)
-                .unwrap_or("allow")
-            {
-                "skip" => ConcurrencyPolicy::Skip,
-                "queue" => ConcurrencyPolicy::Queue,
-                "replace" => ConcurrencyPolicy::Replace,
-                "allow" => ConcurrencyPolicy::Allow,
-                value => {
-                    return Err(RuntimeError::diagnostic(
-                        "invalid_workflow",
-                        format!("Unsupported concurrency policy {value}."),
-                    ))
-                }
-            };
-            let on_error = match workflow
-                .pointer("/run/on_error")
-                .and_then(Value::as_str)
-                .unwrap_or("stop")
-            {
-                "stop" => OnError::Stop,
-                "continue" => OnError::Continue,
-                value => {
-                    return Err(RuntimeError::diagnostic(
-                        "invalid_workflow",
-                        format!("Unsupported on_error policy {value}."),
-                    ))
-                }
-            };
-            let debounce_ms = trigger
-                .get("debounce")
-                .and_then(Value::as_str)
-                .map(parse_duration_ms)
-                .transpose()?
-                .unwrap_or(0);
-            let minimum_interval_ms = trigger
-                .get("minimum_interval")
-                .and_then(Value::as_str)
-                .map(parse_duration_ms)
-                .transpose()?;
-            let not_before = now
-                + TimeDelta::milliseconds(i64::try_from(debounce_ms).map_err(|_| {
-                    RuntimeError::diagnostic(
-                        "duration_out_of_range",
-                        "Trigger debounce exceeds the supported range.",
-                    )
-                })?);
-            let workflow_timeout = workflow
-                .pointer("/run/limits/timeout")
-                .and_then(Value::as_str)
-                .map(parse_duration_ms)
-                .transpose()?;
-            let policy_timeout = selected_policy_value
-                .and_then(|policy| policy.pointer("/limits/workflow_timeout"))
-                .and_then(Value::as_str)
-                .map(parse_duration_ms)
-                .transpose()?;
-            let timeout_ms = match (workflow_timeout, policy_timeout) {
-                (Some(workflow), Some(policy)) => Some(workflow.min(policy)),
-                (workflow, policy) => workflow.or(policy),
-            };
-            let timeout_at = timeout_ms
-                .map(|timeout| {
-                    i64::try_from(timeout)
-                        .map(TimeDelta::milliseconds)
-                        .map(|timeout| now + timeout)
-                })
-                .transpose()
-                .map_err(|_| {
-                    RuntimeError::diagnostic(
-                        "duration_out_of_range",
-                        "Workflow timeout exceeds the supported range.",
-                    )
-                })?;
-            let steps = plan_steps(registry, workflow, workflow_id)?;
-            let run_id = stable_id(
-                "run",
-                &format!(
-                    "{}:{workflow_id}:{trigger_id}:{event_id}:{}",
-                    config.executor_id, idempotency_key
-                ),
-            );
-            plans.push(PlannedRun {
-                id: run_id,
-                workflow: workflow_id.clone(),
-                workflow_version,
-                workflow_revision: revision(workflow),
-                registry_revision: registry_revision.clone(),
-                policy_revision: policy_revision.clone(),
-                trigger: trigger_id.to_string(),
-                event_id: event_id.to_string(),
-                event_type: event_type.to_string(),
-                event_cursor: 0,
-                event: event.clone(),
-                executor: config.executor_id.clone(),
-                idempotency_key,
-                idempotency_scope,
-                concurrency_group,
-                concurrency_policy,
-                replacement_blockers: Vec::new(),
-                on_error,
-                not_before,
-                timeout_at,
-                minimum_interval_ms,
-                vars,
-                workflow_value: workflow.clone(),
-                steps,
-                created_at: now,
-            });
-        }
+        };
+        let debounce_ms = trigger
+            .get("debounce")
+            .and_then(Value::as_str)
+            .map(parse_duration_ms)
+            .transpose()?
+            .unwrap_or(0);
+        let minimum_interval_ms = trigger
+            .get("minimum_interval")
+            .and_then(Value::as_str)
+            .map(parse_duration_ms)
+            .transpose()?;
+        let not_before = now
+            + TimeDelta::milliseconds(i64::try_from(debounce_ms).map_err(|_| {
+                RuntimeError::diagnostic(
+                    "duration_out_of_range",
+                    "Trigger debounce exceeds the supported range.",
+                )
+            })?);
+        let timeout_ms = workflow
+            .pointer("/run/limits/timeout")
+            .and_then(Value::as_str)
+            .map(parse_duration_ms)
+            .transpose()?;
+        let timeout_at = timeout_ms
+            .map(|timeout| {
+                i64::try_from(timeout)
+                    .map(TimeDelta::milliseconds)
+                    .map(|timeout| now + timeout)
+            })
+            .transpose()
+            .map_err(|_| {
+                RuntimeError::diagnostic(
+                    "duration_out_of_range",
+                    "Workflow timeout exceeds the supported range.",
+                )
+            })?;
+        let steps = plan_steps(workflow, &admitted)?;
+        let run_id = stable_id(
+            "run",
+            &format!(
+                "{}:{workflow_id}:{trigger_id}:{event_id}:{}",
+                config.executor_id, idempotency_key
+            ),
+        );
+        plans.push(PlannedRun {
+            id: run_id,
+            workflow: workflow_id.to_string(),
+            workflow_version,
+            workflow_revision: admitted.workflow_revision,
+            catalog_revision: catalog.revision().to_string(),
+            policy_id: admitted.policy_id,
+            policy_revision: admitted.policy_revision,
+            trigger: trigger_id.to_string(),
+            event_id: event_id.to_string(),
+            event_type: event_type.to_string(),
+            event_contract: admitted.event_contract,
+            event_source: admitted.event_source,
+            source_declaration_digest: admitted.source_declaration_digest,
+            event_cursor: 0,
+            event: event.clone(),
+            executor: config.executor_id.clone(),
+            idempotency_key,
+            idempotency_scope,
+            concurrency_group,
+            concurrency_policy,
+            replacement_blockers: Vec::new(),
+            on_error,
+            not_before,
+            timeout_at,
+            minimum_interval_ms,
+            vars,
+            workflow_value: workflow.clone(),
+            steps,
+            created_at: now,
+        });
     }
     Ok(plans)
 }
 
-fn plan_steps(
-    registry: &RuntimeRegistry,
-    workflow: &Value,
-    workflow_id: &str,
-) -> RuntimeResult<Vec<PlannedStep>> {
+fn plan_steps(workflow: &Value, admitted: &AdmittedWorkflow) -> RuntimeResult<Vec<PlannedStep>> {
     workflow
         .get("steps")
         .and_then(Value::as_array)
@@ -254,21 +201,14 @@ fn plan_steps(
         .flatten()
         .map(|step| {
             let id = required_string(step, "id")?.to_string();
-            let action = required_string(step, "action")?.to_string();
-            let contract = registry.actions.get(&action).ok_or_else(|| {
-                RuntimeError::diagnostic(
-                    "unresolved_action",
-                    format!("Workflow {workflow_id} references unknown action {action}."),
-                )
-            })?;
-            let action_version = contract
-                .contract
-                .get("version")
-                .and_then(Value::as_u64)
+            let binding = admitted
+                .steps
+                .iter()
+                .find(|binding| binding.id == id)
                 .ok_or_else(|| {
                     RuntimeError::diagnostic(
-                        "invalid_action",
-                        format!("Action {action} has no integer version."),
+                        "unresolved_action",
+                        format!("Admitted plan has no action binding for step {id}."),
                     )
                 })?;
             let condition = step
@@ -285,23 +225,18 @@ fn plan_steps(
             });
             Ok(PlannedStep {
                 id,
-                action: action.clone(),
-                action_version,
-                action_revision: revision(&contract.contract),
-                action_contract: contract.contract.clone(),
+                action: binding.contract.id.clone(),
+                action_version: binding.contract.version.clone(),
+                action_digest: binding.contract.digest.clone(),
+                action_contract: binding.artifact.clone(),
+                provider: binding.provider.clone(),
+                provider_declaration_digest: binding.provider_declaration_digest.clone(),
+                handler_id: binding.handler_id.clone(),
                 condition,
                 input: step.get("input").cloned().unwrap_or_else(|| json!({})),
                 for_each,
-                idempotent: contract
-                    .contract
-                    .pointer("/dispatch/idempotency")
-                    .and_then(Value::as_str)
-                    == Some("invocation_id"),
-                cooperative_cancellation: contract
-                    .contract
-                    .pointer("/dispatch/cancellation")
-                    .and_then(Value::as_str)
-                    == Some("cooperative"),
+                idempotent: binding.idempotent,
+                cooperative_cancellation: binding.cooperative_cancellation,
             })
         })
         .collect()
@@ -398,20 +333,6 @@ fn evaluated_string(
     })
 }
 
-fn selected_executor(policy: Option<&Value>, workflow_id: &str) -> Option<String> {
-    policy
-        .and_then(|policy| {
-            policy
-                .pointer(&format!(
-                    "/executors/workflows/{}",
-                    workflow_id.replace('~', "~0").replace('/', "~1")
-                ))
-                .and_then(Value::as_str)
-                .or_else(|| policy.pointer("/executors/default").and_then(Value::as_str))
-        })
-        .map(str::to_string)
-}
-
 fn required_string<'a>(value: &'a Value, key: &str) -> RuntimeResult<&'a str> {
     value.get(key).and_then(Value::as_str).ok_or_else(|| {
         RuntimeError::diagnostic(
@@ -442,11 +363,6 @@ fn parse_duration_ms(value: &str) -> RuntimeResult<u64> {
             "Duration exceeds u64 milliseconds.",
         )
     })
-}
-
-pub(crate) fn revision(value: &Value) -> String {
-    let canonical = serde_json::to_vec(value).expect("JSON value serialization cannot fail");
-    format!("sha256:{:x}", Sha256::digest(canonical))
 }
 
 pub(crate) fn stable_id(prefix: &str, source: &str) -> String {

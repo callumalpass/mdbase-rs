@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{TimeDelta, TimeZone, Utc};
+use mdbase_interop::{ExactContractReference, ImplementationIdentity};
 #[cfg(feature = "postgres")]
 use mdbase_runtime::PostgresRuntimeStore;
 #[cfg(feature = "sqlite")]
@@ -34,13 +35,17 @@ fn run(
     PlannedRun {
         id: id.to_string(),
         workflow: "contract.workflow".to_string(),
-        workflow_version: 1,
-        workflow_revision: "workflow-revision".to_string(),
-        registry_revision: "registry-revision".to_string(),
-        policy_revision: None,
+        workflow_version: "1.0.0".to_string(),
+        workflow_revision: digest('a'),
+        catalog_revision: digest('b'),
+        policy_id: "contract.policy".to_string(),
+        policy_revision: digest('c'),
         trigger: "contract".to_string(),
         event_id: event_id.to_string(),
         event_type: "contract.event".to_string(),
+        event_contract: contract("contract.event"),
+        event_source: identity(),
+        source_declaration_digest: digest('d'),
         event_cursor: 0,
         event: json!({"id": event_id}),
         executor: "contract-executor".to_string(),
@@ -66,12 +71,35 @@ fn timer(id: &str, at: chrono::DateTime<Utc>) -> TimerRecord {
         generation: 0,
         status: TimerStatus::Scheduled,
         fire_at: at,
-        event_type: "timer.fired".to_string(),
-        contract_version: 1,
-        payload: json!({"id": id}),
+        event_contract: contract("mdbase.runtime.timer.fired"),
+        event_source: identity(),
+        source_uri: "urn:test:timer".to_string(),
+        subject: None,
+        data: json!({"id": id}),
         created_at: at,
         updated_at: at,
         fired_at: None,
+    }
+}
+
+fn digest(character: char) -> String {
+    format!("sha256:{}", character.to_string().repeat(64))
+}
+
+fn contract(id: &str) -> ExactContractReference {
+    ExactContractReference {
+        id: id.to_string(),
+        version: "1.0.0".to_string(),
+        digest: digest('e'),
+    }
+}
+
+fn identity() -> ImplementationIdentity {
+    ImplementationIdentity {
+        application: "contract-test".to_string(),
+        implementation: "store-contract".to_string(),
+        version: "1.0.0".to_string(),
+        instance_id: None,
     }
 }
 

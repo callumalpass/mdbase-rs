@@ -49,10 +49,6 @@
         "has_more": {
           "type": "boolean"
         },
-        "snapshot": {
-          "type": "string",
-          "minLength": 1
-        },
         "context": {
           "type": "object",
           "required": ["path"],

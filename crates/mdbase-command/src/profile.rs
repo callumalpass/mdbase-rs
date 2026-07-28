@@ -916,14 +916,6 @@ fn summarize_query_counters(profiles: &[QueryPerformance]) -> BTreeMap<String, f
                 .count() as f64
                 / count,
         ),
-        (
-            "snapshot_reused",
-            profiles
-                .iter()
-                .filter(|profile| profile.snapshot_reused)
-                .count() as f64
-                / count,
-        ),
     ]
     .into_iter()
     .map(|(name, value)| (name.to_string(), value))
@@ -952,7 +944,6 @@ fn merge_query_performance(target: &mut QueryPerformance, value: QueryPerformanc
     target.cache_used |= value.cache_used;
     target.cache_fallback |= value.cache_fallback;
     target.link_graph_built |= value.link_graph_built;
-    target.snapshot_reused |= value.snapshot_reused;
 }
 
 fn print_report(report: &ProfileReport) {

@@ -35,8 +35,6 @@ pub enum ProviderError {
     UnsupportedOperation(String),
     #[error("collection provider operation lock is unavailable")]
     LockPoisoned,
-    #[error("runtime contracts could not be initialized: {0}")]
-    RuntimeContracts(String),
     #[error(transparent)]
     Watch(#[from] WatchError),
 }
@@ -47,7 +45,6 @@ impl ProviderError {
             Self::CollectionOpen(_) => "collection_open_failed",
             Self::UnsupportedOperation(_) => "unsupported_operation",
             Self::LockPoisoned => "operation_lock_unavailable",
-            Self::RuntimeContracts(_) => "runtime_contracts_unavailable",
             Self::Watch(_) => "watch_failed",
         }
     }

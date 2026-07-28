@@ -14,7 +14,6 @@ pub enum WatchKind {
     RecordRenamed,
     ConfigChanged,
     TypeChanged,
-    RuntimeRegistryChanged,
     /// A collection reload failed. This extension preserves the diagnostic
     /// carried by the transport event without pretending a record changed.
     CollectionInvalidated,
@@ -91,16 +90,7 @@ impl From<WatchEvent> for PortableWatchEvent {
             WatchKind::RecordDeleted => payload.get("before").cloned(),
             _ => None,
         };
-        let subject = match kind {
-            WatchKind::RuntimeRegistryChanged => payload
-                .get("identity")
-                .and_then(Value::as_str)
-                .unwrap_or("effective_registry")
-                .to_string()
-                .into(),
-            WatchKind::CollectionInvalidated => Some("collection".to_string()),
-            _ => None,
-        };
+        let subject = (kind == WatchKind::CollectionInvalidated).then(|| "collection".to_string());
 
         Self {
             kind,
@@ -124,7 +114,6 @@ fn kind(event_type: &str) -> WatchKind {
         "mdbase.record.renamed" => WatchKind::RecordRenamed,
         "mdbase.config.changed" => WatchKind::ConfigChanged,
         "mdbase.type.changed" => WatchKind::TypeChanged,
-        "mdbase.runtime.registry.changed" => WatchKind::RuntimeRegistryChanged,
         _ => WatchKind::CollectionInvalidated,
     }
 }

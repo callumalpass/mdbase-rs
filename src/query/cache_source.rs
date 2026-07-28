@@ -16,12 +16,7 @@ use crate::Collection;
 pub(crate) struct MetadataPage {
     pub records: Vec<FileRecord>,
     pub total: usize,
-    pub snapshot: String,
     pub performance: LoadQueryPerf,
-}
-
-pub(crate) enum MetadataPageError {
-    SnapshotExpired,
 }
 
 /// Common intermediate representation that both the cache path and disk-fallback
@@ -61,18 +56,6 @@ pub(crate) struct LoadQueryPerf {
 
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
-}
-
-fn current_cache_snapshot(conn: &Connection) -> Result<Option<String>, CacheError> {
-    use rusqlite::OptionalExtension;
-
-    Ok(conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'query_snapshot'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?)
 }
 
 fn replace_cache_snapshot(conn: &Connection) -> Result<String, CacheError> {
@@ -223,8 +206,7 @@ impl Collection {
         order_by: &[(&str, bool)],
         offset: u64,
         limit: Option<u64>,
-        expected_snapshot: Option<&str>,
-    ) -> Result<Option<MetadataPage>, MetadataPageError> {
+    ) -> Option<MetadataPage> {
         let mut clauses = Vec::new();
         for (field, descending) in order_by {
             let direction = if *descending { "DESC" } else { "ASC" };
@@ -239,7 +221,7 @@ impl Collection {
                     "(f.ctime_ns IS NULL) {}, (f.ctime_ns / 1000000000) {direction}",
                     if *descending { "DESC" } else { "ASC" }
                 ),
-                _ => return Ok(None),
+                _ => return None,
             };
             clauses.push(clause);
         }
@@ -248,40 +230,13 @@ impl Collection {
         let total_started = Instant::now();
         let mut perf = LoadQueryPerf::default();
         let open_started = Instant::now();
-        let mut conn = match sqlite::open_cache_db(&self.root, &self.settings.cache_folder) {
-            Ok(conn) => conn,
-            Err(_) if expected_snapshot.is_some() => {
-                return Err(MetadataPageError::SnapshotExpired)
-            }
-            Err(_) => return Ok(None),
-        };
+        let mut conn = sqlite::open_cache_db(&self.root, &self.settings.cache_folder).ok()?;
         perf.try_open_cache_ms = elapsed_ms(open_started);
         perf.cache_used = true;
 
-        let snapshot = if let Some(expected) = expected_snapshot {
-            let current = match current_cache_snapshot(&conn) {
-                Ok(Some(current)) => current,
-                _ => return Err(MetadataPageError::SnapshotExpired),
-            };
-            if current != expected {
-                return Err(MetadataPageError::SnapshotExpired);
-            }
-            current
-        } else {
-            let refresh_started = Instant::now();
-            if self.refresh_cache(&mut conn).is_err() {
-                return Ok(None);
-            }
-            perf.refresh_cache_ms = elapsed_ms(refresh_started);
-            match current_cache_snapshot(&conn) {
-                Ok(Some(snapshot)) => snapshot,
-                Ok(None) => match replace_cache_snapshot(&conn) {
-                    Ok(snapshot) => snapshot,
-                    Err(_) => return Ok(None),
-                },
-                Err(_) => return Ok(None),
-            }
-        };
+        let refresh_started = Instant::now();
+        self.refresh_cache(&mut conn).ok()?;
+        perf.refresh_cache_ms = elapsed_ms(refresh_started);
 
         let load_started = Instant::now();
         let total = match conn.query_row(
@@ -290,10 +245,7 @@ impl Collection {
             |row| row.get::<_, usize>(0),
         ) {
             Ok(total) => total,
-            Err(_) if expected_snapshot.is_some() => {
-                return Err(MetadataPageError::SnapshotExpired)
-            }
-            Err(_) => return Ok(None),
+            Err(_) => return None,
         };
         let sql = format!(
             "SELECT f.path, f.frontmatter_json, f.body, f.size, f.mtime_ns, f.ctime_ns \
@@ -302,10 +254,7 @@ impl Collection {
         );
         let mut statement = match conn.prepare(&sql) {
             Ok(statement) => statement,
-            Err(_) if expected_snapshot.is_some() => {
-                return Err(MetadataPageError::SnapshotExpired)
-            }
-            Err(_) => return Ok(None),
+            Err(_) => return None,
         };
         let limit = limit
             .map(|value| value.min(i64::MAX as u64) as i64)
@@ -322,26 +271,17 @@ impl Collection {
             ))
         }) {
             Ok(rows) => rows,
-            Err(_) if expected_snapshot.is_some() => {
-                return Err(MetadataPageError::SnapshotExpired)
-            }
-            Err(_) => return Ok(None),
+            Err(_) => return None,
         };
         let mut records = Vec::new();
         for row in rows {
             let (path, frontmatter, body, size, mtime_ns, ctime_ns) = match row {
                 Ok(row) => row,
-                Err(_) if expected_snapshot.is_some() => {
-                    return Err(MetadataPageError::SnapshotExpired)
-                }
-                Err(_) => return Ok(None),
+                Err(_) => return None,
             };
             let raw_frontmatter: serde_json::Value = match serde_json::from_str(&frontmatter) {
                 Ok(frontmatter) => frontmatter,
-                Err(_) if expected_snapshot.is_some() => {
-                    return Err(MetadataPageError::SnapshotExpired)
-                }
-                Err(_) => return Ok(None),
+                Err(_) => return None,
             };
             records.push(FileRecord {
                 rel_path: path,
@@ -357,12 +297,11 @@ impl Collection {
         perf.load_records_ms = elapsed_ms(load_started);
         perf.file_records = records.len();
         perf.total_ms = elapsed_ms(total_started);
-        Ok(Some(MetadataPage {
+        Some(MetadataPage {
             records,
             total,
-            snapshot,
             performance: perf,
-        }))
+        })
     }
 
     /// Load the file_types table into a HashMap for bulk access.

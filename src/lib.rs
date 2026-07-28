@@ -27,7 +27,6 @@ pub mod matching;
 pub mod operations;
 pub mod query;
 pub mod runtime;
-pub mod runtime_contracts;
 pub(crate) mod snapshot;
 pub(crate) mod transactions;
 pub mod types;

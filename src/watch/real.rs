@@ -1,5 +1,4 @@
 use super::{PortableWatchEvent, WatchEvent};
-use crate::runtime_contracts::{ContractSource, LoadOptions, RuntimeContracts};
 use crate::Collection;
 use notify::{
     event::{MetadataKind, ModifyKind, RenameMode},
@@ -49,34 +48,12 @@ enum WorkerInput {
 
 impl CollectionWatcher {
     pub fn open(root: impl AsRef<Path>, debounce: Duration) -> Result<Self, WatchError> {
-        Self::open_internal(root.as_ref(), debounce, None)
+        Self::open_internal(root.as_ref(), debounce)
     }
 
-    /// Open a watcher that also recomposes the effective Runtime Contracts
-    /// registry and emits `mdbase.runtime.registry.changed` after its inputs
-    /// change. Virtual built-in/provider/pack sources stay in memory and are
-    /// never materialized into the collection.
-    pub fn open_with_runtime_contracts(
-        root: impl AsRef<Path>,
-        debounce: Duration,
-        implicit_sources: Vec<ContractSource>,
-        options: LoadOptions,
-    ) -> Result<Self, WatchError> {
-        let runtime = RuntimeSnapshotter {
-            engine: RuntimeContracts::new().map_err(WatchError::Collection)?,
-            implicit_sources,
-            options,
-        };
-        Self::open_internal(root.as_ref(), debounce, Some(runtime))
-    }
-
-    fn open_internal(
-        root: &Path,
-        debounce: Duration,
-        runtime: Option<RuntimeSnapshotter>,
-    ) -> Result<Self, WatchError> {
+    fn open_internal(root: &Path, debounce: Duration) -> Result<Self, WatchError> {
         let root = root.to_path_buf();
-        let initial = Snapshot::load(&root, runtime.as_ref())?;
+        let initial = Snapshot::load(&root)?;
         let (events_tx, events) = mpsc::channel();
         let (commands, command_rx) = mpsc::channel();
         let filesystem_tx = commands.clone();
@@ -88,7 +65,6 @@ impl CollectionWatcher {
                     root,
                     debounce,
                     initial,
-                    runtime,
                     WorkerChannels {
                         inputs: command_rx,
                         filesystem_tx,
@@ -186,13 +162,7 @@ struct WorkerChannels {
     ready: mpsc::SyncSender<Result<(), notify::Error>>,
 }
 
-fn watch_loop(
-    root: PathBuf,
-    debounce: Duration,
-    mut snapshot: Snapshot,
-    runtime: Option<RuntimeSnapshotter>,
-    channels: WorkerChannels,
-) {
+fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channels: WorkerChannels) {
     let WorkerChannels {
         inputs,
         filesystem_tx,
@@ -216,7 +186,7 @@ fn watch_loop(
     // Close the gap between the caller's initial snapshot and OS watch
     // registration before reporting readiness. Hosts can now treat `open` as
     // a stable boundary instead of triggering an additional full rescan.
-    match Snapshot::load(&root, runtime.as_ref()) {
+    match Snapshot::load(&root) {
         Ok(next) => {
             for event in snapshot.diff(&next) {
                 sequence += 1;
@@ -314,13 +284,13 @@ fn watch_loop(
             let refresh_mode = if full_rescan { "full" } else { "incremental" };
             let refresh_path_count = pending_paths.len();
             let refreshed = if full_rescan {
-                Snapshot::load(&root, runtime.as_ref()).map(|next| {
+                Snapshot::load(&root).map(|next| {
                     let diff = snapshot.diff(&next);
                     snapshot = next;
                     diff
                 })
             } else {
-                snapshot.refresh_paths(&root, &pending_paths, runtime.as_ref())
+                snapshot.refresh_paths(&root, &pending_paths)
             };
             match refreshed {
                 Ok(changes) => {
@@ -410,24 +380,10 @@ struct Snapshot {
     config_revision: String,
     types: BTreeMap<String, String>,
     records: BTreeMap<String, RecordState>,
-    runtime: Option<RuntimeRegistryState>,
     types_folder: String,
     contracts_folder: String,
     cache_folder: String,
     record_extensions: BTreeSet<String>,
-}
-
-struct RuntimeSnapshotter {
-    engine: RuntimeContracts,
-    implicit_sources: Vec<ContractSource>,
-    options: LoadOptions,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct RuntimeRegistryState {
-    revision: String,
-    valid: bool,
-    diagnostic_codes: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -439,7 +395,7 @@ struct RecordState {
 }
 
 impl Snapshot {
-    fn load(root: &Path, runtime: Option<&RuntimeSnapshotter>) -> Result<Self, WatchError> {
+    fn load(root: &Path) -> Result<Self, WatchError> {
         let collection = Collection::open(root)
             .map_err(|error| WatchError::Collection(collection_error(&error)))?;
         let config_revision = file_revision(&root.join("mdbase.yaml"))?;
@@ -457,32 +413,10 @@ impl Snapshot {
                 records.insert(relative, record);
             }
         }
-        let runtime = runtime.map(|snapshotter| {
-            let loaded = snapshotter.engine.load(
-                &collection,
-                snapshotter.implicit_sources.clone(),
-                &snapshotter.options,
-            );
-            let mut diagnostic_codes = loaded
-                .registry
-                .diagnostics
-                .iter()
-                .chain(loaded.preflight.diagnostics.iter())
-                .map(|diagnostic| diagnostic.code.clone())
-                .collect::<Vec<_>>();
-            diagnostic_codes.sort();
-            diagnostic_codes.dedup();
-            RuntimeRegistryState {
-                revision: loaded.registry.revision(),
-                valid: loaded.valid(),
-                diagnostic_codes,
-            }
-        });
         Ok(Self {
             config_revision,
             types,
             records,
-            runtime,
             types_folder: collection.settings.types_folder.clone(),
             contracts_folder: collection.settings.contracts_folder.clone(),
             cache_folder: collection.settings.cache_folder.clone(),
@@ -552,7 +486,6 @@ impl Snapshot {
         &mut self,
         root: &Path,
         paths: &BTreeSet<PathBuf>,
-        runtime: Option<&RuntimeSnapshotter>,
     ) -> Result<Vec<PendingEvent>, WatchError> {
         if paths.is_empty() {
             return Ok(Vec::new());
@@ -585,14 +518,7 @@ impl Snapshot {
                     .map(|record| (path, record))
             })
             .collect::<BTreeMap<_, _>>();
-        let mut events = record_events(&before, &after);
-
-        if let Some(snapshotter) = runtime {
-            let previous = self.runtime.clone();
-            self.runtime = Some(load_runtime_state(&collection, snapshotter));
-            events.extend(runtime_events(previous.as_ref(), self.runtime.as_ref()));
-        }
-        Ok(events)
+        Ok(record_events(&before, &after))
     }
 
     fn diff(&self, next: &Self) -> Vec<PendingEvent> {
@@ -629,7 +555,6 @@ impl Snapshot {
 
         events.extend(record_events(&self.records, &next.records));
 
-        events.extend(runtime_events(self.runtime.as_ref(), next.runtime.as_ref()));
         events
     }
 }
@@ -726,29 +651,6 @@ fn record_events(
     events
 }
 
-fn runtime_events(
-    previous: Option<&RuntimeRegistryState>,
-    current: Option<&RuntimeRegistryState>,
-) -> Vec<PendingEvent> {
-    if previous == current {
-        return Vec::new();
-    }
-    current
-        .map(|current| {
-            vec![PendingEvent::new(
-                "mdbase.runtime.registry.changed",
-                json!({
-                    "identity": "effective_registry",
-                    "previous_revision": previous.map(|state| &state.revision),
-                    "revision": current.revision,
-                    "valid": current.valid,
-                    "diagnostic_codes": current.diagnostic_codes,
-                }),
-            )]
-        })
-        .unwrap_or_default()
-}
-
 fn load_record(collection: &Collection, path: &str) -> Result<Option<RecordState>, WatchError> {
     if collection.is_excluded(path) || !collection.is_valid_extension(path) {
         return Ok(None);
@@ -788,31 +690,6 @@ fn is_invalid_yaml_frontmatter(read: &Value) -> bool {
     read.pointer("/error/code").and_then(Value::as_str) == Some(crate::errors::INVALID_FRONTMATTER)
         && read.pointer("/error/message").and_then(Value::as_str)
             == Some("Failed to parse YAML frontmatter")
-}
-
-fn load_runtime_state(
-    collection: &Collection,
-    snapshotter: &RuntimeSnapshotter,
-) -> RuntimeRegistryState {
-    let loaded = snapshotter.engine.load(
-        collection,
-        snapshotter.implicit_sources.clone(),
-        &snapshotter.options,
-    );
-    let mut diagnostic_codes = loaded
-        .registry
-        .diagnostics
-        .iter()
-        .chain(loaded.preflight.diagnostics.iter())
-        .map(|diagnostic| diagnostic.code.clone())
-        .collect::<Vec<_>>();
-    diagnostic_codes.sort();
-    diagnostic_codes.dedup();
-    RuntimeRegistryState {
-        revision: loaded.registry.revision(),
-        valid: loaded.valid(),
-        diagnostic_codes,
-    }
 }
 
 struct PendingEvent {

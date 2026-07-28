@@ -446,32 +446,3 @@ fn observer_reports_performance_when_provider_execution_fails_early() {
     assert_eq!(errors[0].code, error.code());
     assert!(errors[0].message.is_none());
 }
-
-#[test]
-fn provider_loads_runtime_contracts_inside_its_authority_gate() {
-    let directory = collection();
-    fs::write(
-        directory.path().join("event.md"),
-        concat!(
-            "---\ntype: event\nid: test.event\nversion: 1\n",
-            "provider: test\nname: Test\nschemas:\n",
-            "  dialect: json-schema-2020-12\n  payload:\n    type: object\n---\n"
-        ),
-    )
-    .unwrap();
-    let observer = Arc::new(RecordingObserver::default());
-    let provider = FilesystemProvider::open_observed(
-        directory.path(),
-        observer.clone(),
-        ObserverOptions::default(),
-    )
-    .unwrap();
-
-    let loaded = provider
-        .load_runtime_contracts(vec![], &crate::runtime_contracts::LoadOptions::default())
-        .unwrap();
-    assert!(loaded.registry.events.contains_key("test.event"));
-    let performance = observer.performance.lock().unwrap();
-    assert_eq!(performance.len(), 1);
-    assert_eq!(performance[0].operation, "runtime_contracts.load");
-}

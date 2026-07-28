@@ -158,14 +158,6 @@ fn symlinks_cannot_escape_the_collection_boundary() {
         .unwrap()
         .contains("never-return-this"));
 
-    let runtime = mdbase::runtime_contracts::RuntimeContracts::new().unwrap();
-    let loaded = runtime.load(
-        &collection,
-        vec![],
-        &mdbase::runtime_contracts::LoadOptions::default(),
-    );
-    assert!(loaded.contracts.records.is_empty());
-
     let resolved = collection.resolve_link(&serde_json::json!({
         "path": "link.md",
         "field": "target"
