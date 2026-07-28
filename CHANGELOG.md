@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Breaking
+- Removed the standalone `mdb` and `mdb-profile` binaries. The final native
+  executable is now the unified `mdbase` binary assembled by mdbase Connect.
+- Removed the separately installed `mdb-fzf` helper; specialized interactive
+  presentation is not a second core CLI surface.
+
+### Added
+- Added the transport-neutral `mdbase-command` crate for canonical CLI
+  parsing, direct/daemon operation mapping, Watch-profile streaming, and
+  deterministic engine profiling.
+- Added canonical list/create/read/update type-resource commands and public
+  wire encoders for query and batch requests.
+- Exposed the embedded engine version for unified release diagnostics.
+
+### Tests
+- Moved CLI lifecycle and security regressions onto the command adapter and
+  added direct-versus-daemon parity coverage in the final executable.
+
 ## 0.4.0-rc.1 - 2026-07-26
 
 ### Breaking

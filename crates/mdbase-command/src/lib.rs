@@ -1,7 +1,3 @@
-use std::io::IsTerminal;
-use std::path::PathBuf;
-use std::process;
-
 use clap::{Parser, Subcommand};
 use mdbase::api::{
     BatchOperation, BatchRequest, CollectionPath, CreateRequest, DeleteRequest, MdbaseError,
@@ -10,25 +6,39 @@ use mdbase::api::{
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
 
-/// mdbase - a markdown-based data store
-#[derive(Parser)]
-#[command(name = "mdbase", version, about)]
-struct Cli {
-    /// Root directory of the collection (defaults to current directory)
-    #[arg(short = 'C', long = "root", global = true)]
-    root: Option<PathBuf>,
+pub mod profile;
 
-    /// Pretty-print JSON output
-    #[arg(long, global = true)]
-    pretty: bool,
+/// Version of the transport-neutral command adapter embedded by a host.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    #[command(subcommand)]
-    command: Command,
+/// Version of the mdbase collection engine linked into the final executable.
+pub const fn engine_version() -> &'static str {
+    mdbase::VERSION
 }
 
-#[derive(Subcommand)]
-enum Command {
+/// Standalone parser for the data-plane command surface. The unified binary
+/// flattens [`Command`] beside its Connect and profiling namespaces.
+#[derive(Debug, Parser)]
+#[command(name = "mdbase", about = "Work with mdbase collections")]
+pub struct DirectArgs {
+    /// Root directory of the collection (defaults to the current directory).
+    #[arg(short = 'C', long = "root", global = true)]
+    pub root: Option<PathBuf>,
+
+    /// Pretty-print the portable JSON result.
+    #[arg(long, global = true)]
+    pub pretty: bool,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Collection data and maintenance commands shared by every mdbase transport.
+#[derive(Clone, Debug, Subcommand)]
+pub enum Command {
     /// Initialize a new collection
     Init {
         /// Config YAML string to write into mdbase.yaml
@@ -182,6 +192,12 @@ enum Command {
         action: ViewAction,
     },
 
+    /// Inspect and manage canonical type definition resources.
+    Types {
+        #[command(subcommand)]
+        action: TypeAction,
+    },
+
     /// Validate a file or the entire collection
     Validate {
         /// File path (omit for collection-wide validation)
@@ -246,10 +262,44 @@ enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
+
+    /// Stream portable filesystem change events as JSON lines.
+    Watch {
+        /// Debounce window for atomic-save event bursts.
+        #[arg(long, default_value_t = 150)]
+        debounce_ms: u64,
+        /// Stop after this many events; omit to continue until interrupted.
+        #[arg(long)]
+        count: Option<usize>,
+    },
 }
 
-#[derive(Subcommand)]
-enum CacheAction {
+impl Command {
+    /// Stable payload-free command label used by CLI performance telemetry.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Init { .. } => "init",
+            Self::Read { .. } => "read",
+            Self::Create { .. } => "create",
+            Self::Update { .. } => "update",
+            Self::Delete { .. } => "delete",
+            Self::Rename { .. } => "rename",
+            Self::Query { .. } => "query",
+            Self::Batch { .. } => "batch",
+            Self::Views { .. } => "views",
+            Self::Types { .. } => "types",
+            Self::Validate { .. } => "validate",
+            Self::Backfill { .. } => "backfill",
+            Self::Migrate { .. } => "migrate",
+            Self::MigrateV02 { .. } => "migrate_v02",
+            Self::Cache { .. } => "cache",
+            Self::Watch { .. } => "watch",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum CacheAction {
     /// Show cache status
     Status,
     /// Rebuild the cache
@@ -258,8 +308,8 @@ enum CacheAction {
     Clear,
 }
 
-#[derive(Subcommand)]
-enum ViewAction {
+#[derive(Clone, Debug, Subcommand)]
+pub enum ViewAction {
     /// List saved views from every enabled source
     List,
     /// Execute one named saved view
@@ -279,6 +329,339 @@ enum ViewAction {
     },
 }
 
+#[derive(Clone, Debug, Subcommand)]
+pub enum TypeAction {
+    /// List the collection's canonical type resources.
+    List,
+    /// Read a complete type definition and its revision.
+    Show { name: String },
+    /// Create a type definition from a complete Markdown document.
+    Create {
+        /// Markdown document file (`-` for stdin).
+        #[arg(long, default_value = "-")]
+        document: String,
+        /// Optional path inside the configured types folder.
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Replace a complete type definition.
+    Update {
+        name: String,
+        /// Markdown document file (`-` for stdin).
+        #[arg(long, default_value = "-")]
+        document: String,
+        /// Require the current opaque revision.
+        #[arg(long)]
+        if_revision: Option<String>,
+    },
+}
+
+/// A canonical operation that can be executed by either the filesystem engine
+/// or the local Connect authority.
+#[derive(Debug)]
+pub struct PortableInvocation {
+    pub operation: &'static str,
+    pub input: serde_json::Value,
+}
+
+/// Convert a data command into the portable operation envelope used by
+/// Connect. Filesystem-only maintenance commands return a stable diagnostic.
+pub fn into_portable(command: Command) -> Result<PortableInvocation, CommandResult> {
+    use serde_json::{json, Map, Value};
+
+    let invocation = match command {
+        Command::Read { path } => PortableInvocation {
+            operation: "read",
+            input: json!({"path": normalized_path(path).map_err(command_error)?}),
+        },
+        Command::Create {
+            path,
+            file_type,
+            fields,
+            if_revision,
+            dry_run,
+        } => {
+            let frontmatter = parse_fields_or_stdin(fields.as_deref()).map_err(command_error)?;
+            let mut input = Map::new();
+            insert_option(
+                &mut input,
+                "path",
+                path.map(normalized_path)
+                    .transpose()
+                    .map_err(command_error)?,
+            );
+            insert_option(&mut input, "type", file_type);
+            insert_option(&mut input, "if_revision", if_revision);
+            input.insert("frontmatter".to_string(), frontmatter);
+            if dry_run {
+                PortableInvocation {
+                    operation: "batch",
+                    input: json!({
+                        "operations": [{"kind": "create", "input": Value::Object(input)}],
+                        "allow_partial": false,
+                        "dry_run": true,
+                    }),
+                }
+            } else {
+                PortableInvocation {
+                    operation: "create",
+                    input: Value::Object(input),
+                }
+            }
+        }
+        Command::Update {
+            path,
+            fields,
+            if_revision,
+            dry_run,
+        } => {
+            let patch = parse_fields_or_stdin(fields.as_deref()).map_err(command_error)?;
+            let mut input = Map::from_iter([
+                (
+                    "path".to_string(),
+                    Value::String(normalized_path(path).map_err(command_error)?),
+                ),
+                ("patch".to_string(), patch),
+            ]);
+            insert_option(&mut input, "if_revision", if_revision);
+            if dry_run {
+                PortableInvocation {
+                    operation: "batch",
+                    input: json!({
+                        "operations": [{"kind": "update", "input": Value::Object(input)}],
+                        "allow_partial": false,
+                        "dry_run": true,
+                    }),
+                }
+            } else {
+                PortableInvocation {
+                    operation: "update",
+                    input: Value::Object(input),
+                }
+            }
+        }
+        Command::Delete {
+            path,
+            check_backlinks,
+            if_revision,
+            dry_run,
+        } => {
+            let mut input = Map::from_iter([
+                (
+                    "path".to_string(),
+                    Value::String(normalized_path(path).map_err(command_error)?),
+                ),
+                ("check_backlinks".to_string(), Value::Bool(check_backlinks)),
+                ("dry_run".to_string(), Value::Bool(dry_run)),
+            ]);
+            insert_option(&mut input, "if_revision", if_revision);
+            PortableInvocation {
+                operation: "delete",
+                input: Value::Object(input),
+            }
+        }
+        Command::Rename {
+            from,
+            to,
+            update_refs,
+            no_update_refs,
+            if_revision,
+            dry_run,
+        } => {
+            let mut input = Map::from_iter([
+                (
+                    "from".to_string(),
+                    Value::String(normalized_path(from).map_err(command_error)?),
+                ),
+                (
+                    "to".to_string(),
+                    Value::String(normalized_path(to).map_err(command_error)?),
+                ),
+                (
+                    "update_refs".to_string(),
+                    Value::Bool(update_refs || !no_update_refs),
+                ),
+                ("dry_run".to_string(), Value::Bool(dry_run)),
+            ]);
+            insert_option(&mut input, "if_revision", if_revision);
+            PortableInvocation {
+                operation: "rename",
+                input: Value::Object(input),
+            }
+        }
+        Command::Query {
+            request,
+            types,
+            where_clause,
+            folder,
+            order_by,
+            limit,
+            offset,
+            include_body,
+        } => PortableInvocation {
+            operation: "query",
+            input: portable_query(
+                request.as_deref(),
+                types,
+                where_clause,
+                folder,
+                order_by,
+                limit,
+                offset,
+                include_body,
+            )
+            .map_err(command_error)?,
+        },
+        Command::Batch { request } => PortableInvocation {
+            operation: "batch",
+            input: parse_json_input::<BatchRequest>(&request)
+                .map_err(command_error)?
+                .to_wire(),
+        },
+        Command::Views { action } => match action {
+            ViewAction::List => PortableInvocation {
+                operation: "list_views",
+                input: json!({}),
+            },
+            ViewAction::Execute {
+                path,
+                view_id,
+                context,
+                limit,
+                offset,
+            } => {
+                let mut input = Map::from_iter([
+                    (
+                        "path".to_string(),
+                        Value::String(normalized_path(path).map_err(command_error)?),
+                    ),
+                    ("view".to_string(), Value::String(view_id)),
+                ]);
+                if let Some(context) = context {
+                    input.insert(
+                        "context".to_string(),
+                        json!({"path": normalized_path(context).map_err(command_error)?}),
+                    );
+                }
+                if let Some(limit) = limit {
+                    input.insert("limit".to_string(), json!(limit));
+                }
+                if let Some(offset) = offset {
+                    input.insert("offset".to_string(), json!(offset));
+                }
+                PortableInvocation {
+                    operation: "execute_view",
+                    input: Value::Object(input),
+                }
+            }
+        },
+        Command::Types { action } => match action {
+            TypeAction::List => PortableInvocation {
+                operation: "list_types",
+                input: json!({}),
+            },
+            TypeAction::Show { name } => PortableInvocation {
+                operation: "read_type",
+                input: json!({"name": name}),
+            },
+            TypeAction::Create { document, path } => {
+                let document = read_text_input(&document).map_err(command_error)?;
+                let mut input = Map::from_iter([("document".to_string(), Value::String(document))]);
+                insert_option(
+                    &mut input,
+                    "path",
+                    path.map(normalized_path)
+                        .transpose()
+                        .map_err(command_error)?,
+                );
+                PortableInvocation {
+                    operation: "create_type",
+                    input: Value::Object(input),
+                }
+            }
+            TypeAction::Update {
+                name,
+                document,
+                if_revision,
+            } => {
+                let document = read_text_input(&document).map_err(command_error)?;
+                let mut input = Map::from_iter([
+                    ("name".to_string(), Value::String(name)),
+                    ("document".to_string(), Value::String(document)),
+                ]);
+                insert_option(&mut input, "if_revision", if_revision);
+                PortableInvocation {
+                    operation: "update_type",
+                    input: Value::Object(input),
+                }
+            }
+        },
+        Command::Validate { path } => PortableInvocation {
+            operation: "validate",
+            input: path
+                .map(normalized_path)
+                .transpose()
+                .map_err(command_error)?
+                .map_or_else(|| json!({}), |path| json!({"path": path})),
+        },
+        Command::Init { .. }
+        | Command::Backfill { .. }
+        | Command::Migrate { .. }
+        | Command::MigrateV02 { .. }
+        | Command::Cache { .. }
+        | Command::Watch { .. } => {
+            return Err(CommandResult::diagnostic(
+                json!({
+                    "valid": false,
+                    "result": {},
+                    "diagnostics": [{
+                        "severity": "error",
+                        "code": "unsupported_target",
+                        "message": "This command requires direct filesystem access; use --root.",
+                    }]
+                }),
+                EXIT_GENERAL_ERROR,
+            ));
+        }
+    };
+    Ok(invocation)
+}
+
+fn is_portable(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Read { .. }
+            | Command::Create { .. }
+            | Command::Update { .. }
+            | Command::Delete { .. }
+            | Command::Rename { .. }
+            | Command::Query { .. }
+            | Command::Batch { .. }
+            | Command::Views { .. }
+            | Command::Types { .. }
+            | Command::Validate { .. }
+    )
+}
+
+fn insert_option(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<String>,
+) {
+    if let Some(value) = value {
+        map.insert(key.to_string(), serde_json::Value::String(value));
+    }
+}
+
+fn normalized_path(path: String) -> MdbaseResult<String> {
+    Ok(CollectionPath::new(path)?.to_string())
+}
+
+fn command_error(error: MdbaseError) -> CommandResult {
+    let (value, exit_code) = typed_error_result(error);
+    CommandResult::diagnostic(value, exit_code)
+}
+
 // Exit codes per spec Appendix C.9
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_GENERAL_ERROR: i32 = 1;
@@ -288,65 +671,156 @@ const EXIT_NOT_FOUND: i32 = 4;
 #[allow(dead_code)]
 const EXIT_PERMISSION_DENIED: i32 = 5;
 
-fn main() {
-    let cli = Cli::parse();
+/// Result of executing one data command.
+#[derive(Debug)]
+pub struct CommandResult {
+    pub value: serde_json::Value,
+    pub exit_code: i32,
+    pub diagnostic: bool,
+}
 
-    let root = cli
-        .root
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-    let is_tty = atty_check();
-    let pretty = cli.pretty || is_tty;
-
-    if let Command::Init {
-        config,
-        config_file,
-    } = cli.command
-    {
-        let config_value = match (config, config_file) {
-            (Some(c), None) => Some(c),
-            (None, Some(path)) => match std::fs::read_to_string(&path) {
-                Ok(content) => Some(content),
-                Err(e) => {
-                    let err = serde_json::json!({
-                        "error": {
-                            "code": "invalid_path",
-                            "message": format!("Failed to read --config-file '{}': {}", path, e),
-                        }
-                    });
-                    output_json(&err, pretty);
-                    process::exit(EXIT_GENERAL_ERROR);
-                }
-            },
-            (None, None) => None,
-            (Some(_), Some(_)) => unreachable!(),
-        };
-
-        let mut input = serde_json::Map::new();
-        if let Some(cfg) = config_value {
-            input.insert("config".to_string(), serde_json::Value::String(cfg));
+impl CommandResult {
+    fn output(value: serde_json::Value, exit_code: i32) -> Self {
+        Self {
+            value,
+            exit_code,
+            diagnostic: false,
         }
-        let result = mdbase::init::init_collection(&root, &serde_json::Value::Object(input));
-        let exit_code = if result.get("error").is_some() {
-            error_to_exit_code(&result)
-        } else {
-            EXIT_SUCCESS
-        };
-        output_json(&result, pretty);
-        process::exit(exit_code);
     }
 
-    let collection = match mdbase::Collection::open(&root) {
+    fn diagnostic(value: serde_json::Value, exit_code: i32) -> Self {
+        Self {
+            value,
+            exit_code,
+            diagnostic: true,
+        }
+    }
+}
+
+/// Execute a command against a filesystem collection without terminating the
+/// host process. The unified CLI owns final rendering and process exit.
+pub fn execute_direct(root: &std::path::Path, command: Command) -> CommandResult {
+    let command = match command {
+        Command::Init {
+            config,
+            config_file,
+        } => {
+            let config_value = match (config, config_file) {
+                (Some(c), None) => Some(c),
+                (None, Some(path)) => match std::fs::read_to_string(&path) {
+                    Ok(content) => Some(content),
+                    Err(e) => {
+                        return CommandResult::diagnostic(
+                            serde_json::json!({
+                                "error": {
+                                    "code": "invalid_path",
+                                    "message": format!(
+                                        "Failed to read --config-file '{}': {}",
+                                        path, e
+                                    ),
+                                }
+                            }),
+                            EXIT_GENERAL_ERROR,
+                        );
+                    }
+                },
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!(),
+            };
+
+            let mut input = serde_json::Map::new();
+            if let Some(cfg) = config_value {
+                input.insert("config".to_string(), serde_json::Value::String(cfg));
+            }
+            let result = mdbase::init::init_collection(root, &serde_json::Value::Object(input));
+            let exit_code = if result.get("error").is_some() {
+                error_to_exit_code(&result)
+            } else {
+                EXIT_SUCCESS
+            };
+            return CommandResult::output(result, exit_code);
+        }
+        command => command,
+    };
+
+    let collection = match mdbase::Collection::open(root) {
         Ok(c) => c,
         Err(e) => {
-            output_json_stderr(&e);
-            process::exit(EXIT_CONFIG_ERROR);
+            return CommandResult::diagnostic(e, EXIT_CONFIG_ERROR);
         }
     };
 
-    let (result, exit_code) = execute_command(&collection, cli.command);
-    output_json(&result, pretty);
-    process::exit(exit_code);
+    if collection.spec_profile() == mdbase::SpecProfile::V03 && is_portable(&command) {
+        let invocation = match into_portable(command.clone()) {
+            Ok(invocation) => invocation,
+            Err(result) => return result,
+        };
+        let operations = match collection.v03_operations() {
+            Ok(operations) => operations,
+            Err(diagnostic) => {
+                let value = serde_json::json!({
+                    "valid": false,
+                    "result": {},
+                    "diagnostics": [*diagnostic],
+                });
+                return CommandResult::output(value, EXIT_GENERAL_ERROR);
+            }
+        };
+        let result = match invocation.operation {
+            "read" => operations.read(&invocation.input),
+            "query" => operations.query(&invocation.input),
+            "list_views" => operations.list_views(&invocation.input),
+            "execute_view" => operations.execute_view(&invocation.input),
+            "list_types" => operations.list_types(&invocation.input),
+            "read_type" => operations.read_type(&invocation.input),
+            "create_type" => operations.create_type(&invocation.input),
+            "update_type" => operations.update_type(&invocation.input),
+            "validate" => operations.validate(&invocation.input),
+            "batch" => operations.batch(&invocation.input),
+            "create" => operations.create(&invocation.input),
+            "update" => operations.update(&invocation.input),
+            "delete" => operations.delete(&invocation.input),
+            "rename" => operations.rename(&invocation.input),
+            operation => {
+                let value = serde_json::json!({
+                    "valid": false,
+                    "result": {},
+                    "diagnostics": [{
+                        "severity": "error",
+                        "code": "unsupported_operation",
+                        "message": format!("Unsupported portable operation '{operation}'."),
+                    }],
+                });
+                return CommandResult::output(value, EXIT_GENERAL_ERROR);
+            }
+        };
+        let value = serde_json::to_value(result)
+            .expect("the canonical portable operation result must serialize");
+        let exit_code = portable_exit_code(&value);
+        return CommandResult::output(value, exit_code);
+    }
+
+    let (value, exit_code) = execute_command(&collection, command);
+    CommandResult::output(value, exit_code)
+}
+
+pub fn execute_args(args: DirectArgs) -> CommandResult {
+    let root = args
+        .root
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    execute_direct(&root, args.command)
+}
+
+/// Derive the stable CLI exit status from a portable operation result.
+pub fn portable_exit_code(value: &serde_json::Value) -> i32 {
+    if value.get("valid").and_then(serde_json::Value::as_bool) != Some(false) {
+        return EXIT_SUCCESS;
+    }
+    value
+        .pointer("/diagnostics/0/code")
+        .and_then(serde_json::Value::as_str)
+        .map(diagnostic_code_to_exit)
+        .unwrap_or(EXIT_GENERAL_ERROR)
 }
 
 fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_json::Value, i32) {
@@ -376,7 +850,10 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             if_revision,
             dry_run,
         } => {
-            let fields_value = parse_fields_or_stdin(fields.as_deref());
+            let fields_value = match parse_fields_or_stdin(fields.as_deref()) {
+                Ok(value) => value,
+                Err(error) => return typed_error_result(error),
+            };
             let request: MdbaseResult<CreateRequest> = (|| {
                 let mut request = match path {
                     Some(path) => CreateRequest::new(CollectionPath::new(path)?)
@@ -406,7 +883,10 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             if_revision,
             dry_run,
         } => {
-            let fields_value = parse_fields_or_stdin(fields.as_deref());
+            let fields_value = match parse_fields_or_stdin(fields.as_deref()) {
+                Ok(value) => value,
+                Err(error) => return typed_error_result(error),
+            };
             let request: MdbaseResult<UpdateRequest> = (|| {
                 let mut request = UpdateRequest::new(CollectionPath::new(path)?, fields_value);
                 request.if_revision = parse_optional_revision(if_revision)?;
@@ -592,6 +1072,10 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             )
         }
 
+        Command::Types { .. } => {
+            typed_error_result(MdbaseError::MigrationRequired { operation: "types" })
+        }
+
         Command::Validate { path } => {
             let input = if let Some(p) = path {
                 serde_json::json!({ "path": p })
@@ -748,6 +1232,50 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
             };
             (result, exit)
         }
+
+        Command::Watch { .. } => {
+            let result = serde_json::json!({
+                "valid": false,
+                "result": {},
+                "diagnostics": [{
+                    "severity": "error",
+                    "code": "streaming_command_required",
+                    "message": "Watch must be run by a streaming CLI host.",
+                }],
+            });
+            (result, EXIT_GENERAL_ERROR)
+        }
+    }
+}
+
+/// Stream payload-bearing collection events intentionally requested by the
+/// local operator. Performance telemetry remains separate and payload-free.
+pub fn run_watch(
+    root: &std::path::Path,
+    debounce_ms: u64,
+    count: Option<usize>,
+) -> Result<(), String> {
+    if debounce_ms == 0 {
+        return Err("--debounce-ms must be greater than zero".to_string());
+    }
+    if count == Some(0) {
+        return Err("--count must be greater than zero".to_string());
+    }
+    let watcher =
+        mdbase::watch::CollectionWatcher::open(root, std::time::Duration::from_millis(debounce_ms))
+            .map_err(|error| error.to_string())?;
+    let mut emitted = 0usize;
+    loop {
+        let event = watcher.recv_portable().map_err(|error| error.to_string())?;
+        let rendered = serde_json::to_string(&event).map_err(|error| error.to_string())?;
+        println!("{rendered}");
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        emitted += 1;
+        if count.is_some_and(|count| emitted >= count) {
+            return Ok(());
+        }
     }
 }
 
@@ -845,6 +1373,85 @@ fn parse_json_input<T: DeserializeOwned>(source: &str) -> MdbaseResult<T> {
     })
 }
 
+fn read_text_input(source: &str) -> MdbaseResult<String> {
+    if source == "-" {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).map_err(|error| {
+            MdbaseError::InvalidRequest {
+                message: format!("could not read document from stdin: {error}"),
+            }
+        })?;
+        return Ok(input);
+    }
+    std::fs::read_to_string(source).map_err(|error| MdbaseError::InvalidRequest {
+        message: format!("could not read document '{source}': {error}"),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn portable_query(
+    request_file: Option<&str>,
+    types: Option<String>,
+    where_clause: Option<String>,
+    folder: Option<String>,
+    order_by: Option<String>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    include_body: bool,
+) -> MdbaseResult<serde_json::Value> {
+    let request = if let Some(request_file) = request_file {
+        parse_json_input::<QueryRequest>(request_file)?
+    } else {
+        let mut request = QueryRequest::builder();
+        if let Some(types) = types {
+            for type_name in types
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                request = request.type_name(type_name);
+            }
+        }
+        let mut expression = where_clause;
+        if let Some(folder) = folder {
+            let folder = folder.trim_end_matches(['/', '\\']).replace('\\', "/");
+            let quoted = serde_json::to_string(&folder).expect("string serializes");
+            let child = serde_json::to_string(&format!("{folder}/")).expect("string serializes");
+            let folder_expression =
+                format!("(file.folder == {quoted} || file.folder.startsWith({child}))");
+            expression = Some(match expression {
+                Some(existing) => format!("({existing}) && {folder_expression}"),
+                None => folder_expression,
+            });
+        }
+        if let Some(expression) = expression {
+            request = request.where_expression(expression);
+        }
+        if let Some(order_by) = order_by {
+            for field in order_by
+                .split(',')
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+            {
+                let (field, direction) = match field.strip_prefix('-') {
+                    Some(field) => (field, QueryDirection::Desc),
+                    None => (field, QueryDirection::Asc),
+                };
+                request = request.order_by(field, direction);
+            }
+        }
+        if let Some(limit) = limit {
+            request = request.limit(limit);
+        }
+        if let Some(offset) = offset {
+            request = request.offset(offset);
+        }
+        request.include_body = include_body;
+        request
+    };
+    Ok(request.to_wire())
+}
+
 fn canonical_exit_code(result: &mdbase::v03::OperationResult) -> i32 {
     if result.valid {
         return EXIT_SUCCESS;
@@ -869,26 +1476,27 @@ fn diagnostic_code_to_exit(code: &str) -> i32 {
 }
 
 /// Parse fields from --fields argument or stdin.
-fn parse_fields_or_stdin(fields_arg: Option<&str>) -> serde_json::Value {
+fn parse_fields_or_stdin(fields_arg: Option<&str>) -> MdbaseResult<serde_json::Value> {
     if let Some(fields_str) = fields_arg {
-        serde_json::from_str(fields_str).unwrap_or_else(|e| {
-            eprintln!("Error parsing --fields JSON: {}", e);
-            process::exit(EXIT_GENERAL_ERROR);
+        serde_json::from_str(fields_str).map_err(|error| MdbaseError::InvalidRequest {
+            message: format!("could not parse --fields JSON: {error}"),
         })
     } else {
         // Try reading from stdin if not a TTY
         if !atty_check_stdin() {
             let mut input = String::new();
-            if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_ok()
-                && !input.trim().is_empty()
-            {
-                return serde_json::from_str(&input).unwrap_or_else(|e| {
-                    eprintln!("Error parsing stdin JSON: {}", e);
-                    process::exit(EXIT_GENERAL_ERROR);
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).map_err(|error| {
+                MdbaseError::InvalidRequest {
+                    message: format!("could not read fields JSON from stdin: {error}"),
+                }
+            })?;
+            if !input.trim().is_empty() {
+                return serde_json::from_str(&input).map_err(|error| MdbaseError::InvalidRequest {
+                    message: format!("could not parse stdin fields JSON: {error}"),
                 });
             }
         }
-        serde_json::json!({})
+        Ok(serde_json::json!({}))
     }
 }
 
@@ -909,28 +1517,6 @@ fn error_to_exit_code(result: &serde_json::Value) -> i32 {
         | "missing_parent_type" => EXIT_CONFIG_ERROR,
         _ => EXIT_GENERAL_ERROR,
     }
-}
-
-fn output_json(value: &serde_json::Value, pretty: bool) {
-    let output = if pretty {
-        serde_json::to_string_pretty(value)
-    } else {
-        serde_json::to_string(value)
-    };
-    if let Ok(s) = output {
-        println!("{}", s);
-    }
-}
-
-fn output_json_stderr(value: &serde_json::Value) {
-    if let Ok(s) = serde_json::to_string_pretty(value) {
-        eprintln!("{}", s);
-    }
-}
-
-/// Check if stdout is a TTY.
-fn atty_check() -> bool {
-    std::io::stdout().is_terminal()
 }
 
 /// Check if stdin is a TTY.

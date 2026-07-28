@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 #[cfg(unix)]
 use mdbase::Collection;
@@ -305,60 +304,6 @@ fn concurrent_renames_never_replace_the_winner() {
             "only the winning source should move"
         );
     }
-}
-
-#[test]
-fn cli_update_refs_flag_is_honored() {
-    let tmp = TempDir::new().expect("tempdir");
-    let root = tmp.path();
-    write_file(
-        &root.join("mdbase.yaml"),
-        "spec_version: 0.3.0\nsettings:\n  rename_update_refs: false\n",
-    );
-    write_file(&root.join("a.md"), "---\nid: a\n---\n");
-    write_file(&root.join("r.md"), "---\nref: \"[[a]]\"\n---\n");
-
-    let status = Command::new(env!("CARGO_BIN_EXE_mdb"))
-        .arg("-C")
-        .arg(root)
-        .arg("rename")
-        .arg("a.md")
-        .arg("b.md")
-        .arg("--update-refs")
-        .status()
-        .expect("run mdb rename");
-    assert!(status.success());
-
-    let ref_content = fs::read_to_string(root.join("r.md")).expect("read r.md");
-    assert!(
-        ref_content.contains("[[b]]"),
-        "reference not updated: {}",
-        ref_content
-    );
-}
-
-#[test]
-fn cli_cache_clear_uses_configured_cache_folder() {
-    let tmp = TempDir::new().expect("tempdir");
-    let root = tmp.path();
-    write_file(
-        &root.join("mdbase.yaml"),
-        "spec_version: 0.2.0\nsettings:\n  cache_folder: custom-cache\n",
-    );
-    write_file(&root.join("custom-cache/cache.db"), "x");
-
-    let status = Command::new(env!("CARGO_BIN_EXE_mdb"))
-        .arg("-C")
-        .arg(root)
-        .arg("cache")
-        .arg("clear")
-        .status()
-        .expect("run mdb cache clear");
-    assert!(status.success());
-    assert!(
-        !root.join("custom-cache/cache.db").exists(),
-        "custom cache db should be removed"
-    );
 }
 
 #[cfg(unix)]

@@ -3,7 +3,9 @@ set -euo pipefail
 
 profile_report="${MDBASE_BENCH_REPORT:-target/benchmarks/release.json}"
 
-cargo run --locked --release --bin mdb-profile -- \
+cargo run --locked --release \
+  --manifest-path ../mdbase-connect/Cargo.toml \
+  -p mdbase-cli -- profile engine \
   --scenario all \
   --files 5000 \
   --projects 80 \

@@ -56,19 +56,26 @@ then recover deterministically after interruption.
 See [the Rust API guide](docs/rust-api.md) and
 [the v0.2 migration guide](docs/migration-v02-to-v03.md).
 
-## CLI
+## Unified CLI integration
 
-`mdb init` creates a canonical v0.3 collection. CRUD/query commands use the
-same typed service as the Rust API and emit a consistent
-`{ valid, result, diagnostics }` JSON envelope.
+This repository intentionally does not publish a competing executable.
+`mdbase-command` is the transport-neutral command adapter used by the final
+`mdbase` executable in the adjacent `mdbase-connect` repository. It owns
+argument-to-operation mapping, canonical output envelopes, watch streaming,
+and deterministic engine workloads, but no daemon, service, or process
+lifecycle.
+
+The unified executable can open a filesystem root directly or send the same
+portable operation through Connect:
 
 ```bash
-mdb -C ./notes read tasks/example.md
-mdb -C ./notes update tasks/example.md \
+mdbase --root ./notes read tasks/example.md
+mdbase --root ./notes update tasks/example.md \
   --fields '{"status":"done"}' \
   --if-revision sha256:...
-mdb -C ./notes query --request query.json
-mdb -C ./notes batch --request batch.json
+mdbase --root ./notes query --request query.json
+mdbase --root ./notes batch --request batch.json
+mdbase --collection <uuid> query --request query.json
 ```
 
 Use `--dry-run` on mutations. Rename updates references by default; pass
@@ -125,8 +132,7 @@ path for fixture-driven watch tests.
 
 - Library crate: `mdbase`
 - Workflow crate: `mdbase-runtime` (Runtime profile 0.1)
-- CLI binary: `mdb` (`init`, CRUD/query/validate, `backfill`, `migrate`, cache)
-- Profiling binary: `mdb-profile` (synthetic workload profiler with JSON output)
+- Command adapter crate: `mdbase-command` (embedded by the unified CLI)
 
 ## Build
 
@@ -173,7 +179,7 @@ Profile metadata paging and the editor workload against an existing collection
 without mutating records (the report redacts the collection path):
 
 ```bash
-./scripts/profile.sh --collection /path/to/collection --editor-iters 3
+./scripts/profile.sh --root /path/to/collection --editor-iters 3
 ```
 
 Use `--scenario core` for CRUD, rename/reference updates, runtime startup, and
@@ -185,9 +191,11 @@ Set `MDBASE_WATCH_PROFILE=1` to print payload-free watcher invalidation mode,
 record counts, and refresh time. For CPU sampling with symbols:
 
 ```bash
-cargo build --profile profiling --bin mdb-profile
+cargo build --profile profiling \
+  --manifest-path ../mdbase-connect/Cargo.toml -p mdbase-cli
 perf record -g --call-graph dwarf -- \
-  target/profiling/mdb-profile --scenario queries --files 5000
+  ../mdbase-connect/target/profiling/mdbase profile engine \
+  --scenario queries --files 5000
 perf report
 ```
 

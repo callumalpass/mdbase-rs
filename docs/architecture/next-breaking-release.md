@@ -227,8 +227,8 @@ The canonical engine contains no `if v0.2` behavior branches.
 Migration supports dry-run and transactional apply:
 
 ```text
-mdb migrate-v02 --dry-run
-mdb migrate-v02
+mdbase migrate-v02 --dry-run
+mdbase migrate-v02
 ```
 
 It writes canonical v0.3 config/type wrappers, preserves a recovery manifest,

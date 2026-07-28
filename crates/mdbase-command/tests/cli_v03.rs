@@ -1,6 +1,7 @@
 use std::fs;
-use std::process::{Command, Output};
 
+use clap::Parser;
+use mdbase_command::{execute_args, DirectArgs};
 use serde_json::Value;
 
 fn cli_collection() -> tempfile::TempDir {
@@ -32,21 +33,15 @@ schema:
     root
 }
 
-fn run(root: &tempfile::TempDir, arguments: &[&str]) -> (Output, Value) {
-    let output = Command::new(env!("CARGO_BIN_EXE_mdb"))
-        .arg("-C")
-        .arg(root.path())
-        .args(arguments)
-        .output()
-        .unwrap();
-    let value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!(
-            "CLI output was not JSON: {error}\nstdout={}\nstderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    });
-    (output, value)
+fn run(root: &tempfile::TempDir, arguments: &[&str]) -> (i32, Value) {
+    let mut argv = vec![
+        "mdbase".to_string(),
+        "-C".to_string(),
+        root.path().to_string_lossy().into_owned(),
+    ];
+    argv.extend(arguments.iter().map(|argument| (*argument).to_string()));
+    let result = execute_args(DirectArgs::try_parse_from(argv).expect("valid command arguments"));
+    (result.exit_code, result.value)
 }
 
 #[test]
@@ -65,7 +60,7 @@ fn canonical_cli_runs_a_typed_record_lifecycle() {
             r#"{"title":"First"}"#,
         ],
     );
-    assert!(output.status.success(), "{created:#}");
+    assert_eq!(output, 0, "{created:#}");
     assert_eq!(created["valid"], true);
     assert_eq!(created["result"]["path"], "tasks/first.md");
     assert!(created["result"]["revision"]
@@ -81,7 +76,7 @@ fn canonical_cli_runs_a_typed_record_lifecycle() {
             r#"{"status":"done"}"#,
         ],
     );
-    assert!(output.status.success(), "{updated:#}");
+    assert_eq!(output, 0, "{updated:#}");
     assert_eq!(updated["valid"], true);
     assert_eq!(updated["result"]["frontmatter"]["status"], "done");
 
@@ -97,7 +92,7 @@ fn canonical_cli_runs_a_typed_record_lifecycle() {
             "status == 'done'",
         ],
     );
-    assert!(output.status.success(), "{queried:#}");
+    assert_eq!(output, 0, "{queried:#}");
     assert_eq!(queried["valid"], true);
     assert_eq!(queried["result"]["meta"]["total_count"], 1);
     assert_eq!(
@@ -114,17 +109,17 @@ fn canonical_cli_runs_a_typed_record_lifecycle() {
             "--update-refs",
         ],
     );
-    assert!(output.status.success(), "{renamed:#}");
+    assert_eq!(output, 0, "{renamed:#}");
     assert_eq!(renamed["valid"], true);
     assert_eq!(renamed["result"]["to"], "archive/first.md");
 
     let (output, deleted) = run(&root, &["delete", "archive/first.md"]);
-    assert!(output.status.success(), "{deleted:#}");
+    assert_eq!(output, 0, "{deleted:#}");
     assert_eq!(deleted["valid"], true);
     assert_eq!(deleted["result"]["deleted"], true);
 
     let (output, invalid) = run(&root, &["read", "../outside.md"]);
-    assert!(!output.status.success(), "{invalid:#}");
+    assert_ne!(output, 0, "{invalid:#}");
     assert_eq!(invalid["valid"], false);
     assert_eq!(invalid["diagnostics"][0]["code"], "invalid_path");
 }
@@ -158,7 +153,7 @@ fn canonical_cli_supports_revision_dry_run_and_typed_json_requests() {
             "--dry-run",
         ],
     );
-    assert!(output.status.success(), "{preview:#}");
+    assert_eq!(output, 0, "{preview:#}");
     assert!(!fs::read_to_string(root.path().join("tasks/base.md"))
         .unwrap()
         .contains("preview"));
@@ -189,7 +184,7 @@ fn canonical_cli_supports_revision_dry_run_and_typed_json_requests() {
     .unwrap();
     let batch_path = batch_path.to_string_lossy();
     let (output, batch) = run(&root, &["batch", "--request", &batch_path]);
-    assert!(output.status.success(), "{batch:#}");
+    assert_eq!(output, 0, "{batch:#}");
     assert_eq!(batch["result"]["succeeded"], 2);
     assert_eq!(batch["result"]["failed"], 0);
 
@@ -205,14 +200,14 @@ fn canonical_cli_supports_revision_dry_run_and_typed_json_requests() {
     .unwrap();
     let query_path = query_path.to_string_lossy();
     let (output, query) = run(&root, &["query", "--request", &query_path]);
-    assert!(output.status.success(), "{query:#}");
+    assert_eq!(output, 0, "{query:#}");
     assert_eq!(query["result"]["meta"]["total_count"], 2);
 
     let (output, stale) = run(
         &root,
         &["delete", "tasks/base.md", "--if-revision", "sha256:stale"],
     );
-    assert!(!output.status.success(), "{stale:#}");
+    assert_ne!(output, 0, "{stale:#}");
     assert_eq!(stale["diagnostics"][0]["code"], "concurrent_modification");
 }
 
@@ -230,7 +225,7 @@ fn legacy_cli_is_read_only_and_exposes_verified_migration() {
     fs::write(root.path().join("legacy.md"), record).unwrap();
 
     let (output, read) = run(&root, &["read", "legacy.md"]);
-    assert!(output.status.success(), "{read:#}");
+    assert_eq!(output, 0, "{read:#}");
     assert_eq!(read["valid"], true);
     assert_eq!(read["result"]["frontmatter"]["title"], "Legacy");
 
@@ -238,7 +233,7 @@ fn legacy_cli_is_read_only_and_exposes_verified_migration() {
         &root,
         &["update", "legacy.md", "--fields", r#"{"title":"Changed"}"#],
     );
-    assert!(!output.status.success(), "{rejected:#}");
+    assert_ne!(output, 0, "{rejected:#}");
     assert_eq!(rejected["diagnostics"][0]["code"], "migration_required");
     assert_eq!(
         fs::read_to_string(root.path().join("legacy.md")).unwrap(),
@@ -246,7 +241,7 @@ fn legacy_cli_is_read_only_and_exposes_verified_migration() {
     );
 
     let (output, plan) = run(&root, &["migrate-v02", "--dry-run"]);
-    assert!(output.status.success(), "{plan:#}");
+    assert_eq!(output, 0, "{plan:#}");
     assert_eq!(plan["result"]["applied"], false);
     assert_eq!(plan["result"]["verified_records"], 1);
     assert!(fs::read_to_string(root.path().join("mdbase.yaml"))
@@ -254,9 +249,43 @@ fn legacy_cli_is_read_only_and_exposes_verified_migration() {
         .contains("0.2.0"));
 
     let (output, applied) = run(&root, &["migrate-v02"]);
-    assert!(output.status.success(), "{applied:#}");
+    assert_eq!(output, 0, "{applied:#}");
     assert_eq!(applied["result"]["applied"], true);
     assert!(fs::read_to_string(root.path().join("mdbase.yaml"))
         .unwrap()
         .contains("0.3.0"));
+}
+
+#[test]
+fn update_refs_flag_overrides_the_collection_default() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("mdbase.yaml"),
+        "spec_version: 0.3.0\nsettings:\n  rename_update_refs: false\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("a.md"), "---\nid: a\n---\n").unwrap();
+    fs::write(root.path().join("r.md"), "---\nref: \"[[a]]\"\n---\n").unwrap();
+
+    let (status, result) = run(&root, &["rename", "a.md", "b.md", "--update-refs"]);
+    assert_eq!(status, 0, "{result:#}");
+    assert!(fs::read_to_string(root.path().join("r.md"))
+        .unwrap()
+        .contains("[[b]]"));
+}
+
+#[test]
+fn cache_clear_uses_the_configured_cache_folder() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("mdbase.yaml"),
+        "spec_version: 0.2.0\nsettings:\n  cache_folder: custom-cache\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("custom-cache")).unwrap();
+    fs::write(root.path().join("custom-cache/cache.db"), "x").unwrap();
+
+    let (status, result) = run(&root, &["cache", "clear"]);
+    assert_eq!(status, 0, "{result:#}");
+    assert!(!root.path().join("custom-cache/cache.db").exists());
 }

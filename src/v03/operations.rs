@@ -175,6 +175,28 @@ impl<'a> Operations<'a> {
         super::batch::execute(self.collection, input)
     }
 
+    pub fn list_types(&self, _input: &Value) -> OperationResult {
+        let mut types = self
+            .collection
+            .types()
+            .values()
+            .map(|definition| {
+                serde_json::json!({
+                    "name": definition.name,
+                    "path": definition.source_path,
+                    "version": definition.version,
+                    "description": definition.description,
+                })
+            })
+            .collect::<Vec<_>>();
+        types.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+        OperationResult {
+            valid: true,
+            result: serde_json::json!({"types": types}),
+            diagnostics: Vec::new(),
+        }
+    }
+
     pub fn read_type(&self, input: &Value) -> OperationResult {
         self.collection.read_type_file(input)
     }

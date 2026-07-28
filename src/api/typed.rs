@@ -555,7 +555,9 @@ impl BatchRequest {
         })
     }
 
-    fn into_wire(self) -> Value {
+    /// Encode the batch with absent nested optional fields omitted, matching
+    /// the canonical v0.3 operation wire contract.
+    pub fn to_wire(self) -> Value {
         json!({
             "operations": self
                 .operations
@@ -681,7 +683,9 @@ impl QueryRequest {
         self
     }
 
-    pub(crate) fn to_wire(&self) -> Value {
+    /// Encode the canonical portable query object used by providers and local
+    /// transports, omitting unset defaults that are invalid on the wire.
+    pub fn to_wire(&self) -> Value {
         let mut value = Map::new();
         if !self.types.is_empty() {
             value.insert("types".to_string(), json!(self.types));
@@ -973,7 +977,7 @@ impl<'a> TypedCollection<'a> {
     /// Execute typed mutations as one recoverable batch.
     pub fn batch(&self, request: BatchRequest) -> MdbaseResult<OperationOutcome<BatchResult>> {
         self.require_canonical("batch")?;
-        let input = request.into_wire();
+        let input = request.to_wire();
         self.execute(self.operations()?.batch(&input))
     }
 
