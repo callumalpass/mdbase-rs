@@ -3,12 +3,11 @@ status: verified
 implementation:
   id: mdbase-rs
   name: mdbase Rust implementation
-  version: 0.3.0-rc.1
+  version: 0.4.0-rc.2
   language: Rust
   target: crate
   url: https://github.com/callumalpass/mdbase-rs
 spec_version: 0.3.0
-runtime_profile_version: 0.1.0
 profiles:
   - core_read
   - collection_semantics
@@ -18,10 +17,8 @@ profiles:
   - links
   - core_write
   - lifecycle
-  - runtime_contracts/0.1
   - watch
 optional_features:
-  - runtime_contract_materialization
 json_schema:
   dialect: https://json-schema.org/draft/2020-12/schema
   keywords:
@@ -76,41 +73,27 @@ limits:
   cel_as_file_hops: 10
   cel_clock_scope: operation
   watch_debounce: host_configurable
-  runtime_execution: false
-  runtime_external_schema_refs: false
-  runtime_source_order:
-    - built_in
-    - provider_id
-    - pack_id
-    - collection_path
-  runtime_authorization: embedding_host_final_boundary
 evidence:
   - kind: conformance_suite
     command: MDBASE_REQUIRE_V03_CONFORMANCE=1 cargo test --test v03_conformance
     result: pass
-    verified_at: "2026-07-22T01:34:25+10:00"
+    verified_at: "2026-07-28T21:00:00+10:00"
     artifact: tests/v03_conformance.rs
     environment: Linux x86_64, Rust 1.94.0
   - kind: test_suite
     command: MDBASE_REQUIRE_V03_CONFORMANCE=1 cargo test --workspace --all-features
     result: pass
-    verified_at: "2026-07-22T01:34:25+10:00"
+    verified_at: "2026-07-28T21:00:00+10:00"
     artifact: tests/v03_*_profiles.rs and tests/v03_lifecycle.rs
-    environment: Linux x86_64, Rust 1.94.0
-  - kind: conformance_suite
-    command: cargo test --release --test v03_runtime_conformance --test v03_runtime_contracts --test v03_runtime_performance --all-features
-    result: pass
-    verified_at: "2026-07-22T01:20:56+10:00"
-    artifact: tests/v03_runtime_conformance.rs
     environment: Linux x86_64, Rust 1.94.0
   - kind: test_suite
     command: cargo clippy --workspace --all-targets --all-features -- -D warnings
     result: pass
-    verified_at: "2026-07-22T01:34:25+10:00"
+    verified_at: "2026-07-28T21:00:00+10:00"
     environment: Linux x86_64, Rust 1.94.0
   - kind: package_smoke
     command: cargo package --allow-dirty
     result: pass
-    verified_at: "2026-07-22T01:34:25+10:00"
-    artifact: target/package/mdbase-0.3.0-rc.1.crate
+    verified_at: "2026-07-28T21:00:00+10:00"
+    artifact: target/package/mdbase-0.4.0-rc.2.crate
     environment: Linux x86_64, Rust 1.94.0

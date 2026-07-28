@@ -139,7 +139,7 @@ fn provider_snapshot_includes_contract_and_schema_resources() {
     fs::create_dir(directory.path().join("_schemas")).unwrap();
     fs::write(
         directory.path().join("_contracts/task.md"),
-        "---\nkind: mdbase.contract\nid: example.task\nversion: 1.0.0\nschema:\n  dialect: json-schema-2020-12\n  ref: ../_schemas/task.json\n---\n",
+        "---\nkind: mdbase.contract\ncontract_type: record\nid: example.task\nversion: 1.0.0\nrecord_schema:\n  dialect: json-schema-2020-12\n  ref: ../_schemas/task.json\n---\n",
     )
     .unwrap();
     fs::write(

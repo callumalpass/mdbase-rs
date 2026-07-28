@@ -4,7 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## 0.4.0-rc.2 - 2026-07-28
+
 ### Breaking
+
+- Make `mdbase.contract` a discriminated `record`, `event`, or `action`
+  artifact and restrict type-file implementations to record contracts.
 - Removed the standalone `mdb` and `mdb-profile` binaries. The final native
   executable is now the unified `mdbase` binary assembled by mdbase Connect.
 - Removed the separately installed `mdb-fzf` helper; specialized interactive
@@ -17,6 +22,13 @@ All notable changes to this project are documented in this file.
 - Added canonical list/create/read/update type-resource commands and public
   wire encoders for query and batch requests.
 - Exposed the embedded engine version for unified release diagnostics.
+
+### Changed
+
+- Expose every contract kind through the core registry while retaining record
+  projection and binding semantics only for record contracts.
+- Withdraw the legacy Runtime Contracts conformance claim until the durable
+  runtime is rebuilt on the portable event/action interoperability profile.
 
 ### Tests
 - Moved CLI lifecycle and security regressions onto the command adapter and
