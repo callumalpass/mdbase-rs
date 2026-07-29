@@ -18,7 +18,11 @@ use crate::store::{
 };
 use crate::timer::{next_timer_generation, timer_matches};
 
-pub const SQLITE_SCHEMA_VERSION: u32 = 1;
+/// Version of the SQLite tables and every Rust value serialized into them.
+///
+/// Changing `RunRecord`, `TimerRecord`, or a stored event envelope incompatibly
+/// requires a new migration here even when the SQL columns do not change.
+pub const SQLITE_SCHEMA_VERSION: u32 = 2;
 const SQLITE_WORK_QUEUE_CAPACITY: usize = 64;
 
 type SqliteCommand = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
@@ -61,6 +65,7 @@ impl SqliteRuntimeStore {
             )
             .map_err(store_error)?;
         migrate(&mut connection)?;
+        validate_persisted_records(&connection)?;
 
         let (worker, mut receiver) = mpsc::channel::<SqliteCommand>(SQLITE_WORK_QUEUE_CAPACITY);
         thread::Builder::new()
@@ -106,12 +111,9 @@ fn migrate(connection: &mut Connection) -> RuntimeResult<()> {
             ),
         ));
     }
-    if installed == SQLITE_SCHEMA_VERSION {
-        return Ok(());
-    }
-
     let transaction = connection.transaction().map_err(store_error)?;
-    if installed == 0 {
+    let mut version = installed;
+    if version == 0 {
         transaction
             .execute_batch(
                 "
@@ -184,11 +186,76 @@ fn migrate(connection: &mut Connection) -> RuntimeResult<()> {
                 ",
             )
             .map_err(store_error)?;
+        version = 1;
+    }
+    if version == 1 {
+        // Runtime profile 0.2 made the persisted run and timer model
+        // incompatible with profile 0.1. The missing exact contract evidence
+        // cannot be reconstructed from old JSON, so this prerelease migration
+        // explicitly resets runtime-owned execution state.
+        transaction
+            .execute_batch(
+                "
+                DELETE FROM runtime_timers;
+                DELETE FROM runtime_runs;
+                DELETE FROM runtime_event_dedup;
+                DELETE FROM runtime_events;
+                DELETE FROM runtime_meta;
+                INSERT INTO runtime_meta(key, value) VALUES ('retained_after', 0);
+                ",
+            )
+            .map_err(store_error)?;
+        version = 2;
+    }
+    if version != SQLITE_SCHEMA_VERSION {
+        return Err(RuntimeError::Store(format!(
+            "SQLite runtime migration stopped at version {version}; expected {SQLITE_SCHEMA_VERSION}."
+        )));
     }
     transaction
         .pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)
         .map_err(store_error)?;
     transaction.commit().map_err(store_error)
+}
+
+fn validate_persisted_records(connection: &Connection) -> RuntimeResult<()> {
+    let mut runs = connection
+        .prepare("SELECT id, record_json FROM runtime_runs ORDER BY id")
+        .map_err(store_error)?;
+    let rows = runs
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(store_error)?;
+    for row in rows {
+        let (id, json) = row.map_err(store_error)?;
+        serde_json::from_str::<RunRecord>(&json).map_err(|error| {
+            RuntimeError::diagnostic(
+                "invalid_persisted_runtime_record",
+                format!("Runtime run {id} is incompatible with this build: {error}"),
+            )
+        })?;
+    }
+    drop(runs);
+
+    let mut timers = connection
+        .prepare("SELECT id, record_json FROM runtime_timers ORDER BY id")
+        .map_err(store_error)?;
+    let rows = timers
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(store_error)?;
+    for row in rows {
+        let (id, json) = row.map_err(store_error)?;
+        serde_json::from_str::<TimerRecord>(&json).map_err(|error| {
+            RuntimeError::diagnostic(
+                "invalid_persisted_runtime_record",
+                format!("Runtime timer {id} is incompatible with this build: {error}"),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[async_trait]

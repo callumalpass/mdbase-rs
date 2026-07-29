@@ -351,4 +351,88 @@ async fn postgres_store_preserves_dedupe_retention_timers_and_namespace_fencing(
         .unwrap()
         .unwrap();
     assert_eq!(claim.run.plan.id, "run-queue-older");
+
+    // Profile 0.1 persisted Rust values under schema version 1 even though
+    // profile 0.2 cannot deserialize them safely. The v2 migration makes the
+    // prerelease reset explicit and leaves the store immediately reusable.
+    sqlx::query("UPDATE mdbase_runtime_schema SET version = 1 WHERE singleton = TRUE")
+        .execute(first.pool())
+        .await
+        .unwrap();
+    PostgresRuntimeStore::prepare(first.pool()).await.unwrap();
+    assert_eq!(
+        first.schema_version().await.unwrap(),
+        POSTGRES_SCHEMA_VERSION
+    );
+    for table in [
+        "mdbase_runtime_events",
+        "mdbase_runtime_event_dedup",
+        "mdbase_runtime_runs",
+        "mdbase_runtime_timers",
+        "mdbase_runtime_meta",
+    ] {
+        let count = match table {
+            "mdbase_runtime_events" => {
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM mdbase_runtime_events")
+                    .fetch_one(first.pool())
+                    .await
+                    .unwrap()
+            }
+            "mdbase_runtime_event_dedup" => {
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM mdbase_runtime_event_dedup")
+                    .fetch_one(first.pool())
+                    .await
+                    .unwrap()
+            }
+            "mdbase_runtime_runs" => {
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM mdbase_runtime_runs")
+                    .fetch_one(first.pool())
+                    .await
+                    .unwrap()
+            }
+            "mdbase_runtime_timers" => {
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM mdbase_runtime_timers")
+                    .fetch_one(first.pool())
+                    .await
+                    .unwrap()
+            }
+            "mdbase_runtime_meta" => {
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM mdbase_runtime_meta")
+                    .fetch_one(first.pool())
+                    .await
+                    .unwrap()
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(count, 0, "{table} was not reset");
+    }
+    let reset_store =
+        PostgresRuntimeStore::new(first.pool().clone(), format!("test:{test_id}:after-v2"))
+            .await
+            .unwrap();
+    assert_eq!(
+        reset_store
+            .admit_event(prepared_event("event-after-v2"))
+            .await
+            .unwrap()
+            .cursor,
+        1
+    );
+    sqlx::query(
+        "INSERT INTO mdbase_runtime_timers
+            (namespace, id, generation, status, fire_at, record_json)
+         VALUES ($1, 'broken', 1, 'scheduled', now(), '{}'::jsonb)",
+    )
+    .bind(format!("test:{test_id}:invalid"))
+    .execute(first.pool())
+    .await
+    .unwrap();
+    let error = PostgresRuntimeStore::prepare(first.pool())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_persisted_runtime_record");
+    sqlx::query("DELETE FROM mdbase_runtime_timers WHERE id = 'broken'")
+        .execute(first.pool())
+        .await
+        .unwrap();
 }

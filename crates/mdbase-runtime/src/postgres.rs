@@ -16,7 +16,11 @@ use crate::store::{
 };
 use crate::timer::{next_timer_generation, timer_matches};
 
-pub const POSTGRES_SCHEMA_VERSION: u32 = 1;
+/// Version of the PostgreSQL tables and every Rust value serialized into them.
+///
+/// Changing `RunRecord`, `TimerRecord`, or a stored event envelope incompatibly
+/// requires a new migration here even when the SQL columns do not change.
+pub const POSTGRES_SCHEMA_VERSION: u32 = 2;
 const POSTGRES_MIGRATION_LOCK: i64 = 7_567_456_982_327_403_786;
 
 /// PostgreSQL runtime store scoped by an embedding-host authority namespace.
@@ -45,6 +49,16 @@ impl PostgresRuntimeStore {
         }
         migrate(&pool).await?;
         Ok(Self { pool, namespace })
+    }
+
+    /// Migrates and validates all persisted runtime state in a shared pool.
+    ///
+    /// Embedding hosts should call this once during startup, before reporting
+    /// readiness. `new` still performs the serialized migration, but does not
+    /// scan unrelated namespaces each time a namespace-scoped runtime is made.
+    pub async fn prepare(pool: &PgPool) -> RuntimeResult<()> {
+        migrate(pool).await?;
+        validate_persisted_records(pool).await
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -1065,13 +1079,10 @@ async fn migrate(pool: &PgPool) -> RuntimeResult<()> {
             ),
         ));
     }
-    if installed == POSTGRES_SCHEMA_VERSION {
-        transaction.commit().await.map_err(store_error)?;
-        return Ok(());
-    }
-
-    sqlx::raw_sql(
-        "
+    let mut version = installed;
+    if version == 0 {
+        sqlx::raw_sql(
+            "
         CREATE TABLE IF NOT EXISTS mdbase_runtime_meta (
             namespace text PRIMARY KEY,
             next_cursor bigint NOT NULL DEFAULT 0 CHECK (next_cursor >= 0),
@@ -1135,10 +1146,40 @@ async fn migrate(pool: &PgPool) -> RuntimeResult<()> {
         CREATE INDEX IF NOT EXISTS mdbase_runtime_timers_due
             ON mdbase_runtime_timers(namespace, status, fire_at);
         ",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(store_error)?;
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(store_error)?;
+        version = 1;
+    }
+    if version == 1 {
+        // Runtime profile 0.2 made the persisted run and timer model
+        // incompatible with profile 0.1 (including exact string versions and
+        // implementation identities). Those values cannot be reconstructed
+        // safely from the old JSON. This prerelease boundary deliberately
+        // discards the runtime-owned execution journal; embedding-host source
+        // outboxes remain authoritative and can replay work that was not
+        // marked processed.
+        sqlx::raw_sql(
+            "
+            DELETE FROM mdbase_runtime_timers;
+            DELETE FROM mdbase_runtime_runs;
+            DELETE FROM mdbase_runtime_event_dedup;
+            DELETE FROM mdbase_runtime_events;
+            DELETE FROM mdbase_runtime_meta;
+            ",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(store_error)?;
+        version = 2;
+    }
+    if version != POSTGRES_SCHEMA_VERSION {
+        transaction.rollback().await.map_err(store_error)?;
+        return Err(RuntimeError::Store(format!(
+            "PostgreSQL runtime migration stopped at version {version}; expected {POSTGRES_SCHEMA_VERSION}."
+        )));
+    }
     sqlx::query(
         "INSERT INTO mdbase_runtime_schema(singleton, version)
          VALUES (TRUE, $1)
@@ -1149,6 +1190,40 @@ async fn migrate(pool: &PgPool) -> RuntimeResult<()> {
     .await
     .map_err(store_error)?;
     transaction.commit().await.map_err(store_error)
+}
+
+async fn validate_persisted_records(pool: &PgPool) -> RuntimeResult<()> {
+    for row in sqlx::query("SELECT namespace, id, record_json FROM mdbase_runtime_runs")
+        .fetch_all(pool)
+        .await
+        .map_err(store_error)?
+    {
+        let namespace: String = row.try_get("namespace").map_err(store_error)?;
+        let id: String = row.try_get("id").map_err(store_error)?;
+        let value: Value = row.try_get("record_json").map_err(store_error)?;
+        serde_json::from_value::<RunRecord>(value).map_err(|error| {
+            RuntimeError::diagnostic(
+                "invalid_persisted_runtime_record",
+                format!("Runtime run {namespace}/{id} is incompatible with this build: {error}"),
+            )
+        })?;
+    }
+    for row in sqlx::query("SELECT namespace, id, record_json FROM mdbase_runtime_timers")
+        .fetch_all(pool)
+        .await
+        .map_err(store_error)?
+    {
+        let namespace: String = row.try_get("namespace").map_err(store_error)?;
+        let id: String = row.try_get("id").map_err(store_error)?;
+        let value: Value = row.try_get("record_json").map_err(store_error)?;
+        serde_json::from_value::<TimerRecord>(value).map_err(|error| {
+            RuntimeError::diagnostic(
+                "invalid_persisted_runtime_record",
+                format!("Runtime timer {namespace}/{id} is incompatible with this build: {error}"),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn add_duration(now: DateTime<Utc>, duration: Duration) -> RuntimeResult<DateTime<Utc>> {
