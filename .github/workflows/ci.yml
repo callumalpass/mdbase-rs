@@ -13,7 +13,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  MDBASE_SPEC_REVISION: 88f4d64ff2d54df23631db9d03a95eba566b4eee
+  MDBASE_SPEC_REVISION: 9155a3d7b390da0c5b7d1928b95f89ad23b8fb2c
 
 jobs:
   quality:
@@ -51,11 +51,27 @@ jobs:
           path: mdbase-spec
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --workspace --all-features
         env:
           MDBASE_SPEC_REPO_DIR: ${{ github.workspace }}/mdbase-spec
           MDBASE_SPEC_TESTS_DIR: ${{ github.workspace }}/mdbase-spec/tests
+      - name: Install portable testbed runner
+        working-directory: mdbase-spec/packages/testbed
+        run: npm ci
+      - name: Run contract and durable runtime black-box scenarios
+        run: >-
+          node mdbase-spec/packages/testbed/src/cli.mjs run
+          --adapter command:cargo
+          --adapter-arg run
+          --adapter-arg --quiet
+          --adapter-arg -p
+          --adapter-arg mdbase-testbed-adapter
+          --adapter-arg --
+          --timeout-ms 120000
 
   postgres:
     name: Live PostgreSQL 17

@@ -1,0 +1,33 @@
+{
+  "kind": "mdbase.testbed.evidence",
+  "protocol_version": "0.1",
+  "implementation": {
+    "id": "mdbase-rs",
+    "language": "Rust",
+    "name": "mdbase Rust core and durable runtime",
+    "target": "native",
+    "version": "0.4.0-rc.3",
+    "x-runtime-version": "0.3.0-rc.1"
+  },
+  "result": "pass",
+  "scenarios": [
+    {
+      "id": "core.shared-contract-consumers",
+      "profile": "core_read",
+      "result": "pass",
+      "transcript_digest": "sha256:ab50981d4f208487d79970a7c4a22a6368cc9c217ccb927912c7816e715a6a61"
+    },
+    {
+      "id": "runtime.competing-workers",
+      "profile": "runtime/0.2",
+      "result": "pass",
+      "transcript_digest": "sha256:2e39abc7d331ee0e18b39c8e691b8ec971c789bd37093e5b8cadd13cf9c8369f"
+    },
+    {
+      "id": "runtime.crash-recovery",
+      "profile": "runtime/0.2",
+      "result": "pass",
+      "transcript_digest": "sha256:c2112700e387355d9754d06588a7cf0fa69e02ec11b81742ead88659588c27b1"
+    }
+  ]
+}

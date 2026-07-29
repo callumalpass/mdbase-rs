@@ -22,7 +22,12 @@ include = [
 ]
 
 [workspace]
-members = [".", "crates/mdbase-command", "crates/mdbase-runtime"]
+members = [
+    ".",
+    "crates/mdbase-command",
+    "crates/mdbase-runtime",
+    "crates/mdbase-testbed-adapter",
+]
 resolver = "2"
 
 [features]
