@@ -693,7 +693,7 @@ fn shared_v03_saved_views_fixture_passes() {
 
 #[test]
 fn shared_v03_data_contract_fixture_passes() {
-    run_suite("data-contracts/data-contracts.yaml", "data_contracts", 13);
+    run_suite("data-contracts/data-contracts.yaml", "data_contracts", 17);
 }
 
 #[test]
