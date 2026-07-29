@@ -127,6 +127,8 @@ path for fixture-driven watch tests.
 - Library crate: `mdbase`
 - Workflow crate: `mdbase-runtime` (Runtime companion profile 0.2)
 - Command adapter crate: `mdbase-command` (embedded by the unified CLI)
+- Private verification crate: `mdbase-testbed-adapter` (black-box contract,
+  crash-recovery, and lease-fencing scenarios; never shipped as a runtime API)
 
 ## Build
 
@@ -145,6 +147,12 @@ cargo test --locked -p mdbase-runtime --no-default-features
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo deny check
 ```
+
+CI also runs the spec-owned interoperability testbed through
+`mdbase-testbed-adapter`. The adapter uses the public `Collection`, `Runtime`,
+and `RuntimeStore` boundaries and emits canonical transcripts, so the Rust core
+and durable runtime can be compared directly with implementations in other
+languages.
 
 ## Performance Profiling
 

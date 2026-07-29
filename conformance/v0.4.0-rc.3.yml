@@ -74,6 +74,18 @@ limits:
   cel_clock_scope: operation
   watch_debounce: host_configurable
 evidence:
+  - kind: testbed_transcript
+    command: mdbase-testbed run --adapter command:cargo --adapter-arg run --adapter-arg --quiet --adapter-arg -p --adapter-arg mdbase-testbed-adapter --adapter-arg -- --evidence conformance/testbed-v0.1.json
+    result: pass
+    verified_at: "2026-07-29T09:21:42+10:00"
+    artifact: conformance/testbed-v0.1.json
+    environment: Linux x86_64, Rust 1.94.0, Node.js 22
+    testbed_protocol_version: "0.1"
+    scenario_ids:
+      - core.shared-contract-consumers
+      - runtime.competing-workers
+      - runtime.crash-recovery
+    evidence_digest: sha256:e5a261375b494edef1e076713d9ee46ce1e1982aea334b9cff1e31b92a8e4133
   - kind: conformance_suite
     command: MDBASE_REQUIRE_V03_CONFORMANCE=1 cargo test --test v03_conformance
     result: pass
