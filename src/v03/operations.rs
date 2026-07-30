@@ -135,6 +135,58 @@ impl<'a> Operations<'a> {
     }
 
     pub fn create(&self, input: &Value) -> OperationResult {
+        super::batch::execute_single(self.collection, "create", input)
+    }
+
+    pub fn update(&self, input: &Value) -> OperationResult {
+        super::batch::execute_single(self.collection, "update", input)
+    }
+
+    pub fn delete(&self, input: &Value) -> OperationResult {
+        super::batch::execute_single(self.collection, "delete", input)
+    }
+
+    pub fn rename(&self, input: &Value) -> OperationResult {
+        if input.get("simulate_before_ref_update").is_some()
+            || input.get("last_known_ref_mtimes").is_some()
+        {
+            return failed_result(vec![Diagnostic::error(
+                "invalid_request",
+                "Internal concurrency simulation fields are not accepted by canonical operations.",
+                None,
+            )]);
+        }
+        super::batch::execute_single(self.collection, "rename", input)
+    }
+
+    pub(super) fn execute_mutation_direct(
+        &self,
+        operation: &str,
+        input: &Value,
+    ) -> OperationResult {
+        if input.get("simulate_before_ref_update").is_some()
+            || input.get("last_known_ref_mtimes").is_some()
+        {
+            return failed_result(vec![Diagnostic::error(
+                "invalid_request",
+                "Internal concurrency simulation fields are not accepted by canonical operations.",
+                None,
+            )]);
+        }
+        match operation {
+            "create" => self.create_direct(input),
+            "update" => self.update_direct(input),
+            "delete" => self.delete_direct(input),
+            "rename" => self.rename_direct(input),
+            _ => failed_result(vec![Diagnostic::error(
+                "invalid_request",
+                format!("Unsupported mutation operation '{operation}'."),
+                None,
+            )]),
+        }
+    }
+
+    fn create_direct(&self, input: &Value) -> OperationResult {
         if let Some(result) = invalid_revision_input(input) {
             return result;
         }
@@ -145,7 +197,7 @@ impl<'a> Operations<'a> {
         self.normalize("create", &input, self.collection.create(&input))
     }
 
-    pub fn update(&self, input: &Value) -> OperationResult {
+    fn update_direct(&self, input: &Value) -> OperationResult {
         if let Some(result) = invalid_revision_input(input) {
             return result;
         }
@@ -156,14 +208,14 @@ impl<'a> Operations<'a> {
         self.normalize("update", &input, self.collection.update(&input))
     }
 
-    pub fn delete(&self, input: &Value) -> OperationResult {
+    fn delete_direct(&self, input: &Value) -> OperationResult {
         if let Some(result) = invalid_revision_input(input) {
             return result;
         }
         self.normalize("delete", input, self.collection.delete(input))
     }
 
-    pub fn rename(&self, input: &Value) -> OperationResult {
+    fn rename_direct(&self, input: &Value) -> OperationResult {
         if let Some(result) = invalid_revision_input(input) {
             return result;
         }

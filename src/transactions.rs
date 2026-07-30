@@ -438,22 +438,16 @@ fn validate_entry_path(
     path: &str,
     scope: TransactionScope,
 ) -> Result<(), TransactionError> {
-    let logical = CollectionPath::new(path)
+    let logical = match scope {
+        TransactionScope::Records => collection
+            .validate_record_path(path)
+            .map_err(|error| TransactionError::UnsafePath(error.to_string()))?,
+        TransactionScope::SystemMigration => CollectionPath::new(path)
+            .map_err(|error| TransactionError::UnsafePath(error.to_string()))?,
+    };
+    ensure_safe_relative_path(logical.as_str(), SpecProfile::V03)
         .map_err(|error| TransactionError::UnsafePath(error.to_string()))?;
-    let platform_path = logical.to_path_buf();
-    if scope == TransactionScope::Records
-        && (path == "mdbase.yaml"
-            || platform_path.starts_with(&collection.settings.types_folder)
-            || platform_path.starts_with(&collection.settings.migrations_folder)
-            || platform_path.starts_with(".mdbase"))
-    {
-        return Err(TransactionError::UnsafePath(format!(
-            "batch transactions cannot mutate system definition path '{path}'"
-        )));
-    }
-    ensure_safe_relative_path(path, SpecProfile::V03)
-        .map_err(|error| TransactionError::UnsafePath(error.to_string()))?;
-    ensure_no_symlink_components(&collection.root, path, SpecProfile::V03)
+    ensure_no_symlink_components(&collection.root, logical.as_str(), SpecProfile::V03)
         .map_err(|error| TransactionError::UnsafePath(error.to_string()))
 }
 

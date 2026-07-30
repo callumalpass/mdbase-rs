@@ -121,7 +121,7 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
             continue;
         }
         let path = relative_resource_path(root, entry.path())?;
-        if path == ".mdbase" || path.starts_with(".mdbase/") {
+        if !is_schema_resource_path(&path) {
             continue;
         }
         resources.push(read_resource(
@@ -217,6 +217,14 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
         resources,
         records,
     })
+}
+
+fn is_schema_resource_path(path: &str) -> bool {
+    let mut components = path.split('/');
+    components
+        .clone()
+        .all(|component| !component.starts_with('.'))
+        && components.any(|component| matches!(component, "schemas" | "_schemas"))
 }
 
 fn resource_revision(resources: &[CollectionSnapshotResource]) -> String {

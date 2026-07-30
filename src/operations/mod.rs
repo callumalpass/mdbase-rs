@@ -14,9 +14,10 @@ use std::io::Write;
 use std::path::{Component, Path};
 
 use crate::errors::{
-    op_error, CONCURRENT_MODIFICATION, INVALID_PATH, PATH_TRAVERSAL, PERMISSION_DENIED,
+    op_error, CONCURRENT_MODIFICATION, FILE_NOT_FOUND, INVALID_PATH, PATH_TRAVERSAL,
+    PERMISSION_DENIED,
 };
-use crate::SpecProfile;
+use crate::{Collection, SpecProfile};
 
 /// Validate that a user-supplied path is relative to the collection root.
 pub(crate) fn ensure_safe_relative_path(
@@ -99,6 +100,37 @@ fn path_boundary_error(spec_profile: SpecProfile, message: &str) -> serde_json::
         },
         message,
     )
+}
+
+pub(crate) fn mutation_record_path(
+    collection: &Collection,
+    path: &str,
+) -> Result<crate::api::CollectionPath, serde_json::Value> {
+    collection
+        .validate_record_path(path)
+        .map_err(|error| op_error(INVALID_PATH, &error.to_string()))
+}
+
+pub(crate) fn readable_record_path(
+    collection: &Collection,
+    path: &str,
+) -> Result<crate::api::CollectionPath, serde_json::Value> {
+    collection
+        .validate_record_path(path)
+        .map_err(|_| op_error(FILE_NOT_FOUND, &format!("File not found: {path}")))
+}
+
+pub(crate) fn ensure_regular_record_file(
+    path: &Path,
+    display_path: &str,
+) -> Result<(), serde_json::Value> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) | Err(_) => Err(op_error(
+            FILE_NOT_FOUND,
+            &format!("File not found: {display_path}"),
+        )),
+    }
 }
 
 /// Move a regular collection file without ever replacing an existing target.

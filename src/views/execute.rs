@@ -1099,8 +1099,10 @@ pub(crate) fn obsidian_source_paths(collection: &Collection) -> Vec<PathBuf> {
         .filter(|entry| entry.file_type().is_file())
         .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("base"))
         .filter(|entry| {
-            relative_path(&collection.root, entry.path())
-                .is_some_and(|path| patterns.iter().any(|pattern| pattern.is_match(&path)))
+            relative_path(&collection.root, entry.path()).is_some_and(|path| {
+                super::normalized_source_path(&path).is_some()
+                    && patterns.iter().any(|pattern| pattern.is_match(&path))
+            })
         })
         .map(|entry| entry.into_path())
         .collect()
@@ -1155,16 +1157,24 @@ fn glob_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
 }
 
 fn safe_view_path(collection: &Collection, path: &str) -> Result<PathBuf, Box<Diagnostic>> {
-    crate::operations::ensure_safe_relative_path(path, collection.spec_profile).map_err(|_| {
+    let normalized = super::normalized_source_path(path).ok_or_else(|| {
         Box::new(Diagnostic::error(
             "invalid_path",
-            "View source path must remain inside the collection.",
+            "View source path must be portable and must not use hidden filesystem components.",
             Some(path.to_string()),
         ))
     })?;
+    crate::operations::ensure_safe_relative_path(normalized.as_str(), collection.spec_profile)
+        .map_err(|_| {
+            Box::new(Diagnostic::error(
+                "invalid_path",
+                "View source path must remain inside the collection.",
+                Some(path.to_string()),
+            ))
+        })?;
     crate::operations::ensure_no_symlink_components(
         &collection.root,
-        path,
+        normalized.as_str(),
         collection.spec_profile,
     )
     .map_err(|_| {
@@ -1174,7 +1184,7 @@ fn safe_view_path(collection: &Collection, path: &str) -> Result<PathBuf, Box<Di
             Some(path.to_string()),
         ))
     })?;
-    Ok(collection.root.join(path))
+    Ok(normalized.under(&collection.root))
 }
 
 fn relative_path(root: &Path, path: &Path) -> Option<String> {

@@ -110,6 +110,12 @@ fn provider_snapshot_includes_configured_saved_view_sources() {
         "views:\n  - type: table\n    name: Ignored\n",
     )
     .unwrap();
+    fs::create_dir_all(directory.path().join(".git/hooks")).unwrap();
+    fs::write(
+        directory.path().join(".git/hooks/post-commit.base"),
+        "views:\n  - type: table\n    name: Hidden\n",
+    )
+    .unwrap();
     let provider = FilesystemProvider::open(directory.path()).unwrap();
 
     let first = provider.snapshot().unwrap();
@@ -137,6 +143,7 @@ fn provider_snapshot_includes_contract_and_schema_resources() {
     let directory = collection();
     fs::create_dir(directory.path().join("_contracts")).unwrap();
     fs::create_dir(directory.path().join("_schemas")).unwrap();
+    fs::create_dir_all(directory.path().join(".git/hooks")).unwrap();
     fs::write(
         directory.path().join("_contracts/task.md"),
         "---\nkind: mdbase.contract\ncontract_type: record\nid: example.task\nversion: 1.0.0\nrecord_schema:\n  dialect: json-schema-2020-12\n  ref: ../_schemas/task.json\n---\n",
@@ -145,6 +152,16 @@ fn provider_snapshot_includes_contract_and_schema_resources() {
     fs::write(
         directory.path().join("_schemas/task.json"),
         "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("package.json"),
+        "{\"scripts\":{\"postinstall\":\"malware\"}}\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join(".git/hooks/payload.json"),
+        "{\"type\":\"object\"}\n",
     )
     .unwrap();
     let provider = FilesystemProvider::open(directory.path()).unwrap();
