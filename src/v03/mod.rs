@@ -27,7 +27,10 @@ pub use cel::{
 };
 pub use operations::{OperationResult, Operations};
 pub use query::QueryPerformance;
-pub use type_pack::TypePackResource;
+pub use type_pack::{
+    ContractIdentity, ContractSetupChoice, ContractSetupMode, ExistingContractImplementation,
+    TypePackInstall, TypePackResource,
+};
 
 pub const SPEC_VERSION: &str = "0.3.0";
 pub const PRERELEASE_SPEC_VERSIONS: &[&str] = &["0.3.0-alpha.1"];

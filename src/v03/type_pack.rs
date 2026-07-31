@@ -16,6 +16,43 @@ pub struct TypePackResource {
     pub document: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct ContractIdentity {
+    pub id: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TypePackInstall {
+    pub manifest: Value,
+    pub resources: Vec<TypePackResource>,
+    pub provides: Vec<ContractIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ExistingContractImplementation {
+    pub type_name: String,
+    pub type_revision: String,
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ContractSetupMode {
+    Starter,
+    Existing(ExistingContractImplementation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ContractSetupChoice {
+    pub contract: ContractIdentity,
+    #[serde(flatten)]
+    pub mode: ContractSetupMode,
+}
+
 #[derive(Debug, Deserialize)]
 struct ManifestResource {
     kind: String,
@@ -31,6 +68,18 @@ impl Collection {
         manifest: &Value,
         resources: &[TypePackResource],
         replace: bool,
+    ) -> OperationResult {
+        self.install_type_pack_with_preconditions(manifest, resources, replace, &BTreeMap::new())
+    }
+
+    /// Transactionally install a type pack only if exact existing targets still
+    /// match their reviewed revisions.
+    pub fn install_type_pack_with_preconditions(
+        &self,
+        manifest: &Value,
+        resources: &[TypePackResource],
+        replace: bool,
+        expected_revisions: &BTreeMap<String, String>,
     ) -> OperationResult {
         let diagnostics = validate_type_pack(manifest, "mdbase-pack.yaml");
         if !diagnostics.is_empty() {
@@ -112,6 +161,7 @@ impl Collection {
                 (*bytes).to_vec(),
                 action,
                 resource.digest,
+                resource.kind,
             ));
         }
         if planned.len() != sources.len() {
@@ -122,9 +172,34 @@ impl Collection {
             Ok(shadow) => shadow,
             Err(diagnostic) => return failed(vec![*diagnostic]),
         };
-        for (target, bytes, action, _) in &planned {
+        for (target, expected) in expected_revisions {
+            if !planned
+                .iter()
+                .any(|(planned, _, _, _, _)| planned == target)
+            {
+                return pack_error(&format!(
+                    "Type pack precondition target '{target}' is not a declared resource."
+                ));
+            }
+            let Some(bytes) = shadow.baseline.get(target) else {
+                return failed(vec![Diagnostic::error(
+                    "concurrent_modification",
+                    format!("Type pack target '{target}' no longer exists."),
+                    Some(target.clone()),
+                )]);
+            };
+            let actual = format!("sha256:{:x}", Sha256::digest(bytes));
+            if &actual != expected {
+                return failed(vec![Diagnostic::error(
+                    "concurrent_modification",
+                    format!("Type pack target '{target}' changed after it was reviewed."),
+                    Some(target.clone()),
+                )]);
+            }
+        }
+        for (target, bytes, action, _, _) in &planned {
             let path = shadow.directory.path().join(target);
-            if *action == "replace" && !replace {
+            if *action == "replace" && !replace && !expected_revisions.contains_key(target) {
                 return failed(vec![Diagnostic::error(
                     "type_pack_conflict",
                     format!("Type pack target '{target}' already has different content."),
@@ -203,11 +278,12 @@ impl Collection {
         }
         let resource_diff = planned
             .iter()
-            .map(|(target, _, action, digest)| {
+            .map(|(target, _, action, digest, kind)| {
                 json!({
                     "target": target,
                     "action": action,
                     "digest": digest,
+                    "kind": kind,
                 })
             })
             .collect::<Vec<_>>();
@@ -222,6 +298,604 @@ impl Collection {
             diagnostics: Vec::new(),
         }
     }
+
+    /// Atomically install every type pack needed by one authorization decision.
+    ///
+    /// Contract choices are evaluated against one collection snapshot. Starter
+    /// implementations are retained per contract, reviewed existing types are
+    /// edited once even when several packs target them, and the combined result
+    /// is validated and committed as one transaction.
+    pub fn install_type_packs_with_contract_setups(
+        &self,
+        packs: &[TypePackInstall],
+        setups: &[ContractSetupChoice],
+    ) -> OperationResult {
+        let prepared = match prepare_contract_setup_pack(self, packs, setups) {
+            Ok(prepared) => prepared,
+            Err(diagnostic) => return failed(vec![*diagnostic]),
+        };
+        self.install_type_pack_with_preconditions(
+            &prepared.manifest,
+            &prepared.resources,
+            false,
+            &prepared.expected_revisions,
+        )
+    }
+}
+
+struct PreparedContractSetupPack {
+    manifest: Value,
+    resources: Vec<TypePackResource>,
+    expected_revisions: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+struct PlannedResource {
+    kind: String,
+    document: String,
+}
+
+type ContractSetupResult<T> = Result<T, Box<Diagnostic>>;
+
+fn prepare_contract_setup_pack(
+    collection: &Collection,
+    packs: &[TypePackInstall],
+    setups: &[ContractSetupChoice],
+) -> ContractSetupResult<PreparedContractSetupPack> {
+    if packs.is_empty() {
+        return Err(contract_setup_diagnostic(
+            "Contract setup requires at least one type pack.",
+        ));
+    }
+    if setups.is_empty() {
+        return Err(contract_setup_diagnostic(
+            "Contract setup requires an explicit choice for at least one contract.",
+        ));
+    }
+    let setup_by_contract = setups
+        .iter()
+        .map(|setup| (setup.contract.clone(), setup))
+        .collect::<BTreeMap<_, _>>();
+    if setup_by_contract.len() != setups.len() {
+        return Err(contract_setup_diagnostic(
+            "Each contract must have exactly one setup choice.",
+        ));
+    }
+    let provided = packs
+        .iter()
+        .flat_map(|pack| pack.provides.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if setups
+        .iter()
+        .any(|setup| !provided.contains(&setup.contract))
+    {
+        return Err(contract_setup_diagnostic(
+            "A setup choice refers to a contract not provided by these type packs.",
+        ));
+    }
+
+    let mut planned = BTreeMap::<String, PlannedResource>::new();
+    for pack in packs {
+        let diagnostics = validate_type_pack(&pack.manifest, "mdbase-pack.yaml");
+        if let Some(diagnostic) = diagnostics.into_iter().next() {
+            return Err(Box::new(diagnostic));
+        }
+        let manifest_resources = serde_json::from_value::<Vec<ManifestResource>>(
+            pack.manifest
+                .get("resources")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )
+        .map_err(|error| {
+            contract_setup_diagnostic(format!("Could not read type pack resources: {error}"))
+        })?;
+        let sources = pack
+            .resources
+            .iter()
+            .map(|resource| (resource.source.as_str(), resource.document.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        if sources.len() != pack.resources.len() || sources.len() != manifest_resources.len() {
+            return Err(contract_setup_diagnostic(
+                "Each type pack source must be declared exactly once.",
+            ));
+        }
+        let pack_contracts = pack.provides.iter().cloned().collect::<BTreeSet<_>>();
+        let starter_contracts = pack_contracts
+            .iter()
+            .filter(|contract| {
+                setup_by_contract
+                    .get(*contract)
+                    .is_some_and(|setup| matches!(setup.mode, ContractSetupMode::Starter))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let pack_has_starter = !starter_contracts.is_empty();
+
+        for manifest_resource in manifest_resources {
+            CollectionPath::new(&manifest_resource.source).map_err(|error| {
+                contract_setup_diagnostic(format!("Unsafe type pack source: {error}"))
+            })?;
+            let Some(original) = sources.get(manifest_resource.source.as_str()) else {
+                return Err(contract_setup_diagnostic(format!(
+                    "Type pack source '{}' is missing.",
+                    manifest_resource.source
+                )));
+            };
+            let actual = format!("sha256:{:x}", Sha256::digest(original.as_bytes()));
+            if actual != manifest_resource.digest {
+                return Err(contract_setup_diagnostic(format!(
+                    "Type pack source '{}' has digest {}, expected {}.",
+                    manifest_resource.source, actual, manifest_resource.digest
+                )));
+            }
+            let document = if manifest_resource.kind == "type" {
+                filter_starter_type_document(
+                    original,
+                    &pack_contracts,
+                    &starter_contracts,
+                    pack_has_starter,
+                )?
+            } else {
+                Some((*original).to_string())
+            };
+            let Some(document) = document else {
+                continue;
+            };
+            insert_planned_resource(
+                &mut planned,
+                manifest_resource.target,
+                PlannedResource {
+                    kind: manifest_resource.kind,
+                    document,
+                },
+            )?;
+        }
+    }
+
+    let mut existing_documents = BTreeMap::<String, (String, String)>::new();
+    let mut expected_revisions = BTreeMap::new();
+    for setup in setups {
+        let ContractSetupMode::Existing(existing) = &setup.mode else {
+            continue;
+        };
+        validate_existing_setup(existing)?;
+        let read = collection.read_type_file(&json!({ "name": existing.type_name }));
+        if !read.valid {
+            return Err(contract_setup_diagnostic(format!(
+                "Type '{}' is no longer available.",
+                existing.type_name
+            )));
+        }
+        let target = read.result["path"].as_str().unwrap_or_default().to_string();
+        let revision = read.result["revision"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let document = read.result["document"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if target.is_empty() || revision.is_empty() || document.is_empty() {
+            return Err(contract_setup_diagnostic(format!(
+                "Type '{}' is no longer available.",
+                existing.type_name
+            )));
+        }
+        let entry = existing_documents
+            .entry(target.clone())
+            .or_insert((revision.clone(), document));
+        match implementation_state(&entry.1, &setup.contract, existing)? {
+            ImplementationState::Exact => continue,
+            ImplementationState::Conflicting => {
+                return Err(contract_setup_diagnostic(format!(
+                    "Type '{}' already implements {} {} differently.",
+                    existing.type_name, setup.contract.id, setup.contract.version
+                )))
+            }
+            ImplementationState::Missing => {}
+        }
+        if entry.0 != existing.type_revision {
+            return Err(Box::new(Diagnostic::error(
+                "concurrent_modification",
+                format!(
+                    "Type '{}' changed after it was reviewed.",
+                    existing.type_name
+                ),
+                Some(target),
+            )));
+        }
+        entry.1 = add_contract_implementation(&entry.1, &setup.contract, existing)?;
+        expected_revisions.insert(target, entry.0.clone());
+    }
+
+    for (target, (_, document)) in existing_documents {
+        if !expected_revisions.contains_key(&target) {
+            continue;
+        }
+        insert_planned_resource(
+            &mut planned,
+            target,
+            PlannedResource {
+                kind: "type".to_string(),
+                document,
+            },
+        )?;
+    }
+    if planned.is_empty() {
+        return Err(contract_setup_diagnostic(
+            "Contract setup produced no collection resources.",
+        ));
+    }
+
+    let mut manifest_resources = Vec::with_capacity(planned.len());
+    let mut resources = Vec::with_capacity(planned.len());
+    for (index, (target, resource)) in planned.into_iter().enumerate() {
+        let extension = std::path::Path::new(&target)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("bin");
+        let source = format!("contract-setup/resource-{index}.{extension}");
+        manifest_resources.push(json!({
+            "kind": resource.kind,
+            "source": source,
+            "target": target,
+            "digest": format!("sha256:{:x}", Sha256::digest(resource.document.as_bytes())),
+        }));
+        resources.push(TypePackResource {
+            source,
+            document: resource.document,
+        });
+    }
+    Ok(PreparedContractSetupPack {
+        manifest: json!({
+            "kind": "mdbase.type-pack",
+            "id": "dev.mdbase.authorization-contract-setup",
+            "version": "1.0.0",
+            "resources": manifest_resources,
+        }),
+        resources,
+        expected_revisions,
+    })
+}
+
+fn insert_planned_resource(
+    planned: &mut BTreeMap<String, PlannedResource>,
+    target: String,
+    resource: PlannedResource,
+) -> ContractSetupResult<()> {
+    if let Some(current) = planned.get(&target) {
+        if current.kind == resource.kind && current.document == resource.document {
+            return Ok(());
+        }
+        return Err(contract_setup_diagnostic(format!(
+            "Contract setup contains conflicting resources for '{target}'."
+        )));
+    }
+    planned.insert(target, resource);
+    Ok(())
+}
+
+fn validate_existing_setup(setup: &ExistingContractImplementation) -> ContractSetupResult<()> {
+    if setup.type_name.trim().is_empty()
+        || setup.type_name.len() > 100
+        || setup.type_revision.len() > 100
+        || setup.fields.len() > 100
+        || setup.fields.iter().any(|(contract_field, type_field)| {
+            contract_field.is_empty()
+                || contract_field.len() > 500
+                || type_field.is_empty()
+                || type_field.len() > 500
+        })
+    {
+        return Err(contract_setup_diagnostic(
+            "The selected contract implementation is invalid.",
+        ));
+    }
+    Ok(())
+}
+
+fn filter_starter_type_document(
+    document: &str,
+    provided: &BTreeSet<ContractIdentity>,
+    starter: &BTreeSet<ContractIdentity>,
+    pack_has_starter: bool,
+) -> ContractSetupResult<Option<String>> {
+    let (yaml_start, yaml_end) = frontmatter_bounds(document)?;
+    let yaml = &document[yaml_start..yaml_end];
+    let mut parsed = serde_yaml::from_str::<serde_yaml::Value>(yaml)
+        .map_err(|_| contract_setup_diagnostic("A starter type has invalid YAML frontmatter."))?;
+    let mapping = parsed
+        .as_mapping_mut()
+        .ok_or_else(|| contract_setup_diagnostic("A starter type has invalid YAML frontmatter."))?;
+    let key = serde_yaml::Value::String("implements".to_string());
+    let Some(value) = mapping.get_mut(&key) else {
+        return Ok(pack_has_starter.then(|| document.to_string()));
+    };
+    let sequence = value.as_sequence_mut().ok_or_else(|| {
+        contract_setup_diagnostic("A starter type has an unsupported implements declaration.")
+    })?;
+    let before = sequence.len();
+    sequence.retain(|implementation| {
+        implementation_identity(implementation)
+            .is_none_or(|identity| !provided.contains(&identity) || starter.contains(&identity))
+    });
+    if sequence.is_empty() {
+        return Ok(None);
+    }
+    if sequence.len() == before {
+        return Ok(Some(document.to_string()));
+    }
+    replace_frontmatter(document, &parsed).map(Some)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplementationState {
+    Missing,
+    Exact,
+    Conflicting,
+}
+
+fn implementation_state(
+    document: &str,
+    contract: &ContractIdentity,
+    setup: &ExistingContractImplementation,
+) -> ContractSetupResult<ImplementationState> {
+    let (yaml_start, yaml_end) = frontmatter_bounds(document)?;
+    let parsed = serde_yaml::from_str::<serde_yaml::Value>(&document[yaml_start..yaml_end])
+        .map_err(|_| {
+            contract_setup_diagnostic("The selected type has invalid YAML frontmatter.")
+        })?;
+    let Some(sequence) = parsed
+        .as_mapping()
+        .and_then(|mapping| mapping.get(serde_yaml::Value::String("implements".to_string())))
+        .and_then(serde_yaml::Value::as_sequence)
+    else {
+        return Ok(ImplementationState::Missing);
+    };
+    let Some(existing) = sequence
+        .iter()
+        .find(|implementation| implementation_identity(implementation).as_ref() == Some(contract))
+    else {
+        return Ok(ImplementationState::Missing);
+    };
+    let mapping = existing.as_mapping().ok_or_else(|| {
+        contract_setup_diagnostic("The selected type has invalid implements entries.")
+    })?;
+    let fields = mapping
+        .get(serde_yaml::Value::String("fields".to_string()))
+        .cloned()
+        .unwrap_or_else(|| serde_yaml::Value::Mapping(Default::default()));
+    let fields = serde_yaml::from_value::<BTreeMap<String, String>>(fields)
+        .map_err(|_| contract_setup_diagnostic("The selected type has invalid field mappings."))?;
+    let binding = mapping
+        .get(serde_yaml::Value::String("binding".to_string()))
+        .cloned()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|_| contract_setup_diagnostic("The selected type has an invalid binding."))?;
+    let binding_matches =
+        normalized_binding(binding.as_ref()) == normalized_binding(setup.binding.as_ref());
+    Ok(if fields == setup.fields && binding_matches {
+        ImplementationState::Exact
+    } else {
+        ImplementationState::Conflicting
+    })
+}
+
+fn normalized_binding(value: Option<&Value>) -> Option<&Value> {
+    value.filter(|value| !value.as_object().is_some_and(serde_json::Map::is_empty))
+}
+
+fn implementation_identity(value: &serde_yaml::Value) -> Option<ContractIdentity> {
+    let mapping = value.as_mapping()?;
+    Some(ContractIdentity {
+        id: mapping
+            .get(serde_yaml::Value::String("contract".to_string()))?
+            .as_str()?
+            .to_string(),
+        version: mapping
+            .get(serde_yaml::Value::String("version".to_string()))?
+            .as_str()?
+            .to_string(),
+    })
+}
+
+fn add_contract_implementation(
+    document: &str,
+    contract: &ContractIdentity,
+    setup: &ExistingContractImplementation,
+) -> ContractSetupResult<String> {
+    let (yaml_start, yaml_end) = frontmatter_bounds(document)?;
+    let yaml = &document[yaml_start..yaml_end];
+    let parsed = serde_yaml::from_str::<serde_yaml::Value>(yaml).map_err(|_| {
+        contract_setup_diagnostic("The selected type has invalid YAML frontmatter.")
+    })?;
+    let mapping = parsed.as_mapping().ok_or_else(|| {
+        contract_setup_diagnostic("The selected type has invalid YAML frontmatter.")
+    })?;
+    let key = serde_yaml::Value::String("implements".to_string());
+    let mut implementations = match mapping.get(&key) {
+        None | Some(serde_yaml::Value::Null) => Vec::new(),
+        Some(serde_yaml::Value::Sequence(values)) => values.clone(),
+        Some(_) => {
+            return Err(contract_setup_diagnostic(
+                "The selected type has an unsupported implements declaration.",
+            ))
+        }
+    };
+    let mut implementation = serde_yaml::Mapping::new();
+    implementation.insert(
+        serde_yaml::Value::String("contract".to_string()),
+        serde_yaml::Value::String(contract.id.clone()),
+    );
+    implementation.insert(
+        serde_yaml::Value::String("version".to_string()),
+        serde_yaml::Value::String(contract.version.clone()),
+    );
+    implementation.insert(
+        serde_yaml::Value::String("fields".to_string()),
+        serde_yaml::to_value(&setup.fields)
+            .map_err(|_| contract_setup_diagnostic("The field mapping is invalid."))?,
+    );
+    if let Some(binding) = &setup.binding {
+        implementation.insert(
+            serde_yaml::Value::String("binding".to_string()),
+            serde_yaml::to_value(binding)
+                .map_err(|_| contract_setup_diagnostic("The binding is invalid."))?,
+        );
+    }
+    implementations.push(serde_yaml::Value::Mapping(implementation));
+    replace_yaml_node(
+        document,
+        yaml_start,
+        yaml_end,
+        "implements",
+        &implementations,
+    )
+}
+
+fn replace_yaml_node<T: Serialize>(
+    document: &str,
+    yaml_start: usize,
+    yaml_end: usize,
+    key: &str,
+    value: &T,
+) -> ContractSetupResult<String> {
+    let yaml = &document[yaml_start..yaml_end];
+    let serialized = serde_yaml::to_string(value)
+        .map_err(|_| contract_setup_diagnostic("The contract setup could not be serialized."))?;
+    let serialized = serialized.strip_prefix("---\n").unwrap_or(&serialized);
+    let newline = if document.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let block = format!(
+        "{key}:{newline}{}",
+        serialized
+            .trim_end_matches('\n')
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join(newline)
+    );
+    let (node_start, node_end) = yaml_node_range(yaml, key).unwrap_or((yaml.len(), yaml.len()));
+    let mut next_yaml = String::new();
+    next_yaml.push_str(&yaml[..node_start]);
+    if node_start == yaml.len() && !next_yaml.is_empty() && !next_yaml.ends_with(['\n', '\r']) {
+        next_yaml.push_str(newline);
+    }
+    next_yaml.push_str(&block);
+    next_yaml.push_str(newline);
+    next_yaml.push_str(&yaml[node_end..]);
+    let mut result = String::with_capacity(document.len() + block.len());
+    result.push_str(&document[..yaml_start]);
+    result.push_str(&next_yaml);
+    result.push_str(&document[yaml_end..]);
+    Ok(result)
+}
+
+fn replace_frontmatter(
+    document: &str,
+    frontmatter: &serde_yaml::Value,
+) -> ContractSetupResult<String> {
+    let (yaml_start, yaml_end) = frontmatter_bounds(document)?;
+    let serialized = serde_yaml::to_string(frontmatter)
+        .map_err(|_| contract_setup_diagnostic("A starter type could not be serialized."))?;
+    let serialized = serialized.strip_prefix("---\n").unwrap_or(&serialized);
+    let serialized = if document.contains("\r\n") {
+        serialized.replace('\n', "\r\n")
+    } else {
+        serialized.to_string()
+    };
+    Ok(format!(
+        "{}{}{}",
+        &document[..yaml_start],
+        serialized,
+        &document[yaml_end..]
+    ))
+}
+
+fn frontmatter_bounds(document: &str) -> ContractSetupResult<(usize, usize)> {
+    let mut lines = document.split_inclusive('\n');
+    let first = lines
+        .next()
+        .ok_or_else(|| contract_setup_diagnostic("The selected type has no YAML frontmatter."))?;
+    if first.trim_end_matches(['\n', '\r']).trim() != "---" {
+        return Err(contract_setup_diagnostic(
+            "The selected type has no YAML frontmatter.",
+        ));
+    }
+    let yaml_start = first.len();
+    let mut cursor = yaml_start;
+    for line in lines {
+        if line.trim_end_matches(['\n', '\r']).trim() == "---" {
+            return Ok((yaml_start, cursor));
+        }
+        cursor += line.len();
+    }
+    Err(contract_setup_diagnostic(
+        "The selected type has unterminated YAML frontmatter.",
+    ))
+}
+
+fn yaml_node_range(yaml: &str, key: &str) -> Option<(usize, usize)> {
+    let mut offsets = Vec::new();
+    let mut cursor = 0;
+    for line in yaml.split_inclusive('\n') {
+        offsets.push((cursor, line));
+        cursor += line.len();
+    }
+    if cursor < yaml.len() || yaml.is_empty() {
+        offsets.push((cursor, &yaml[cursor..]));
+    }
+    let start_index = offsets
+        .iter()
+        .position(|(_, line)| top_level_yaml_key(line).as_deref() == Some(key))?;
+    let start = offsets[start_index].0;
+    let mut pending_trivia = None;
+    for (offset, line) in offsets.iter().skip(start_index + 1) {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            pending_trivia.get_or_insert(*offset);
+            continue;
+        }
+        if top_level_yaml_key(line).is_some() {
+            return Some((start, pending_trivia.unwrap_or(*offset)));
+        }
+        pending_trivia = None;
+    }
+    Some((start, pending_trivia.unwrap_or(yaml.len())))
+}
+
+fn top_level_yaml_key(line: &str) -> Option<String> {
+    let line = line.trim_end_matches(['\n', '\r']);
+    if line.is_empty() || line.starts_with(char::is_whitespace) || line.starts_with('#') {
+        return None;
+    }
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if double => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            ':' if !single && !double => {
+                return serde_yaml::from_str::<String>(line[..index].trim()).ok()
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn contract_setup_diagnostic(message: impl Into<String>) -> Box<Diagnostic> {
+    Box::new(Diagnostic::error("invalid_contract_setup", message, None))
 }
 
 fn validate_resource_target(
@@ -394,6 +1068,102 @@ mod tests {
         (root, collection)
     }
 
+    fn contract_pack(contract_id: &str, slug: &str) -> TypePackInstall {
+        let schema = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["title"],"additionalProperties":false,"properties":{"title":{"type":"string"}}}"#.to_string();
+        let contract = format!(
+            "---\nkind: mdbase.contract\ncontract_type: record\nid: {contract_id}\nversion: 1.0.0\nrecord_schema:\n  dialect: json-schema-2020-12\n  ref: ../schemas/{slug}.schema.json\n---\n"
+        );
+        let starter = format!(
+            "---\nkind: mdbase.type\nname: {slug}\nversion: 1\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    required: [title]\n    additionalProperties: true\n    properties:\n      title: {{ type: string }}\nimplements:\n  - contract: {contract_id}\n    version: 1.0.0\n    fields:\n      title: title\n---\n"
+        );
+        let definitions = [
+            (
+                "schema",
+                format!("{slug}.schema.json"),
+                format!("schemas/{slug}.schema.json"),
+                schema,
+            ),
+            (
+                "contract",
+                format!("{slug}.contract.md"),
+                format!("_contracts/{contract_id}.md"),
+                contract,
+            ),
+            (
+                "type",
+                format!("{slug}.type.md"),
+                format!("_types/{slug}.md"),
+                starter,
+            ),
+        ];
+        TypePackInstall {
+            manifest: json!({
+                "kind": "mdbase.type-pack",
+                "id": format!("example.{slug}"),
+                "version": "1.0.0",
+                "resources": definitions.iter().map(|(kind, source, target, document)| json!({
+                    "kind": kind,
+                    "source": source,
+                    "target": target,
+                    "digest": format!("sha256:{:x}", Sha256::digest(document.as_bytes())),
+                })).collect::<Vec<_>>(),
+            }),
+            resources: definitions
+                .into_iter()
+                .map(|(_, source, _, document)| TypePackResource { source, document })
+                .collect(),
+            provides: vec![ContractIdentity {
+                id: contract_id.to_string(),
+                version: "1.0.0".to_string(),
+            }],
+        }
+    }
+
+    fn combined_pack(mut left: TypePackInstall, right: TypePackInstall) -> TypePackInstall {
+        left.manifest["resources"].as_array_mut().unwrap().extend(
+            right.manifest["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+        left.resources.extend(right.resources);
+        left.provides.extend(right.provides);
+        left
+    }
+
+    fn existing_setup(contract_id: &str, revision: &str) -> ContractSetupChoice {
+        ContractSetupChoice {
+            contract: ContractIdentity {
+                id: contract_id.to_string(),
+                version: "1.0.0".to_string(),
+            },
+            mode: ContractSetupMode::Existing(ExistingContractImplementation {
+                type_name: "note".to_string(),
+                type_revision: revision.to_string(),
+                fields: [("title".to_string(), "title".to_string())]
+                    .into_iter()
+                    .collect(),
+                binding: None,
+            }),
+        }
+    }
+
+    const EXISTING_TYPE: &str = r#"---
+kind: mdbase.type
+name: note
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    additionalProperties: true
+    properties:
+      title: { type: string }
+---
+Existing documentation.
+"#;
+
     fn task_resources() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
         vec![
             (
@@ -521,6 +1291,44 @@ record_schema:
     }
 
     #[test]
+    fn reviewed_target_revisions_are_checked_against_the_transaction_baseline() {
+        let (root, collection) = collection();
+        let definitions = task_resources();
+        let resources = definitions
+            .iter()
+            .map(|(_, source, _, document)| resource(source, document))
+            .collect::<Vec<_>>();
+        let manifest = manifest(&definitions);
+        assert!(
+            collection
+                .install_type_pack(&manifest, &resources, false)
+                .valid
+        );
+        let target = "_types/task.md".to_string();
+        let original = fs::read(root.path().join(&target)).unwrap();
+        let reviewed = format!("sha256:{:x}", Sha256::digest(&original));
+        let externally_changed = String::from_utf8(original)
+            .unwrap()
+            .replace("required: [title]", "required: []");
+        fs::write(root.path().join(&target), &externally_changed).unwrap();
+        let reopened = Collection::open(root.path()).unwrap();
+
+        let rejected = reopened.install_type_pack_with_preconditions(
+            &manifest,
+            &resources,
+            true,
+            &[(target.clone(), reviewed)].into_iter().collect(),
+        );
+
+        assert!(!rejected.valid);
+        assert_eq!(rejected.diagnostics[0].code, "concurrent_modification");
+        assert_eq!(
+            fs::read_to_string(root.path().join(target)).unwrap(),
+            externally_changed
+        );
+    }
+
+    #[test]
     fn digest_or_registry_errors_create_no_partial_files() {
         let (root, collection) = collection();
         let definitions = task_resources();
@@ -631,5 +1439,99 @@ schema:
         assert!(!rejected.valid);
         assert_eq!(rejected.diagnostics[0].code, "invalid_type_pack");
         assert!(!root.path().join("_types/task.md").exists());
+    }
+
+    #[test]
+    fn mixed_starter_and_existing_choices_in_one_pack_are_applied_per_contract() {
+        let (root, _) = collection();
+        write(&root.path().join("_types/note.md"), EXISTING_TYPE);
+        let collection = Collection::open(root.path()).unwrap();
+        let revision = format!("sha256:{:x}", Sha256::digest(EXISTING_TYPE.as_bytes()));
+        let pack = combined_pack(
+            contract_pack("example.alpha", "alpha"),
+            contract_pack("example.beta", "beta"),
+        );
+        let result = collection.install_type_packs_with_contract_setups(
+            &[pack],
+            &[
+                existing_setup("example.alpha", &revision),
+                ContractSetupChoice {
+                    contract: ContractIdentity {
+                        id: "example.beta".to_string(),
+                        version: "1.0.0".to_string(),
+                    },
+                    mode: ContractSetupMode::Starter,
+                },
+            ],
+        );
+
+        assert!(result.valid, "{:?}", result.diagnostics);
+        assert!(!root.path().join("_types/alpha.md").exists());
+        assert!(root.path().join("_types/beta.md").is_file());
+        let note = fs::read_to_string(root.path().join("_types/note.md")).unwrap();
+        assert!(note.contains("contract: example.alpha"));
+        assert!(!note.contains("contract: example.beta"));
+    }
+
+    #[test]
+    fn separate_packs_can_map_to_one_existing_type_and_retry_idempotently() {
+        let (root, _) = collection();
+        write(&root.path().join("_types/note.md"), EXISTING_TYPE);
+        let collection = Collection::open(root.path()).unwrap();
+        let revision = format!("sha256:{:x}", Sha256::digest(EXISTING_TYPE.as_bytes()));
+        let packs = [
+            contract_pack("example.alpha", "alpha"),
+            contract_pack("example.beta", "beta"),
+        ];
+        let setups = [
+            existing_setup("example.alpha", &revision),
+            existing_setup("example.beta", &revision),
+        ];
+
+        let installed = collection.install_type_packs_with_contract_setups(&packs, &setups);
+        assert!(installed.valid, "{:?}", installed.diagnostics);
+        let once = fs::read_to_string(root.path().join("_types/note.md")).unwrap();
+        assert!(once.contains("contract: example.alpha"));
+        assert!(once.contains("contract: example.beta"));
+
+        let reopened = Collection::open(root.path()).unwrap();
+        let retried = reopened.install_type_packs_with_contract_setups(&packs, &setups);
+        assert!(retried.valid, "{:?}", retried.diagnostics);
+        assert_eq!(
+            fs::read_to_string(root.path().join("_types/note.md")).unwrap(),
+            once
+        );
+        assert!(retried.result["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|resource| resource["action"] == "unchanged"));
+    }
+
+    #[test]
+    fn one_stale_existing_choice_rolls_back_the_complete_multi_pack_plan() {
+        let (root, _) = collection();
+        write(&root.path().join("_types/note.md"), EXISTING_TYPE);
+        let collection = Collection::open(root.path()).unwrap();
+        let revision = format!("sha256:{:x}", Sha256::digest(EXISTING_TYPE.as_bytes()));
+        let rejected = collection.install_type_packs_with_contract_setups(
+            &[
+                contract_pack("example.alpha", "alpha"),
+                contract_pack("example.beta", "beta"),
+            ],
+            &[
+                existing_setup("example.alpha", &revision),
+                existing_setup("example.beta", &format!("sha256:{}", "0".repeat(64))),
+            ],
+        );
+
+        assert!(!rejected.valid);
+        assert_eq!(rejected.diagnostics[0].code, "concurrent_modification");
+        assert_eq!(
+            fs::read_to_string(root.path().join("_types/note.md")).unwrap(),
+            EXISTING_TYPE
+        );
+        assert!(!root.path().join("_contracts/example.alpha.md").exists());
+        assert!(!root.path().join("_contracts/example.beta.md").exists());
     }
 }
