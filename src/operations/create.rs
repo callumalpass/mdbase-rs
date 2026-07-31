@@ -6,7 +6,9 @@ use crate::frontmatter;
 use crate::frontmatter::serializer;
 use crate::generated::derive_path;
 use crate::matching::engine::matches_rules_checked_compiled;
-use crate::operations::{atomic_create, ensure_no_symlink_components, ensure_safe_relative_path};
+use crate::operations::{
+    atomic_create, ensure_no_symlink_components, ensure_safe_relative_path, mutation_record_path,
+};
 use crate::Collection;
 
 impl Collection {
@@ -104,10 +106,13 @@ impl Collection {
         if path.is_empty() {
             return op_error(PATH_REQUIRED, "path must not be empty");
         }
-        if let Err(error) = ensure_safe_relative_path(&path, self.spec_profile) {
-            return error;
-        }
-        if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
+        let path = match mutation_record_path(self, &path) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
+        if let Err(error) =
+            ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)
+        {
             return error;
         }
         let _write_lock = match crate::transactions::WriteLock::acquire(self) {
@@ -116,14 +121,20 @@ impl Collection {
         };
 
         // Check existence
-        let full_path = self.root.join(&path);
+        let full_path = path.under(&self.root);
         if full_path.exists() {
-            return op_error(PATH_CONFLICT, &format!("File already exists: {}", path));
+            return op_error(
+                PATH_CONFLICT,
+                &format!("File already exists: {}", path.as_str()),
+            );
         }
         if if_revision.is_some() {
             return op_error(
                 CONCURRENT_MODIFICATION,
-                &format!("File '{}' no longer matches the requested revision", path),
+                &format!(
+                    "File '{}' no longer matches the requested revision",
+                    path.as_str()
+                ),
             );
         }
 
@@ -147,7 +158,7 @@ impl Collection {
                     if !matches_rules_checked_compiled(
                         rules,
                         compiled,
-                        &path,
+                        path.as_str(),
                         match_frontmatter,
                         self.settings.timezone.as_deref(),
                     )
@@ -173,7 +184,7 @@ impl Collection {
             } else {
                 &effective
             };
-            let validation = self.validate(validation_frontmatter, &type_names, &path);
+            let validation = self.validate(validation_frontmatter, &type_names, path.as_str());
             if !validation.valid {
                 return validation_failed_error(&validation.issues);
             }
@@ -183,7 +194,7 @@ impl Collection {
             } else {
                 &effective
             };
-            let validation = self.validate(validation_frontmatter, &type_names, &path);
+            let validation = self.validate(validation_frontmatter, &type_names, path.as_str());
             // §5.5: strict: true causes validation failure regardless of validation level
             let has_strict_errors = validation
                 .issues
@@ -230,7 +241,9 @@ impl Collection {
             frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
         let content = serializer::serialize_document(&yaml_mapping, body);
 
-        if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
+        if let Err(error) =
+            ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)
+        {
             return error;
         }
         if let Err(e) = atomic_create(&full_path, content.as_bytes()) {
@@ -245,7 +258,7 @@ impl Collection {
         }
 
         CreateOutput {
-            path,
+            path: path.to_string(),
             types: type_names,
             frontmatter: effective,
             body: body.to_string(),

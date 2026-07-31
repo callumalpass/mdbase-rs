@@ -22,10 +22,14 @@ pub(super) fn read(collection: &Collection, input: &Value) -> OperationResult {
         Ok(path) => path,
         Err(diagnostic) => return failed(*diagnostic),
     };
-    if let Err(diagnostic) = validate_existing_path(collection, path) {
+    let path = match validate_safe_path(collection, path) {
+        Ok(path) => path,
+        Err(diagnostic) => return failed(*diagnostic),
+    };
+    if let Err(diagnostic) = validate_existing_path(collection, &path) {
         return failed(*diagnostic);
     }
-    source_result(collection, path)
+    source_result(collection, &path)
 }
 
 pub(super) fn create(collection: &Collection, input: &Value) -> OperationResult {
@@ -63,23 +67,27 @@ pub(super) fn update(collection: &Collection, input: &Value) -> OperationResult 
         Ok(document) => document,
         Err(diagnostic) => return failed(*diagnostic),
     };
-    if let Err(diagnostic) = validate_existing_path(collection, path) {
+    let path = match validate_safe_path(collection, path) {
+        Ok(path) => path,
+        Err(diagnostic) => return failed(*diagnostic),
+    };
+    if let Err(diagnostic) = validate_existing_path(collection, &path) {
         return failed(*diagnostic);
     }
-    if let Err(diagnostics) = validate_document(collection, path, document, true) {
+    if let Err(diagnostics) = validate_document(collection, &path, document, true) {
         return failed_many(diagnostics);
     }
-    let full_path = collection.root.join(path);
+    let full_path = collection.root.join(&path);
     if let Err(error) = ensure_revision(
         &full_path,
-        path,
+        &path,
         input.get("if_revision").and_then(Value::as_str),
     ) {
-        return legacy_failure(error, path);
+        return legacy_failure(error, &path);
     }
     match atomic_write(&full_path, document.as_bytes()) {
-        Ok(()) => source_result(collection, path),
-        Err(error) => failed(io_diagnostic(path, error)),
+        Ok(()) => source_result(collection, &path),
+        Err(error) => failed(io_diagnostic(&path, error)),
     }
 }
 
@@ -88,16 +96,20 @@ pub(super) fn delete(collection: &Collection, input: &Value) -> OperationResult 
         Ok(path) => path,
         Err(diagnostic) => return failed(*diagnostic),
     };
-    if let Err(diagnostic) = validate_existing_path(collection, path) {
+    let path = match validate_safe_path(collection, path) {
+        Ok(path) => path,
+        Err(diagnostic) => return failed(*diagnostic),
+    };
+    if let Err(diagnostic) = validate_existing_path(collection, &path) {
         return failed(*diagnostic);
     }
-    let full_path = collection.root.join(path);
+    let full_path = collection.root.join(&path);
     if let Err(error) = ensure_revision(
         &full_path,
-        path,
+        &path,
         input.get("if_revision").and_then(Value::as_str),
     ) {
-        return legacy_failure(error, path);
+        return legacy_failure(error, &path);
     }
     match fs::remove_file(&full_path) {
         Ok(()) => OperationResult {
@@ -105,14 +117,13 @@ pub(super) fn delete(collection: &Collection, input: &Value) -> OperationResult 
             result: json!({ "path": path, "deleted": true }),
             diagnostics: Vec::new(),
         },
-        Err(error) => failed(io_diagnostic(path, error)),
+        Err(error) => failed(io_diagnostic(&path, error)),
     }
 }
 
 fn create_path(collection: &Collection, input: &Value, document: &str) -> DiagnosticResult<String> {
     if let Some(path) = input.get("path").and_then(Value::as_str) {
-        validate_safe_path(collection, path)?;
-        return Ok(path.replace('\\', "/"));
+        return validate_safe_path(collection, path);
     }
     let format = input
         .get("format")
@@ -137,8 +148,7 @@ fn create_path(collection: &Collection, input: &Value, document: &str) -> Diagno
         }
     };
     let path = format!("{}/{stem}.{extension}", folder.trim_matches('/'));
-    validate_safe_path(collection, &path)?;
-    Ok(path)
+    validate_safe_path(collection, &path)
 }
 
 fn default_format(collection: &Collection) -> &str {
@@ -204,7 +214,6 @@ fn slug(value: &str) -> String {
 }
 
 fn validate_existing_path(collection: &Collection, path: &str) -> DiagnosticResult<()> {
-    validate_safe_path(collection, path)?;
     if !collection.root.join(path).is_file() {
         return Err(Box::new(Diagnostic::error(
             "view_not_found",
@@ -230,23 +239,39 @@ fn validate_existing_path(collection: &Collection, path: &str) -> DiagnosticResu
     })
 }
 
-fn validate_safe_path(collection: &Collection, path: &str) -> DiagnosticResult<()> {
-    ensure_safe_relative_path(path, collection.spec_profile)
+fn validate_safe_path(collection: &Collection, path: &str) -> DiagnosticResult<String> {
+    let normalized = super::normalized_source_path(path).ok_or_else(|| {
+        Box::new(Diagnostic::error(
+            "invalid_view_path",
+            "Saved-view source paths must be portable and must not use hidden filesystem components.",
+            Some(path.to_string()),
+        ))
+    })?;
+    ensure_safe_relative_path(normalized.as_str(), collection.spec_profile)
         .map_err(|error| Box::new(legacy_diagnostic(error, path)))?;
-    ensure_no_symlink_components(&collection.root, path, collection.spec_profile)
-        .map_err(|error| Box::new(legacy_diagnostic(error, path)))?;
-    match Path::new(path).extension().and_then(|value| value.to_str()) {
-        Some("base") if is_configured_obsidian_source(collection, path) => Ok(()),
+    ensure_no_symlink_components(
+        &collection.root,
+        normalized.as_str(),
+        collection.spec_profile,
+    )
+    .map_err(|error| Box::new(legacy_diagnostic(error, path)))?;
+    match Path::new(normalized.as_str())
+        .extension()
+        .and_then(|value| value.to_str())
+    {
+        Some("base") if is_configured_obsidian_source(collection, normalized.as_str()) => {
+            Ok(normalized.to_string())
+        }
         Some("base") => Err(Box::new(Diagnostic::error(
             "invalid_view_path",
             "Obsidian Base sources must match x-obsidian.bases.include.",
-            Some(path.to_string()),
+            Some(normalized.to_string()),
         ))),
-        Some("md") => Ok(()),
+        Some("md") => Ok(normalized.to_string()),
         _ => Err(Box::new(Diagnostic::error(
             "invalid_view_path",
             "Saved-view sources must use a configured .base path or a .md path.",
-            Some(path.to_string()),
+            Some(normalized.to_string()),
         ))),
     }
 }

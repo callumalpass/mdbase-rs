@@ -121,7 +121,7 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
             continue;
         }
         let path = relative_resource_path(root, entry.path())?;
-        if path == ".mdbase" || path.starts_with(".mdbase/") {
+        if !is_schema_resource_path(&path) {
             continue;
         }
         resources.push(read_resource(
@@ -144,7 +144,9 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
     }
     resources[1..].sort_by(|left, right| left.path.cmp(&right.path));
 
-    let mut paths = collection.scan_collection_files();
+    let mut paths = collection
+        .scan_collection_files_checked()
+        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
     paths.sort();
     let mut records = Vec::with_capacity(paths.len());
     for absolute in paths {
@@ -160,7 +162,7 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
         let revision = read
             .get("revision")
             .and_then(Value::as_str)
-            .ok_or_else(|| ProviderError::CollectionOpen(operation_error(&read)))?
+            .ok_or_else(|| ProviderError::CollectionOpen(record_read_error(&path, &read)))?
             .to_string();
         let frontmatter = read
             .get("frontmatter")
@@ -217,6 +219,14 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
         resources,
         records,
     })
+}
+
+fn is_schema_resource_path(path: &str) -> bool {
+    let mut components = path.split('/');
+    components
+        .clone()
+        .all(|component| !component.starts_with('.'))
+        && components.any(|component| matches!(component, "schemas" | "_schemas"))
 }
 
 fn resource_revision(resources: &[CollectionSnapshotResource]) -> String {
@@ -287,13 +297,19 @@ fn snapshot_revision(
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn operation_error(value: &Value) -> String {
-    value
-        .get("diagnostics")
-        .and_then(Value::as_array)
-        .and_then(|diagnostics| diagnostics.first())
-        .and_then(|diagnostic| diagnostic.get("message"))
+fn record_read_error(path: &str, value: &Value) -> String {
+    let detail = value
+        .get("error")
+        .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
-        .unwrap_or("collection record could not be read")
-        .to_string()
+        .or_else(|| {
+            value
+                .get("diagnostics")
+                .and_then(Value::as_array)
+                .and_then(|diagnostics| diagnostics.first())
+                .and_then(|diagnostic| diagnostic.get("message"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("record read returned no revision");
+    format!("failed to read collection record '{path}': {detail}")
 }

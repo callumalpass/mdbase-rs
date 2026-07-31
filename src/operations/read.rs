@@ -3,7 +3,10 @@
 use crate::api::operations::ReadInput;
 use crate::errors::*;
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to_json};
-use crate::operations::{ensure_no_symlink_components, ensure_safe_relative_path};
+use crate::operations::{
+    ensure_no_symlink_components, ensure_regular_record_file, ensure_safe_relative_path,
+    readable_record_path,
+};
 use crate::Collection;
 use std::path::Path;
 
@@ -17,19 +20,19 @@ impl Collection {
         if let Err(error) = ensure_safe_relative_path(&input.path, self.spec_profile) {
             return error;
         }
-        if let Err(error) = ensure_no_symlink_components(&self.root, &input.path, self.spec_profile)
+        let path = match readable_record_path(self, &input.path) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
+        if let Err(error) =
+            ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)
         {
             return error;
         }
 
-        // Check exclusions
-        if self.is_excluded(&input.path) || !self.is_valid_extension(&input.path) {
-            return op_error(FILE_NOT_FOUND, &format!("File not found: {}", input.path));
-        }
-
-        let full_path = self.root.join(&input.path);
-        if !full_path.exists() {
-            return op_error(FILE_NOT_FOUND, &format!("File not found: {}", input.path));
+        let full_path = path.under(&self.root);
+        if let Err(error) = ensure_regular_record_file(&full_path, path.as_str()) {
+            return error;
         }
 
         let content = match std::fs::read_to_string(&full_path) {
@@ -79,7 +82,7 @@ impl Collection {
         };
 
         // Determine types (using path for match rule evaluation)
-        let type_names = self.determine_types_for_path(&persisted_frontmatter, Some(&input.path));
+        let type_names = self.determine_types_for_path(&persisted_frontmatter, Some(path.as_str()));
 
         // Apply defaults for effective frontmatter
         let effective = self.apply_defaults(&persisted_frontmatter, &type_names);
@@ -91,16 +94,16 @@ impl Collection {
         let effective = self.evaluate_computed_fields(
             effective,
             &type_names,
-            &input.path,
+            path.as_str(),
             Some(doc.body.as_str()),
         );
 
         // File metadata
-        let file_name = Path::new(&input.path)
+        let file_name = Path::new(path.as_str())
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        let folder = Path::new(&input.path)
+        let folder = Path::new(path.as_str())
             .parent()
             .and_then(|p| p.to_str())
             .unwrap_or("");
@@ -129,7 +132,7 @@ impl Collection {
                     &effective
                 },
                 &type_names,
-                &input.path,
+                path.as_str(),
             )
         };
         let issues_json: Vec<serde_json::Value> =
@@ -143,7 +146,7 @@ impl Collection {
         };
 
         let mut result = serde_json::json!({
-            "path": input.path,
+            "path": path.as_str(),
             "revision": crate::v03::revision(content.as_bytes()),
             "types": type_names,
             "frontmatter": persisted_frontmatter,

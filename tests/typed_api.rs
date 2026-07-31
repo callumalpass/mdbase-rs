@@ -305,6 +305,99 @@ fn document_updates_reject_invalid_or_ambiguous_candidates_without_writing() {
 }
 
 #[test]
+fn canonical_record_mutations_cannot_reach_control_or_executable_paths() {
+    let (root, collection) = typed_collection();
+    fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+    fs::write(root.path().join("payload.bat"), b"original executable").unwrap();
+    fs::write(
+        root.path().join(".git/hooks/post-checkout.md"),
+        b"original hook",
+    )
+    .unwrap();
+    let config_before = fs::read(root.path().join("mdbase.yaml")).unwrap();
+    let type_before = fs::read(root.path().join("_types/task.md")).unwrap();
+    let executable_before = fs::read(root.path().join("payload.bat")).unwrap();
+    let hook_before = fs::read(root.path().join(".git/hooks/post-checkout.md")).unwrap();
+    let operations = collection.v03_operations().unwrap();
+
+    for (operation, input) in [
+        (
+            "create",
+            json!({"path": "created.exe", "document": "malware"}),
+        ),
+        (
+            "update",
+            json!({"path": "mdbase.yaml", "document": "spec_version: 0.2.0\n"}),
+        ),
+        (
+            "update",
+            json!({"path": "_types/task.md", "document": "replaced"}),
+        ),
+        ("delete", json!({"path": "payload.bat"})),
+        (
+            "rename",
+            json!({"from": ".git/hooks/post-checkout.md", "to": "hook.md"}),
+        ),
+    ] {
+        let result = match operation {
+            "create" => operations.create(&input),
+            "update" => operations.update(&input),
+            "delete" => operations.delete(&input),
+            "rename" => operations.rename(&input),
+            _ => unreachable!(),
+        };
+        assert!(
+            !result.valid,
+            "{operation} unexpectedly succeeded: {result:#?}"
+        );
+    }
+
+    assert!(!root.path().join("created.exe").exists());
+    assert_eq!(
+        fs::read(root.path().join("mdbase.yaml")).unwrap(),
+        config_before
+    );
+    assert_eq!(
+        fs::read(root.path().join("_types/task.md")).unwrap(),
+        type_before
+    );
+    assert_eq!(
+        fs::read(root.path().join("payload.bat")).unwrap(),
+        executable_before
+    );
+    assert_eq!(
+        fs::read(root.path().join(".git/hooks/post-checkout.md")).unwrap(),
+        hook_before
+    );
+    assert!(!root.path().join("hook.md").exists());
+}
+
+#[test]
+fn canonical_rename_rejects_internal_concurrency_test_fields() {
+    let (root, collection) = typed_collection();
+    fs::create_dir_all(root.path().join("tasks")).unwrap();
+    fs::write(
+        root.path().join("tasks/source.md"),
+        "---\ntype: task\ntitle: Source\n---\n",
+    )
+    .unwrap();
+    let result = collection.v03_operations().unwrap().rename(&json!({
+        "from": "tasks/source.md",
+        "to": "tasks/destination.md",
+        "simulate_before_ref_update": [{
+            "path": ".git/hooks/post-checkout.md",
+            "content": "malware"
+        }]
+    }));
+
+    assert!(!result.valid);
+    assert_eq!(result.diagnostics[0].code, "invalid_request");
+    assert!(root.path().join("tasks/source.md").exists());
+    assert!(!root.path().join("tasks/destination.md").exists());
+    assert!(!root.path().join(".git/hooks/post-checkout.md").exists());
+}
+
+#[test]
 fn typed_non_partial_batch_commits_all_mutations_together() {
     let (root, collection) = typed_collection();
     fs::create_dir_all(root.path().join("tasks")).unwrap();

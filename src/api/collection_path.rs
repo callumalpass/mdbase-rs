@@ -69,11 +69,49 @@ impl FromStr for CollectionPath {
                 "" => return Err(CollectionPathError::EmptyComponent),
                 "." => return Err(CollectionPathError::CurrentDirectory),
                 ".." => return Err(CollectionPathError::Traversal),
-                value => components.push(value),
+                value => {
+                    validate_portable_component(value)?;
+                    components.push(value);
+                }
             }
         }
         Ok(Self(components.join("/")))
     }
+}
+
+fn validate_portable_component(component: &str) -> Result<(), CollectionPathError> {
+    if component
+        .chars()
+        .any(|character| character == ':' || character.is_control())
+    {
+        return Err(CollectionPathError::PlatformUnsafe);
+    }
+    if component.ends_with(['.', ' ']) {
+        return Err(CollectionPathError::PlatformUnsafe);
+    }
+
+    let basename = component
+        .split_once('.')
+        .map_or(component, |(basename, _)| basename)
+        .to_ascii_uppercase();
+    let reserved_device = matches!(basename.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || basename
+            .strip_prefix("COM")
+            .is_some_and(is_reserved_device_suffix)
+        || basename
+            .strip_prefix("LPT")
+            .is_some_and(is_reserved_device_suffix);
+    if reserved_device {
+        return Err(CollectionPathError::PlatformUnsafe);
+    }
+    Ok(())
+}
+
+fn is_reserved_device_suffix(value: &str) -> bool {
+    matches!(
+        value,
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+    )
 }
 
 impl TryFrom<&Path> for CollectionPath {
@@ -128,6 +166,9 @@ pub enum CollectionPathError {
     /// The platform path could not be represented as Unicode.
     #[error("collection path must be valid Unicode")]
     NonUnicode,
+    /// A component has platform-dependent aliasing or device semantics.
+    #[error("collection path contains a platform-reserved component")]
+    PlatformUnsafe,
 }
 
 #[cfg(test)]
@@ -154,6 +195,11 @@ mod tests {
             ("a/./b.md", CollectionPathError::CurrentDirectory),
             ("a//b.md", CollectionPathError::EmptyComponent),
             ("a/", CollectionPathError::EmptyComponent),
+            ("CON.md", CollectionPathError::PlatformUnsafe),
+            ("notes/aux", CollectionPathError::PlatformUnsafe),
+            ("notes/file.md.", CollectionPathError::PlatformUnsafe),
+            ("notes/file.md ", CollectionPathError::PlatformUnsafe),
+            ("notes/file.md:payload", CollectionPathError::PlatformUnsafe),
         ] {
             assert_eq!(CollectionPath::new(path).unwrap_err(), expected);
         }

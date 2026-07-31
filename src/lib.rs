@@ -26,6 +26,7 @@ pub mod links;
 pub mod matching;
 pub mod operations;
 pub mod query;
+pub mod record_path;
 pub mod runtime;
 pub(crate) mod snapshot;
 pub(crate) mod transactions;
@@ -176,7 +177,7 @@ impl Collection {
             _ => SpecProfile::V02,
         };
 
-        let settings = Settings {
+        let mut settings = Settings {
             extensions: settings_json["extensions"]
                 .as_array()
                 .map(|a| {
@@ -259,19 +260,35 @@ impl Collection {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
 
-        for (label, path) in [
-            ("types_folder", settings.types_folder.as_str()),
-            ("contracts_folder", settings.contracts_folder.as_str()),
-            ("migrations_folder", settings.migrations_folder.as_str()),
-            ("cache_folder", settings.cache_folder.as_str()),
+        for (label, folder, allow_hidden) in [
+            ("types_folder", &mut settings.types_folder, false),
+            ("contracts_folder", &mut settings.contracts_folder, false),
+            ("migrations_folder", &mut settings.migrations_folder, false),
+            ("cache_folder", &mut settings.cache_folder, true),
         ] {
-            crate::operations::ensure_safe_relative_path(path, spec_profile).map_err(|_| {
+            let normalized = crate::api::CollectionPath::new(folder.as_str()).map_err(|error| {
                 crate::errors::op_error(
                     crate::errors::INVALID_CONFIG,
-                    &format!("settings.{label} must be relative to the collection"),
+                    &format!("settings.{label} is not a portable collection path: {error}"),
                 )
             })?;
-            crate::operations::ensure_no_symlink_components(root, path, spec_profile)?;
+            if !allow_hidden
+                && normalized
+                    .as_str()
+                    .split('/')
+                    .any(|component| component.starts_with('.'))
+            {
+                return Err(crate::errors::op_error(
+                    crate::errors::INVALID_CONFIG,
+                    &format!("settings.{label} must not use a hidden filesystem namespace"),
+                ));
+            }
+            *folder = normalized.to_string();
+            crate::operations::ensure_no_symlink_components(
+                root,
+                normalized.as_str(),
+                spec_profile,
+            )?;
         }
 
         // Recovery must precede type loading. A system migration may have
@@ -437,7 +454,7 @@ impl Collection {
                         .map_err(|_| CollectionScanError::OutsideRoot { path: path.clone() })?
                         .to_string_lossy()
                         .to_string();
-                    if !self.is_excluded(&rel) {
+                    if !crate::record_path::has_hidden_component(&rel) && !self.is_excluded(&rel) {
                         self.scan_dir_recursive_checked(&path, files)?;
                     }
                 }
@@ -447,7 +464,7 @@ impl Collection {
                     .map_err(|_| CollectionScanError::OutsideRoot { path: path.clone() })?
                     .to_string_lossy()
                     .to_string();
-                if !self.is_excluded(&rel) && self.is_valid_extension(&rel) {
+                if self.validate_record_path(&rel).is_ok() {
                     files.push(path);
                 }
             }

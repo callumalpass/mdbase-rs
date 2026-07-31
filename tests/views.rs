@@ -275,6 +275,16 @@ fn creates_valid_sources_without_clobbering_or_escaping_configuration() {
     assert!(!invalid.valid);
     assert_eq!(invalid.diagnostics[0].code, "invalid_view");
     assert!(!root.path().join("TaskNotes/Views/broken.base").exists());
+
+    for path in [".git/hooks/post-commit.md", "TaskNotes/Views/CON.base"] {
+        let rejected = operations.create_view_source(&json!({
+            "path": path,
+            "document": document,
+        }));
+        assert!(!rejected.valid, "{path} must be rejected");
+        assert_eq!(rejected.diagnostics[0].code, "invalid_view_path");
+        assert!(!root.path().join(path).exists());
+    }
 }
 
 #[test]

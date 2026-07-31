@@ -8,8 +8,8 @@ use crate::api::operations::RenameInput;
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::operations::{
-    atomic_rename_noclobber, ensure_no_symlink_components, ensure_revision,
-    ensure_safe_relative_path,
+    atomic_rename_noclobber, ensure_no_symlink_components, ensure_regular_record_file,
+    ensure_revision, mutation_record_path,
 };
 use crate::Collection;
 
@@ -27,25 +27,28 @@ impl Collection {
             dry_run,
             last_known_mtime,
             if_revision,
-            simulate_before_ref_update,
+            mut simulate_before_ref_update,
             last_known_ref_mtimes,
         } = input;
-        if let Err(error) = ensure_safe_relative_path(&from, self.spec_profile) {
-            return error;
-        }
-        if let Err(error) = ensure_safe_relative_path(&to, self.spec_profile) {
-            return error;
-        }
+        let from = match mutation_record_path(self, &from) {
+            Ok(path) => path.to_string(),
+            Err(error) => return error,
+        };
+        let to = match mutation_record_path(self, &to) {
+            Ok(path) => path.to_string(),
+            Err(error) => return error,
+        };
         if let Err(error) = ensure_no_symlink_components(&self.root, &from, self.spec_profile) {
             return error;
         }
         if let Err(error) = ensure_no_symlink_components(&self.root, &to, self.spec_profile) {
             return error;
         }
-        for simulated in &simulate_before_ref_update {
-            if let Err(error) = ensure_safe_relative_path(&simulated.path, self.spec_profile) {
-                return error;
-            }
+        for simulated in &mut simulate_before_ref_update {
+            simulated.path = match mutation_record_path(self, &simulated.path) {
+                Ok(path) => path.to_string(),
+                Err(error) => return error,
+            };
             if let Err(error) =
                 ensure_no_symlink_components(&self.root, &simulated.path, self.spec_profile)
             {
@@ -64,6 +67,9 @@ impl Collection {
         let from_path = self.root.join(&from);
         let to_path = self.root.join(&to);
 
+        if let Err(error) = ensure_regular_record_file(&from_path, &from) {
+            return error;
+        }
         if !from_path.exists() {
             return op_error(FILE_NOT_FOUND, &format!("Source not found: {}", from));
         }

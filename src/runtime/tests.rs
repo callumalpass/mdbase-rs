@@ -92,6 +92,61 @@ fn provider_snapshot_is_canonical_stable_and_observes_external_changes() {
 }
 
 #[test]
+fn provider_snapshot_skips_paths_with_hidden_components() {
+    let directory = collection();
+    fs::create_dir_all(directory.path().join(".clump/commands")).unwrap();
+    fs::create_dir_all(directory.path().join("notes/.private")).unwrap();
+    fs::write(
+        directory.path().join(".clump/commands/tool.md"),
+        "---\ntitle: Tool configuration\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("notes/.private/draft.md"),
+        "---\ntitle: Private draft\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join(".hidden.md"),
+        "---\ntitle: Hidden root record\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("visible.md"),
+        "---\ntitle: Visible\n---\n",
+    )
+    .unwrap();
+
+    let snapshot = FilesystemProvider::open(directory.path())
+        .unwrap()
+        .snapshot()
+        .unwrap();
+
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(snapshot.records[0].path, "visible.md");
+}
+
+#[test]
+fn provider_snapshot_reports_the_record_path_and_read_error() {
+    let directory = collection();
+    fs::write(
+        directory.path().join("broken.md"),
+        "---\ntitle: [unterminated\n---\n",
+    )
+    .unwrap();
+
+    let error = FilesystemProvider::open(directory.path())
+        .unwrap()
+        .snapshot()
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "collection failed to open: failed to read collection record 'broken.md': Failed to parse YAML frontmatter"
+    );
+}
+
+#[test]
 fn provider_snapshot_includes_configured_saved_view_sources() {
     let directory = collection();
     fs::write(
@@ -108,6 +163,12 @@ fn provider_snapshot_includes_configured_saved_view_sources() {
     fs::write(
         directory.path().join("ignored.base"),
         "views:\n  - type: table\n    name: Ignored\n",
+    )
+    .unwrap();
+    fs::create_dir_all(directory.path().join(".git/hooks")).unwrap();
+    fs::write(
+        directory.path().join(".git/hooks/post-commit.base"),
+        "views:\n  - type: table\n    name: Hidden\n",
     )
     .unwrap();
     let provider = FilesystemProvider::open(directory.path()).unwrap();
@@ -137,6 +198,7 @@ fn provider_snapshot_includes_contract_and_schema_resources() {
     let directory = collection();
     fs::create_dir(directory.path().join("_contracts")).unwrap();
     fs::create_dir(directory.path().join("_schemas")).unwrap();
+    fs::create_dir_all(directory.path().join(".git/hooks")).unwrap();
     fs::write(
         directory.path().join("_contracts/task.md"),
         "---\nkind: mdbase.contract\ncontract_type: record\nid: example.task\nversion: 1.0.0\nrecord_schema:\n  dialect: json-schema-2020-12\n  ref: ../_schemas/task.json\n---\n",
@@ -145,6 +207,16 @@ fn provider_snapshot_includes_contract_and_schema_resources() {
     fs::write(
         directory.path().join("_schemas/task.json"),
         "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("package.json"),
+        "{\"scripts\":{\"postinstall\":\"malware\"}}\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join(".git/hooks/payload.json"),
+        "{\"type\":\"object\"}\n",
     )
     .unwrap();
     let provider = FilesystemProvider::open(directory.path()).unwrap();
@@ -300,7 +372,10 @@ fn runtime_queues_change_before_successful_mutation_returns() {
         .recv_timeout(Duration::ZERO)
         .unwrap()
         .expect("successful mutation must queue a change before returning");
-    assert_eq!(event.event_type, "mdbase.record.created");
+    assert_eq!(
+        event.event_type, "mdbase.record.created",
+        "unexpected watcher event: {event:#?}"
+    );
     assert_eq!(event.payload["path"], "created.md");
     assert_eq!(event.payload["after"]["title"], "Created");
 }

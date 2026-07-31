@@ -5,7 +5,8 @@ use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::frontmatter::serializer;
 use crate::operations::{
-    atomic_write, ensure_no_symlink_components, ensure_revision, ensure_safe_relative_path,
+    atomic_write, ensure_no_symlink_components, ensure_regular_record_file, ensure_revision,
+    mutation_record_path,
 };
 use crate::Collection;
 
@@ -24,10 +25,13 @@ impl Collection {
             last_known_mtime,
             if_revision,
         } = input;
-        if let Err(error) = ensure_safe_relative_path(&path, self.spec_profile) {
-            return error;
-        }
-        if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
+        let path = match mutation_record_path(self, &path) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
+        if let Err(error) =
+            ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)
+        {
             return error;
         }
         let _write_lock = match crate::transactions::WriteLock::acquire(self) {
@@ -36,9 +40,9 @@ impl Collection {
         };
 
         let new_body = new_body.as_deref();
-        let full_path = self.root.join(&path);
-        if !full_path.exists() {
-            return op_error(FILE_NOT_FOUND, &format!("File not found: {}", path));
+        let full_path = path.under(&self.root);
+        if let Err(error) = ensure_regular_record_file(&full_path, path.as_str()) {
+            return error;
         }
 
         // Concurrent modification detection: record mtime at read time
@@ -56,7 +60,7 @@ impl Collection {
                 if current_ms != known_ms {
                     return op_error(
                         CONCURRENT_MODIFICATION,
-                        &format!("File '{}' was modified externally", path),
+                        &format!("File '{}' was modified externally", path.as_str()),
                     );
                 }
             }
@@ -66,7 +70,7 @@ impl Collection {
             Ok(c) => c,
             Err(e) => return op_error(FILE_NOT_FOUND, &format!("Failed to read: {}", e)),
         };
-        if let Err(error) = ensure_revision(&full_path, &path, if_revision.as_deref()) {
+        if let Err(error) = ensure_revision(&full_path, path.as_str(), if_revision.as_deref()) {
             return error;
         }
 
@@ -111,7 +115,7 @@ impl Collection {
             Some(o) => o.clone(),
             None => serde_json::Map::new(),
         };
-        self.apply_generated(&mut merged_obj, &type_names, false, Some(&path));
+        self.apply_generated(&mut merged_obj, &type_names, false, Some(path.as_str()));
 
         // Apply defaults for effective frontmatter
         let effective =
@@ -124,10 +128,10 @@ impl Collection {
             } else {
                 &effective
             };
-            let mut validation = self.validate(validation_frontmatter, &type_names, &path);
+            let mut validation = self.validate(validation_frontmatter, &type_names, path.as_str());
 
             // Cross-file uniqueness checks for update
-            let uniqueness_issues = self.check_uniqueness(&effective, &type_names, &path);
+            let uniqueness_issues = self.check_uniqueness(&effective, &type_names, path.as_str());
             validation.issues.extend(uniqueness_issues.iter().cloned());
             if !uniqueness_issues.is_empty() {
                 validation.valid = false;
@@ -144,7 +148,7 @@ impl Collection {
                 if current != *recorded {
                     return op_error(
                         CONCURRENT_MODIFICATION,
-                        &format!("File '{}' was modified during operation", path),
+                        &format!("File '{}' was modified during operation", path.as_str()),
                     );
                 }
             }
@@ -181,7 +185,9 @@ impl Collection {
             serializer::serialize_document(&write_mapping, body)
         };
 
-        if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
+        if let Err(error) =
+            ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)
+        {
             return error;
         }
         if let Err(e) = atomic_write(&full_path, output.as_bytes()) {
@@ -209,10 +215,11 @@ impl Collection {
         }
 
         // Evaluate computed fields for the returned result (not written to disk)
-        let effective = self.evaluate_computed_fields(effective, &type_names, &path, Some(body));
+        let effective =
+            self.evaluate_computed_fields(effective, &type_names, path.as_str(), Some(body));
 
         UpdateOutput {
-            path,
+            path: path.to_string(),
             frontmatter: effective,
             body: body.to_string(),
             warnings: result_warnings,

@@ -133,6 +133,11 @@ fn commit_shadow_controlled(
     scope: TransactionScope,
     _fail_after_applied: Option<usize>,
 ) -> Result<CommitOutcome, TransactionError> {
+    // Keep transaction directories private until they are durable and retain
+    // the same lock through commit and cleanup. Collection recovery takes this
+    // lock before discovering journals, so it can never observe staging state
+    // or a transaction directory another writer is removing.
+    let _write_lock = WriteLock::acquire(collection)?;
     ensure_transaction_root(collection)?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     let directory = collection.root.join(TRANSACTIONS_DIR).join(&id);
@@ -206,13 +211,6 @@ fn commit_shadow_controlled(
     persist_journal(&directory, &journal)?;
     staging.durable = true;
 
-    let _write_lock = match WriteLock::acquire(collection) {
-        Ok(write_lock) => write_lock,
-        Err(error) => {
-            cleanup_transaction(&directory);
-            return Err(error);
-        }
-    };
     if let Err(error) = recheck_preconditions(collection, &journal) {
         cleanup_transaction(&directory);
         return Err(error);
@@ -252,6 +250,13 @@ pub(crate) fn recover_pending(collection: &Collection) -> Result<bool, Transacti
     if !root.exists() {
         return Ok(false);
     }
+    // Discover transactions only while holding the same lock used to stage,
+    // commit, and clean them up. Enumerating before locking leaves a stale path
+    // if a concurrent writer completes while recovery is waiting.
+    let _write_lock = WriteLock::acquire(collection)?;
+    if !root.exists() {
+        return Ok(false);
+    }
     let mut directories = fs::read_dir(&root)
         .map_err(|source| io_error(root.clone(), source))?
         .map(|entry| {
@@ -265,7 +270,6 @@ pub(crate) fn recover_pending(collection: &Collection) -> Result<bool, Transacti
         return Ok(false);
     }
 
-    let _write_lock = WriteLock::acquire(collection)?;
     for directory in directories {
         let metadata = fs::symlink_metadata(&directory)
             .map_err(|source| io_error(directory.clone(), source))?;
@@ -438,22 +442,16 @@ fn validate_entry_path(
     path: &str,
     scope: TransactionScope,
 ) -> Result<(), TransactionError> {
-    let logical = CollectionPath::new(path)
+    let logical = match scope {
+        TransactionScope::Records => collection
+            .validate_record_path(path)
+            .map_err(|error| TransactionError::UnsafePath(error.to_string()))?,
+        TransactionScope::SystemMigration => CollectionPath::new(path)
+            .map_err(|error| TransactionError::UnsafePath(error.to_string()))?,
+    };
+    ensure_safe_relative_path(logical.as_str(), SpecProfile::V03)
         .map_err(|error| TransactionError::UnsafePath(error.to_string()))?;
-    let platform_path = logical.to_path_buf();
-    if scope == TransactionScope::Records
-        && (path == "mdbase.yaml"
-            || platform_path.starts_with(&collection.settings.types_folder)
-            || platform_path.starts_with(&collection.settings.migrations_folder)
-            || platform_path.starts_with(".mdbase"))
-    {
-        return Err(TransactionError::UnsafePath(format!(
-            "batch transactions cannot mutate system definition path '{path}'"
-        )));
-    }
-    ensure_safe_relative_path(path, SpecProfile::V03)
-        .map_err(|error| TransactionError::UnsafePath(error.to_string()))?;
-    ensure_no_symlink_components(&collection.root, path, SpecProfile::V03)
+    ensure_no_symlink_components(&collection.root, logical.as_str(), SpecProfile::V03)
         .map_err(|error| TransactionError::UnsafePath(error.to_string()))
 }
 

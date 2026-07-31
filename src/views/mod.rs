@@ -12,6 +12,7 @@ pub use model::{
 use serde_json::Value;
 use std::path::PathBuf;
 
+use crate::api::CollectionPath;
 use crate::v03::OperationResult;
 use crate::Collection;
 
@@ -41,4 +42,12 @@ pub(crate) fn delete_source(collection: &Collection, input: &Value) -> Operation
 
 pub(crate) fn compatibility_source_paths(collection: &Collection) -> Vec<PathBuf> {
     execute::obsidian_source_paths(collection)
+}
+
+fn normalized_source_path(path: &str) -> Option<CollectionPath> {
+    let path = CollectionPath::new(path).ok()?;
+    path.as_str()
+        .split('/')
+        .all(|component| !component.starts_with('.'))
+        .then_some(path)
 }

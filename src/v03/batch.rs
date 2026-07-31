@@ -8,6 +8,68 @@ use walkdir::WalkDir;
 use super::{Diagnostic, OperationResult, Operations};
 use crate::Collection;
 
+pub(crate) fn execute_single(
+    collection: &Collection,
+    operation: &str,
+    input: &Value,
+) -> OperationResult {
+    if input
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let operations = match collection.v03_operations() {
+            Ok(operations) => operations,
+            Err(diagnostic) => return failed(vec![*diagnostic]),
+        };
+        return operations.execute_mutation_direct(operation, input);
+    }
+
+    let shadow = match shadow_collection(collection) {
+        Ok(shadow) => shadow,
+        Err(diagnostic) => return failed(vec![*diagnostic]),
+    };
+    let shadow_input = match adapt_mtime_precondition(collection, &shadow.collection, input) {
+        Ok(input) => input,
+        Err(diagnostic) => return failed(vec![*diagnostic]),
+    };
+    let shadow_operations = match shadow.collection.v03_operations() {
+        Ok(operations) => operations,
+        Err(diagnostic) => return failed(vec![*diagnostic]),
+    };
+    let mut result = shadow_operations.execute_mutation_direct(operation, &shadow_input);
+    if !result.valid {
+        return result;
+    }
+    let desired = match collect_collection_files(&shadow.collection) {
+        Ok(desired) => desired,
+        Err(diagnostic) => return failed(vec![*diagnostic]),
+    };
+    let commit = match crate::transactions::commit_shadow(collection, &shadow.baseline, &desired) {
+        Ok(commit) => commit,
+        Err(error) => {
+            return failed(vec![Diagnostic::error(
+                error.code(),
+                error.to_string(),
+                None,
+            )])
+        }
+    };
+    if commit.cleanup_deferred {
+        result.diagnostics.push(Diagnostic {
+            severity: "warning".to_string(),
+            code: "transaction_cleanup_deferred".to_string(),
+            message: "The mutation committed, but transaction cleanup was deferred.".to_string(),
+            path: None,
+            field: None,
+            type_name: None,
+            schema_location: None,
+            details: None,
+        });
+    }
+    result
+}
+
 pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult {
     let Some(items) = input.get("operations").and_then(Value::as_array) else {
         return invalid_request("Batch input requires an operations array.");
@@ -33,7 +95,7 @@ pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult
             Ok(operations) => operations,
             Err(diagnostic) => return failed(vec![*diagnostic]),
         };
-        let preview = execute_items(&shadow_operations, items, false);
+        let preview = execute_items(&shadow_operations, items, false, false);
         if dry_run || !preview.valid {
             return batch_result(preview, true, dry_run);
         }
@@ -73,10 +135,68 @@ pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult
         Err(diagnostic) => return failed(vec![*diagnostic]),
     };
     batch_result(
-        execute_items(&operations, items, allow_partial),
+        execute_items(&operations, items, allow_partial, true),
         false,
         false,
     )
+}
+
+fn adapt_mtime_precondition(
+    collection: &Collection,
+    shadow: &Collection,
+    input: &Value,
+) -> Result<Value, Box<Diagnostic>> {
+    let Some(expected) = input.get("last_known_mtime").and_then(Value::as_u64) else {
+        return Ok(input.clone());
+    };
+    let path = input
+        .get("path")
+        .or_else(|| input.get("from"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            Box::new(Diagnostic::error(
+                "invalid_request",
+                "A mutation mtime precondition requires a record path.",
+                None,
+            ))
+        })?;
+    let current = modified_millis(&collection.root.join(path)).ok_or_else(|| {
+        Box::new(Diagnostic::error(
+            "concurrent_modification",
+            format!("File '{path}' no longer matches the requested modification time."),
+            Some(path.to_string()),
+        ))
+    })?;
+    if current != expected {
+        return Err(Box::new(Diagnostic::error(
+            "concurrent_modification",
+            format!("File '{path}' was modified externally."),
+            Some(path.to_string()),
+        )));
+    }
+    let shadow_mtime = modified_millis(&shadow.root.join(path)).ok_or_else(|| {
+        Box::new(Diagnostic::error(
+            "batch_preflight_failed",
+            format!("Preflight record '{path}' is unavailable."),
+            Some(path.to_string()),
+        ))
+    })?;
+    let mut adapted = input.as_object().cloned().unwrap_or_default();
+    adapted.insert(
+        "last_known_mtime".to_string(),
+        Value::Number(shadow_mtime.into()),
+    );
+    Ok(Value::Object(adapted))
+}
+
+fn modified_millis(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
 
 pub(crate) struct ShadowCollection {
@@ -208,8 +328,17 @@ fn should_descend(collection: &Collection, path: &Path) -> bool {
 }
 
 fn should_copy_file(collection: &Collection, relative: &Path) -> bool {
-    if relative == Path::new("mdbase.yaml") || is_system_definition_path(collection, relative) {
+    if relative == Path::new("mdbase.yaml") {
         return true;
+    }
+    let extension = relative.extension().and_then(|value| value.to_str());
+    if relative.starts_with(Path::new(&collection.settings.migrations_folder)) {
+        return matches!(extension, Some("md" | "json"));
+    }
+    if relative.starts_with(Path::new(&collection.settings.types_folder))
+        || relative.starts_with(Path::new(&collection.settings.contracts_folder))
+    {
+        return extension == Some("md");
     }
     let relative = portable_path(relative);
     !collection.is_excluded(&relative)
@@ -251,6 +380,7 @@ fn execute_items(
     operations: &Operations<'_>,
     items: &[Value],
     allow_partial: bool,
+    atomic: bool,
 ) -> BatchExecution {
     let mut results = Vec::new();
     let mut diagnostics = Vec::new();
@@ -276,11 +406,14 @@ fn execute_items(
             continue;
         };
         let operation_input = item.get("input").cloned().unwrap_or_else(|| json!({}));
-        let operation = match kind {
-            "create" => operations.create(&operation_input),
-            "update" => operations.update(&operation_input),
-            "delete" => operations.delete(&operation_input),
-            "rename" => operations.rename(&operation_input),
+        let operation = match (kind, atomic) {
+            ("create", true) => operations.create(&operation_input),
+            ("update", true) => operations.update(&operation_input),
+            ("delete", true) => operations.delete(&operation_input),
+            ("rename", true) => operations.rename(&operation_input),
+            ("create" | "update" | "delete" | "rename", false) => {
+                operations.execute_mutation_direct(kind, &operation_input)
+            }
             _ => OperationResult {
                 valid: false,
                 result: json!({}),

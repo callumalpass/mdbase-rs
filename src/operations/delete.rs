@@ -2,7 +2,9 @@
 
 use crate::api::operations::{DeleteInput, DeleteOutput};
 use crate::errors::*;
-use crate::operations::{ensure_no_symlink_components, ensure_revision, ensure_safe_relative_path};
+use crate::operations::{
+    ensure_no_symlink_components, ensure_regular_record_file, ensure_revision, mutation_record_path,
+};
 use crate::Collection;
 
 impl Collection {
@@ -12,14 +14,15 @@ impl Collection {
             Ok(parsed) => parsed,
             Err(err) => return err,
         };
-        if let Err(error) = ensure_safe_relative_path(&input.path, self.spec_profile) {
-            return error;
-        }
-        if let Err(error) = ensure_no_symlink_components(&self.root, &input.path, self.spec_profile)
+        let path = match mutation_record_path(self, &input.path) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
+        if let Err(error) =
+            ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)
         {
             return error;
         }
-        let path = input.path;
         let check_backlinks = input.check_backlinks;
         let dry_run = input.dry_run;
         let _write_lock = if dry_run {
@@ -31,11 +34,12 @@ impl Collection {
             }
         };
 
-        let full_path = self.root.join(&path);
-        if !full_path.exists() {
-            return op_error(FILE_NOT_FOUND, &format!("File not found: {}", path));
+        let full_path = path.under(&self.root);
+        if let Err(error) = ensure_regular_record_file(&full_path, path.as_str()) {
+            return error;
         }
-        if let Err(error) = ensure_revision(&full_path, &path, input.if_revision.as_deref()) {
+        if let Err(error) = ensure_revision(&full_path, path.as_str(), input.if_revision.as_deref())
+        {
             return error;
         }
 
@@ -50,7 +54,7 @@ impl Collection {
                     if current_ms != known_ms {
                         return op_error(
                             CONCURRENT_MODIFICATION,
-                            &format!("File '{}' was modified externally", path),
+                            &format!("File '{}' was modified externally", path.as_str()),
                         );
                     }
                 }
@@ -62,7 +66,7 @@ impl Collection {
         if check_backlinks {
             let all_files = self.build_all_files_data();
             let bl_index = self.build_backlinks_index(&all_files);
-            if let Some(sources) = bl_index.get(&path) {
+            if let Some(sources) = bl_index.get(path.as_str()) {
                 for source in sources {
                     broken_links.push(serde_json::json!({
                         "path": source,
@@ -72,10 +76,14 @@ impl Collection {
         }
 
         if !dry_run {
-            if let Err(error) = ensure_revision(&full_path, &path, input.if_revision.as_deref()) {
+            if let Err(error) =
+                ensure_revision(&full_path, path.as_str(), input.if_revision.as_deref())
+            {
                 return error;
             }
-            if let Err(error) = ensure_no_symlink_components(&self.root, &path, self.spec_profile) {
+            if let Err(error) =
+                ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)
+            {
                 return error;
             }
             if let Err(e) = std::fs::remove_file(&full_path) {
@@ -84,7 +92,7 @@ impl Collection {
         }
 
         DeleteOutput {
-            path,
+            path: path.to_string(),
             deleted: !dry_run,
             dry_run,
             broken_links,
