@@ -443,6 +443,31 @@ impl<'a> Operations<'a> {
             "include_document": include_document,
         }));
         if let Some(error) = read.get("error") {
+            if error.get("code").and_then(Value::as_str) == Some("invalid_frontmatter") {
+                match self.collection.snapshot_record(path) {
+                    Ok(record) if record.frontmatter_error.is_some() => {
+                        result.insert("path".to_string(), Value::String(record.path));
+                        result.insert("revision".to_string(), Value::String(record.revision));
+                        result.insert("types".to_string(), serde_json::json!(record.types));
+                        result.insert("frontmatter".to_string(), Value::Object(record.frontmatter));
+                        result.insert("effective_frontmatter".to_string(), serde_json::json!({}));
+                        result.insert("body".to_string(), Value::String(record.body));
+                        if include_document {
+                            result.insert("document".to_string(), Value::String(record.document));
+                        }
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(snapshot_error) => {
+                        diagnostics.push(Diagnostic::error(
+                            snapshot_error.code(),
+                            snapshot_error.to_string(),
+                            Some(path.to_string()),
+                        ));
+                        return;
+                    }
+                }
+            }
             diagnostics.push(diagnostic_from_value(error, "error", Some(path)));
             return;
         }
