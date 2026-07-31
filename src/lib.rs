@@ -454,7 +454,7 @@ impl Collection {
                         .map_err(|_| CollectionScanError::OutsideRoot { path: path.clone() })?
                         .to_string_lossy()
                         .to_string();
-                    if !self.is_excluded(&rel) {
+                    if !crate::record_path::has_hidden_component(&rel) && !self.is_excluded(&rel) {
                         self.scan_dir_recursive_checked(&path, files)?;
                     }
                 }
@@ -464,7 +464,7 @@ impl Collection {
                     .map_err(|_| CollectionScanError::OutsideRoot { path: path.clone() })?
                     .to_string_lossy()
                     .to_string();
-                if !self.is_excluded(&rel) && self.is_valid_extension(&rel) {
+                if self.validate_record_path(&rel).is_ok() {
                     files.push(path);
                 }
             }

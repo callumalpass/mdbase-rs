@@ -92,6 +92,61 @@ fn provider_snapshot_is_canonical_stable_and_observes_external_changes() {
 }
 
 #[test]
+fn provider_snapshot_skips_paths_with_hidden_components() {
+    let directory = collection();
+    fs::create_dir_all(directory.path().join(".clump/commands")).unwrap();
+    fs::create_dir_all(directory.path().join("notes/.private")).unwrap();
+    fs::write(
+        directory.path().join(".clump/commands/tool.md"),
+        "---\ntitle: Tool configuration\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("notes/.private/draft.md"),
+        "---\ntitle: Private draft\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join(".hidden.md"),
+        "---\ntitle: Hidden root record\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("visible.md"),
+        "---\ntitle: Visible\n---\n",
+    )
+    .unwrap();
+
+    let snapshot = FilesystemProvider::open(directory.path())
+        .unwrap()
+        .snapshot()
+        .unwrap();
+
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(snapshot.records[0].path, "visible.md");
+}
+
+#[test]
+fn provider_snapshot_reports_the_record_path_and_read_error() {
+    let directory = collection();
+    fs::write(
+        directory.path().join("broken.md"),
+        "---\ntitle: [unterminated\n---\n",
+    )
+    .unwrap();
+
+    let error = FilesystemProvider::open(directory.path())
+        .unwrap()
+        .snapshot()
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "collection failed to open: failed to read collection record 'broken.md': Failed to parse YAML frontmatter"
+    );
+}
+
+#[test]
 fn provider_snapshot_includes_configured_saved_view_sources() {
     let directory = collection();
     fs::write(

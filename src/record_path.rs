@@ -5,6 +5,11 @@ use thiserror::Error;
 use crate::api::{CollectionPath, CollectionPathError};
 use crate::Collection;
 
+pub(crate) fn has_hidden_component(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|component| component.starts_with('.'))
+}
+
 /// Reason a logical path cannot be used as an ordinary collection record.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum RecordPathError {
@@ -34,11 +39,7 @@ impl Collection {
         path: impl AsRef<str>,
     ) -> Result<CollectionPath, RecordPathError> {
         let path = CollectionPath::new(path)?;
-        if path
-            .as_str()
-            .split('/')
-            .any(|component| component.starts_with('.'))
-        {
+        if has_hidden_component(path.as_str()) {
             return Err(RecordPathError::HiddenComponent);
         }
         if self.is_excluded(path.as_str()) {
