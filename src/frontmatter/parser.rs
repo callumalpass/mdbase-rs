@@ -13,6 +13,39 @@ pub struct ParsedDocument {
     pub has_frontmatter: bool,
 }
 
+/// Structural frontmatter state shared by collection consumers.
+///
+/// Parsing is deliberately separate from policy: queries may omit opaque
+/// records, validation may diagnose them, and snapshots may preserve them.
+/// Consumers should match this enum instead of interpreting the YAML error
+/// sentinel themselves.
+#[derive(Debug, Clone, Copy)]
+pub enum FrontmatterState<'a> {
+    /// The document has no complete leading frontmatter block.
+    Absent,
+    /// The document has canonical object frontmatter.
+    Mapping(&'a serde_yaml::Mapping),
+    /// The frontmatter block is not valid YAML.
+    InvalidYaml,
+    /// The frontmatter block explicitly contains YAML null.
+    Null,
+    /// The frontmatter block is valid YAML but is not an object.
+    NonMapping(&'a YamlValue),
+}
+
+impl ParsedDocument {
+    /// Classify frontmatter once so callers only choose policy.
+    pub fn frontmatter_state(&self) -> FrontmatterState<'_> {
+        match self.frontmatter.as_ref() {
+            None => FrontmatterState::Absent,
+            Some(value) if is_parse_error(value) => FrontmatterState::InvalidYaml,
+            Some(YamlValue::Mapping(mapping)) => FrontmatterState::Mapping(mapping),
+            Some(YamlValue::Null) => FrontmatterState::Null,
+            Some(value) => FrontmatterState::NonMapping(value),
+        }
+    }
+}
+
 /// Parse a markdown document into frontmatter and body.
 ///
 /// Returns the raw YAML value for frontmatter (which may be a mapping, list, scalar, or null)

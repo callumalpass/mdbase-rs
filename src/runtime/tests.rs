@@ -1,5 +1,6 @@
 use super::*;
 use crate::v03::OperationResult;
+use crate::Collection;
 use serde_json::json;
 use std::fs;
 use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
@@ -127,7 +128,7 @@ fn provider_snapshot_skips_paths_with_hidden_components() {
 }
 
 #[test]
-fn provider_snapshot_reports_the_record_path_and_read_error() {
+fn provider_snapshot_preserves_invalid_frontmatter_as_opaque_markdown() {
     let directory = collection();
     fs::write(
         directory.path().join("broken.md"),
@@ -135,15 +136,63 @@ fn provider_snapshot_reports_the_record_path_and_read_error() {
     )
     .unwrap();
 
-    let error = FilesystemProvider::open(directory.path())
+    let snapshot = FilesystemProvider::open(directory.path())
         .unwrap()
         .snapshot()
-        .unwrap_err();
+        .unwrap();
 
+    assert_eq!(snapshot.records.len(), 1);
+    let broken = &snapshot.records[0];
+    assert_eq!(broken.path, "broken.md");
+    assert!(broken.frontmatter.is_empty());
+    assert_eq!(broken.body, "---\ntitle: [unterminated\n---\n");
+    assert_eq!(broken.document, broken.body);
     assert_eq!(
-        error.to_string(),
-        "collection failed to open: failed to read collection record 'broken.md': Failed to parse YAML frontmatter"
+        broken.frontmatter_error.as_deref(),
+        Some("Failed to parse YAML frontmatter")
     );
+}
+
+#[test]
+fn provider_snapshot_preserves_non_mapping_frontmatter_as_opaque_markdown() {
+    let directory = collection();
+    let document = "---\n- one\n- two\n---\nBody\n";
+    fs::write(directory.path().join("list.md"), document).unwrap();
+
+    let provider = FilesystemProvider::open(directory.path()).unwrap();
+    let record = provider.snapshot_record("list.md").unwrap();
+
+    assert!(record.frontmatter.is_empty());
+    assert_eq!(record.body, document);
+    assert_eq!(record.document, document);
+    assert_eq!(
+        record.frontmatter_error.as_deref(),
+        Some("Frontmatter must be a YAML mapping")
+    );
+}
+
+#[test]
+fn canonical_create_preserves_opaque_body_while_typed_read_stays_strict() {
+    let directory = collection();
+    let collection = Collection::open(directory.path()).unwrap();
+    let operations = collection.v03_operations().unwrap();
+    let document = "---\ntitle: [unterminated\n---\nOpaque body";
+
+    let created = operations.create(&json!({
+        "path": "opaque.md",
+        "frontmatter": {},
+        "body": document,
+    }));
+    assert!(created.valid, "{:?}", created.diagnostics);
+    assert_eq!(created.result["body"], document);
+
+    let read = operations.read(&json!({"path": "opaque.md"}));
+    assert!(!read.valid);
+    assert_eq!(read.diagnostics[0].code, "invalid_frontmatter");
+
+    let record = collection.snapshot_record("opaque.md").unwrap();
+    assert_eq!(record.body, document);
+    assert_eq!(record.document, document);
 }
 
 #[test]

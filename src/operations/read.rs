@@ -2,7 +2,7 @@
 
 use crate::api::operations::ReadInput;
 use crate::errors::*;
-use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to_json};
+use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json, FrontmatterState};
 use crate::operations::{
     ensure_no_symlink_components, ensure_regular_record_file, ensure_safe_relative_path,
     readable_record_path,
@@ -42,26 +42,22 @@ impl Collection {
 
         let doc = parse_document(&content);
 
-        // Check for parse errors
-        if let Some(ref fm) = doc.frontmatter {
-            if is_parse_error(fm) {
-                return op_error(INVALID_FRONTMATTER, "Failed to parse YAML frontmatter");
-            }
-        }
-
         // Get frontmatter as JSON
         let mut warnings: Vec<serde_json::Value> = Vec::new();
-        let persisted_frontmatter = match &doc.frontmatter {
-            Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
-            Some(serde_yaml::Value::Null) => {
+        let persisted_frontmatter = match doc.frontmatter_state() {
+            FrontmatterState::InvalidYaml => {
+                return op_error(INVALID_FRONTMATTER, "Failed to parse YAML frontmatter")
+            }
+            FrontmatterState::Mapping(mapping) => yaml_mapping_to_json(mapping),
+            FrontmatterState::Null => {
                 let validation_level = &self.settings.default_validation;
                 if validation_level == "error" {
                     return op_error(INVALID_FRONTMATTER, "Frontmatter is null");
                 }
                 serde_json::json!({})
             }
-            None => serde_json::json!({}),
-            Some(_other) => {
+            FrontmatterState::Absent => serde_json::json!({}),
+            FrontmatterState::NonMapping(_) => {
                 // Non-mapping frontmatter (list, scalar) - structural error
                 let validation_level = &self.settings.default_validation;
                 if validation_level == "off" {

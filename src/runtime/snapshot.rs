@@ -1,3 +1,8 @@
+use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json, FrontmatterState};
+use crate::operations::{
+    ensure_no_symlink_components, ensure_regular_record_file, ensure_safe_relative_path,
+    readable_record_path,
+};
 use crate::Collection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -49,6 +54,10 @@ pub struct CollectionSnapshotRecord {
     pub body: String,
     pub types: Vec<String>,
     pub document: String,
+    /// Present when the record is preserved as opaque Markdown because its
+    /// frontmatter cannot be represented as a structured object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontmatter_error: Option<String>,
 }
 
 impl Collection {
@@ -58,6 +67,33 @@ impl Collection {
     /// which also holds the provider's read gate for the full capture.
     pub fn snapshot(&self) -> Result<CollectionSnapshot, ProviderError> {
         collection_snapshot(self)
+    }
+
+    /// Materialize one record for provider and synchronization boundaries.
+    ///
+    /// Malformed or non-object frontmatter is preserved byte-for-byte as an
+    /// opaque body while structured fields remain empty. Typed `read` remains
+    /// strict, but transport layers no longer need to reimplement this policy.
+    pub fn snapshot_record(&self, path: &str) -> Result<CollectionSnapshotRecord, ProviderError> {
+        ensure_safe_relative_path(path, self.spec_profile)
+            .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
+        let record_path = readable_record_path(self, path)
+            .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
+        ensure_no_symlink_components(&self.root, record_path.as_str(), self.spec_profile)
+            .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
+        let absolute = record_path.under(&self.root);
+        ensure_regular_record_file(&absolute, record_path.as_str())
+            .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
+        let document = fs::read_to_string(&absolute).map_err(|error| {
+            ProviderError::CollectionOpen(format!(
+                "failed to read collection record '{path}': {error}"
+            ))
+        })?;
+        Ok(materialize_snapshot_record(
+            self,
+            record_path.as_str(),
+            document,
+        ))
     }
 }
 
@@ -155,50 +191,7 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
             .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?
             .to_string_lossy()
             .replace('\\', "/");
-        let read = collection.read(&serde_json::json!({
-            "path": path,
-            "include_document": true,
-        }));
-        let revision = read
-            .get("revision")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ProviderError::CollectionOpen(record_read_error(&path, &read)))?
-            .to_string();
-        let frontmatter = read
-            .get("frontmatter")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let body = read
-            .get("body")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let document = read
-            .get("document")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProviderError::CollectionOpen(format!(
-                    "collection read omitted canonical document for {path}"
-                ))
-            })?
-            .to_string();
-        let types = read
-            .get("types")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect();
-        records.push(CollectionSnapshotRecord {
-            path,
-            revision,
-            frontmatter,
-            body,
-            types,
-            document,
-        });
+        records.push(collection.snapshot_record(&path)?);
     }
 
     let spec_version = serde_yaml::from_str::<serde_yaml::Value>(&resources[0].document)
@@ -219,6 +212,46 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
         resources,
         records,
     })
+}
+
+fn materialize_snapshot_record(
+    collection: &Collection,
+    path: &str,
+    document: String,
+) -> CollectionSnapshotRecord {
+    let parsed = parse_document(&document);
+    let (frontmatter, body, frontmatter_error) = match parsed.frontmatter_state() {
+        FrontmatterState::Absent => (Map::new(), parsed.body, None),
+        FrontmatterState::Mapping(mapping) => (
+            yaml_mapping_to_json(mapping)
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+            parsed.body,
+            None,
+        ),
+        FrontmatterState::InvalidYaml => (
+            Map::new(),
+            document.clone(),
+            Some("Failed to parse YAML frontmatter".to_string()),
+        ),
+        FrontmatterState::Null | FrontmatterState::NonMapping(_) => (
+            Map::new(),
+            document.clone(),
+            Some("Frontmatter must be a YAML mapping".to_string()),
+        ),
+    };
+    let types =
+        collection.determine_types_for_path(&Value::Object(frontmatter.clone()), Some(path));
+    CollectionSnapshotRecord {
+        path: path.to_string(),
+        revision: crate::v03::revision(document.as_bytes()),
+        frontmatter,
+        body,
+        types,
+        document,
+        frontmatter_error,
+    }
 }
 
 fn is_schema_resource_path(path: &str) -> bool {

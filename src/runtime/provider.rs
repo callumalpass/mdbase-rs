@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::observer::NoopObserver;
-use super::CollectionSnapshot;
+use super::{CollectionSnapshot, CollectionSnapshotRecord};
 use super::{
     ErrorReporting, ObserverOptions, OperationError, OperationKind, OperationPerformance,
     OperationRequest, ProviderError, RuntimeObserver,
@@ -94,6 +94,11 @@ impl FilesystemProvider {
     /// opaque revisions and by a subsequent capture before cutover.
     pub fn snapshot(&self) -> Result<CollectionSnapshot, ProviderError> {
         self.with_collection_read(Collection::snapshot)
+    }
+
+    /// Materialize one record at the provider's read boundary.
+    pub fn snapshot_record(&self, path: &str) -> Result<CollectionSnapshotRecord, ProviderError> {
+        self.with_collection_read(|collection| collection.snapshot_record(path))
     }
 
     /// Execute a compound provider operation against one freshly loaded

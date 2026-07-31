@@ -8,7 +8,7 @@ use crate::cache::CacheError;
 use crate::expressions::evaluator::{
     extract_embeds_from_body, extract_links_from_body, extract_links_from_fm_value,
 };
-use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to_json};
+use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json, FrontmatterState};
 use crate::Collection;
 
 /// Parse and index a single file into the cache database.
@@ -45,20 +45,20 @@ pub(crate) fn reindex_file(
     let doc = parse_document(&content);
 
     // 4. Convert frontmatter to JSON, detect parse errors
-    let (frontmatter_json, body, parse_error) = match &doc.frontmatter {
-        Some(yaml_val) if is_parse_error(yaml_val) => {
+    let (frontmatter_json, body, parse_error) = match doc.frontmatter_state() {
+        FrontmatterState::InvalidYaml => {
             // Parse error: store empty object as frontmatter, flag the error
             (serde_json::json!({}), doc.body.clone(), 1i64)
         }
-        Some(serde_yaml::Value::Mapping(m)) => {
+        FrontmatterState::Mapping(m) => {
             let fm = yaml_mapping_to_json(m);
             (fm, doc.body.clone(), 0i64)
         }
-        Some(_) => {
+        FrontmatterState::Null | FrontmatterState::NonMapping(_) => {
             // Non-mapping frontmatter (scalar, list, etc.) -- treat as empty
             (serde_json::json!({}), doc.body.clone(), 0i64)
         }
-        None => {
+        FrontmatterState::Absent => {
             // No frontmatter delimiters
             (serde_json::json!({}), doc.body.clone(), 0i64)
         }
