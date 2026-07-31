@@ -372,7 +372,10 @@ fn runtime_queues_change_before_successful_mutation_returns() {
         .recv_timeout(Duration::ZERO)
         .unwrap()
         .expect("successful mutation must queue a change before returning");
-    assert_eq!(event.event_type, "mdbase.record.created");
+    assert_eq!(
+        event.event_type, "mdbase.record.created",
+        "unexpected watcher event: {event:#?}"
+    );
     assert_eq!(event.payload["path"], "created.md");
     assert_eq!(event.payload["after"]["title"], "Created");
 }
