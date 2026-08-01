@@ -80,10 +80,9 @@ impl FromStr for CollectionPath {
 }
 
 fn validate_portable_component(component: &str) -> Result<(), CollectionPathError> {
-    if component
-        .chars()
-        .any(|character| character == ':' || character.is_control())
-    {
+    if component.chars().any(|character| {
+        matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*') || character.is_control()
+    }) {
         return Err(CollectionPathError::PlatformUnsafe);
     }
     if component.ends_with(['.', ' ']) {
@@ -200,6 +199,11 @@ mod tests {
             ("notes/file.md.", CollectionPathError::PlatformUnsafe),
             ("notes/file.md ", CollectionPathError::PlatformUnsafe),
             ("notes/file.md:payload", CollectionPathError::PlatformUnsafe),
+            ("notes/file?.md", CollectionPathError::PlatformUnsafe),
+            ("notes/<draft>.md", CollectionPathError::PlatformUnsafe),
+            ("notes/a|b.md", CollectionPathError::PlatformUnsafe),
+            ("notes/\"quoted\".md", CollectionPathError::PlatformUnsafe),
+            ("COM¹.bin", CollectionPathError::PlatformUnsafe),
         ] {
             assert_eq!(CollectionPath::new(path).unwrap_err(), expected);
         }
