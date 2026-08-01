@@ -19,6 +19,7 @@ pub mod data_contracts;
 pub mod expressions;
 pub mod field_reference;
 pub(crate) mod field_references;
+pub mod file_path;
 pub mod frontmatter;
 pub mod generated;
 pub mod init;
