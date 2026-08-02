@@ -660,12 +660,14 @@ pub fn into_portable(command: Command) -> Result<PortableInvocation, CommandResu
                 input: pack_operation_input(
                     &manifest,
                     &resources,
-                    installed_by,
-                    adoptions,
-                    preserve_seed_targets,
-                    target_overrides,
-                    None,
-                    false,
+                    PackOperationOptions {
+                        installed_by,
+                        adoptions,
+                        preserve_seed_targets,
+                        target_overrides,
+                        assessment_digest: None,
+                        allow_downgrade: false,
+                    },
                 )
                 .map_err(command_error)?,
             },
@@ -683,12 +685,14 @@ pub fn into_portable(command: Command) -> Result<PortableInvocation, CommandResu
                 input: pack_operation_input(
                     &manifest,
                     &resources,
-                    installed_by,
-                    adoptions,
-                    preserve_seed_targets,
-                    target_overrides,
-                    Some(assessment_digest),
-                    allow_downgrade,
+                    PackOperationOptions {
+                        installed_by,
+                        adoptions,
+                        preserve_seed_targets,
+                        target_overrides,
+                        assessment_digest: Some(assessment_digest),
+                        allow_downgrade,
+                    },
                 )
                 .map_err(command_error)?,
             },
@@ -1548,15 +1552,19 @@ fn read_text_input(source: &str) -> MdbaseResult<String> {
     })
 }
 
-fn pack_operation_input(
-    manifest_path: &str,
-    resources_root: &str,
+struct PackOperationOptions {
     installed_by: String,
     adoptions: Vec<String>,
     preserve_seed_targets: Vec<String>,
     target_overrides: Vec<String>,
     assessment_digest: Option<String>,
     allow_downgrade: bool,
+}
+
+fn pack_operation_input(
+    manifest_path: &str,
+    resources_root: &str,
+    options: PackOperationOptions,
 ) -> MdbaseResult<serde_json::Value> {
     let source = read_text_input(manifest_path)?;
     let manifest = serde_yaml::from_str::<serde_json::Value>(&source).map_err(|error| {
@@ -1579,7 +1587,7 @@ fn pack_operation_input(
             .ok_or_else(|| MdbaseError::InvalidRequest {
                 message: "each type-pack resource requires source".to_string(),
             })?;
-        let safe_source = CollectionPath::new(source.to_string())?;
+        let safe_source = CollectionPath::new(source)?;
         let path = root.join(safe_source.as_str());
         let document =
             std::fs::read_to_string(&path).map_err(|error| MdbaseError::InvalidRequest {
@@ -1591,14 +1599,14 @@ fn pack_operation_input(
         resources.push(serde_json::json!({ "source": source, "document": document }));
     }
     let mut adopt_resources = serde_json::Map::new();
-    for adoption in adoptions {
+    for adoption in options.adoptions {
         let (target, digest) =
             adoption
                 .split_once('=')
                 .ok_or_else(|| MdbaseError::InvalidRequest {
                     message: format!("invalid --adopt '{adoption}'; expected TARGET=sha256:DIGEST"),
                 })?;
-        CollectionPath::new(target.to_string())?;
+        CollectionPath::new(target)?;
         if !is_sha256_digest(digest) {
             return Err(MdbaseError::InvalidRequest {
                 message: format!("invalid adoption digest for '{target}'"),
@@ -1616,13 +1624,13 @@ fn pack_operation_input(
             });
         }
     }
-    let mut preserved_seeds = Vec::with_capacity(preserve_seed_targets.len());
-    for target in preserve_seed_targets {
+    let mut preserved_seeds = Vec::with_capacity(options.preserve_seed_targets.len());
+    for target in options.preserve_seed_targets {
         let target = CollectionPath::new(target)?;
         preserved_seeds.push(target.as_str().to_string());
     }
     let mut resolved_targets = serde_json::Map::new();
-    for target_override in target_overrides {
+    for target_override in options.target_overrides {
         let (source, target) = target_override.split_once('=').ok_or_else(|| {
             MdbaseError::InvalidRequest {
                 message: format!(
@@ -1630,8 +1638,8 @@ fn pack_operation_input(
                 ),
             }
         })?;
-        let source = CollectionPath::new(source.to_string())?;
-        let target = CollectionPath::new(target.to_string())?;
+        let source = CollectionPath::new(source)?;
+        let target = CollectionPath::new(target)?;
         if resolved_targets
             .insert(
                 source.as_str().to_string(),
@@ -1646,14 +1654,14 @@ fn pack_operation_input(
     }
     let mut input = serde_json::json!({
         "provision": { "manifest": manifest, "resources": resources, "provides": [] },
-        "installed_by": installed_by,
+        "installed_by": options.installed_by,
         "adopt_resources": adopt_resources,
         "preserve_seed_targets": preserved_seeds,
         "target_overrides": resolved_targets,
     });
-    if let Some(digest) = assessment_digest {
+    if let Some(digest) = options.assessment_digest {
         input["expected_assessment_digest"] = serde_json::Value::String(digest);
-        input["allow_downgrade"] = serde_json::Value::Bool(allow_downgrade);
+        input["allow_downgrade"] = serde_json::Value::Bool(options.allow_downgrade);
     }
     Ok(input)
 }
