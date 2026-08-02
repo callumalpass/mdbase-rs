@@ -29,7 +29,7 @@ pub use operations::{OperationResult, Operations};
 pub use query::QueryPerformance;
 pub use type_pack::{
     ContractIdentity, ContractSetupChoice, ContractSetupMode, ExistingContractImplementation,
-    TypePackInstall, TypePackResource,
+    TypePackApplyOptions, TypePackAssessmentOptions, TypePackProvision, TypePackResource,
 };
 
 pub const SPEC_VERSION: &str = "0.3.0";
@@ -58,6 +58,7 @@ const QUERY_SCHEMA: &str = include_str!("../../schemas/v0.3/query.schema.json");
 const QUERY_RESULT_SCHEMA: &str = include_str!("../../schemas/v0.3/query-result.schema.json");
 const TYPE_FILE_SCHEMA: &str = include_str!("../../schemas/v0.3/type-file.schema.json");
 const TYPE_PACK_SCHEMA: &str = include_str!("../../schemas/v0.3/type-pack.schema.json");
+const TYPE_PACK_LOCK_SCHEMA: &str = include_str!("../../schemas/v0.3/type-pack-lock.schema.json");
 const VIEW_SCHEMA: &str = include_str!("../../schemas/v0.3/view.schema.json");
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,6 +124,7 @@ pub fn validate_canonical_schemas() -> Result<(), String> {
         ("query-result", QUERY_RESULT_SCHEMA),
         ("type-file", TYPE_FILE_SCHEMA),
         ("type-pack", TYPE_PACK_SCHEMA),
+        ("type-pack-lock", TYPE_PACK_LOCK_SCHEMA),
         ("view", VIEW_SCHEMA),
     ] {
         let schema: Value = serde_json::from_str(source)
@@ -173,6 +175,16 @@ pub fn validate_type_pack(value: &Value, path: &str) -> Vec<Diagnostic> {
         value,
         path,
         "https://mdbase.dev/schemas/v0.3/type-pack.schema.json",
+        None,
+    )
+}
+
+pub fn validate_type_pack_lock(value: &Value, path: &str) -> Vec<Diagnostic> {
+    validate_canonical_value(
+        TYPE_PACK_LOCK_SCHEMA,
+        value,
+        path,
+        "https://mdbase.dev/schemas/v0.3/type-pack-lock.schema.json",
         None,
     )
 }
@@ -907,6 +919,7 @@ pub fn schema_path(name: &str) -> Option<PathBuf> {
         "query-result" => Some(PathBuf::from("schemas/v0.3/query-result.schema.json")),
         "type-file" => Some(PathBuf::from("schemas/v0.3/type-file.schema.json")),
         "type-pack" => Some(PathBuf::from("schemas/v0.3/type-pack.schema.json")),
+        "type-pack-lock" => Some(PathBuf::from("schemas/v0.3/type-pack-lock.schema.json")),
         "view" => Some(PathBuf::from("schemas/v0.3/view.schema.json")),
         _ => None,
     }

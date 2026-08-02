@@ -286,6 +286,25 @@ fn provider_snapshot_includes_contract_and_schema_resources() {
 }
 
 #[test]
+fn provider_snapshot_includes_the_portable_type_pack_lock() {
+    let directory = collection();
+    fs::write(
+        directory.path().join("mdbase.lock.yaml"),
+        "{\n  \"kind\": \"mdbase.type-pack-lock\",\n  \"lock_version\": 1,\n  \"packs\": []\n}\n",
+    )
+    .unwrap();
+    let provider = FilesystemProvider::open(directory.path()).unwrap();
+
+    let snapshot = provider.snapshot().unwrap();
+    assert_eq!(snapshot.resources.len(), 2);
+    assert_eq!(snapshot.resources[1].path, "mdbase.lock.yaml");
+    assert_eq!(
+        snapshot.resources[1].kind,
+        CollectionSnapshotResourceKind::Lock
+    );
+}
+
+#[test]
 fn provider_snapshot_matches_the_portable_sdk_digest_fixture() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(

@@ -21,7 +21,7 @@ use super::ProviderError;
 pub struct CollectionSnapshot {
     /// Digest of collection resources and records at this capture boundary.
     pub revision: String,
-    /// Digest of configuration, contract, schema, type, and saved-view resources.
+    /// Digest of configuration, lock, contract, schema, type, and saved-view resources.
     pub resource_revision: String,
     pub spec_version: String,
     pub resources: Vec<CollectionSnapshotResource>,
@@ -32,6 +32,7 @@ pub struct CollectionSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum CollectionSnapshotResourceKind {
     Configuration,
+    Lock,
     Contract,
     Schema,
     Type,
@@ -116,6 +117,14 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
     }
 
     let mut resources = vec![configuration];
+    let lock_path = root.join("mdbase.lock.yaml");
+    if lock_path.exists() {
+        resources.push(read_resource(
+            lock_path,
+            "mdbase.lock.yaml".to_string(),
+            CollectionSnapshotResourceKind::Lock,
+        )?);
+    }
     for type_file in report.types {
         resources.push(read_resource(
             root.join(&type_file.path),

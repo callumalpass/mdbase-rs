@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::Path;
 
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
-use super::{batch, validate_type_pack, Diagnostic, OperationResult};
+use super::{
+    batch, revision, validate_type_pack, validate_type_pack_lock, Diagnostic, OperationResult,
+};
 use crate::api::CollectionPath;
 use crate::frontmatter::parser::{is_parse_error, parse_document};
 use crate::{Collection, SpecProfile};
@@ -23,10 +26,38 @@ pub struct ContractIdentity {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TypePackInstall {
+pub struct TypePackProvision {
     pub manifest: Value,
     pub resources: Vec<TypePackResource>,
-    pub provides: Vec<ContractIdentity>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TypePackAssessmentOptions {
+    pub installed_by: String,
+    #[serde(default)]
+    pub adopt_resources: BTreeMap<String, String>,
+    #[serde(default)]
+    pub preserve_seed_targets: BTreeSet<String>,
+    #[serde(default)]
+    pub target_overrides: BTreeMap<String, String>,
+    #[serde(default)]
+    pub contract_setups: Vec<ContractSetupChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TypePackApplyOptions {
+    pub installed_by: String,
+    pub expected_assessment_digest: String,
+    #[serde(default)]
+    pub allow_downgrade: bool,
+    #[serde(default)]
+    pub adopt_resources: BTreeMap<String, String>,
+    #[serde(default)]
+    pub preserve_seed_targets: BTreeSet<String>,
+    #[serde(default)]
+    pub target_overrides: BTreeMap<String, String>,
+    #[serde(default)]
+    pub contract_setups: Vec<ContractSetupChoice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -53,185 +84,646 @@ pub struct ContractSetupChoice {
     pub mode: ContractSetupMode,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ManifestResource {
     kind: String,
+    mode: String,
     source: String,
     target: String,
     digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct TypePackReceiptResource {
+    kind: String,
+    mode: String,
+    source: String,
+    target: String,
+    digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct TypePackReceipt {
+    id: String,
+    version: String,
+    digest: String,
+    installed_by: String,
+    resources: Vec<TypePackReceiptResource>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct TypePackLock {
+    kind: String,
+    lock_version: u32,
+    packs: Vec<TypePackReceipt>,
+}
+
+#[derive(Debug)]
+struct PlannedPackResource {
+    kind: String,
+    mode: String,
+    source: String,
+    target: String,
+    action: String,
+    digest: String,
+    current_digest: Option<String>,
+    installed_digest: Option<String>,
+    adopted_from_digest: Option<String>,
+    reason: Option<String>,
+    bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct TypePackPlan {
+    assessment: Value,
+    assessment_digest: String,
+    next_lock: TypePackLock,
+    next_lock_bytes: Vec<u8>,
+    resources: Vec<PlannedPackResource>,
+    contract_setup: Option<PreparedContractSetupPack>,
+}
+
+const TYPE_PACK_LOCK_PATH: &str = "mdbase.lock.yaml";
+
 impl Collection {
-    /// Transactionally install one complete, self-contained mdbase type pack.
-    pub fn install_type_pack(
+    /// Inspect one exact managed type pack without changing collection files.
+    pub fn assess_type_pack(
         &self,
-        manifest: &Value,
-        resources: &[TypePackResource],
-        replace: bool,
+        provision: &TypePackProvision,
+        options: &TypePackAssessmentOptions,
     ) -> OperationResult {
-        self.install_type_pack_with_preconditions(manifest, resources, replace, &BTreeMap::new())
+        match plan_type_pack(self, provision, options) {
+            Ok(plan) => OperationResult {
+                valid: true,
+                result: plan.assessment,
+                diagnostics: Vec::new(),
+            },
+            Err(diagnostic) => failed(vec![*diagnostic]),
+        }
     }
 
-    /// Transactionally install a type pack only if exact existing targets still
-    /// match their reviewed revisions.
-    pub fn install_type_pack_with_preconditions(
+    /// Apply one reviewed managed type-pack assessment transactionally.
+    pub fn apply_type_pack(
         &self,
-        manifest: &Value,
-        resources: &[TypePackResource],
-        replace: bool,
-        expected_revisions: &BTreeMap<String, String>,
+        provision: &TypePackProvision,
+        options: &TypePackApplyOptions,
     ) -> OperationResult {
-        let diagnostics = validate_type_pack(manifest, "mdbase-pack.yaml");
-        if !diagnostics.is_empty() {
-            return failed(diagnostics);
-        }
-        let manifest_resources = match serde_json::from_value::<Vec<ManifestResource>>(
-            manifest.get("resources").cloned().unwrap_or(Value::Null),
-        ) {
-            Ok(resources) => resources,
-            Err(error) => {
-                return failed(vec![Diagnostic::error(
-                    "invalid_type_pack",
-                    format!("Could not read type pack resources: {error}"),
-                    Some("mdbase-pack.yaml".to_string()),
-                )])
-            }
+        let assessment_options = TypePackAssessmentOptions {
+            installed_by: options.installed_by.clone(),
+            adopt_resources: options.adopt_resources.clone(),
+            preserve_seed_targets: options.preserve_seed_targets.clone(),
+            target_overrides: options.target_overrides.clone(),
+            contract_setups: options.contract_setups.clone(),
         };
-        let sources = resources
-            .iter()
-            .map(|resource| (resource.source.as_str(), resource.document.as_bytes()))
-            .collect::<BTreeMap<_, _>>();
-        if sources.len() != resources.len() {
-            return pack_error("A type pack resource source may appear only once.");
-        }
-        let mut targets = BTreeSet::new();
-        let mut planned = Vec::new();
-        for resource in manifest_resources {
-            if !matches!(resource.kind.as_str(), "contract" | "type" | "schema") {
-                return pack_error("A type pack resource has an unsupported kind.");
-            }
-            if !targets.insert(resource.target.clone()) {
-                return pack_error("A type pack target may appear only once.");
-            }
-            if let Err(error) = CollectionPath::new(&resource.source) {
-                return pack_error(&format!("Unsafe type pack source: {error}"));
-            }
-            let Some(bytes) = sources.get(resource.source.as_str()) else {
-                return pack_error(&format!(
-                    "Type pack source '{}' is missing.",
-                    resource.source
-                ));
-            };
-            let actual = format!("sha256:{:x}", Sha256::digest(bytes));
-            if actual != resource.digest {
-                return pack_error(&format!(
-                    "Type pack source '{}' has digest {}, expected {}.",
-                    resource.source, actual, resource.digest
-                ));
-            }
-            let target =
-                match validate_resource_target(self, &resource.kind, &resource.target, bytes) {
-                    Ok(path) => path,
-                    Err(message) => return pack_error(&message),
-                };
-            if let Err(error) = crate::operations::ensure_no_symlink_components(
-                &self.root,
-                target.as_str(),
-                SpecProfile::V03,
-            ) {
-                return pack_error(&format!("Unsafe type pack target: {error}"));
-            }
-            let live_path = target.under(&self.root);
-            let action = if live_path.exists() {
-                match fs::read(&live_path) {
-                    Ok(existing) if existing == *bytes => "unchanged",
-                    Ok(_) => "replace",
-                    Err(error) => {
-                        return pack_error(&format!(
-                            "Could not inspect existing type pack target '{}': {error}",
-                            target.as_str()
-                        ))
-                    }
-                }
-            } else {
-                "create"
-            };
-            planned.push((
-                target.to_string(),
-                (*bytes).to_vec(),
-                action,
-                resource.digest,
-                resource.kind,
-            ));
-        }
-        if planned.len() != sources.len() {
-            return pack_error("The type pack contains undeclared source resources.");
-        }
-
-        let shadow = match batch::shadow_collection(self) {
-            Ok(shadow) => shadow,
+        let plan = match plan_type_pack(self, provision, &assessment_options) {
+            Ok(plan) => plan,
             Err(diagnostic) => return failed(vec![*diagnostic]),
         };
-        for (target, expected) in expected_revisions {
-            if !planned
-                .iter()
-                .any(|(planned, _, _, _, _)| planned == target)
-            {
-                return pack_error(&format!(
-                    "Type pack precondition target '{target}' is not a declared resource."
-                ));
-            }
-            let Some(bytes) = shadow.baseline.get(target) else {
-                return failed(vec![Diagnostic::error(
-                    "concurrent_modification",
-                    format!("Type pack target '{target}' no longer exists."),
-                    Some(target.clone()),
-                )]);
-            };
-            let actual = format!("sha256:{:x}", Sha256::digest(bytes));
-            if &actual != expected {
-                return failed(vec![Diagnostic::error(
-                    "concurrent_modification",
-                    format!("Type pack target '{target}' changed after it was reviewed."),
-                    Some(target.clone()),
-                )]);
-            }
+        if plan.assessment_digest != options.expected_assessment_digest {
+            return pack_diagnostic(
+                "concurrent_modification",
+                "The managed type-pack assessment is stale. Assess the collection again before applying it.",
+            );
         }
-        for (target, bytes, action, _, _) in &planned {
-            let path = shadow.directory.path().join(target);
-            if *action == "replace" && !replace && !expected_revisions.contains_key(target) {
-                return failed(vec![Diagnostic::error(
-                    "type_pack_conflict",
-                    format!("Type pack target '{target}' already has different content."),
-                    Some(target.clone()),
-                )]);
+        if plan.assessment["applicable"].as_bool() != Some(true) {
+            let reason = plan
+                .resources
+                .iter()
+                .find(|resource| resource.action == "conflict")
+                .and_then(|resource| resource.reason.as_deref())
+                .unwrap_or("The managed type pack has unresolved conflicts.");
+            return pack_diagnostic("type_pack_conflict", reason);
+        }
+        if plan.assessment["status"].as_str() == Some("downgrade") && !options.allow_downgrade {
+            return pack_diagnostic(
+                "type_pack_downgrade",
+                "A managed type-pack downgrade requires explicit approval.",
+            );
+        }
+        apply_type_pack_plan(self, plan)
+    }
+}
+
+fn plan_type_pack(
+    collection: &Collection,
+    provision: &TypePackProvision,
+    options: &TypePackAssessmentOptions,
+) -> Result<TypePackPlan, Box<Diagnostic>> {
+    let installer_pattern = regex::Regex::new(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$")
+        .expect("valid installer identity expression");
+    if !installer_pattern.is_match(&options.installed_by) {
+        return Err(Box::new(Diagnostic::error(
+            "invalid_type_pack",
+            "installed_by must be a stable namespaced identifier.",
+            Some("mdbase-pack.yaml".to_string()),
+        )));
+    }
+    let diagnostics = validate_type_pack(&provision.manifest, "mdbase-pack.yaml");
+    if let Some(diagnostic) = diagnostics.into_iter().next() {
+        return Err(Box::new(diagnostic));
+    }
+    let manifest_resources = serde_json::from_value::<Vec<ManifestResource>>(
+        provision
+            .manifest
+            .get("resources")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+    .map_err(|error| {
+        Box::new(Diagnostic::error(
+            "invalid_type_pack",
+            format!("Could not read type pack resources: {error}"),
+            Some("mdbase-pack.yaml".to_string()),
+        ))
+    })?;
+    for target in options.target_overrides.keys() {
+        if !manifest_resources
+            .iter()
+            .any(|resource| resource.target == *target)
+        {
+            return Err(pack_plan_error(format!(
+                "Target override '{target}' is not a resource in the desired pack."
+            )));
+        }
+    }
+    let resolved_resources = manifest_resources
+        .iter()
+        .cloned()
+        .map(|mut resource| {
+            if let Some(target) = options.target_overrides.get(&resource.target) {
+                resource.target = target.clone();
             }
-            if let Some(parent) = path.parent() {
-                if let Err(error) = fs::create_dir_all(parent) {
-                    return pack_error(&format!(
-                        "Could not stage type pack target '{target}': {error}"
-                    ));
+            resource
+        })
+        .collect::<Vec<_>>();
+    if resolved_resources
+        .iter()
+        .map(|resource| resource.target.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        != resolved_resources.len()
+    {
+        return Err(pack_plan_error(
+            "Target overrides resolve more than one resource to the same path.",
+        ));
+    }
+    for target in options.adopt_resources.keys() {
+        if !resolved_resources
+            .iter()
+            .any(|resource| resource.target == *target && resource.mode == "managed")
+        {
+            return Err(pack_plan_error(format!(
+                "Adoption target '{target}' is not a managed resource in the desired pack."
+            )));
+        }
+    }
+    for target in &options.preserve_seed_targets {
+        if !resolved_resources
+            .iter()
+            .any(|resource| resource.target == *target && resource.mode == "seed")
+        {
+            return Err(pack_plan_error(format!(
+                "Preserved seed target '{target}' is not a seed resource in the desired pack."
+            )));
+        }
+    }
+    let sources = provision
+        .resources
+        .iter()
+        .map(|resource| (resource.source.as_str(), resource.document.as_bytes()))
+        .collect::<BTreeMap<_, _>>();
+    if sources.len() != provision.resources.len() || sources.len() != manifest_resources.len() {
+        return Err(pack_plan_error(
+            "Each type-pack source must be declared exactly once.",
+        ));
+    }
+
+    let (lock, lock_bytes) = read_type_pack_lock(collection)?;
+    let pack_id = provision
+        .manifest
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("validated pack ID")
+        .to_string();
+    let pack_version = provision
+        .manifest
+        .get("version")
+        .and_then(Value::as_str)
+        .expect("validated pack version")
+        .to_string();
+    let current = lock
+        .packs
+        .iter()
+        .find(|receipt| receipt.id == pack_id)
+        .cloned();
+    let desired = TypePackReceipt {
+        id: pack_id.clone(),
+        version: pack_version.clone(),
+        digest: jcs_digest(&provision.manifest)?,
+        installed_by: current
+            .as_ref()
+            .map(|receipt| receipt.installed_by.clone())
+            .unwrap_or_else(|| options.installed_by.clone()),
+        resources: resolved_resources
+            .iter()
+            .map(|resource| TypePackReceiptResource {
+                kind: resource.kind.clone(),
+                mode: resource.mode.clone(),
+                source: resource.source.clone(),
+                target: resource.target.clone(),
+                digest: resource.digest.clone(),
+            })
+            .collect(),
+    };
+    let current_resources = current
+        .as_ref()
+        .map(|receipt| {
+            receipt
+                .resources
+                .iter()
+                .map(|resource| (resource.source.as_str(), resource))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let desired_resources = resolved_resources
+        .iter()
+        .map(|resource| (resource.source.as_str(), resource))
+        .collect::<BTreeMap<_, _>>();
+    let other_owners = lock
+        .packs
+        .iter()
+        .filter(|receipt| receipt.id != pack_id)
+        .flat_map(|receipt| {
+            receipt
+                .resources
+                .iter()
+                .filter(|resource| resource.mode == "managed")
+                .map(|resource| (resource.target.as_str(), receipt.id.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut targets = BTreeSet::new();
+    let mut planned = Vec::new();
+    for resource in &resolved_resources {
+        if !targets.insert(resource.target.clone()) {
+            return Err(pack_plan_error("A type-pack target may appear only once."));
+        }
+        CollectionPath::new(&resource.source)
+            .map_err(|error| pack_plan_error(format!("Unsafe type-pack source: {error}")))?;
+        let bytes = sources.get(resource.source.as_str()).ok_or_else(|| {
+            pack_plan_error(format!(
+                "Type-pack source '{}' is missing.",
+                resource.source
+            ))
+        })?;
+        let actual = revision(bytes);
+        if actual != resource.digest {
+            return Err(pack_plan_error(format!(
+                "Type-pack source '{}' has digest {}, expected {}.",
+                resource.source, actual, resource.digest
+            )));
+        }
+        let target = validate_resource_target(collection, &resource.kind, &resource.target, bytes)
+            .map_err(pack_plan_error)?;
+        crate::operations::ensure_no_symlink_components(
+            &collection.root,
+            target.as_str(),
+            SpecProfile::V03,
+        )
+        .map_err(|error| pack_plan_error(format!("Unsafe type-pack target: {error}")))?;
+        let before = read_optional(&target.under(&collection.root)).map_err(|error| {
+            pack_plan_error(format!(
+                "Could not inspect type-pack target '{}': {error}",
+                resource.target
+            ))
+        })?;
+        let current_digest = before.as_deref().map(revision);
+        let installed = current_resources
+            .get(resource.source.as_str())
+            .copied()
+            .filter(|installed| installed.target == resource.target);
+        let owner = other_owners.get(resource.target.as_str()).copied();
+        let mut adopted_from_digest = None;
+        let (action, reason) = if let Some(owner) = owner {
+            (
+                "conflict",
+                Some(format!("{} is managed by {}.", resource.target, owner)),
+            )
+        } else if resource.mode == "seed" {
+            (
+                if before.is_none()
+                    && installed.is_none()
+                    && !options.preserve_seed_targets.contains(&resource.target)
+                {
+                    "create"
+                } else {
+                    "preserve"
+                },
+                None,
+            )
+        } else if installed.is_none() {
+            if before.is_none() {
+                ("create", None)
+            } else if current_digest.as_deref() == Some(resource.digest.as_str()) {
+                adopted_from_digest = current_digest.clone();
+                ("adopt", None)
+            } else if options
+                .adopt_resources
+                .get(resource.target.as_str())
+                .is_some_and(|expected| Some(expected.as_str()) == current_digest.as_deref())
+            {
+                adopted_from_digest = current_digest.clone();
+                ("update", None)
+            } else {
+                (
+                    "conflict",
+                    Some(format!(
+                        "{} exists but is not managed by {}.",
+                        resource.target, pack_id
+                    )),
+                )
+            }
+        } else if installed.is_some_and(|installed| installed.mode != "managed") {
+            (
+                "conflict",
+                Some(format!(
+                    "{} was installed as a seed and cannot be claimed as managed implicitly.",
+                    resource.target
+                )),
+            )
+        } else if current_digest.as_deref() != installed.map(|installed| installed.digest.as_str())
+        {
+            (
+                "conflict",
+                Some(format!(
+                    "{} changed since {} {} was applied.",
+                    resource.target,
+                    pack_id,
+                    current
+                        .as_ref()
+                        .map(|receipt| receipt.version.as_str())
+                        .unwrap_or("unknown")
+                )),
+            )
+        } else if installed.is_some_and(|installed| installed.digest == resource.digest) {
+            ("unchanged", None)
+        } else {
+            ("update", None)
+        };
+        planned.push(PlannedPackResource {
+            kind: resource.kind.clone(),
+            mode: resource.mode.clone(),
+            source: resource.source.clone(),
+            target: resource.target.clone(),
+            action: action.to_string(),
+            digest: resource.digest.clone(),
+            current_digest,
+            installed_digest: installed.map(|installed| installed.digest.clone()),
+            adopted_from_digest,
+            reason,
+            bytes: Some((*bytes).to_vec()),
+        });
+    }
+
+    if let Some(current) = &current {
+        for resource in &current.resources {
+            if desired_resources
+                .get(resource.source.as_str())
+                .is_some_and(|desired| desired.target == resource.target)
+            {
+                continue;
+            }
+            let target = CollectionPath::new(&resource.target).map_err(|error| {
+                pack_plan_error(format!("Unsafe installed type-pack target: {error}"))
+            })?;
+            let before = read_optional(&target.under(&collection.root)).map_err(|error| {
+                pack_plan_error(format!(
+                    "Could not inspect installed type-pack target '{}': {error}",
+                    resource.target
+                ))
+            })?;
+            let current_digest = before.as_deref().map(revision);
+            let (action, reason) = if resource.mode != "managed" {
+                ("preserve", None)
+            } else if current_digest.as_deref() == Some(resource.digest.as_str()) {
+                ("delete", None)
+            } else {
+                (
+                    "conflict",
+                    Some(format!(
+                        "{} changed and cannot be retired safely.",
+                        resource.target
+                    )),
+                )
+            };
+            planned.push(PlannedPackResource {
+                kind: resource.kind.clone(),
+                mode: resource.mode.clone(),
+                source: resource.source.clone(),
+                target: resource.target.clone(),
+                action: action.to_string(),
+                digest: resource.digest.clone(),
+                current_digest,
+                installed_digest: Some(resource.digest.clone()),
+                adopted_from_digest: None,
+                reason,
+                bytes: None,
+            });
+        }
+    }
+
+    let mut status = if planned.iter().any(|resource| resource.action == "conflict") {
+        "conflict"
+    } else if current.is_none() {
+        "install"
+    } else if current.as_ref().is_some_and(|receipt| {
+        receipt.version == desired.version && receipt.digest == desired.digest
+    }) {
+        if current
+            .as_ref()
+            .is_some_and(|receipt| receipt.resources != desired.resources)
+            || planned.iter().any(|resource| {
+                !matches!(resource.action.as_str(), "unchanged" | "preserve" | "adopt")
+            })
+        {
+            "reconfigure"
+        } else {
+            "current"
+        }
+    } else if current
+        .as_ref()
+        .is_some_and(|receipt| receipt.version == desired.version)
+    {
+        "conflict"
+    } else {
+        let current_version = Version::parse(&current.as_ref().expect("current receipt").version)
+            .map_err(|error| {
+            pack_plan_error(format!("Invalid installed pack version: {error}"))
+        })?;
+        let desired_version = Version::parse(&desired.version)
+            .map_err(|error| pack_plan_error(format!("Invalid desired pack version: {error}")))?;
+        if desired_version > current_version {
+            "upgrade"
+        } else {
+            "downgrade"
+        }
+    };
+    if status == "conflict"
+        && current.as_ref().is_some_and(|receipt| {
+            receipt.version == desired.version && receipt.digest != desired.digest
+        })
+        && !planned.iter().any(|resource| resource.action == "conflict")
+    {
+        if let Some(first) = planned.first_mut() {
+            first.action = "conflict".to_string();
+            first.reason = Some(format!(
+                "{} {} has a different immutable pack digest. Publish a new version.",
+                desired.id, desired.version
+            ));
+        }
+        status = "conflict";
+    }
+
+    let mut packs = lock
+        .packs
+        .iter()
+        .filter(|receipt| receipt.id != desired.id)
+        .cloned()
+        .collect::<Vec<_>>();
+    packs.push(desired.clone());
+    packs.sort_by(|left, right| left.id.cmp(&right.id));
+    let next_lock = TypePackLock {
+        kind: "mdbase.type-pack-lock".to_string(),
+        lock_version: 1,
+        packs,
+    };
+    let next_lock_bytes = serialize_type_pack_lock(&next_lock)?;
+    let lock_action = match lock_bytes.as_deref() {
+        None => "create",
+        Some(current) if current == next_lock_bytes => "unchanged",
+        Some(_) => "update",
+    };
+    let resource_values = planned
+        .iter()
+        .map(planned_resource_value)
+        .collect::<Vec<_>>();
+    let contract_setup = if options.contract_setups.is_empty() {
+        None
+    } else {
+        Some(prepare_existing_contract_setups(
+            collection,
+            &options.contract_setups,
+        )?)
+    };
+    let contract_setup_resources = contract_setup
+        .as_ref()
+        .map(prepared_contract_setup_resources)
+        .transpose()?
+        .unwrap_or_default();
+    if status == "current" && !contract_setup_resources.is_empty() {
+        status = "reconfigure";
+    }
+    let mut assessment = json!({
+        "status": status,
+        "applicable": status != "conflict",
+        "desired": desired,
+        "resources": resource_values,
+        "lock": {
+            "target": TYPE_PACK_LOCK_PATH,
+            "action": lock_action,
+            "digest": revision(&next_lock_bytes),
+        },
+        "contract_setups": {
+            "choices": options.contract_setups,
+            "resources": contract_setup_resources,
+        },
+    });
+    if let Some(current) = current {
+        assessment["current"] = serde_json::to_value(current).expect("receipt serializes");
+    }
+    let mut assessment_identity = assessment.clone();
+    assessment_identity["lock_digest"] = lock_bytes
+        .as_deref()
+        .map(revision)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let assessment_digest = jcs_digest(&assessment_identity)?;
+    assessment["assessment_digest"] = Value::String(assessment_digest.clone());
+    Ok(TypePackPlan {
+        assessment,
+        assessment_digest,
+        next_lock,
+        next_lock_bytes,
+        resources: planned,
+        contract_setup,
+    })
+}
+
+fn apply_type_pack_plan(collection: &Collection, plan: TypePackPlan) -> OperationResult {
+    let shadow = match batch::shadow_collection(collection) {
+        Ok(shadow) => shadow,
+        Err(diagnostic) => return failed(vec![*diagnostic]),
+    };
+    for resource in &plan.resources {
+        let path = shadow.directory.path().join(&resource.target);
+        match resource.action.as_str() {
+            "create" | "update" => {
+                if let Some(parent) = path.parent() {
+                    if let Err(error) = fs::create_dir_all(parent) {
+                        return pack_diagnostic(
+                            "type_pack_apply_failed",
+                            format!("Could not stage '{}': {error}", resource.target),
+                        );
+                    }
+                }
+                if let Err(error) = fs::write(&path, resource.bytes.as_deref().unwrap_or_default())
+                {
+                    return pack_diagnostic(
+                        "type_pack_apply_failed",
+                        format!("Could not stage '{}': {error}", resource.target),
+                    );
                 }
             }
-            if let Err(error) = fs::write(&path, bytes) {
-                return pack_error(&format!(
-                    "Could not stage type pack target '{target}': {error}"
-                ));
+            "delete" => {
+                if let Err(error) = fs::remove_file(&path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return pack_diagnostic(
+                            "type_pack_apply_failed",
+                            format!("Could not retire '{}': {error}", resource.target),
+                        );
+                    }
+                }
             }
+            _ => {}
         }
-        let staged = match Collection::open(shadow.directory.path()) {
-            Ok(staged) => staged,
-            Err(error) => {
-                return failed(vec![Diagnostic::error(
-                    "invalid_type_pack",
-                    format!("The staged type pack does not produce a valid collection: {error:?}"),
-                    None,
-                )])
-            }
-        };
-        let validation = staged.validate_op(&json!({}));
-        if validation.get("valid").and_then(Value::as_bool) != Some(true) {
-            let diagnostics = validation
+    }
+    if let Some(prepared) = &plan.contract_setup {
+        if let Err(diagnostic) = stage_prepared_contract_setup(&shadow, prepared, &plan.resources) {
+            return failed(vec![*diagnostic]);
+        }
+    }
+    if let Err(error) = fs::write(
+        shadow.directory.path().join(TYPE_PACK_LOCK_PATH),
+        &plan.next_lock_bytes,
+    ) {
+        return pack_diagnostic(
+            "type_pack_apply_failed",
+            format!("Could not stage {TYPE_PACK_LOCK_PATH}: {error}"),
+        );
+    }
+    let staged = match Collection::open(shadow.directory.path()) {
+        Ok(staged) => staged,
+        Err(error) => {
+            return pack_diagnostic(
+                "invalid_type_pack",
+                format!("The staged type pack does not produce a valid collection: {error:?}"),
+            )
+        }
+    };
+    let validation = staged.validate_op(&json!({}));
+    if validation.get("valid").and_then(Value::as_bool) != Some(true) {
+        return failed(
+            validation
                 .get("issues")
                 .cloned()
                 .and_then(|issues| serde_json::from_value(issues).ok())
@@ -241,222 +733,330 @@ impl Collection {
                         "Existing records do not conform after staging the type pack.",
                         None,
                     )]
-                });
-            return failed(diagnostics);
-        }
-        let desired = match batch::collect_collection_files(&staged) {
-            Ok(desired) => desired,
-            Err(diagnostic) => return failed(vec![*diagnostic]),
-        };
-        let commit = match crate::transactions::commit_migration(self, &shadow.baseline, &desired) {
-            Ok(commit) => commit,
-            Err(error) => {
-                return failed(vec![Diagnostic::error(
-                    "type_pack_apply_failed",
-                    error.to_string(),
-                    None,
-                )])
-            }
-        };
-        let committed = match Collection::open(&self.root) {
-            Ok(committed) => committed,
-            Err(error) => {
-                return failed(vec![Diagnostic::error(
-                    "type_pack_apply_failed",
-                    format!("The committed type pack could not be reopened: {error:?}"),
-                    None,
-                )])
-            }
-        };
-        let committed_validation = committed.validate_op(&json!({}));
-        if committed_validation.get("valid").and_then(Value::as_bool) != Some(true) {
-            return failed(vec![Diagnostic::error(
-                "type_pack_apply_failed",
-                "The committed type pack did not pass collection validation.",
-                None,
-            )]);
-        }
-        let resource_diff = planned
-            .iter()
-            .map(|(target, _, action, digest, kind)| {
-                json!({
-                    "target": target,
-                    "action": action,
-                    "digest": digest,
-                    "kind": kind,
-                })
-            })
-            .collect::<Vec<_>>();
-        OperationResult {
-            valid: true,
-            result: json!({
-                "id": manifest["id"],
-                "version": manifest["version"],
-                "resources": resource_diff,
-                "cleanup_deferred": commit.cleanup_deferred,
-            }),
-            diagnostics: Vec::new(),
-        }
+                }),
+        );
     }
-
-    /// Atomically install every type pack needed by one authorization decision.
-    ///
-    /// Contract choices are evaluated against one collection snapshot. Starter
-    /// implementations are retained per contract, reviewed existing types are
-    /// edited once even when several packs target them, and the combined result
-    /// is validated and committed as one transaction.
-    pub fn install_type_packs_with_contract_setups(
-        &self,
-        packs: &[TypePackInstall],
-        setups: &[ContractSetupChoice],
-    ) -> OperationResult {
-        let prepared = match prepare_contract_setup_pack(self, packs, setups) {
-            Ok(prepared) => prepared,
-            Err(diagnostic) => return failed(vec![*diagnostic]),
-        };
-        self.install_type_pack_with_preconditions(
-            &prepared.manifest,
-            &prepared.resources,
-            false,
-            &prepared.expected_revisions,
-        )
+    let desired = match batch::collect_collection_files(&staged) {
+        Ok(desired) => desired,
+        Err(diagnostic) => return failed(vec![*diagnostic]),
+    };
+    let commit = match crate::transactions::commit_migration(collection, &shadow.baseline, &desired)
+    {
+        Ok(commit) => commit,
+        Err(error) => return pack_diagnostic(error.code(), error.to_string()),
+    };
+    let reopened = match Collection::open(&collection.root) {
+        Ok(reopened) => reopened,
+        Err(error) => {
+            return pack_diagnostic(
+                "type_pack_apply_failed",
+                format!("The committed type pack could not be reopened: {error:?}"),
+            )
+        }
+    };
+    if reopened.validate_op(&json!({}))["valid"].as_bool() != Some(true) {
+        return pack_diagnostic(
+            "type_pack_apply_failed",
+            "The committed type pack did not pass collection validation.",
+        );
+    }
+    let mut result = plan.assessment;
+    result["receipt"] = serde_json::to_value(
+        plan.next_lock
+            .packs
+            .iter()
+            .find(|receipt| receipt.id == result["desired"]["id"])
+            .expect("desired receipt retained"),
+    )
+    .expect("receipt serializes");
+    result["cleanup_deferred"] = Value::Bool(commit.cleanup_deferred);
+    OperationResult {
+        valid: true,
+        result,
+        diagnostics: Vec::new(),
     }
 }
 
+fn read_type_pack_lock(
+    collection: &Collection,
+) -> Result<(TypePackLock, Option<Vec<u8>>), Box<Diagnostic>> {
+    let path = collection.root.join(TYPE_PACK_LOCK_PATH);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(pack_plan_error(format!(
+                "Could not read {TYPE_PACK_LOCK_PATH}: {error}"
+            )))
+        }
+    };
+    let Some(bytes) = bytes else {
+        return Ok((
+            TypePackLock {
+                kind: "mdbase.type-pack-lock".to_string(),
+                lock_version: 1,
+                packs: Vec::new(),
+            },
+            None,
+        ));
+    };
+    let yaml: serde_yaml::Value = serde_yaml::from_slice(&bytes).map_err(|error| {
+        pack_plan_error(format!("Could not parse {TYPE_PACK_LOCK_PATH}: {error}"))
+    })?;
+    let value = crate::frontmatter::parser::yaml_to_json(&yaml);
+    if let Some(diagnostic) = validate_type_pack_lock(&value, TYPE_PACK_LOCK_PATH)
+        .into_iter()
+        .next()
+    {
+        return Err(Box::new(diagnostic));
+    }
+    let lock: TypePackLock = serde_json::from_value(value).map_err(|error| {
+        pack_plan_error(format!("Could not load {TYPE_PACK_LOCK_PATH}: {error}"))
+    })?;
+    let mut ids = BTreeSet::new();
+    let mut targets = BTreeMap::new();
+    for receipt in &lock.packs {
+        if !ids.insert(receipt.id.as_str()) {
+            return Err(pack_plan_error(format!(
+                "{TYPE_PACK_LOCK_PATH} contains duplicate pack {}.",
+                receipt.id
+            )));
+        }
+        for resource in &receipt.resources {
+            if resource.mode != "managed" {
+                continue;
+            }
+            if let Some(owner) = targets.insert(resource.target.as_str(), receipt.id.as_str()) {
+                return Err(pack_plan_error(format!(
+                    "{TYPE_PACK_LOCK_PATH} assigns {} to both {} and {}.",
+                    resource.target, owner, receipt.id
+                )));
+            }
+        }
+    }
+    Ok((lock, Some(bytes)))
+}
+
+fn serialize_type_pack_lock(lock: &TypePackLock) -> Result<Vec<u8>, Box<Diagnostic>> {
+    let mut bytes = serde_json::to_vec_pretty(lock).map_err(|error| {
+        pack_plan_error(format!(
+            "Could not serialize managed type-pack provenance: {error}"
+        ))
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn read_optional(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn planned_resource_value(resource: &PlannedPackResource) -> Value {
+    let mut value = json!({
+        "kind": resource.kind,
+        "mode": resource.mode,
+        "source": resource.source,
+        "target": resource.target,
+        "action": resource.action,
+        "digest": resource.digest,
+    });
+    if let Some(digest) = &resource.current_digest {
+        value["current_digest"] = Value::String(digest.clone());
+    }
+    if let Some(digest) = &resource.installed_digest {
+        value["installed_digest"] = Value::String(digest.clone());
+    }
+    if let Some(digest) = &resource.adopted_from_digest {
+        value["adopted_from_digest"] = Value::String(digest.clone());
+    }
+    if let Some(reason) = &resource.reason {
+        value["reason"] = Value::String(reason.clone());
+    }
+    value
+}
+
+fn jcs_digest(value: &Value) -> Result<String, Box<Diagnostic>> {
+    let bytes = serde_jcs::to_vec(value).map_err(|error| {
+        pack_plan_error(format!(
+            "Could not canonicalize type-pack identity: {error}"
+        ))
+    })?;
+    Ok(revision(&bytes))
+}
+
+fn pack_plan_error(message: impl Into<String>) -> Box<Diagnostic> {
+    Box::new(Diagnostic::error(
+        "invalid_type_pack",
+        message,
+        Some("mdbase-pack.yaml".to_string()),
+    ))
+}
+
+fn pack_diagnostic(code: impl Into<String>, message: impl Into<String>) -> OperationResult {
+    failed(vec![Diagnostic::error(
+        code,
+        message,
+        Some("mdbase-pack.yaml".to_string()),
+    )])
+}
+
+#[derive(Debug)]
 struct PreparedContractSetupPack {
     manifest: Value,
     resources: Vec<TypePackResource>,
     expected_revisions: BTreeMap<String, String>,
 }
 
-#[derive(Debug)]
-struct PlannedResource {
-    kind: String,
-    document: String,
+fn prepared_contract_setup_resources(
+    prepared: &PreparedContractSetupPack,
+) -> Result<Vec<Value>, Box<Diagnostic>> {
+    let manifest_resources = serde_json::from_value::<Vec<ManifestResource>>(
+        prepared
+            .manifest
+            .get("resources")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+    .map_err(|error| {
+        contract_setup_diagnostic(format!(
+            "Could not inspect prepared contract setup resources: {error}"
+        ))
+    })?;
+    Ok(manifest_resources
+        .into_iter()
+        .map(|resource| {
+            let current_digest = prepared.expected_revisions.get(&resource.target).cloned();
+            json!({
+                "kind": resource.kind,
+                "source": resource.source,
+                "target": resource.target,
+                "action": "update",
+                "digest": resource.digest,
+                "current_digest": current_digest,
+            })
+        })
+        .collect())
+}
+
+fn stage_prepared_contract_setup(
+    shadow: &batch::ShadowCollection,
+    prepared: &PreparedContractSetupPack,
+    pack_resources: &[PlannedPackResource],
+) -> Result<(), Box<Diagnostic>> {
+    let manifest_resources = serde_json::from_value::<Vec<ManifestResource>>(
+        prepared
+            .manifest
+            .get("resources")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+    .map_err(|error| {
+        contract_setup_diagnostic(format!(
+            "Could not stage prepared contract setup resources: {error}"
+        ))
+    })?;
+    let sources = prepared
+        .resources
+        .iter()
+        .map(|resource| (resource.source.as_str(), resource.document.as_bytes()))
+        .collect::<BTreeMap<_, _>>();
+    for resource in manifest_resources {
+        let bytes = sources.get(resource.source.as_str()).ok_or_else(|| {
+            contract_setup_diagnostic(format!(
+                "Prepared contract setup source '{}' is missing.",
+                resource.source
+            ))
+        })?;
+        let target =
+            validate_resource_target(&shadow.collection, &resource.kind, &resource.target, bytes)
+                .map_err(contract_setup_diagnostic)?;
+        if pack_resources.iter().any(|pack_resource| {
+            pack_resource.target == resource.target
+                && matches!(
+                    pack_resource.action.as_str(),
+                    "create" | "update" | "delete"
+                )
+        }) {
+            return Err(contract_setup_diagnostic(format!(
+                "Contract setup target '{}' is also changed by the managed type pack.",
+                resource.target
+            )));
+        }
+        let expected = prepared
+            .expected_revisions
+            .get(target.as_str())
+            .ok_or_else(|| {
+                contract_setup_diagnostic(format!(
+                    "Contract setup target '{}' has no reviewed revision.",
+                    target.as_str()
+                ))
+            })?;
+        let current = shadow.baseline.get(target.as_str()).ok_or_else(|| {
+            Box::new(Diagnostic::error(
+                "concurrent_modification",
+                format!("Type pack target '{}' no longer exists.", target.as_str()),
+                Some(target.to_string()),
+            ))
+        })?;
+        if revision(current) != *expected {
+            return Err(Box::new(Diagnostic::error(
+                "concurrent_modification",
+                format!(
+                    "Type pack target '{}' changed after it was reviewed.",
+                    target.as_str()
+                ),
+                Some(target.to_string()),
+            )));
+        }
+        let path = shadow.directory.path().join(target.as_str());
+        fs::write(&path, bytes).map_err(|error| {
+            contract_setup_diagnostic(format!(
+                "Could not stage contract setup target '{}': {error}",
+                target.as_str()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 type ContractSetupResult<T> = Result<T, Box<Diagnostic>>;
 
-fn prepare_contract_setup_pack(
+fn prepare_existing_contract_setups(
     collection: &Collection,
-    packs: &[TypePackInstall],
     setups: &[ContractSetupChoice],
 ) -> ContractSetupResult<PreparedContractSetupPack> {
-    if packs.is_empty() {
-        return Err(contract_setup_diagnostic(
-            "Contract setup requires at least one type pack.",
-        ));
-    }
     if setups.is_empty() {
         return Err(contract_setup_diagnostic(
-            "Contract setup requires an explicit choice for at least one contract.",
+            "Existing-type setup requires at least one reviewed contract mapping.",
         ));
     }
-    let setup_by_contract = setups
-        .iter()
-        .map(|setup| (setup.contract.clone(), setup))
-        .collect::<BTreeMap<_, _>>();
-    if setup_by_contract.len() != setups.len() {
-        return Err(contract_setup_diagnostic(
-            "Each contract must have exactly one setup choice.",
-        ));
-    }
-    let provided = packs
-        .iter()
-        .flat_map(|pack| pack.provides.iter().cloned())
-        .collect::<BTreeSet<_>>();
     if setups
         .iter()
-        .any(|setup| !provided.contains(&setup.contract))
+        .any(|setup| matches!(setup.mode, ContractSetupMode::Starter))
     {
         return Err(contract_setup_diagnostic(
-            "A setup choice refers to a contract not provided by these type packs.",
+            "Starter setup is controlled by seed resources in the managed type pack.",
+        ));
+    }
+    let identities = setups
+        .iter()
+        .map(|setup| setup.contract.clone())
+        .collect::<BTreeSet<_>>();
+    if identities.len() != setups.len() {
+        return Err(contract_setup_diagnostic(
+            "Each contract must have exactly one existing-type setup choice.",
         ));
     }
 
-    let mut planned = BTreeMap::<String, PlannedResource>::new();
-    for pack in packs {
-        let diagnostics = validate_type_pack(&pack.manifest, "mdbase-pack.yaml");
-        if let Some(diagnostic) = diagnostics.into_iter().next() {
-            return Err(Box::new(diagnostic));
-        }
-        let manifest_resources = serde_json::from_value::<Vec<ManifestResource>>(
-            pack.manifest
-                .get("resources")
-                .cloned()
-                .unwrap_or(Value::Null),
-        )
-        .map_err(|error| {
-            contract_setup_diagnostic(format!("Could not read type pack resources: {error}"))
-        })?;
-        let sources = pack
-            .resources
-            .iter()
-            .map(|resource| (resource.source.as_str(), resource.document.as_str()))
-            .collect::<BTreeMap<_, _>>();
-        if sources.len() != pack.resources.len() || sources.len() != manifest_resources.len() {
-            return Err(contract_setup_diagnostic(
-                "Each type pack source must be declared exactly once.",
-            ));
-        }
-        let pack_contracts = pack.provides.iter().cloned().collect::<BTreeSet<_>>();
-        let starter_contracts = pack_contracts
-            .iter()
-            .filter(|contract| {
-                setup_by_contract
-                    .get(*contract)
-                    .is_some_and(|setup| matches!(setup.mode, ContractSetupMode::Starter))
-            })
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let pack_has_starter = !starter_contracts.is_empty();
-
-        for manifest_resource in manifest_resources {
-            CollectionPath::new(&manifest_resource.source).map_err(|error| {
-                contract_setup_diagnostic(format!("Unsafe type pack source: {error}"))
-            })?;
-            let Some(original) = sources.get(manifest_resource.source.as_str()) else {
-                return Err(contract_setup_diagnostic(format!(
-                    "Type pack source '{}' is missing.",
-                    manifest_resource.source
-                )));
-            };
-            let actual = format!("sha256:{:x}", Sha256::digest(original.as_bytes()));
-            if actual != manifest_resource.digest {
-                return Err(contract_setup_diagnostic(format!(
-                    "Type pack source '{}' has digest {}, expected {}.",
-                    manifest_resource.source, actual, manifest_resource.digest
-                )));
-            }
-            let document = if manifest_resource.kind == "type" {
-                filter_starter_type_document(
-                    original,
-                    &pack_contracts,
-                    &starter_contracts,
-                    pack_has_starter,
-                )?
-            } else {
-                Some((*original).to_string())
-            };
-            let Some(document) = document else {
-                continue;
-            };
-            insert_planned_resource(
-                &mut planned,
-                manifest_resource.target,
-                PlannedResource {
-                    kind: manifest_resource.kind,
-                    document,
-                },
-            )?;
-        }
-    }
-
-    let mut existing_documents = BTreeMap::<String, (String, String)>::new();
+    let mut documents = BTreeMap::<String, (String, String)>::new();
     let mut expected_revisions = BTreeMap::new();
     for setup in setups {
         let ContractSetupMode::Existing(existing) = &setup.mode else {
-            continue;
+            unreachable!("starter setup rejected above")
         };
         validate_existing_setup(existing)?;
         let read = collection.read_type_file(&json!({ "name": existing.type_name }));
@@ -481,7 +1081,7 @@ fn prepare_contract_setup_pack(
                 existing.type_name
             )));
         }
-        let entry = existing_documents
+        let entry = documents
             .entry(target.clone())
             .or_insert((revision.clone(), document));
         match implementation_state(&entry.1, &setup.contract, existing)? {
@@ -508,71 +1108,50 @@ fn prepare_contract_setup_pack(
         expected_revisions.insert(target, entry.0.clone());
     }
 
-    for (target, (_, document)) in existing_documents {
-        if !expected_revisions.contains_key(&target) {
-            continue;
-        }
-        insert_planned_resource(
-            &mut planned,
-            target,
-            PlannedResource {
-                kind: "type".to_string(),
-                document,
-            },
-        )?;
-    }
-    if planned.is_empty() {
-        return Err(contract_setup_diagnostic(
-            "Contract setup produced no collection resources.",
-        ));
+    let changed = documents
+        .into_iter()
+        .filter(|(target, _)| expected_revisions.contains_key(target))
+        .collect::<BTreeMap<_, _>>();
+    if changed.is_empty() {
+        return Ok(PreparedContractSetupPack {
+            manifest: json!({
+                "kind": "mdbase.type-pack",
+                "id": "dev.mdbase.existing-contract-setup",
+                "version": "1.0.0",
+                "resources": [],
+            }),
+            resources: Vec::new(),
+            expected_revisions,
+        });
     }
 
-    let mut manifest_resources = Vec::with_capacity(planned.len());
-    let mut resources = Vec::with_capacity(planned.len());
-    for (index, (target, resource)) in planned.into_iter().enumerate() {
-        let extension = std::path::Path::new(&target)
+    let mut manifest_resources = Vec::with_capacity(changed.len());
+    let mut resources = Vec::with_capacity(changed.len());
+    for (index, (target, (_, document))) in changed.into_iter().enumerate() {
+        let extension = Path::new(&target)
             .extension()
             .and_then(|value| value.to_str())
-            .unwrap_or("bin");
+            .unwrap_or("md");
         let source = format!("contract-setup/resource-{index}.{extension}");
         manifest_resources.push(json!({
-            "kind": resource.kind,
+            "kind": "type",
+            "mode": "managed",
             "source": source,
             "target": target,
-            "digest": format!("sha256:{:x}", Sha256::digest(resource.document.as_bytes())),
+            "digest": revision(document.as_bytes()),
         }));
-        resources.push(TypePackResource {
-            source,
-            document: resource.document,
-        });
+        resources.push(TypePackResource { source, document });
     }
     Ok(PreparedContractSetupPack {
         manifest: json!({
             "kind": "mdbase.type-pack",
-            "id": "dev.mdbase.authorization-contract-setup",
+            "id": "dev.mdbase.existing-contract-setup",
             "version": "1.0.0",
             "resources": manifest_resources,
         }),
         resources,
         expected_revisions,
     })
-}
-
-fn insert_planned_resource(
-    planned: &mut BTreeMap<String, PlannedResource>,
-    target: String,
-    resource: PlannedResource,
-) -> ContractSetupResult<()> {
-    if let Some(current) = planned.get(&target) {
-        if current.kind == resource.kind && current.document == resource.document {
-            return Ok(());
-        }
-        return Err(contract_setup_diagnostic(format!(
-            "Contract setup contains conflicting resources for '{target}'."
-        )));
-    }
-    planned.insert(target, resource);
-    Ok(())
 }
 
 fn validate_existing_setup(setup: &ExistingContractImplementation) -> ContractSetupResult<()> {
@@ -592,40 +1171,6 @@ fn validate_existing_setup(setup: &ExistingContractImplementation) -> ContractSe
         ));
     }
     Ok(())
-}
-
-fn filter_starter_type_document(
-    document: &str,
-    provided: &BTreeSet<ContractIdentity>,
-    starter: &BTreeSet<ContractIdentity>,
-    pack_has_starter: bool,
-) -> ContractSetupResult<Option<String>> {
-    let (yaml_start, yaml_end) = frontmatter_bounds(document)?;
-    let yaml = &document[yaml_start..yaml_end];
-    let mut parsed = serde_yaml::from_str::<serde_yaml::Value>(yaml)
-        .map_err(|_| contract_setup_diagnostic("A starter type has invalid YAML frontmatter."))?;
-    let mapping = parsed
-        .as_mapping_mut()
-        .ok_or_else(|| contract_setup_diagnostic("A starter type has invalid YAML frontmatter."))?;
-    let key = serde_yaml::Value::String("implements".to_string());
-    let Some(value) = mapping.get_mut(&key) else {
-        return Ok(pack_has_starter.then(|| document.to_string()));
-    };
-    let sequence = value.as_sequence_mut().ok_or_else(|| {
-        contract_setup_diagnostic("A starter type has an unsupported implements declaration.")
-    })?;
-    let before = sequence.len();
-    sequence.retain(|implementation| {
-        implementation_identity(implementation)
-            .is_none_or(|identity| !provided.contains(&identity) || starter.contains(&identity))
-    });
-    if sequence.is_empty() {
-        return Ok(None);
-    }
-    if sequence.len() == before {
-        return Ok(Some(document.to_string()));
-    }
-    replace_frontmatter(document, &parsed).map(Some)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -793,27 +1338,6 @@ fn replace_yaml_node<T: Serialize>(
     result.push_str(&next_yaml);
     result.push_str(&document[yaml_end..]);
     Ok(result)
-}
-
-fn replace_frontmatter(
-    document: &str,
-    frontmatter: &serde_yaml::Value,
-) -> ContractSetupResult<String> {
-    let (yaml_start, yaml_end) = frontmatter_bounds(document)?;
-    let serialized = serde_yaml::to_string(frontmatter)
-        .map_err(|_| contract_setup_diagnostic("A starter type could not be serialized."))?;
-    let serialized = serialized.strip_prefix("---\n").unwrap_or(&serialized);
-    let serialized = if document.contains("\r\n") {
-        serialized.replace('\n', "\r\n")
-    } else {
-        serialized.to_string()
-    };
-    Ok(format!(
-        "{}{}{}",
-        &document[..yaml_start],
-        serialized,
-        &document[yaml_end..]
-    ))
 }
 
 fn frontmatter_bounds(document: &str) -> ContractSetupResult<(usize, usize)> {
@@ -1010,14 +1534,6 @@ fn validate_markdown_kind(bytes: &[u8], expected: &str, target: &str) -> Result<
     Ok(())
 }
 
-fn pack_error(message: &str) -> OperationResult {
-    failed(vec![Diagnostic::error(
-        "invalid_type_pack",
-        message,
-        Some("mdbase-pack.yaml".to_string()),
-    )])
-}
-
 fn failed(diagnostics: Vec<Diagnostic>) -> OperationResult {
     OperationResult {
         valid: false,
@@ -1029,6 +1545,7 @@ fn failed(diagnostics: Vec<Diagnostic>) -> OperationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn write(path: &std::path::Path, contents: &str) {
         if let Some(parent) = path.parent() {
@@ -1051,11 +1568,83 @@ mod tests {
             "version": "1.0.0",
             "resources": resources.iter().map(|(kind, source, target, document)| json!({
                 "kind": kind,
+                "mode": "managed",
                 "source": source,
                 "target": target,
                 "digest": format!("sha256:{:x}", Sha256::digest(document.as_bytes())),
             })).collect::<Vec<_>>(),
         })
+    }
+
+    fn provision(manifest: Value, resources: Vec<TypePackResource>) -> TypePackProvision {
+        TypePackProvision {
+            manifest,
+            resources,
+        }
+    }
+
+    fn apply_pack(collection: &Collection, provision: &TypePackProvision) -> OperationResult {
+        let assessment = collection.assess_type_pack(provision, &assessment_options());
+        if !assessment.valid {
+            return assessment;
+        }
+        collection.apply_type_pack(
+            provision,
+            &TypePackApplyOptions {
+                installed_by: "dev.mdbase.tests".to_string(),
+                expected_assessment_digest: assessment.result["assessment_digest"]
+                    .as_str()
+                    .expect("assessment digest")
+                    .to_string(),
+                allow_downgrade: false,
+                adopt_resources: BTreeMap::new(),
+                preserve_seed_targets: BTreeSet::new(),
+                target_overrides: BTreeMap::new(),
+                contract_setups: Vec::new(),
+            },
+        )
+    }
+
+    fn apply_pack_with_setups(
+        collection: &Collection,
+        provision: &TypePackProvision,
+        contract_setups: Vec<ContractSetupChoice>,
+    ) -> OperationResult {
+        let assessment = collection.assess_type_pack(
+            provision,
+            &TypePackAssessmentOptions {
+                contract_setups: contract_setups.clone(),
+                ..assessment_options()
+            },
+        );
+        if !assessment.valid {
+            return assessment;
+        }
+        collection.apply_type_pack(
+            provision,
+            &TypePackApplyOptions {
+                installed_by: "dev.mdbase.tests".to_string(),
+                expected_assessment_digest: assessment.result["assessment_digest"]
+                    .as_str()
+                    .expect("assessment digest")
+                    .to_string(),
+                allow_downgrade: false,
+                adopt_resources: BTreeMap::new(),
+                preserve_seed_targets: BTreeSet::new(),
+                target_overrides: BTreeMap::new(),
+                contract_setups,
+            },
+        )
+    }
+
+    fn assessment_options() -> TypePackAssessmentOptions {
+        TypePackAssessmentOptions {
+            installed_by: "dev.mdbase.tests".to_string(),
+            adopt_resources: BTreeMap::new(),
+            preserve_seed_targets: BTreeSet::new(),
+            target_overrides: BTreeMap::new(),
+            contract_setups: Vec::new(),
+        }
     }
 
     fn collection() -> (tempfile::TempDir, Collection) {
@@ -1066,70 +1655,6 @@ mod tests {
         );
         let collection = Collection::open(root.path()).unwrap();
         (root, collection)
-    }
-
-    fn contract_pack(contract_id: &str, slug: &str) -> TypePackInstall {
-        let schema = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["title"],"additionalProperties":false,"properties":{"title":{"type":"string"}}}"#.to_string();
-        let contract = format!(
-            "---\nkind: mdbase.contract\ncontract_type: record\nid: {contract_id}\nversion: 1.0.0\nrecord_schema:\n  dialect: json-schema-2020-12\n  ref: ../schemas/{slug}.schema.json\n---\n"
-        );
-        let starter = format!(
-            "---\nkind: mdbase.type\nname: {slug}\nversion: 1\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    required: [title]\n    additionalProperties: true\n    properties:\n      title: {{ type: string }}\nimplements:\n  - contract: {contract_id}\n    version: 1.0.0\n    fields:\n      title: title\n---\n"
-        );
-        let definitions = [
-            (
-                "schema",
-                format!("{slug}.schema.json"),
-                format!("schemas/{slug}.schema.json"),
-                schema,
-            ),
-            (
-                "contract",
-                format!("{slug}.contract.md"),
-                format!("_contracts/{contract_id}.md"),
-                contract,
-            ),
-            (
-                "type",
-                format!("{slug}.type.md"),
-                format!("_types/{slug}.md"),
-                starter,
-            ),
-        ];
-        TypePackInstall {
-            manifest: json!({
-                "kind": "mdbase.type-pack",
-                "id": format!("example.{slug}"),
-                "version": "1.0.0",
-                "resources": definitions.iter().map(|(kind, source, target, document)| json!({
-                    "kind": kind,
-                    "source": source,
-                    "target": target,
-                    "digest": format!("sha256:{:x}", Sha256::digest(document.as_bytes())),
-                })).collect::<Vec<_>>(),
-            }),
-            resources: definitions
-                .into_iter()
-                .map(|(_, source, _, document)| TypePackResource { source, document })
-                .collect(),
-            provides: vec![ContractIdentity {
-                id: contract_id.to_string(),
-                version: "1.0.0".to_string(),
-            }],
-        }
-    }
-
-    fn combined_pack(mut left: TypePackInstall, right: TypePackInstall) -> TypePackInstall {
-        left.manifest["resources"].as_array_mut().unwrap().extend(
-            right.manifest["resources"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .cloned(),
-        );
-        left.resources.extend(right.resources);
-        left.provides.extend(right.provides);
-        left
     }
 
     fn existing_setup(contract_id: &str, revision: &str) -> ContractSetupChoice {
@@ -1224,7 +1749,8 @@ implements:
             .collect::<Vec<_>>();
         let manifest = manifest(&definitions);
 
-        let installed = collection.install_type_pack(&manifest, &resources, false);
+        let provision = provision(manifest, resources);
+        let installed = apply_pack(&collection, &provision);
         assert!(installed.valid, "{:?}", installed.diagnostics);
         assert_eq!(
             installed.result["resources"]
@@ -1244,7 +1770,7 @@ implements:
             1
         );
 
-        let repeated = reopened.install_type_pack(&manifest, &resources, false);
+        let repeated = apply_pack(&reopened, &provision);
         assert!(repeated.valid, "{:?}", repeated.diagnostics);
         assert!(repeated.result["resources"]
             .as_array()
@@ -1261,13 +1787,15 @@ implements:
             .iter()
             .map(|(_, source, _, document)| resource(source, document))
             .collect::<Vec<_>>();
-        assert!(
-            collection
-                .install_type_pack(&manifest(&definitions), &resources, false)
-                .valid
-        );
+        let initial = provision(manifest(&definitions), resources);
+        assert!(apply_pack(&collection, &initial).valid);
         let contract_path = root.path().join("_contracts/example.task.md");
         let before = fs::read(&contract_path).unwrap();
+        fs::write(
+            &contract_path,
+            [before.as_slice(), b"\nUser change.\n"].concat(),
+        )
+        .unwrap();
 
         let mut changed = task_resources();
         changed[1].3 = r#"---
@@ -1284,10 +1812,14 @@ record_schema:
             .iter()
             .map(|(_, source, _, document)| resource(source, document))
             .collect::<Vec<_>>();
-        let rejected = collection.install_type_pack(&manifest(&changed), &changed_resources, false);
-        assert!(!rejected.valid);
-        assert_eq!(rejected.diagnostics[0].code, "type_pack_conflict");
-        assert_eq!(fs::read(contract_path).unwrap(), before);
+        let changed = provision(manifest(&changed), changed_resources);
+        let rejected = collection.assess_type_pack(&changed, &assessment_options());
+        assert!(rejected.valid);
+        assert_eq!(rejected.result["status"], "conflict");
+        assert_eq!(
+            fs::read(contract_path).unwrap(),
+            [before, b"\nUser change.\n".to_vec()].concat()
+        );
     }
 
     #[test]
@@ -1299,25 +1831,31 @@ record_schema:
             .map(|(_, source, _, document)| resource(source, document))
             .collect::<Vec<_>>();
         let manifest = manifest(&definitions);
-        assert!(
-            collection
-                .install_type_pack(&manifest, &resources, false)
-                .valid
-        );
+        let provision = provision(manifest, resources);
+        assert!(apply_pack(&collection, &provision).valid);
         let target = "_types/task.md".to_string();
         let original = fs::read(root.path().join(&target)).unwrap();
-        let reviewed = format!("sha256:{:x}", Sha256::digest(&original));
+        let assessment = collection.assess_type_pack(&provision, &assessment_options());
         let externally_changed = String::from_utf8(original)
             .unwrap()
             .replace("required: [title]", "required: []");
         fs::write(root.path().join(&target), &externally_changed).unwrap();
         let reopened = Collection::open(root.path()).unwrap();
 
-        let rejected = reopened.install_type_pack_with_preconditions(
-            &manifest,
-            &resources,
-            true,
-            &[(target.clone(), reviewed)].into_iter().collect(),
+        let rejected = reopened.apply_type_pack(
+            &provision,
+            &TypePackApplyOptions {
+                installed_by: "dev.mdbase.tests".to_string(),
+                expected_assessment_digest: assessment.result["assessment_digest"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                allow_downgrade: false,
+                adopt_resources: BTreeMap::new(),
+                preserve_seed_targets: BTreeSet::new(),
+                target_overrides: BTreeMap::new(),
+                contract_setups: Vec::new(),
+            },
         );
 
         assert!(!rejected.valid);
@@ -1339,7 +1877,7 @@ record_schema:
         let mut invalid_digest = manifest(&definitions);
         invalid_digest["resources"][1]["digest"] =
             Value::String(format!("sha256:{}", "0".repeat(64)));
-        let rejected = collection.install_type_pack(&invalid_digest, &resources, false);
+        let rejected = apply_pack(&collection, &provision(invalid_digest, resources));
         assert!(!rejected.valid);
         assert!(!root.path().join("_contracts/example.task.md").exists());
         assert!(!root.path().join("_types/task.md").exists());
@@ -1366,8 +1904,10 @@ implements:
             .iter()
             .map(|(_, source, _, document)| resource(source, document))
             .collect::<Vec<_>>();
-        let rejected =
-            collection.install_type_pack(&manifest(&invalid_registry), &invalid_resources, false);
+        let rejected = apply_pack(
+            &collection,
+            &provision(manifest(&invalid_registry), invalid_resources),
+        );
         assert!(!rejected.valid);
         assert!(!root.path().join("_contracts/example.task.md").exists());
         assert!(!root.path().join("_types/task.md").exists());
@@ -1412,10 +1952,12 @@ schema:
         ];
 
         for (kind, source, target, document) in cases {
-            let rejected = collection.install_type_pack(
-                &manifest(&[(kind, source, target, document)]),
-                &[resource(source, document)],
-                false,
+            let rejected = apply_pack(
+                &collection,
+                &provision(
+                    manifest(&[(kind, source, target, document)]),
+                    vec![resource(source, document)],
+                ),
             );
             assert!(!rejected.valid, "{kind} target {target} was accepted");
             assert_eq!(rejected.diagnostics[0].code, "invalid_type_pack");
@@ -1430,10 +1972,12 @@ schema:
     fn markdown_resource_kind_must_match_its_manifest_kind() {
         let (root, collection) = collection();
         let contract_document = "---\nkind: mdbase.contract\n---\n";
-        let rejected = collection.install_type_pack(
-            &manifest(&[("type", "task.md", "_types/task.md", contract_document)]),
-            &[resource("task.md", contract_document)],
-            false,
+        let rejected = apply_pack(
+            &collection,
+            &provision(
+                manifest(&[("type", "task.md", "_types/task.md", contract_document)]),
+                vec![resource("task.md", contract_document)],
+            ),
         );
 
         assert!(!rejected.valid);
@@ -1442,96 +1986,91 @@ schema:
     }
 
     #[test]
-    fn mixed_starter_and_existing_choices_in_one_pack_are_applied_per_contract() {
+    fn reviewed_existing_type_mappings_apply_together_and_retry_idempotently() {
         let (root, _) = collection();
         write(&root.path().join("_types/note.md"), EXISTING_TYPE);
         let collection = Collection::open(root.path()).unwrap();
-        let revision = format!("sha256:{:x}", Sha256::digest(EXISTING_TYPE.as_bytes()));
-        let pack = combined_pack(
-            contract_pack("example.alpha", "alpha"),
-            contract_pack("example.beta", "beta"),
-        );
-        let result = collection.install_type_packs_with_contract_setups(
-            &[pack],
-            &[
-                existing_setup("example.alpha", &revision),
-                ContractSetupChoice {
-                    contract: ContractIdentity {
-                        id: "example.beta".to_string(),
-                        version: "1.0.0".to_string(),
-                    },
-                    mode: ContractSetupMode::Starter,
-                },
-            ],
-        );
-
-        assert!(result.valid, "{:?}", result.diagnostics);
-        assert!(!root.path().join("_types/alpha.md").exists());
-        assert!(root.path().join("_types/beta.md").is_file());
-        let note = fs::read_to_string(root.path().join("_types/note.md")).unwrap();
-        assert!(note.contains("contract: example.alpha"));
-        assert!(!note.contains("contract: example.beta"));
-    }
-
-    #[test]
-    fn separate_packs_can_map_to_one_existing_type_and_retry_idempotently() {
-        let (root, _) = collection();
-        write(&root.path().join("_types/note.md"), EXISTING_TYPE);
-        let collection = Collection::open(root.path()).unwrap();
-        let revision = format!("sha256:{:x}", Sha256::digest(EXISTING_TYPE.as_bytes()));
-        let packs = [
-            contract_pack("example.alpha", "alpha"),
-            contract_pack("example.beta", "beta"),
-        ];
+        let revision = revision(EXISTING_TYPE.as_bytes());
         let setups = [
             existing_setup("example.alpha", &revision),
             existing_setup("example.beta", &revision),
         ];
+        let alpha = contract_document("example.alpha");
+        let beta = contract_document("example.beta");
+        let definitions = [
+            (
+                "contract",
+                "alpha.md",
+                "_contracts/example.alpha.md",
+                alpha.as_str(),
+            ),
+            (
+                "contract",
+                "beta.md",
+                "_contracts/example.beta.md",
+                beta.as_str(),
+            ),
+        ];
+        let provision = provision(
+            manifest(&definitions),
+            vec![resource("alpha.md", &alpha), resource("beta.md", &beta)],
+        );
 
-        let installed = collection.install_type_packs_with_contract_setups(&packs, &setups);
-        assert!(installed.valid, "{:?}", installed.diagnostics);
+        let applied = apply_pack_with_setups(&collection, &provision, setups.to_vec());
+        assert!(applied.valid, "{:?}", applied.diagnostics);
         let once = fs::read_to_string(root.path().join("_types/note.md")).unwrap();
         assert!(once.contains("contract: example.alpha"));
         assert!(once.contains("contract: example.beta"));
 
         let reopened = Collection::open(root.path()).unwrap();
-        let retried = reopened.install_type_packs_with_contract_setups(&packs, &setups);
+        let retried = apply_pack_with_setups(&reopened, &provision, setups.to_vec());
         assert!(retried.valid, "{:?}", retried.diagnostics);
+        assert!(retried.result["contract_setups"]["resources"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(
             fs::read_to_string(root.path().join("_types/note.md")).unwrap(),
             once
         );
-        assert!(retried.result["resources"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|resource| resource["action"] == "unchanged"));
     }
 
     #[test]
-    fn one_stale_existing_choice_rolls_back_the_complete_multi_pack_plan() {
+    fn stale_existing_type_review_writes_nothing() {
         let (root, _) = collection();
         write(&root.path().join("_types/note.md"), EXISTING_TYPE);
         let collection = Collection::open(root.path()).unwrap();
-        let revision = format!("sha256:{:x}", Sha256::digest(EXISTING_TYPE.as_bytes()));
-        let rejected = collection.install_type_packs_with_contract_setups(
-            &[
-                contract_pack("example.alpha", "alpha"),
-                contract_pack("example.beta", "beta"),
-            ],
-            &[
-                existing_setup("example.alpha", &revision),
-                existing_setup("example.beta", &format!("sha256:{}", "0".repeat(64))),
-            ],
+        let contract = contract_document("example.alpha");
+        let provision = provision(
+            manifest(&[(
+                "contract",
+                "alpha.md",
+                "_contracts/example.alpha.md",
+                contract.as_str(),
+            )]),
+            vec![resource("alpha.md", &contract)],
+        );
+        let rejected = apply_pack_with_setups(
+            &collection,
+            &provision,
+            vec![existing_setup(
+                "example.alpha",
+                &format!("sha256:{}", "0".repeat(64)),
+            )],
         );
 
         assert!(!rejected.valid);
         assert_eq!(rejected.diagnostics[0].code, "concurrent_modification");
+        assert!(!root.path().join("_contracts/example.alpha.md").exists());
         assert_eq!(
             fs::read_to_string(root.path().join("_types/note.md")).unwrap(),
             EXISTING_TYPE
         );
-        assert!(!root.path().join("_contracts/example.alpha.md").exists());
-        assert!(!root.path().join("_contracts/example.beta.md").exists());
+    }
+
+    fn contract_document(id: &str) -> String {
+        format!(
+            "---\nkind: mdbase.contract\ncontract_type: record\nid: {id}\nversion: 1.0.0\nrecord_schema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    required: [title]\n    properties:\n      title: {{ type: string }}\n---\n"
+        )
     }
 }

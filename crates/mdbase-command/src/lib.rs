@@ -198,6 +198,12 @@ pub enum Command {
         action: TypeAction,
     },
 
+    /// Assess and apply versioned type-pack definition bundles.
+    Packs {
+        #[command(subcommand)]
+        action: PackAction,
+    },
+
     /// Validate a file or the entire collection
     Validate {
         /// File path (omit for collection-wide validation)
@@ -288,6 +294,7 @@ impl Command {
             Self::Batch { .. } => "batch",
             Self::Views { .. } => "views",
             Self::Types { .. } => "types",
+            Self::Packs { .. } => "packs",
             Self::Validate { .. } => "validate",
             Self::Backfill { .. } => "backfill",
             Self::Migrate { .. } => "migrate",
@@ -353,6 +360,50 @@ pub enum TypeAction {
         /// Require the current opaque revision.
         #[arg(long)]
         if_revision: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum PackAction {
+    /// Inspect the exact resource and provenance changes without writing.
+    Assess {
+        #[arg(long, default_value = "mdbase-pack.yaml")]
+        manifest: String,
+        #[arg(long, default_value = ".")]
+        resources: String,
+        #[arg(long, default_value = "dev.mdbase.cli")]
+        installed_by: String,
+        /// Explicitly adopt an unmanaged target as TARGET=sha256:DIGEST.
+        #[arg(long = "adopt", value_name = "TARGET=DIGEST")]
+        adoptions: Vec<String>,
+        /// Record a seed as intentionally omitted instead of creating it.
+        #[arg(long = "preserve-seed", value_name = "TARGET")]
+        preserve_seed_targets: Vec<String>,
+        /// Resolve a canonical pack target to a collection path as FROM=TO.
+        #[arg(long = "target", value_name = "MANIFEST_TARGET=COLLECTION_TARGET")]
+        target_overrides: Vec<String>,
+    },
+    /// Apply a previously reviewed assessment transactionally.
+    Apply {
+        #[arg(long, default_value = "mdbase-pack.yaml")]
+        manifest: String,
+        #[arg(long, default_value = ".")]
+        resources: String,
+        #[arg(long, default_value = "dev.mdbase.cli")]
+        installed_by: String,
+        #[arg(long)]
+        assessment_digest: String,
+        #[arg(long)]
+        allow_downgrade: bool,
+        /// Explicitly adopt an unmanaged target as TARGET=sha256:DIGEST.
+        #[arg(long = "adopt", value_name = "TARGET=DIGEST")]
+        adoptions: Vec<String>,
+        /// Record a seed as intentionally omitted instead of creating it.
+        #[arg(long = "preserve-seed", value_name = "TARGET")]
+        preserve_seed_targets: Vec<String>,
+        /// Resolve a canonical pack target to a collection path as FROM=TO.
+        #[arg(long = "target", value_name = "MANIFEST_TARGET=COLLECTION_TARGET")]
+        target_overrides: Vec<String>,
     },
 }
 
@@ -596,6 +647,52 @@ pub fn into_portable(command: Command) -> Result<PortableInvocation, CommandResu
                 }
             }
         },
+        Command::Packs { action } => match action {
+            PackAction::Assess {
+                manifest,
+                resources,
+                installed_by,
+                adoptions,
+                preserve_seed_targets,
+                target_overrides,
+            } => PortableInvocation {
+                operation: "assess_type_pack",
+                input: pack_operation_input(
+                    &manifest,
+                    &resources,
+                    installed_by,
+                    adoptions,
+                    preserve_seed_targets,
+                    target_overrides,
+                    None,
+                    false,
+                )
+                .map_err(command_error)?,
+            },
+            PackAction::Apply {
+                manifest,
+                resources,
+                installed_by,
+                assessment_digest,
+                allow_downgrade,
+                adoptions,
+                preserve_seed_targets,
+                target_overrides,
+            } => PortableInvocation {
+                operation: "apply_type_pack",
+                input: pack_operation_input(
+                    &manifest,
+                    &resources,
+                    installed_by,
+                    adoptions,
+                    preserve_seed_targets,
+                    target_overrides,
+                    Some(assessment_digest),
+                    allow_downgrade,
+                )
+                .map_err(command_error)?,
+            },
+        },
         Command::Validate { path } => PortableInvocation {
             operation: "validate",
             input: path
@@ -639,6 +736,7 @@ fn is_portable(command: &Command) -> bool {
             | Command::Batch { .. }
             | Command::Views { .. }
             | Command::Types { .. }
+            | Command::Packs { .. }
             | Command::Validate { .. }
     )
 }
@@ -755,6 +853,13 @@ pub fn execute_direct(root: &std::path::Path, command: Command) -> CommandResult
             Ok(invocation) => invocation,
             Err(result) => return result,
         };
+        if matches!(invocation.operation, "assess_type_pack" | "apply_type_pack") {
+            let result = execute_direct_pack(&collection, &invocation);
+            let value = serde_json::to_value(result)
+                .expect("the type-pack operation result must serialize");
+            let exit_code = portable_exit_code(&value);
+            return CommandResult::output(value, exit_code);
+        }
         let operations = match collection.v03_operations() {
             Ok(operations) => operations,
             Err(diagnostic) => {
@@ -802,6 +907,57 @@ pub fn execute_direct(root: &std::path::Path, command: Command) -> CommandResult
 
     let (value, exit_code) = execute_command(&collection, command);
     CommandResult::output(value, exit_code)
+}
+
+fn execute_direct_pack(
+    collection: &mdbase::Collection,
+    invocation: &PortableInvocation,
+) -> mdbase::v03::OperationResult {
+    let provision = serde_json::from_value::<mdbase::v03::TypePackProvision>(
+        invocation.input["provision"].clone(),
+    )
+    .expect("CLI pack input constructs a valid provision");
+    let adoptions = serde_json::from_value(invocation.input["adopt_resources"].clone())
+        .expect("CLI pack input constructs valid adoptions");
+    let preserve_seed_targets =
+        serde_json::from_value(invocation.input["preserve_seed_targets"].clone())
+            .unwrap_or_default();
+    let target_overrides =
+        serde_json::from_value(invocation.input["target_overrides"].clone()).unwrap_or_default();
+    let installed_by = invocation.input["installed_by"]
+        .as_str()
+        .expect("CLI pack input includes installed_by")
+        .to_string();
+    if invocation.operation == "assess_type_pack" {
+        collection.assess_type_pack(
+            &provision,
+            &mdbase::v03::TypePackAssessmentOptions {
+                installed_by,
+                adopt_resources: adoptions,
+                preserve_seed_targets,
+                target_overrides,
+                contract_setups: Vec::new(),
+            },
+        )
+    } else {
+        collection.apply_type_pack(
+            &provision,
+            &mdbase::v03::TypePackApplyOptions {
+                installed_by,
+                expected_assessment_digest: invocation.input["expected_assessment_digest"]
+                    .as_str()
+                    .expect("CLI apply input includes the assessment digest")
+                    .to_string(),
+                allow_downgrade: invocation.input["allow_downgrade"]
+                    .as_bool()
+                    .unwrap_or(false),
+                adopt_resources: adoptions,
+                preserve_seed_targets,
+                target_overrides,
+                contract_setups: Vec::new(),
+            },
+        )
+    }
 }
 
 pub fn execute_args(args: DirectArgs) -> CommandResult {
@@ -1074,6 +1230,10 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
 
         Command::Types { .. } => {
             typed_error_result(MdbaseError::MigrationRequired { operation: "types" })
+        }
+
+        Command::Packs { .. } => {
+            typed_error_result(MdbaseError::MigrationRequired { operation: "packs" })
         }
 
         Command::Validate { path } => {
@@ -1386,6 +1546,122 @@ fn read_text_input(source: &str) -> MdbaseResult<String> {
     std::fs::read_to_string(source).map_err(|error| MdbaseError::InvalidRequest {
         message: format!("could not read document '{source}': {error}"),
     })
+}
+
+fn pack_operation_input(
+    manifest_path: &str,
+    resources_root: &str,
+    installed_by: String,
+    adoptions: Vec<String>,
+    preserve_seed_targets: Vec<String>,
+    target_overrides: Vec<String>,
+    assessment_digest: Option<String>,
+    allow_downgrade: bool,
+) -> MdbaseResult<serde_json::Value> {
+    let source = read_text_input(manifest_path)?;
+    let manifest = serde_yaml::from_str::<serde_json::Value>(&source).map_err(|error| {
+        MdbaseError::InvalidRequest {
+            message: format!("could not parse type-pack manifest '{manifest_path}': {error}"),
+        }
+    })?;
+    let declarations = manifest
+        .get("resources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| MdbaseError::InvalidRequest {
+            message: "type-pack manifest resources must be an array".to_string(),
+        })?;
+    let root = std::path::Path::new(resources_root);
+    let mut resources = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let source = declaration
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| MdbaseError::InvalidRequest {
+                message: "each type-pack resource requires source".to_string(),
+            })?;
+        let safe_source = CollectionPath::new(source.to_string())?;
+        let path = root.join(safe_source.as_str());
+        let document =
+            std::fs::read_to_string(&path).map_err(|error| MdbaseError::InvalidRequest {
+                message: format!(
+                    "could not read type-pack resource '{}': {error}",
+                    path.display()
+                ),
+            })?;
+        resources.push(serde_json::json!({ "source": source, "document": document }));
+    }
+    let mut adopt_resources = serde_json::Map::new();
+    for adoption in adoptions {
+        let (target, digest) =
+            adoption
+                .split_once('=')
+                .ok_or_else(|| MdbaseError::InvalidRequest {
+                    message: format!("invalid --adopt '{adoption}'; expected TARGET=sha256:DIGEST"),
+                })?;
+        CollectionPath::new(target.to_string())?;
+        if !is_sha256_digest(digest) {
+            return Err(MdbaseError::InvalidRequest {
+                message: format!("invalid adoption digest for '{target}'"),
+            });
+        }
+        if adopt_resources
+            .insert(
+                target.to_string(),
+                serde_json::Value::String(digest.to_string()),
+            )
+            .is_some()
+        {
+            return Err(MdbaseError::InvalidRequest {
+                message: format!("duplicate adoption target '{target}'"),
+            });
+        }
+    }
+    let mut preserved_seeds = Vec::with_capacity(preserve_seed_targets.len());
+    for target in preserve_seed_targets {
+        let target = CollectionPath::new(target)?;
+        preserved_seeds.push(target.as_str().to_string());
+    }
+    let mut resolved_targets = serde_json::Map::new();
+    for target_override in target_overrides {
+        let (source, target) = target_override.split_once('=').ok_or_else(|| {
+            MdbaseError::InvalidRequest {
+                message: format!(
+                    "invalid --target '{target_override}'; expected MANIFEST_TARGET=COLLECTION_TARGET"
+                ),
+            }
+        })?;
+        let source = CollectionPath::new(source.to_string())?;
+        let target = CollectionPath::new(target.to_string())?;
+        if resolved_targets
+            .insert(
+                source.as_str().to_string(),
+                serde_json::Value::String(target.as_str().to_string()),
+            )
+            .is_some()
+        {
+            return Err(MdbaseError::InvalidRequest {
+                message: format!("duplicate target override '{}'", source.as_str()),
+            });
+        }
+    }
+    let mut input = serde_json::json!({
+        "provision": { "manifest": manifest, "resources": resources, "provides": [] },
+        "installed_by": installed_by,
+        "adopt_resources": adopt_resources,
+        "preserve_seed_targets": preserved_seeds,
+        "target_overrides": resolved_targets,
+    });
+    if let Some(digest) = assessment_digest {
+        input["expected_assessment_digest"] = serde_json::Value::String(digest);
+        input["allow_downgrade"] = serde_json::Value::Bool(allow_downgrade);
+    }
+    Ok(input)
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[allow(clippy::too_many_arguments)]
