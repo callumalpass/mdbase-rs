@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mdbase::Collection;
+use mdbase::{v03::TypePackProvision, Collection};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use tempfile::TempDir;
@@ -129,7 +129,8 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
         | "data_contract_registry_validate" => {
             execute_standalone_data_contract_case(&case.operation, &input)
         }
-        "install_type_pack" => execute_type_pack_case(collection, &input),
+        "apply_type_pack" => execute_type_pack_case(collection, &input),
+        "assess_type_pack" => execute_type_pack_assessment(collection, &input),
         "validate" => {
             let envelope = operations.validate(&input);
             let mut result = flatten_envelope(envelope);
@@ -314,12 +315,20 @@ fn execute_type_pack_case(collection: &Collection, input: &Value) -> Value {
         input
             .get("pack")
             .and_then(Value::as_str)
-            .expect("install_type_pack requires input.pack"),
+            .expect("apply_type_pack requires input.pack"),
     );
     let manifest_yaml = fs::read_to_string(&manifest_path).expect("read shared type pack manifest");
     let manifest_yaml: serde_yaml::Value =
         serde_yaml::from_str(&manifest_yaml).expect("parse shared type pack manifest");
     let mut manifest = yaml_to_json(&manifest_yaml);
+    for resource in manifest["resources"]
+        .as_array_mut()
+        .expect("type pack resources must be an array")
+    {
+        if resource.get("mode").is_none() {
+            resource["mode"] = Value::String("managed".to_string());
+        }
+    }
     let resources = manifest["resources"]
         .as_array()
         .expect("type pack resources must be an array")
@@ -346,7 +355,62 @@ fn execute_type_pack_case(collection: &Collection, input: &Value) -> Value {
     let repeat = input.get("repeat").and_then(Value::as_u64).unwrap_or(1);
     let mut runs = Vec::new();
     for _ in 0..repeat {
-        let result = collection.install_type_pack(&manifest, &resources, false);
+        let provision = TypePackProvision {
+            manifest: manifest.clone(),
+            resources: resources.clone(),
+        };
+        let mut assessment_options = mdbase::v03::TypePackAssessmentOptions {
+            installed_by: "dev.mdbase.conformance".to_string(),
+            adopt_resources: BTreeMap::new(),
+            preserve_seed_targets: Default::default(),
+            target_overrides: BTreeMap::new(),
+            contract_setups: Vec::new(),
+        };
+        let mut assessment = collection.assess_type_pack(&provision, &assessment_options);
+        if input.get("adopt_conflicts").and_then(Value::as_bool) == Some(true) && assessment.valid {
+            assessment_options.adopt_resources = assessment.result["resources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|resource| {
+                    resource["action"] == "conflict"
+                        && resource["mode"] == "managed"
+                        && resource["current_digest"].is_string()
+                })
+                .map(|resource| {
+                    (
+                        resource["target"].as_str().unwrap().to_string(),
+                        resource["current_digest"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            assessment = collection.assess_type_pack(&provision, &assessment_options);
+        }
+        if let Some(target) = input.get("mutate_after_assess").and_then(Value::as_str) {
+            let target = collection.root().join(target);
+            fs::create_dir_all(target.parent().expect("mutation target parent"))
+                .expect("create mutation target parent");
+            fs::write(target, "Changed after assessment.\n").expect("mutate assessed target");
+        }
+        let result = if assessment.valid {
+            collection.apply_type_pack(
+                &provision,
+                &mdbase::v03::TypePackApplyOptions {
+                    installed_by: assessment_options.installed_by,
+                    expected_assessment_digest: assessment.result["assessment_digest"]
+                        .as_str()
+                        .expect("assessment digest")
+                        .to_string(),
+                    allow_downgrade: false,
+                    adopt_resources: assessment_options.adopt_resources,
+                    preserve_seed_targets: assessment_options.preserve_seed_targets,
+                    target_overrides: assessment_options.target_overrides,
+                    contract_setups: assessment_options.contract_setups,
+                },
+            )
+        } else {
+            assessment.clone()
+        };
         let actions = result
             .result
             .get("resources")
@@ -363,6 +427,7 @@ fn execute_type_pack_case(collection: &Collection, input: &Value) -> Value {
         });
         runs.push(serde_json::json!({
             "valid": result.valid,
+            "status": assessment.result["status"],
             "actions": actions,
             "error": error,
         }));
@@ -393,12 +458,68 @@ fn execute_type_pack_case(collection: &Collection, input: &Value) -> Value {
         "valid": last["valid"],
         "runs": runs,
         "implementations": implementations,
+        "lock_exists": collection.root().join("mdbase.lock.yaml").exists(),
         "targets_exist": targets_exist,
     });
     if !last["error"].is_null() {
         output["error"] = last["error"].clone();
     }
     output
+}
+
+fn execute_type_pack_assessment(collection: &Collection, input: &Value) -> Value {
+    let mut apply_input = input.clone();
+    apply_input["repeat"] = Value::from(1);
+    let installed = execute_type_pack_case(collection, &apply_input);
+    if !installed["valid"].as_bool().unwrap_or(false) {
+        return installed;
+    }
+    if let Some(target) = input.get("install_then_modify").and_then(Value::as_str) {
+        fs::write(collection.root().join(target), "User-authored change.\n")
+            .expect("modify installed target");
+    }
+    let manifest_path = spec_root().join(input["pack"].as_str().expect("assessment pack"));
+    let manifest_yaml: serde_yaml::Value = serde_yaml::from_str(
+        &fs::read_to_string(&manifest_path).expect("read assessment manifest"),
+    )
+    .expect("parse assessment manifest");
+    let mut manifest = yaml_to_json(&manifest_yaml);
+    for resource in manifest["resources"].as_array_mut().unwrap() {
+        if resource.get("mode").is_none() {
+            resource["mode"] = Value::String("managed".to_string());
+        }
+    }
+    let resources = manifest["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|resource| {
+            let source = resource["source"].as_str().unwrap().to_string();
+            let document = fs::read_to_string(manifest_path.parent().unwrap().join(&source))
+                .expect("read assessment resource");
+            mdbase::v03::TypePackResource { source, document }
+        })
+        .collect();
+    let assessed = collection.assess_type_pack(
+        &TypePackProvision {
+            manifest,
+            resources,
+        },
+        &mdbase::v03::TypePackAssessmentOptions {
+            installed_by: "dev.mdbase.conformance".to_string(),
+            adopt_resources: BTreeMap::new(),
+            preserve_seed_targets: Default::default(),
+            target_overrides: BTreeMap::new(),
+            contract_setups: Vec::new(),
+        },
+    );
+    serde_json::json!({
+        "valid": assessed.valid,
+        "status": assessed.result["status"],
+        "applicable": assessed.result["applicable"],
+        "actions": assessed.result["resources"].as_array().into_iter().flatten()
+            .map(|resource| resource["action"].clone()).collect::<Vec<_>>(),
+    })
 }
 
 fn execute_standalone_data_contract_case(operation: &str, input: &Value) -> Value {
@@ -698,7 +819,7 @@ fn shared_v03_data_contract_fixture_passes() {
 
 #[test]
 fn shared_v03_type_pack_fixture_passes() {
-    run_suite("type-packs/type-packs.yaml", "type_packs", 3);
+    run_suite("type-packs/type-packs.yaml", "type_packs", 6);
 }
 
 fn run_suite(relative_path: &str, fixture_set: &str, expected_cases: usize) {

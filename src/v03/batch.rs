@@ -331,6 +331,9 @@ fn should_copy_file(collection: &Collection, relative: &Path) -> bool {
     if relative == Path::new("mdbase.yaml") {
         return true;
     }
+    if relative == Path::new("mdbase.lock.yaml") {
+        return true;
+    }
     let extension = relative.extension().and_then(|value| value.to_str());
     if relative.starts_with(Path::new(&collection.settings.migrations_folder)) {
         return matches!(extension, Some("md" | "json"));
