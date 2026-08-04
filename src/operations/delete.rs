@@ -3,7 +3,8 @@
 use crate::api::operations::{DeleteInput, DeleteOutput};
 use crate::errors::*;
 use crate::operations::{
-    ensure_no_symlink_components, ensure_regular_record_file, ensure_revision, mutation_record_path,
+    ensure_no_symlink_components, ensure_regular_record_file, ensure_revision,
+    mutation_record_path, sync_directory,
 };
 use crate::Collection;
 
@@ -88,6 +89,14 @@ impl Collection {
             }
             if let Err(e) = std::fs::remove_file(&full_path) {
                 return op_error("io_error", &format!("Failed to delete: {}", e));
+            }
+            if let Some(parent) = full_path.parent() {
+                if let Err(error) = sync_directory(parent) {
+                    return op_error(
+                        "io_error",
+                        &format!("Failed to make deletion durable: {error}"),
+                    );
+                }
             }
         }
 

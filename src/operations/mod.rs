@@ -145,8 +145,11 @@ pub(crate) fn atomic_rename_noclobber(from: &Path, to: &Path) -> std::io::Result
         return Err(error);
     }
     if let Some(parent) = to.parent() {
-        if let Ok(directory) = std::fs::File::open(parent) {
-            let _ = directory.sync_all();
+        sync_directory(parent)?;
+    }
+    if from.parent() != to.parent() {
+        if let Some(parent) = from.parent() {
+            sync_directory(parent)?;
         }
     }
     Ok(())
@@ -228,10 +231,29 @@ fn atomic_write_mode(path: &Path, contents: &[u8], no_clobber: bool) -> std::io:
     } else {
         temporary.persist(path).map_err(|error| error.error)?;
     }
-    if let Ok(directory) = std::fs::File::open(parent) {
-        let _ = directory.sync_all();
-    }
+    sync_directory(parent)?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
 }
 
 #[cfg(test)]
@@ -240,6 +262,25 @@ mod tests {
     use super::ensure_no_symlink_components;
     use super::ensure_safe_relative_path;
     use crate::SpecProfile;
+
+    #[test]
+    fn durability_primitives_cover_create_replace_cross_directory_rename_and_delete() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let source_dir = root.path().join("source");
+        let target_dir = root.path().join("target");
+        std::fs::create_dir_all(&source_dir).expect("source directory");
+        std::fs::create_dir_all(&target_dir).expect("target directory");
+        let source = source_dir.join("record.md");
+        let target = target_dir.join("record.md");
+
+        super::atomic_create(&source, b"one").expect("durable create");
+        super::atomic_write(&source, b"two").expect("durable replace");
+        super::atomic_rename_noclobber(&source, &target).expect("durable rename");
+        assert_eq!(std::fs::read(&target).expect("renamed bytes"), b"two");
+        std::fs::remove_file(&target).expect("delete");
+        super::sync_directory(&target_dir).expect("durable delete");
+        assert!(!target.exists());
+    }
 
     #[test]
     fn rejects_absolute_and_traversal_paths_from_any_platform() {
