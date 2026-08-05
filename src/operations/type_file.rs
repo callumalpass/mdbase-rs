@@ -263,10 +263,8 @@ fn atomic_write(
     }
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
-    temporary
-        .persist(path)
-        .map(|_| ())
-        .map_err(|error| error.error)
+    temporary.persist(path).map_err(|error| error.error)?;
+    crate::operations::sync_directory(parent)
 }
 
 fn atomic_create(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
@@ -277,8 +275,8 @@ fn atomic_create(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     temporary.as_file().sync_all()?;
     temporary
         .persist_noclobber(path)
-        .map(|_| ())
-        .map_err(|error| error.error)
+        .map_err(|error| error.error)?;
+    crate::operations::sync_directory(parent)
 }
 
 fn failed(diagnostic: Diagnostic) -> OperationResult {

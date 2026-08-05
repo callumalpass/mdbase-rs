@@ -57,6 +57,9 @@ notify = "8"
 tempfile = "3"
 tracing = { version = "0.1", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [workspace.package]
 edition = "2021"
 rust-version = "1.94"

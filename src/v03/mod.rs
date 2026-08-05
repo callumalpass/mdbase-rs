@@ -16,6 +16,7 @@ use crate::{Collection, SpecProfile};
 
 mod batch;
 pub(crate) mod cel;
+mod collection_setup;
 mod lifecycle;
 mod operations;
 mod query;
@@ -24,6 +25,13 @@ mod type_pack;
 pub use cel::{
     evaluate_runtime_expression, evaluate_runtime_template, validate_runtime_expression,
     WorkflowCelError,
+};
+pub use collection_setup::{
+    CollectionSetup, CollectionSetupApplyOptions, CollectionSetupAssessment,
+    CollectionSetupProvisions, CollectionSetupReceipt, CollectionSetupRequirements,
+    CollectionSetupTypePack, CollectionSetupTypePackOptions, ConfigurationConflict,
+    ConfigurationContributionReceipt, ConfigurationOperation, ConfigurationPredicate,
+    ConfigurationProvision, ConfigurationRequirement, ConfigurationSetupAssessment,
 };
 pub use operations::{OperationResult, Operations};
 pub use query::QueryPerformance;
@@ -54,6 +62,7 @@ const DATA_CONTRACT_SCHEMA: &str = include_str!("../../schemas/v0.3/data-contrac
 const DIAGNOSTIC_SCHEMA: &str = include_str!("../../schemas/v0.3/diagnostic.schema.json");
 const OPERATION_RESULT_SCHEMA: &str =
     include_str!("../../schemas/v0.3/operation-result.schema.json");
+const PROVISION_LOCK_SCHEMA: &str = include_str!("../../schemas/v0.3/provision-lock.schema.json");
 const QUERY_SCHEMA: &str = include_str!("../../schemas/v0.3/query.schema.json");
 const QUERY_RESULT_SCHEMA: &str = include_str!("../../schemas/v0.3/query-result.schema.json");
 const TYPE_FILE_SCHEMA: &str = include_str!("../../schemas/v0.3/type-file.schema.json");
@@ -120,6 +129,7 @@ pub fn validate_canonical_schemas() -> Result<(), String> {
         ("data-contract", DATA_CONTRACT_SCHEMA),
         ("diagnostic", DIAGNOSTIC_SCHEMA),
         ("operation-result", OPERATION_RESULT_SCHEMA),
+        ("provision-lock", PROVISION_LOCK_SCHEMA),
         ("query", QUERY_SCHEMA),
         ("query-result", QUERY_RESULT_SCHEMA),
         ("type-file", TYPE_FILE_SCHEMA),
@@ -175,6 +185,16 @@ pub fn validate_type_pack(value: &Value, path: &str) -> Vec<Diagnostic> {
         value,
         path,
         "https://mdbase.dev/schemas/v0.3/type-pack.schema.json",
+        None,
+    )
+}
+
+pub(crate) fn validate_provision_lock(value: &Value, path: &str) -> Vec<Diagnostic> {
+    validate_canonical_value(
+        PROVISION_LOCK_SCHEMA,
+        value,
+        path,
+        "https://mdbase.dev/schemas/v0.3/provision-lock.schema.json",
         None,
     )
 }

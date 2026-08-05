@@ -10,7 +10,7 @@ use super::model::ObsidianBaseDocument;
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to_json};
 use crate::operations::{
     atomic_create, atomic_write, ensure_no_symlink_components, ensure_revision,
-    ensure_safe_relative_path,
+    ensure_safe_relative_path, sync_directory,
 };
 use crate::v03::{self, Diagnostic, OperationResult};
 use crate::Collection;
@@ -111,7 +111,13 @@ pub(super) fn delete(collection: &Collection, input: &Value) -> OperationResult 
     ) {
         return legacy_failure(error, &path);
     }
-    match fs::remove_file(&full_path) {
+    match fs::remove_file(&full_path).and_then(|()| {
+        full_path
+            .parent()
+            .map(sync_directory)
+            .transpose()
+            .map(|_| ())
+    }) {
         Ok(()) => OperationResult {
             valid: true,
             result: json!({ "path": path, "deleted": true }),

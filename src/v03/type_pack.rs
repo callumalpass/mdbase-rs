@@ -119,24 +119,24 @@ struct TypePackLock {
 }
 
 #[derive(Debug)]
-struct PlannedPackResource {
+pub(crate) struct PlannedPackResource {
     kind: String,
     mode: String,
     source: String,
     target: String,
-    action: String,
+    pub(crate) action: String,
     digest: String,
     current_digest: Option<String>,
     installed_digest: Option<String>,
     adopted_from_digest: Option<String>,
-    reason: Option<String>,
+    pub(crate) reason: Option<String>,
     bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
-struct TypePackPlan {
-    assessment: Value,
-    assessment_digest: String,
+pub(crate) struct TypePackPlan {
+    pub(crate) assessment: Value,
+    pub(crate) assessment_digest: String,
     next_lock: TypePackLock,
     next_lock_bytes: Vec<u8>,
     resources: Vec<PlannedPackResource>,
@@ -204,7 +204,7 @@ impl Collection {
     }
 }
 
-fn plan_type_pack(
+pub(crate) fn plan_type_pack(
     collection: &Collection,
     provision: &TypePackProvision,
     options: &TypePackAssessmentOptions,
@@ -660,83 +660,14 @@ fn plan_type_pack(
 }
 
 fn apply_type_pack_plan(collection: &Collection, plan: TypePackPlan) -> OperationResult {
-    let shadow = match batch::shadow_collection(collection) {
+    let mut shadow = match batch::shadow_collection(collection) {
         Ok(shadow) => shadow,
         Err(diagnostic) => return failed(vec![*diagnostic]),
     };
-    for resource in &plan.resources {
-        let path = shadow.directory.path().join(&resource.target);
-        match resource.action.as_str() {
-            "create" | "update" => {
-                if let Some(parent) = path.parent() {
-                    if let Err(error) = fs::create_dir_all(parent) {
-                        return pack_diagnostic(
-                            "type_pack_apply_failed",
-                            format!("Could not stage '{}': {error}", resource.target),
-                        );
-                    }
-                }
-                if let Err(error) = fs::write(&path, resource.bytes.as_deref().unwrap_or_default())
-                {
-                    return pack_diagnostic(
-                        "type_pack_apply_failed",
-                        format!("Could not stage '{}': {error}", resource.target),
-                    );
-                }
-            }
-            "delete" => {
-                if let Err(error) = fs::remove_file(&path) {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        return pack_diagnostic(
-                            "type_pack_apply_failed",
-                            format!("Could not retire '{}': {error}", resource.target),
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
+    if let Err(diagnostic) = stage_type_pack_plan(&mut shadow, &plan) {
+        return failed(vec![*diagnostic]);
     }
-    if let Some(prepared) = &plan.contract_setup {
-        if let Err(diagnostic) = stage_prepared_contract_setup(&shadow, prepared, &plan.resources) {
-            return failed(vec![*diagnostic]);
-        }
-    }
-    if let Err(error) = fs::write(
-        shadow.directory.path().join(TYPE_PACK_LOCK_PATH),
-        &plan.next_lock_bytes,
-    ) {
-        return pack_diagnostic(
-            "type_pack_apply_failed",
-            format!("Could not stage {TYPE_PACK_LOCK_PATH}: {error}"),
-        );
-    }
-    let staged = match Collection::open(shadow.directory.path()) {
-        Ok(staged) => staged,
-        Err(error) => {
-            return pack_diagnostic(
-                "invalid_type_pack",
-                format!("The staged type pack does not produce a valid collection: {error:?}"),
-            )
-        }
-    };
-    let validation = staged.validate_op(&json!({}));
-    if validation.get("valid").and_then(Value::as_bool) != Some(true) {
-        return failed(
-            validation
-                .get("issues")
-                .cloned()
-                .and_then(|issues| serde_json::from_value(issues).ok())
-                .unwrap_or_else(|| {
-                    vec![Diagnostic::error(
-                        "invalid_type_pack",
-                        "Existing records do not conform after staging the type pack.",
-                        None,
-                    )]
-                }),
-        );
-    }
-    let desired = match batch::collect_collection_files(&staged) {
+    let desired = match batch::collect_collection_files(&shadow.collection) {
         Ok(desired) => desired,
         Err(diagnostic) => return failed(vec![*diagnostic]),
     };
@@ -775,6 +706,82 @@ fn apply_type_pack_plan(collection: &Collection, plan: TypePackPlan) -> Operatio
         result,
         diagnostics: Vec::new(),
     }
+}
+
+pub(crate) fn stage_type_pack_plan(
+    shadow: &mut batch::ShadowCollection,
+    plan: &TypePackPlan,
+) -> Result<(), Box<Diagnostic>> {
+    for resource in &plan.resources {
+        let path = shadow.directory.path().join(&resource.target);
+        match resource.action.as_str() {
+            "create" | "update" => {
+                if let Some(parent) = path.parent() {
+                    if let Err(error) = fs::create_dir_all(parent) {
+                        return Err(pack_plan_error(format!(
+                            "Could not stage '{}': {error}",
+                            resource.target
+                        )));
+                    }
+                }
+                if let Err(error) = fs::write(&path, resource.bytes.as_deref().unwrap_or_default())
+                {
+                    return Err(pack_plan_error(format!(
+                        "Could not stage '{}': {error}",
+                        resource.target
+                    )));
+                }
+            }
+            "delete" => {
+                if let Err(error) = fs::remove_file(&path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(pack_plan_error(format!(
+                            "Could not retire '{}': {error}",
+                            resource.target
+                        )));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(prepared) = &plan.contract_setup {
+        stage_prepared_contract_setup(shadow, prepared, &plan.resources)?;
+    }
+    if let Err(error) = fs::write(
+        shadow.directory.path().join(TYPE_PACK_LOCK_PATH),
+        &plan.next_lock_bytes,
+    ) {
+        return Err(pack_plan_error(format!(
+            "Could not stage {TYPE_PACK_LOCK_PATH}: {error}"
+        )));
+    }
+    let staged = match Collection::open(shadow.directory.path()) {
+        Ok(staged) => staged,
+        Err(error) => {
+            return Err(pack_plan_error(format!(
+                "The staged type pack does not produce a valid collection: {error:?}"
+            )))
+        }
+    };
+    let validation = staged.validate_op(&json!({}));
+    if validation.get("valid").and_then(Value::as_bool) != Some(true) {
+        let diagnostic = validation
+            .get("issues")
+            .cloned()
+            .and_then(|issues| serde_json::from_value::<Vec<Diagnostic>>(issues).ok())
+            .and_then(|mut issues| issues.drain(..).next())
+            .unwrap_or_else(|| {
+                Diagnostic::error(
+                    "invalid_type_pack",
+                    "Existing records do not conform after staging the type pack.",
+                    None,
+                )
+            });
+        return Err(Box::new(diagnostic));
+    }
+    shadow.collection = staged;
+    Ok(())
 }
 
 fn read_type_pack_lock(

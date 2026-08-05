@@ -125,6 +125,14 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
             CollectionSnapshotResourceKind::Lock,
         )?);
     }
+    let provision_lock_path = root.join("mdbase.provisions.yaml");
+    if provision_lock_path.exists() {
+        resources.push(read_resource(
+            provision_lock_path,
+            "mdbase.provisions.yaml".to_string(),
+            CollectionSnapshotResourceKind::Lock,
+        )?);
+    }
     for type_file in report.types {
         resources.push(read_resource(
             root.join(&type_file.path),
