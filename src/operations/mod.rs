@@ -248,12 +248,21 @@ pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
         FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    OpenOptions::new()
+    let directory = OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?
-        .sync_all()
+        .open(path)?;
+    match directory.sync_all() {
+        Ok(()) => Ok(()),
+        // FlushFileBuffers on a directory handle requires a privilege that is
+        // not granted to ordinary Windows processes, even when the filesystem
+        // supports directory handles. File contents have already been flushed
+        // before the atomic metadata operation; do not turn this platform
+        // limitation into a false mutation failure after the mutation landed.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
