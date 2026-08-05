@@ -528,4 +528,32 @@ mod tests {
         assert!(!root.join(".git").exists());
         assert!(!root.join("nested").exists());
     }
+
+    #[test]
+    fn staged_mutations_write_the_caller_owned_working_set_directly() {
+        let stage = tempfile::tempdir().unwrap();
+        write(
+            &stage.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        );
+        write(
+            &stage.path().join("_types/note.md"),
+            "---\nkind: mdbase.type\nname: note\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n",
+        );
+
+        let collection = Collection::open(stage.path()).unwrap();
+        let operations = collection.v03_operations().unwrap();
+        let result = operations.execute_staged_mutation(
+            "create",
+            &json!({
+                "path": "notes/staged.md",
+                "frontmatter": {"type": "note", "title": "Staged"},
+                "body": "Caller-owned body"
+            }),
+        );
+
+        assert!(result.valid, "{:?}", result.diagnostics);
+        assert!(stage.path().join("notes/staged.md").is_file());
+        assert_eq!(result.result["path"], json!("notes/staged.md"));
+    }
 }
