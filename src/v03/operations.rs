@@ -159,6 +159,20 @@ impl<'a> Operations<'a> {
         super::batch::execute_single(self.collection, "rename", input)
     }
 
+    /// Execute one mutation directly inside a disposable staging collection.
+    ///
+    /// Unlike [`Self::create`], [`Self::update`], [`Self::delete`], and
+    /// [`Self::rename`], this method does not create a second collection-wide
+    /// shadow copy before writing. It is intended for storage providers that
+    /// have already materialized an isolated working set and own a durable
+    /// transaction outside mdbase. The caller must discard that working set
+    /// whenever this operation is invalid or the enclosing transaction does
+    /// not commit. Ordinary filesystem callers should use the atomic mutation
+    /// methods instead.
+    pub fn execute_staged_mutation(&self, operation: &str, input: &Value) -> OperationResult {
+        self.execute_mutation_direct(operation, input)
+    }
+
     pub(super) fn execute_mutation_direct(
         &self,
         operation: &str,
