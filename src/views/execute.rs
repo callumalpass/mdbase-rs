@@ -429,6 +429,9 @@ fn execute_canonical(collection: &Collection, request: &ViewReferenceInput) -> O
     if let Some(offset) = request.offset {
         query.insert("offset".to_string(), json!(offset));
     }
+    if let Some(timezone) = &request.timezone {
+        query.insert("timezone".to_string(), json!(timezone));
+    }
     let shared_where = shared.get("where").and_then(Value::as_str);
     let local_where = view.get("where").and_then(Value::as_str);
     if let (Some(shared), Some(local)) = (shared_where, local_where) {
@@ -626,7 +629,14 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
             diagnostics,
         };
     }
-    let timezone = match BasesTimezone::from_setting(collection.settings.timezone.as_deref()) {
+    let timezone = match crate::expressions::evaluator::resolve_execution_timezone(
+        request.timezone.as_deref(),
+        collection.settings.timezone.as_deref(),
+    ) {
+        Ok(timezone) => timezone,
+        Err(error) => return failed("invalid_timezone", error, None),
+    };
+    let timezone = match BasesTimezone::from_setting(timezone) {
         Ok(timezone) => timezone,
         Err(error) => return failed("invalid_config", error, Some("mdbase.yaml".to_string())),
     };

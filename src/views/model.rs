@@ -96,6 +96,7 @@ pub struct ViewReferenceInput {
     pub path: String,
     #[serde(rename = "view", alias = "view_id")]
     pub view_id: String,
+    pub timezone: Option<String>,
     #[serde(default)]
     pub context: Option<Option<ViewContextInput>>,
     pub limit: Option<u64>,

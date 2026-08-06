@@ -9,6 +9,7 @@ use super::diagnostics;
 use super::model::{Candidate, Query};
 use super::preflight::{self, CompiledSelection};
 use super::result::{build_groups, compare_values, serialize_candidate, sort_candidates};
+use crate::expressions::evaluator::resolve_execution_timezone;
 use crate::query::cache_source::FileRecord;
 use crate::v03::{cel, validate_query, Diagnostic, OperationResult};
 use crate::Collection;
@@ -87,7 +88,20 @@ pub(crate) fn execute_profiled(
     performance.preflight_us = micros(phase.elapsed());
 
     let phase = Instant::now();
-    let clock = match cel::operation_clock(collection.settings.timezone.as_deref()) {
+    let timezone = match resolve_execution_timezone(
+        compiled.query.timezone.as_deref(),
+        collection.settings.timezone.as_deref(),
+    ) {
+        Ok(timezone) => timezone,
+        Err(message) => {
+            finish!(diagnostics::failed(vec![Diagnostic::error(
+                "invalid_timezone",
+                message,
+                None,
+            )]));
+        }
+    };
+    let clock = match cel::operation_clock(timezone) {
         Ok(clock) => clock,
         Err(error) => {
             finish!(diagnostics::failed(vec![Diagnostic::error(
