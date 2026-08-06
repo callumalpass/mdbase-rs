@@ -37,8 +37,8 @@ pub struct BaseLogicalFilter {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum BaseFilterList {
-    One(Box<BaseFilter>),
     Many(Vec<BaseFilter>),
+    One(Box<BaseFilter>),
 }
 
 impl BaseFilterList {
@@ -255,5 +255,36 @@ mod tests {
         let unknown = presentation_for(&view("exampleCustomRenderer", None));
         assert_eq!(unknown.renderer, "exampleCustomRenderer");
         assert!(unknown.mappings.is_empty());
+    }
+
+    #[test]
+    fn deserializes_logical_filter_sequences_as_lists() {
+        let document: ObsidianBaseDocument = serde_yaml::from_str(
+            r#"views:
+  - type: table
+    name: Today
+    filters:
+      and:
+        - 'status != "done"'
+        - or:
+            - 'formula.taskDay.isEmpty()'
+            - 'formula.taskDay <= today()'
+"#,
+        )
+        .unwrap();
+        let BaseFilter::Logical(filters) = document.views[0].filters.as_ref().unwrap() else {
+            panic!("expected a logical view filter");
+        };
+        let BaseFilterList::Many(and) = filters.and.as_ref().unwrap() else {
+            panic!("expected the and sequence to remain a list");
+        };
+        assert_eq!(and.len(), 2);
+        let BaseFilter::Logical(filters) = &and[1] else {
+            panic!("expected the nested or filter");
+        };
+        let BaseFilterList::Many(or) = filters.or.as_ref().unwrap() else {
+            panic!("expected the or sequence to remain a list");
+        };
+        assert_eq!(or.len(), 2);
     }
 }
