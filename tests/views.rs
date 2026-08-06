@@ -185,6 +185,55 @@ fn saved_view_invocation_timezone_overrides_collection_timezone() {
 }
 
 #[test]
+fn tasknotes_today_view_includes_a_date_only_task_scheduled_today() {
+    let (root, _collection) = collection();
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono_tz::Australia::Melbourne)
+        .format("%Y-%m-%d")
+        .to_string();
+    fs::write(
+        root.path().join("tasks/today.md"),
+        format!("---\nstatus: todo\ntags: [task]\nscheduled: {today}\n---\nToday\n"),
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("TaskNotes/Views/today.base"),
+        r#"formulas:
+  taskDate: 'if(note["scheduled"].isEmpty() == false, note["scheduled"], note["due"])'
+  taskDay: 'if(formula.taskDate.isEmpty(), null, date(formula.taskDate))'
+views:
+  - type: tasknotesTaskList
+    name: Today
+    filters:
+      and:
+        - 'note["status"].isEmpty() == false'
+        - 'note["status"] != "done"'
+        - 'file.hasTag("archived") != true'
+        - or:
+            - 'formula.taskDay.isEmpty()'
+            - 'formula.taskDay <= today()'
+    order: [note.title, note.status, note.scheduled, note.due]
+"#,
+    )
+    .unwrap();
+
+    let reopened = Collection::open(root.path()).unwrap();
+    let executed = reopened.v03_operations().unwrap().execute_view(&json!({
+        "path": "TaskNotes/Views/today.base",
+        "view": "today",
+        "timezone": "Australia/Melbourne"
+    }));
+    assert!(executed.valid, "{executed:#?}");
+    let paths = executed.result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, ["tasks/high.md", "tasks/low.md", "tasks/today.md"]);
+}
+
+#[test]
 fn project_relationship_view_filters_records_through_task_project_backlinks() {
     let (root, collection) = collection();
     fs::create_dir_all(root.path().join("Projects")).unwrap();
