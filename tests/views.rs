@@ -388,6 +388,24 @@ fn invalid_collection_timezone_is_rejected_deterministically() {
 }
 
 #[test]
+fn collection_timezone_rejects_ambient_aliases_and_fixed_offsets() {
+    for timezone in ["local", "+10:00"] {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("mdbase.yaml"),
+            format!("spec_version: 0.3.0\nsettings:\n  timezone: {timezone}\n"),
+        )
+        .unwrap();
+        let loaded = mdbase::config::load_config(root.path());
+        assert_eq!(loaded["valid"], false);
+        assert!(loaded["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown IANA timezone"));
+    }
+}
+
+#[test]
 fn reports_invalid_missing_and_unsupported_view_requests() {
     let (root, collection) = collection();
     fs::write(

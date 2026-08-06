@@ -464,7 +464,7 @@ fn parse_settings(
             {
                 return Err(error_json("invalid_config", &error));
             }
-            Some(s.clone())
+            Some(s.trim().to_string())
         }
         Some(serde_yaml::Value::Null) | None => None,
         Some(_) => {
