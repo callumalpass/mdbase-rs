@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 pub(crate) struct Query {
     #[serde(default)]
     pub types: Vec<String>,
+    pub timezone: Option<String>,
     pub context: Option<QueryContext>,
     #[serde(default)]
     pub projections: BTreeMap<String, Projection>,

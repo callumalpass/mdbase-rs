@@ -66,6 +66,15 @@ thread_local! {
 pub struct EvaluationClock {
     now: String,
     today: String,
+    timezone: EvaluationTimezone,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EvaluationTimezone {
+    Local,
+    Utc,
+    Fixed(chrono::FixedOffset),
+    Named(chrono_tz::Tz),
 }
 
 impl EvaluationClock {
@@ -79,24 +88,26 @@ impl EvaluationClock {
         now: chrono::DateTime<Utc>,
         timezone: Option<&str>,
     ) -> Result<Self, String> {
-        let today = match timezone.map(str::trim).filter(|value| !value.is_empty()) {
-            None | Some("local") => now.with_timezone(&Local).date_naive(),
-            Some("UTC" | "utc" | "Z") => now.date_naive(),
+        let timezone = match timezone.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("local") => EvaluationTimezone::Local,
+            Some("UTC" | "utc" | "Z") => EvaluationTimezone::Utc,
             Some(value) if value.starts_with('+') || value.starts_with('-') => {
                 let offset = parse_fixed_offset(value)
                     .ok_or_else(|| format!("Invalid fixed timezone offset '{value}'"))?;
-                now.with_timezone(&offset).date_naive()
+                EvaluationTimezone::Fixed(offset)
             }
             Some(value) => {
                 let timezone = value
                     .parse::<chrono_tz::Tz>()
                     .map_err(|_| format!("Unknown IANA timezone '{value}'"))?;
-                now.with_timezone(&timezone).date_naive()
+                EvaluationTimezone::Named(timezone)
             }
         };
+        let today = timezone.date(now);
         Ok(Self {
             now: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             today: today.format("%Y-%m-%d").to_string(),
+            timezone,
         })
     }
 
@@ -106,6 +117,30 @@ impl EvaluationClock {
 
     pub fn today(&self) -> &str {
         &self.today
+    }
+
+    fn date_value(&self, value: &str) -> Option<String> {
+        if chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok() {
+            return Some(value.to_string());
+        }
+        let instant = chrono::DateTime::parse_from_rfc3339(value).ok()?;
+        Some(
+            self.timezone
+                .date(instant.with_timezone(&Utc))
+                .format("%Y-%m-%d")
+                .to_string(),
+        )
+    }
+}
+
+impl EvaluationTimezone {
+    fn date(&self, instant: chrono::DateTime<Utc>) -> chrono::NaiveDate {
+        match self {
+            Self::Local => instant.with_timezone(&Local).date_naive(),
+            Self::Utc => instant.date_naive(),
+            Self::Fixed(offset) => instant.with_timezone(offset).date_naive(),
+            Self::Named(timezone) => instant.with_timezone(timezone).date_naive(),
+        }
     }
 }
 
@@ -123,6 +158,28 @@ pub(crate) fn validate_timezone_setting(timezone: Option<&str>) -> Result<(), St
             .map(|_| ())
             .map_err(|_| format!("Unknown IANA timezone '{value}'")),
     }
+}
+
+/// Resolve an ephemeral invocation timezone over the collection default.
+///
+/// Invocation values intentionally accept only IANA identifiers. Collection
+/// settings retain their existing compatibility surface (`local` and fixed
+/// offsets), but callers must name a durable timezone that models DST.
+pub(crate) fn resolve_execution_timezone<'a>(
+    requested: Option<&'a str>,
+    configured: Option<&'a str>,
+) -> Result<Option<&'a str>, String> {
+    let Some(requested) = requested else {
+        return Ok(configured);
+    };
+    let requested = requested.trim();
+    if requested.is_empty() || requested.eq_ignore_ascii_case("local") {
+        return Err(format!("Unknown IANA timezone '{requested}'"));
+    }
+    requested
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| format!("Unknown IANA timezone '{requested}'"))?;
+    Ok(Some(requested))
 }
 
 fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
@@ -1212,8 +1269,16 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
                 ));
             }
             let val = evaluate(&args[0], ctx)?;
-            // Return the date string as-is
-            Ok(val)
+            let Some(value) = val.as_str() else {
+                return Ok(val);
+            };
+            Ok(Value::String(EVAL_CLOCK.with(|clock| {
+                clock
+                    .borrow()
+                    .as_ref()
+                    .and_then(|clock| clock.date_value(value))
+                    .unwrap_or_else(|| value.split('T').next().unwrap_or(value).to_string())
+            })))
         }
         "today" => Ok(Value::String(EVAL_CLOCK.with(|clock| {
             clock
@@ -1709,17 +1774,18 @@ fn eval_string_method(
             eval_date_component(s, method)
         }
         "date" => {
-            // .date() extracts date portion from datetime string
             if !args.is_empty() {
                 return Err(EvalError::wrong_argument_count(
                     "date() takes no arguments as method",
                 ));
             }
-            if let Some(date_part) = s.split('T').next() {
-                Ok(Value::String(date_part.to_string()))
-            } else {
-                Ok(Value::String(s.to_string()))
-            }
+            Ok(Value::String(EVAL_CLOCK.with(|clock| {
+                clock
+                    .borrow()
+                    .as_ref()
+                    .and_then(|clock| clock.date_value(s))
+                    .unwrap_or_else(|| s.split('T').next().unwrap_or(s).to_string())
+            })))
         }
         "time" => {
             // .time() extracts time portion from datetime string

@@ -123,6 +123,42 @@ fn schema_and_semantic_preflight_fail_before_scanning() {
 }
 
 #[test]
+fn invocation_timezone_controls_datetime_calendar_conversion() {
+    let (root, collection) = query_collection();
+    write_record(
+        &root,
+        "tasks/temporal.md",
+        "---\ntype: task\ntitle: Temporal\nscheduled: 2026-08-05T23:30:00Z\n---\n",
+    );
+
+    let melbourne = query(
+        &collection,
+        json!({
+            "types": ["task"],
+            "timezone": "Australia/Melbourne",
+            "where": "date(scheduled) == date('2026-08-06')"
+        }),
+    );
+    assert!(melbourne.valid, "{melbourne:#?}");
+    assert_eq!(melbourne.result["meta"]["total_count"], 1);
+
+    let los_angeles = query(
+        &collection,
+        json!({
+            "types": ["task"],
+            "timezone": "America/Los_Angeles",
+            "where": "date(scheduled) == date('2026-08-05')"
+        }),
+    );
+    assert!(los_angeles.valid, "{los_angeles:#?}");
+    assert_eq!(los_angeles.result["meta"]["total_count"], 1);
+
+    let invalid = query(&collection, json!({"timezone": "+10:00", "where": "true"}));
+    assert!(!invalid.valid);
+    assert_eq!(invalid.diagnostics[0].code, "invalid_timezone");
+}
+
+#[test]
 fn context_projections_selection_and_record_errors_follow_portable_semantics() {
     let (_root, collection) = query_collection();
     let result = query(

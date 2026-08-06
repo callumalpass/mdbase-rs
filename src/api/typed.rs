@@ -609,6 +609,9 @@ pub struct QueryRequest {
     /// Type names used to restrict candidate records.
     #[serde(default)]
     pub types: Vec<String>,
+    /// IANA timezone used for calendar semantics in this invocation.
+    #[serde(default)]
+    pub timezone: Option<String>,
     /// Record used to bind the query `this` context.
     #[serde(default)]
     pub context: Option<CollectionPath>,
@@ -653,6 +656,12 @@ impl QueryRequest {
         self
     }
 
+    /// Override the collection timezone for this query invocation.
+    pub fn timezone(mut self, timezone: impl Into<String>) -> Self {
+        self.timezone = Some(timezone.into());
+        self
+    }
+
     /// Set the CEL filter expression.
     pub fn where_expression(mut self, expression: impl Into<String>) -> Self {
         self.where_expression = Some(expression.into());
@@ -686,6 +695,9 @@ impl QueryRequest {
         let mut value = Map::new();
         if !self.types.is_empty() {
             value.insert("types".to_string(), json!(self.types));
+        }
+        if let Some(timezone) = &self.timezone {
+            value.insert("timezone".to_string(), json!(timezone));
         }
         if let Some(context) = &self.context {
             value.insert("context".to_string(), json!({"this": {"path": context}}));

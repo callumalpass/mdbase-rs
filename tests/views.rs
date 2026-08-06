@@ -143,6 +143,48 @@ fn discovers_and_executes_configured_obsidian_bases() {
 }
 
 #[test]
+fn saved_view_invocation_timezone_overrides_collection_timezone() {
+    let (root, _collection) = collection();
+    fs::write(
+        root.path().join("tasks/temporal.md"),
+        "---\nstatus: todo\ntags: [task]\nscheduled: 2026-08-05T23:30:00Z\n---\nTemporal\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("TaskNotes/Views/temporal.base"),
+        r#"views:
+  - type: table
+    name: Local day
+    filters:
+      and:
+        - 'date(scheduled).format("yyyy-MM-dd") == "2026-08-05"'
+    order: [file.name]
+"#,
+    )
+    .unwrap();
+    let reopened = Collection::open(root.path()).unwrap();
+    let operations = reopened.v03_operations().unwrap();
+    let los_angeles = operations.execute_view(&json!({
+        "path": "TaskNotes/Views/temporal.base",
+        "view": "local-day",
+        "timezone": "America/Los_Angeles"
+    }));
+    assert!(los_angeles.valid, "{los_angeles:#?}");
+    assert_eq!(
+        los_angeles.result["meta"]["total_count"], 1,
+        "{los_angeles:#?}"
+    );
+
+    let melbourne = operations.execute_view(&json!({
+        "path": "TaskNotes/Views/temporal.base",
+        "view": "local-day",
+        "timezone": "Australia/Melbourne"
+    }));
+    assert!(melbourne.valid, "{melbourne:#?}");
+    assert_eq!(melbourne.result["meta"]["total_count"], 0);
+}
+
+#[test]
 fn project_relationship_view_filters_records_through_task_project_backlinks() {
     let (root, collection) = collection();
     fs::create_dir_all(root.path().join("Projects")).unwrap();
