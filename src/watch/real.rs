@@ -792,7 +792,10 @@ mod tests {
             "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
         )
         .unwrap();
-        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(60)).unwrap();
+        // Keep the real-filesystem writes comfortably inside one debounce
+        // window even when a shared CI runner pauses this test between them.
+        let debounce = Duration::from_millis(250);
+        let watcher = CollectionWatcher::open(directory.path(), debounce).unwrap();
 
         fs::write(directory.path().join("note.md"), "---\ntitle: One\n---\n").unwrap();
         fs::write(directory.path().join("note.md"), "---\ntitle: Two\n---\n").unwrap();
@@ -805,7 +808,7 @@ mod tests {
         assert_eq!(event.payload["path"], "note.md");
         assert_eq!(event.payload["after"]["title"], "Two");
         assert!(watcher
-            .recv_timeout(Duration::from_millis(250))
+            .recv_timeout(debounce + Duration::from_millis(250))
             .unwrap()
             .is_none());
     }

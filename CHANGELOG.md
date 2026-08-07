@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
-## 0.4.0-rc.3 - 2026-07-28
+## 0.4.0-rc.3 - 2026-08-07
 
 ### Breaking
 
@@ -29,6 +29,21 @@ All notable changes to this project are documented in this file.
 - Timers pin an exact event contract and verified source identity.
 - Core conformance no longer claims a runtime profile; durable runtime
   conformance is independently versioned.
+- Queries evaluate date and datetime operations in an explicit collection
+  authority timezone, including daylight-saving transitions.
+
+### Added
+
+- Transactional data-contract type-pack evolution with reviewed diffs,
+  conflict detection, atomic installation, and recovery.
+- Portable testbed coverage for shared contracts and durable runtime recovery.
+
+### Fixed
+
+- Saved-view logical `and`, `or`, and `not` filter arrays deserialize in their
+  canonical forms.
+- The real-filesystem debounce regression test now allows for scheduling pauses
+  on shared CI runners while still asserting one final-state event.
 
 ## 0.4.0-rc.2 - 2026-07-28
 

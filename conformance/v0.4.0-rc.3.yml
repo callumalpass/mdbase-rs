@@ -77,7 +77,7 @@ evidence:
   - kind: testbed_transcript
     command: mdbase-testbed run --adapter command:cargo --adapter-arg run --adapter-arg --quiet --adapter-arg -p --adapter-arg mdbase-testbed-adapter --adapter-arg -- --evidence conformance/testbed-v0.1.json
     result: pass
-    verified_at: "2026-07-29T09:21:42+10:00"
+    verified_at: "2026-08-08T00:08:36+10:00"
     artifact: conformance/testbed-v0.1.json
     environment: Linux x86_64, Rust 1.94.0, Node.js 22
     testbed_protocol_version: "0.1"
@@ -85,27 +85,27 @@ evidence:
       - core.shared-contract-consumers
       - runtime.competing-workers
       - runtime.crash-recovery
-    evidence_digest: sha256:e5a261375b494edef1e076713d9ee46ce1e1982aea334b9cff1e31b92a8e4133
+    evidence_digest: sha256:0844615d042a0abcd46bc59d08a071730f106c9d6d63b1ef6057bd45c668170a
   - kind: conformance_suite
-    command: MDBASE_REQUIRE_V03_CONFORMANCE=1 cargo test --test v03_conformance
+    command: MDBASE_SPEC_REPO_DIR=/path/to/mdbase-spec MDBASE_SPEC_TESTS_DIR=/path/to/mdbase-spec/tests cargo test --locked --workspace --all-features
     result: pass
-    verified_at: "2026-07-28T21:00:00+10:00"
+    verified_at: "2026-08-08T00:08:36+10:00"
     artifact: tests/v03_conformance.rs
     environment: Linux x86_64, Rust 1.94.0
   - kind: test_suite
-    command: MDBASE_REQUIRE_V03_CONFORMANCE=1 cargo test --workspace --all-features
+    command: MDBASE_SPEC_REPO_DIR=/path/to/mdbase-spec MDBASE_SPEC_TESTS_DIR=/path/to/mdbase-spec/tests cargo test --locked --workspace --all-features
     result: pass
-    verified_at: "2026-07-28T21:00:00+10:00"
+    verified_at: "2026-08-08T00:08:36+10:00"
     artifact: tests/v03_*_profiles.rs and tests/v03_lifecycle.rs
     environment: Linux x86_64, Rust 1.94.0
   - kind: test_suite
-    command: cargo clippy --workspace --all-targets --all-features -- -D warnings
+    command: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
     result: pass
-    verified_at: "2026-07-28T21:00:00+10:00"
+    verified_at: "2026-08-08T00:08:36+10:00"
     environment: Linux x86_64, Rust 1.94.0
   - kind: package_smoke
-    command: cargo package --allow-dirty
+    command: cargo package --locked --allow-dirty -p mdbase -p mdbase-command
     result: pass
-    verified_at: "2026-07-28T21:00:00+10:00"
+    verified_at: "2026-08-08T00:08:36+10:00"
     artifact: target/package/mdbase-0.4.0-rc.3.crate
     environment: Linux x86_64, Rust 1.94.0
