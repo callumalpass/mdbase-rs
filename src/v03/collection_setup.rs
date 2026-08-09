@@ -7,7 +7,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::type_pack::{plan_type_pack, stage_type_pack_plan};
-use super::{batch, revision, Diagnostic, OperationResult};
+use super::{
+    batch, collection_validation_errors, introduced_validation_errors, revision,
+    validation_diagnostic_digest, Diagnostic, OperationResult,
+};
 use crate::v03::{ContractSetupChoice, TypePackAssessmentOptions, TypePackProvision};
 use crate::Collection;
 
@@ -126,6 +129,16 @@ pub struct CollectionSetupAssessment {
     pub configuration: Vec<ConfigurationSetupAssessment>,
     pub type_packs: Vec<Value>,
     pub final_resource_revisions: BTreeMap<String, String>,
+    #[serde(default)]
+    pub baseline_diagnostic_count: usize,
+    #[serde(default)]
+    pub final_diagnostic_count: usize,
+    #[serde(default)]
+    pub resolved_diagnostic_count: usize,
+    #[serde(default)]
+    pub introduced_diagnostic_count: usize,
+    #[serde(default)]
+    pub baseline_diagnostic_digest: String,
     pub assessment_digest: String,
 }
 
@@ -174,6 +187,7 @@ struct CollectionSetupPlan {
     shadow: batch::ShadowCollection,
     assessment: CollectionSetupAssessment,
     receipt_configuration: Vec<ConfigurationContributionReceipt>,
+    baseline_validation_errors: Vec<Diagnostic>,
 }
 
 impl Collection {
@@ -265,10 +279,16 @@ impl Collection {
                 )
             }
         };
-        if reopened.validate_op(&json!({}))["valid"].as_bool() != Some(true) {
+        let committed_validation_errors = collection_validation_errors(&reopened);
+        if !introduced_validation_errors(
+            &plan.baseline_validation_errors,
+            &committed_validation_errors,
+        )
+        .is_empty()
+        {
             return setup_error(
                 "collection_setup_apply_failed",
-                "The committed collection setup did not pass collection validation.",
+                "The committed collection setup introduced validation errors.",
             );
         }
         let committed = match batch::collect_collection_files(&reopened) {
@@ -304,6 +324,7 @@ fn plan_collection_setup(
     setup: &CollectionSetup,
 ) -> Result<CollectionSetupPlan, Vec<Diagnostic>> {
     validate_setup(setup).map_err(|diagnostic| vec![*diagnostic])?;
+    let baseline_validation_errors = collection_validation_errors(collection);
     let provision_value = serde_json::to_value(&setup.provisions)
         .map_err(|error| invalid_setup(format!("Could not serialize setup provisions: {error}")))?;
     let provision_digest = jcs_digest(&provision_value).map_err(|diagnostic| vec![*diagnostic])?;
@@ -410,21 +431,14 @@ fn plan_collection_setup(
             None,
         )]
     })?;
-    let validation = shadow.collection.validate_op(&json!({}));
-    if validation.get("valid").and_then(Value::as_bool) != Some(true) {
-        let diagnostics = validation
-            .get("issues")
-            .cloned()
-            .and_then(|issues| serde_json::from_value::<Vec<Diagnostic>>(issues).ok())
-            .unwrap_or_else(|| {
-                vec![Diagnostic::error(
-                    "invalid_collection_setup",
-                    "Existing records do not conform after staging the complete setup.",
-                    None,
-                )]
-            });
-        return Err(diagnostics);
+    let final_validation_errors = collection_validation_errors(&shadow.collection);
+    let introduced_diagnostics =
+        introduced_validation_errors(&baseline_validation_errors, &final_validation_errors);
+    if !introduced_diagnostics.is_empty() {
+        return Err(introduced_diagnostics);
     }
+    let resolved_diagnostic_count =
+        introduced_validation_errors(&final_validation_errors, &baseline_validation_errors).len();
     let desired = batch::collect_collection_files(&shadow.collection)
         .map_err(|diagnostic| vec![*diagnostic])?;
     let final_collection_revision = baseline_revision(&desired);
@@ -462,6 +476,11 @@ fn plan_collection_setup(
         configuration,
         type_packs,
         final_resource_revisions,
+        baseline_diagnostic_count: baseline_validation_errors.len(),
+        final_diagnostic_count: final_validation_errors.len(),
+        resolved_diagnostic_count,
+        introduced_diagnostic_count: 0,
+        baseline_diagnostic_digest: validation_diagnostic_digest(&baseline_validation_errors),
         assessment_digest: String::new(),
     };
     let identity = serde_json::to_value(&assessment)
@@ -471,6 +490,7 @@ fn plan_collection_setup(
         shadow,
         assessment,
         receipt_configuration,
+        baseline_validation_errors,
     })
 }
 
@@ -904,6 +924,33 @@ mod tests {
         (directory, collection)
     }
 
+    fn collection_with_invalid_record() -> (tempfile::TempDir, Collection) {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: error\n",
+        )
+        .unwrap();
+        fs::create_dir_all(directory.path().join("_types")).unwrap();
+        fs::write(
+            directory.path().join("_types/note.md"),
+            "---\nkind: mdbase.type\nname: note\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    required: [title]\n    properties:\n      title: { type: string }\n---\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("broken.md"), "---\ntype: note\n---\n").unwrap();
+        let collection = Collection::open(directory.path()).unwrap();
+        (directory, collection)
+    }
+
+    fn empty_setup(application_id: &str) -> CollectionSetup {
+        CollectionSetup {
+            application_id: application_id.to_string(),
+            declaration_digest: DECLARATION_DIGEST.to_string(),
+            requirements: CollectionSetupRequirements::default(),
+            provisions: CollectionSetupProvisions::default(),
+        }
+    }
+
     fn setup(application_id: &str) -> CollectionSetup {
         CollectionSetup {
             application_id: application_id.to_string(),
@@ -941,6 +988,102 @@ mod tests {
             expected_provision_digest: assessment["provision_digest"].as_str().unwrap().to_string(),
             allow_type_pack_downgrades: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn empty_setup_is_current_when_the_collection_has_preexisting_errors() {
+        let (directory, collection) = collection_with_invalid_record();
+        let declaration = empty_setup("dev.example.editor");
+
+        let assessment = collection.assess_collection_setup(&declaration);
+        assert!(assessment.valid, "{:?}", assessment.diagnostics);
+        assert_eq!(assessment.result["status"], "current");
+        assert_eq!(assessment.result["baseline_diagnostic_count"], 1);
+        assert_eq!(assessment.result["final_diagnostic_count"], 1);
+        assert_eq!(assessment.result["introduced_diagnostic_count"], 0);
+
+        let applied =
+            collection.apply_collection_setup(&declaration, &apply_options(&assessment.result));
+        assert!(applied.valid, "{:?}", applied.diagnostics);
+        assert!(directory.path().join("broken.md").is_file());
+    }
+
+    #[test]
+    fn unrelated_setup_preserves_preexisting_errors() {
+        let (directory, collection) = collection_with_invalid_record();
+        let declaration = setup("dev.example.tasknotes");
+
+        let assessment = collection.assess_collection_setup(&declaration);
+        assert!(assessment.valid, "{:?}", assessment.diagnostics);
+        assert_eq!(assessment.result["status"], "provision");
+        assert_eq!(assessment.result["baseline_diagnostic_count"], 1);
+        assert_eq!(assessment.result["final_diagnostic_count"], 1);
+        assert_eq!(assessment.result["introduced_diagnostic_count"], 0);
+
+        let applied =
+            collection.apply_collection_setup(&declaration, &apply_options(&assessment.result));
+        assert!(applied.valid, "{:?}", applied.diagnostics);
+        assert!(directory.path().join("broken.md").is_file());
+    }
+
+    #[test]
+    fn setup_rejects_validation_errors_introduced_by_a_type_pack() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: error\n",
+        )
+        .unwrap();
+        fs::create_dir_all(directory.path().join("_types")).unwrap();
+        let current_type = "---\nkind: mdbase.type\nname: note\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    properties:\n      title: { type: string }\n---\n";
+        let desired_type = "---\nkind: mdbase.type\nname: note\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    required: [title]\n    properties:\n      title: { type: string }\n---\n";
+        fs::write(directory.path().join("_types/note.md"), current_type).unwrap();
+        fs::write(directory.path().join("note.md"), "---\ntype: note\n---\n").unwrap();
+        let collection = Collection::open(directory.path()).unwrap();
+        assert!(collection_validation_errors(&collection).is_empty());
+
+        let mut declaration = empty_setup("dev.example.editor");
+        declaration
+            .provisions
+            .type_packs
+            .push(CollectionSetupTypePack {
+                provision: TypePackProvision {
+                    manifest: json!({
+                        "kind": "mdbase.type-pack",
+                        "id": "example.note",
+                        "version": "1.0.0",
+                        "resources": [{
+                            "kind": "type",
+                            "mode": "managed",
+                            "source": "note.md",
+                            "target": "_types/note.md",
+                            "digest": revision(desired_type.as_bytes()),
+                        }],
+                    }),
+                    resources: vec![crate::v03::TypePackResource {
+                        source: "note.md".to_string(),
+                        document: desired_type.to_string(),
+                    }],
+                },
+                options: CollectionSetupTypePackOptions {
+                    adopt_resources: BTreeMap::from([(
+                        "_types/note.md".to_string(),
+                        revision(current_type.as_bytes()),
+                    )]),
+                    ..CollectionSetupTypePackOptions::default()
+                },
+            });
+
+        let assessment = collection.assess_collection_setup(&declaration);
+        assert!(!assessment.valid);
+        assert!(assessment
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "schema_required"));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("_types/note.md")).unwrap(),
+            current_type
+        );
     }
 
     #[test]
