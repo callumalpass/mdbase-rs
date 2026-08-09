@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## 0.4.0-rc.4 - 2026-08-10
+
+### Fixed
+
+- Current application collection-setup assessments now prove configuration,
+  type-pack, provision-lock, revision, and validation state without cloning the
+  complete collection into a second preflight workspace. Applicable setup
+  changes retain the existing staged, revision-safe review path; non-mutating
+  conflicts are assessed directly.
+
 ## 0.4.0-rc.3 - 2026-08-07
 
 ### Breaking

@@ -184,7 +184,7 @@ struct ProvisionLock {
 }
 
 struct CollectionSetupPlan {
-    shadow: batch::ShadowCollection,
+    shadow: Option<batch::ShadowCollection>,
     assessment: CollectionSetupAssessment,
     receipt_configuration: Vec<ConfigurationContributionReceipt>,
     baseline_validation_errors: Vec<Diagnostic>,
@@ -261,15 +261,25 @@ impl Collection {
             }
         }
 
-        let desired = match batch::collect_collection_files(&plan.shadow.collection) {
+        if plan.assessment.status == "current" {
+            return applied_setup_result(&plan, false);
+        }
+
+        let Some(shadow) = plan.shadow.as_ref() else {
+            return setup_error(
+                "collection_setup_apply_failed",
+                "The collection setup plan has changes but no staged workspace.",
+            );
+        };
+
+        let desired = match batch::collect_collection_files(&shadow.collection) {
             Ok(desired) => desired,
             Err(diagnostic) => return failed(vec![*diagnostic]),
         };
-        let commit =
-            match crate::transactions::commit_migration(self, &plan.shadow.baseline, &desired) {
-                Ok(commit) => commit,
-                Err(error) => return setup_error(error.code(), error.to_string()),
-            };
+        let commit = match crate::transactions::commit_migration(self, &shadow.baseline, &desired) {
+            Ok(commit) => commit,
+            Err(error) => return setup_error(error.code(), error.to_string()),
+        };
         let reopened = match Collection::open(&self.root) {
             Ok(collection) => collection,
             Err(error) => {
@@ -295,27 +305,7 @@ impl Collection {
             Ok(files) => baseline_revision(&files),
             Err(diagnostic) => return failed(vec![*diagnostic]),
         };
-        let type_packs = plan
-            .assessment
-            .type_packs
-            .iter()
-            .filter_map(|pack| pack.get("desired").cloned())
-            .collect();
-        let receipt = CollectionSetupReceipt {
-            application_id: setup.application_id.clone(),
-            declaration_digest: setup.declaration_digest.clone(),
-            provision_digest: plan.assessment.provision_digest.clone(),
-            assessment_digest: plan.assessment.assessment_digest.clone(),
-            collection_revision: committed,
-            configuration: plan.receipt_configuration,
-            type_packs,
-            cleanup_deferred: commit.cleanup_deferred,
-        };
-        OperationResult {
-            valid: true,
-            result: json!({"assessment": plan.assessment, "receipt": receipt}),
-            diagnostics: Vec::new(),
-        }
+        applied_setup_result_with_revision(&plan, committed, commit.cleanup_deferred)
     }
 }
 
@@ -328,6 +318,14 @@ fn plan_collection_setup(
     let provision_value = serde_json::to_value(&setup.provisions)
         .map_err(|error| invalid_setup(format!("Could not serialize setup provisions: {error}")))?;
     let provision_digest = jcs_digest(&provision_value).map_err(|diagnostic| vec![*diagnostic])?;
+    if let Some(plan) = plan_unchanged_collection_setup(
+        collection,
+        setup,
+        &baseline_validation_errors,
+        &provision_digest,
+    )? {
+        return Ok(plan);
+    }
     let mut shadow =
         batch::shadow_collection(collection).map_err(|diagnostic| vec![*diagnostic])?;
     let collection_revision = baseline_revision(&shadow.baseline);
@@ -448,16 +446,158 @@ fn plan_collection_setup(
             final_resource_revisions.insert(path.to_string(), revision(bytes));
         }
     }
-    let has_configuration_conflict = configuration.iter().any(|entry| entry.conflict.is_some());
-    let has_pack_conflict = type_packs
-        .iter()
-        .any(|pack| pack.get("applicable").and_then(Value::as_bool) != Some(true));
-    let applicable = !has_configuration_conflict && !has_pack_conflict;
     let changed = config_changed
         || (!receipt_configuration.is_empty() && lock_changed)
         || type_packs
             .iter()
             .any(|pack| pack.get("status").and_then(Value::as_str) != Some("current"));
+    let assessment = complete_assessment(
+        setup,
+        provision_digest,
+        collection_revision,
+        final_collection_revision,
+        configuration,
+        type_packs,
+        final_resource_revisions,
+        &baseline_validation_errors,
+        final_validation_errors.len(),
+        resolved_diagnostic_count,
+        changed,
+    )?;
+    Ok(CollectionSetupPlan {
+        shadow: Some(shadow),
+        assessment,
+        receipt_configuration,
+        baseline_validation_errors,
+    })
+}
+
+fn plan_unchanged_collection_setup(
+    collection: &Collection,
+    setup: &CollectionSetup,
+    baseline_validation_errors: &[Diagnostic],
+    provision_digest: &str,
+) -> Result<Option<CollectionSetupPlan>, Vec<Diagnostic>> {
+    let config_bytes = fs::read(collection.root.join("mdbase.yaml")).map_err(|error| {
+        vec![Diagnostic::error(
+            "invalid_collection_setup",
+            format!("Could not read mdbase.yaml for setup assessment: {error}"),
+            Some("mdbase.yaml".to_string()),
+        )]
+    })?;
+    let mut config: serde_yaml::Value = serde_yaml::from_slice(&config_bytes).map_err(|error| {
+        vec![Diagnostic::error(
+            "invalid_collection_setup",
+            format!("Could not parse mdbase.yaml for setup assessment: {error}"),
+            Some("mdbase.yaml".to_string()),
+        )]
+    })?;
+    let mut configuration = Vec::new();
+    let mut receipt_configuration = Vec::new();
+    for provision in &setup.provisions.configuration {
+        let segments = decode_configuration_pointer(&provision.path)
+            .map_err(|diagnostic| vec![*diagnostic])?;
+        let assessment = assess_and_stage_configuration(&mut config, provision, &segments);
+        if assessment.conflict.is_none() {
+            receipt_configuration.push(ConfigurationContributionReceipt {
+                requirement: provision.requirement.clone(),
+                path: provision.path.clone(),
+                value: provision.value.clone(),
+            });
+        }
+        configuration.push(assessment);
+    }
+    if configuration.iter().any(|entry| entry.action == "add") {
+        return Ok(None);
+    }
+
+    let mut type_packs = Vec::new();
+    for pack in &setup.provisions.type_packs {
+        let options = TypePackAssessmentOptions {
+            installed_by: setup.application_id.clone(),
+            adopt_resources: pack.options.adopt_resources.clone(),
+            preserve_seed_targets: pack.options.preserve_seed_targets.clone(),
+            target_overrides: pack.options.target_overrides.clone(),
+            contract_setups: pack.options.contract_setups.clone(),
+        };
+        let plan = plan_type_pack(collection, &pack.provision, &options)
+            .map_err(|diagnostic| vec![*diagnostic])?;
+        let current = plan.assessment.get("status").and_then(Value::as_str) == Some("current");
+        let applicable = plan.assessment.get("applicable").and_then(Value::as_bool) == Some(true);
+        type_packs.push(plan.assessment);
+        if applicable && !current {
+            return Ok(None);
+        }
+    }
+
+    let previous_lock_bytes = fs::read(collection.root.join(PROVISION_LOCK_PATH)).ok();
+    let mut lock = read_provision_lock(&collection.root).map_err(|diagnostic| vec![*diagnostic])?;
+    for receipt in &receipt_configuration {
+        add_contributor(
+            &mut lock,
+            receipt,
+            &setup.application_id,
+            &setup.declaration_digest,
+            provision_digest,
+        )
+        .map_err(|diagnostic| vec![*diagnostic])?;
+    }
+    let lock_bytes = serialize_provision_lock(&mut lock).map_err(|diagnostic| vec![*diagnostic])?;
+    if !receipt_configuration.is_empty()
+        && previous_lock_bytes.as_deref() != Some(lock_bytes.as_slice())
+    {
+        return Ok(None);
+    }
+
+    let baseline =
+        batch::collect_collection_files(collection).map_err(|diagnostic| vec![*diagnostic])?;
+    let collection_revision = baseline_revision(&baseline);
+    let mut final_resource_revisions = BTreeMap::new();
+    for path in ["mdbase.yaml", "mdbase.lock.yaml", PROVISION_LOCK_PATH] {
+        if let Some(bytes) = baseline.get(path) {
+            final_resource_revisions.insert(path.to_string(), revision(bytes));
+        }
+    }
+    let assessment = complete_assessment(
+        setup,
+        provision_digest.to_string(),
+        collection_revision.clone(),
+        collection_revision,
+        configuration,
+        type_packs,
+        final_resource_revisions,
+        baseline_validation_errors,
+        baseline_validation_errors.len(),
+        0,
+        false,
+    )?;
+    Ok(Some(CollectionSetupPlan {
+        shadow: None,
+        assessment,
+        receipt_configuration,
+        baseline_validation_errors: baseline_validation_errors.to_vec(),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_assessment(
+    setup: &CollectionSetup,
+    provision_digest: String,
+    collection_revision: String,
+    final_collection_revision: String,
+    configuration: Vec<ConfigurationSetupAssessment>,
+    type_packs: Vec<Value>,
+    final_resource_revisions: BTreeMap<String, String>,
+    baseline_validation_errors: &[Diagnostic],
+    final_diagnostic_count: usize,
+    resolved_diagnostic_count: usize,
+    changed: bool,
+) -> Result<CollectionSetupAssessment, Vec<Diagnostic>> {
+    let has_configuration_conflict = configuration.iter().any(|entry| entry.conflict.is_some());
+    let has_pack_conflict = type_packs
+        .iter()
+        .any(|pack| pack.get("applicable").and_then(Value::as_bool) != Some(true));
+    let applicable = !has_configuration_conflict && !has_pack_conflict;
     let status = if !applicable {
         "conflict"
     } else if changed {
@@ -477,21 +617,52 @@ fn plan_collection_setup(
         type_packs,
         final_resource_revisions,
         baseline_diagnostic_count: baseline_validation_errors.len(),
-        final_diagnostic_count: final_validation_errors.len(),
+        final_diagnostic_count,
         resolved_diagnostic_count,
         introduced_diagnostic_count: 0,
-        baseline_diagnostic_digest: validation_diagnostic_digest(&baseline_validation_errors),
+        baseline_diagnostic_digest: validation_diagnostic_digest(baseline_validation_errors),
         assessment_digest: String::new(),
     };
     let identity = serde_json::to_value(&assessment)
         .map_err(|error| invalid_setup(format!("Could not serialize setup assessment: {error}")))?;
     assessment.assessment_digest = jcs_digest(&identity).map_err(|diagnostic| vec![*diagnostic])?;
-    Ok(CollectionSetupPlan {
-        shadow,
-        assessment,
-        receipt_configuration,
-        baseline_validation_errors,
-    })
+    Ok(assessment)
+}
+
+fn applied_setup_result(plan: &CollectionSetupPlan, cleanup_deferred: bool) -> OperationResult {
+    applied_setup_result_with_revision(
+        plan,
+        plan.assessment.final_collection_revision.clone(),
+        cleanup_deferred,
+    )
+}
+
+fn applied_setup_result_with_revision(
+    plan: &CollectionSetupPlan,
+    collection_revision: String,
+    cleanup_deferred: bool,
+) -> OperationResult {
+    let type_packs = plan
+        .assessment
+        .type_packs
+        .iter()
+        .filter_map(|pack| pack.get("desired").cloned())
+        .collect();
+    let receipt = CollectionSetupReceipt {
+        application_id: plan.assessment.application_id.clone(),
+        declaration_digest: plan.assessment.declaration_digest.clone(),
+        provision_digest: plan.assessment.provision_digest.clone(),
+        assessment_digest: plan.assessment.assessment_digest.clone(),
+        collection_revision,
+        configuration: plan.receipt_configuration.clone(),
+        type_packs,
+        cleanup_deferred,
+    };
+    OperationResult {
+        valid: true,
+        result: json!({"assessment": &plan.assessment, "receipt": receipt}),
+        diagnostics: Vec::new(),
+    }
 }
 
 fn validate_setup(setup: &CollectionSetup) -> Result<(), Box<Diagnostic>> {
@@ -1115,6 +1286,11 @@ mod tests {
         assert!(repeated.valid);
         assert_eq!(repeated.result["status"], "current");
         assert_eq!(repeated.result["configuration"][0]["action"], "current");
+        let repeated_plan = plan_collection_setup(&reopened, &declaration).unwrap();
+        assert!(
+            repeated_plan.shadow.is_none(),
+            "current setup checks must not duplicate the collection"
+        );
         let before = fs::read(directory.path().join("mdbase.yaml")).unwrap();
         let reapplied =
             reopened.apply_collection_setup(&declaration, &apply_options(&repeated.result));
