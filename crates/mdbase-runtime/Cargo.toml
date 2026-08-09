@@ -19,7 +19,7 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 jsonschema = { version = "0.18", features = ["draft202012"] }
-mdbase = { version = "0.4.0-rc.3", path = "../.." }
+mdbase = { version = "0.4.0-rc.4", path = "../.." }
 mdbase-interop = { version = "0.1.0-rc.2", git = "https://github.com/mdbase-dev/mdbase-spec.git", rev = "b133c8c24531d793e9ca0dbc93cb7a3b55d01776" }
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }

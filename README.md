@@ -1,7 +1,7 @@
 # mdbase-rs
 
 Typed Rust implementation of the [mdbase specification](https://mdbase.dev).
-The `0.4.0-rc.3` release is a deliberate breaking API release: canonical v0.3
+The `0.4.0-rc.4` release is a deliberate breaking API release: canonical v0.3
 collection semantics now sit behind typed requests, results, paths, revisions,
 diagnostics, and errors.
 
