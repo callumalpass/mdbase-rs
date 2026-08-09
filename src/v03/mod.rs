@@ -1,6 +1,6 @@
 //! mdbase v0.3 schema loading and canonical diagnostics.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -104,6 +104,63 @@ impl Diagnostic {
             details: None,
         }
     }
+}
+
+pub(super) fn collection_validation_errors(collection: &Collection) -> Vec<Diagnostic> {
+    let validation = collection.validate_op(&serde_json::json!({}));
+    let valid = validation.get("valid").and_then(Value::as_bool) == Some(true);
+    let mut diagnostics = validation
+        .get("issues")
+        .cloned()
+        .and_then(|issues| serde_json::from_value::<Vec<Diagnostic>>(issues).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|diagnostic| diagnostic.severity == "error")
+        .collect::<Vec<_>>();
+    if !valid && diagnostics.is_empty() {
+        diagnostics.push(Diagnostic::error(
+            "collection_validation_failed",
+            "Collection validation failed without a structured error diagnostic.",
+            None,
+        ));
+    }
+    diagnostics
+}
+
+pub(super) fn introduced_validation_errors(
+    baseline: &[Diagnostic],
+    candidate: &[Diagnostic],
+) -> Vec<Diagnostic> {
+    // Compare multisets so setup may coexist with legacy errors while still
+    // failing closed if it adds another instance of an existing diagnostic.
+    let mut remaining = diagnostic_counts(baseline);
+    let mut introduced = Vec::new();
+    for diagnostic in candidate {
+        let key = diagnostic_key(diagnostic);
+        match remaining.get_mut(&key) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => introduced.push(diagnostic.clone()),
+        }
+    }
+    introduced
+}
+
+pub(super) fn validation_diagnostic_digest(diagnostics: &[Diagnostic]) -> String {
+    let counts = diagnostic_counts(diagnostics);
+    let bytes = serde_jcs::to_vec(&counts).expect("diagnostic multiset canonicalizes");
+    revision(&bytes)
+}
+
+fn diagnostic_counts(diagnostics: &[Diagnostic]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for diagnostic in diagnostics {
+        *counts.entry(diagnostic_key(diagnostic)).or_default() += 1;
+    }
+    counts
+}
+
+fn diagnostic_key(diagnostic: &Diagnostic) -> String {
+    serde_jcs::to_string(diagnostic).expect("diagnostic canonicalizes")
 }
 
 #[derive(Debug, Clone)]

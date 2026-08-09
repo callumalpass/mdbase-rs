@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{
-    batch, revision, validate_type_pack, validate_type_pack_lock, Diagnostic, OperationResult,
+    batch, collection_validation_errors, introduced_validation_errors, revision,
+    validate_type_pack, validate_type_pack_lock, Diagnostic, OperationResult,
 };
 use crate::api::CollectionPath;
 use crate::frontmatter::parser::{is_parse_error, parse_document};
@@ -660,6 +661,7 @@ pub(crate) fn plan_type_pack(
 }
 
 fn apply_type_pack_plan(collection: &Collection, plan: TypePackPlan) -> OperationResult {
+    let baseline_validation_errors = collection_validation_errors(collection);
     let mut shadow = match batch::shadow_collection(collection) {
         Ok(shadow) => shadow,
         Err(diagnostic) => return failed(vec![*diagnostic]),
@@ -685,10 +687,13 @@ fn apply_type_pack_plan(collection: &Collection, plan: TypePackPlan) -> Operatio
             )
         }
     };
-    if reopened.validate_op(&json!({}))["valid"].as_bool() != Some(true) {
+    let committed_validation_errors = collection_validation_errors(&reopened);
+    if !introduced_validation_errors(&baseline_validation_errors, &committed_validation_errors)
+        .is_empty()
+    {
         return pack_diagnostic(
             "type_pack_apply_failed",
-            "The committed type pack did not pass collection validation.",
+            "The committed type pack introduced validation errors.",
         );
     }
     let mut result = plan.assessment;
@@ -712,6 +717,7 @@ pub(crate) fn stage_type_pack_plan(
     shadow: &mut batch::ShadowCollection,
     plan: &TypePackPlan,
 ) -> Result<(), Box<Diagnostic>> {
+    let baseline_validation_errors = collection_validation_errors(&shadow.collection);
     for resource in &plan.resources {
         let path = shadow.directory.path().join(&resource.target);
         match resource.action.as_str() {
@@ -764,20 +770,12 @@ pub(crate) fn stage_type_pack_plan(
             )))
         }
     };
-    let validation = staged.validate_op(&json!({}));
-    if validation.get("valid").and_then(Value::as_bool) != Some(true) {
-        let diagnostic = validation
-            .get("issues")
-            .cloned()
-            .and_then(|issues| serde_json::from_value::<Vec<Diagnostic>>(issues).ok())
-            .and_then(|mut issues| issues.drain(..).next())
-            .unwrap_or_else(|| {
-                Diagnostic::error(
-                    "invalid_type_pack",
-                    "Existing records do not conform after staging the type pack.",
-                    None,
-                )
-            });
+    let staged_validation_errors = collection_validation_errors(&staged);
+    if let Some(diagnostic) =
+        introduced_validation_errors(&baseline_validation_errors, &staged_validation_errors)
+            .into_iter()
+            .next()
+    {
         return Err(Box::new(diagnostic));
     }
     shadow.collection = staged;
