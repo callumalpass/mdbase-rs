@@ -1,0 +1,363 @@
+{
+  "schema_version": 2,
+  "status": "api_review_fixture",
+  "invariants": {
+    "host_claim": "host_durable_before_prepare_and_restart_queryable",
+    "prepare_commit_id": "durable_and_visible_before_commit",
+    "commit_resolution": "restart_queryable_until_host_acknowledgement",
+    "known_change_delivery": "exact_and_bounded",
+    "change_delivery": "durable_identity_watermark_pull_and_ack",
+    "record_metadata": "canonical_before_after_types_and_exact_changed_fields",
+    "body_change_marker": "explicit_boolean_and_digest_bound",
+    "generation_scope": "one_runtime_epoch",
+    "cursor_pages": "one_pinned_snapshot_or_typed_expiry"
+  },
+  "cases": [
+    {
+      "id": "create",
+      "operation": "create",
+      "input": {"path": "notes/a.md"},
+      "expected": {
+        "result": "valid_record_result",
+        "changes": [{"kind": "created", "path": "notes/a.md", "before_revision": null, "after_revision": "opaque"}],
+        "commit_id": "present",
+        "change_event": "durable_present",
+        "generation": "advance_once"
+      }
+    },
+    {
+      "id": "update",
+      "operation": "update",
+      "input": {"path": "notes/a.md", "if_revision": "sha256:before"},
+      "expected": {
+        "result": "valid_record_result",
+        "changes": [{"kind": "updated", "path": "notes/a.md", "before_revision": "sha256:before", "after_revision": "opaque"}],
+        "commit_id": "present",
+        "change_event": "durable_present",
+        "generation": "advance_once"
+      }
+    },
+    {
+      "id": "delete",
+      "operation": "delete",
+      "input": {"path": "notes/a.md", "if_revision": "sha256:before"},
+      "expected": {
+        "result": "valid_delete_result",
+        "changes": [{"kind": "deleted", "path": "notes/a.md", "before_revision": "sha256:before", "after_revision": null}],
+        "commit_id": "present",
+        "change_event": "durable_present",
+        "generation": "advance_once"
+      }
+    },
+    {
+      "id": "rename_with_reference_updates",
+      "operation": "rename",
+      "input": {"from": "notes/a.md", "to": "archive/a.md", "update_references": true},
+      "expected": {
+        "result": "valid_rename_result",
+        "changes": [
+          {"kind": "renamed", "from": "notes/a.md", "path": "archive/a.md", "before_revision": "opaque", "after_revision": "opaque"},
+          {"kind": "updated", "path": "notes/link.md", "before_revision": "opaque", "after_revision": "opaque"}
+        ],
+        "commit_id": "present",
+        "change_event": "durable_present",
+        "generation": "advance_once"
+      }
+    },
+    {
+      "id": "view_source_mutation",
+      "operation": "update_view_source",
+      "input": {"path": "views/library.base", "if_revision": "sha256:before"},
+      "expected": {
+        "result": "valid_view_result",
+        "changes": [{"kind": "view_source", "path": "views/library.base", "before_revision": "sha256:before", "after_revision": "opaque"}],
+        "commit_id": "present",
+        "change_event": "durable_present",
+        "generation": "advance_once"
+      }
+    },
+    {
+      "id": "external_edit",
+      "origin": "filesystem",
+      "input": {"path": "notes/external.md", "kind": "updated"},
+      "expected": {
+        "changes": [{"kind": "updated", "path": "notes/external.md", "before_revision": "opaque", "after_revision": "opaque"}],
+        "commit_id": null,
+        "change_event": "durable_present",
+        "generation": "advance_once"
+      }
+    },
+    {
+      "id": "dry_run_noop_and_error",
+      "operation": "update",
+      "variants": ["dry_run", "semantic_noop", "invalid", "failed_precondition"],
+      "expected": {
+        "changes": "none",
+        "commit_id": null,
+        "change_event": null,
+        "generation": "unchanged"
+      }
+    },
+    {
+      "id": "cursor_survives_mutation",
+      "operation": "query_pages",
+      "sequence": ["page_1", "committed_mutation", "page_2"],
+      "expected": {
+        "pages": "same_pinned_snapshot",
+        "active_generation": "advance_once_for_mutation",
+        "duplicates_or_omissions": false
+      }
+    },
+    {
+      "id": "cursor_expired",
+      "operation": "query_page",
+      "precondition": "pin_released_lease_expired_or_runtime_restarted",
+      "expected": {
+        "error": "generation_expired",
+        "fallback_to_current_generation": false
+      }
+    },
+    {
+      "id": "cancel_before_commit",
+      "operation": "update",
+      "precondition": "durable_prepared",
+      "expected": {
+        "durable_state": "cancelled_before_commit",
+        "delivery": "not_sent",
+        "changes": "none",
+        "generation": "unchanged"
+      }
+    },
+    {
+      "id": "cancel_after_commit_boundary",
+      "operation": "update",
+      "precondition": "durable_committing",
+      "expected": {
+        "caller_timeout": "pending_or_outcome_unknown",
+        "delivery": "never_not_sent",
+        "recovery": "exact_final_outcome"
+      }
+    },
+    {
+      "id": "external_edit_between_prepare_and_commit",
+      "operation": "update",
+      "sequence": ["durable_prepared", "external_edit", "commit_recheck"],
+      "expected": {
+        "durable_state": "rejected_before_commit",
+        "semantic_result": "same_conflict_on_replay",
+        "claim_and_commit_id": "resolvable_until_host_ack",
+        "delivery": "final_failure_not_cancellation",
+        "canonical_write": false,
+        "change_event": null,
+        "generation": "unchanged"
+      }
+    },
+    {
+      "id": "cancel_waiting_for_runtime_gate",
+      "operation": "query",
+      "precondition": "runtime_gate_contended",
+      "expected": {
+        "error": "operation_cancelled_or_deadline",
+        "gate_acquired": false,
+        "provider_work_started": false,
+        "permit_leak": false
+      }
+    },
+    {
+      "id": "crash_after_prepare_before_commit_id_copy",
+      "operation": "update",
+      "precondition": "host_claim_durable_and_mdbase_prepared",
+      "expected": {
+        "resolve_claim": "same_commit_id_and_prepared_state",
+        "same_claim_same_digest": "resume_idempotently",
+        "same_claim_different_digest": "claim_mismatch"
+      }
+    },
+    {
+      "id": "watcher_failure_reconciliation",
+      "origin": "recovery_reconciliation",
+      "precondition": "watcher_backend_or_scan_failed",
+      "expected": {
+        "durable_marker": "reconciliation_required_until_ack",
+        "changes": "collection_wide",
+        "change_event": "durable_present"
+      }
+    },
+    {
+      "id": "change_event_replay_and_ack",
+      "origin": "known_mutation",
+      "sequence": ["read_event", "host_crash_before_ack", "read_event", "ack"],
+      "expected": {
+        "event_id": "same_on_replay",
+        "watermark": "same_on_replay",
+        "host_effect": "deduplicated_by_event_id",
+        "ack": "monotonic_contiguous"
+      }
+    },
+    {
+      "id": "crash_after_canonical_write_before_feed_append",
+      "origin": "known_mutation",
+      "precondition": "journal_committing_with_exact_descriptor_and_files_at_after_revision",
+      "expected": {
+        "recovery": "same_commit_id_event_id_watermark_and_batch_digest",
+        "generation": "new_runtime_epoch_recovery_observation",
+        "feed_events": 1,
+        "collection_wide_fallback": false
+      }
+    },
+    {
+      "id": "cancel_commit_linearization",
+      "operation": "update",
+      "sequence": ["durable_prepared", "concurrent_cancel_and_commit"],
+      "expected": {
+        "durable_winners": 1,
+        "winner_states": ["cancelled_before_commit", "committing"],
+        "loser": "resolves_durable_winner",
+        "partial_commit": false
+      }
+    },
+    {
+      "id": "unknown_external_rename",
+      "origin": "filesystem",
+      "precondition": "identity_not_provable",
+      "expected": {
+        "changes": [
+          {"kind": "deleted", "path": "notes/old.md", "before_revision": "opaque", "after_revision": null},
+          {"kind": "created", "path": "notes/new.md", "before_revision": null, "after_revision": "opaque"}
+        ],
+        "guessed_rename": false
+      }
+    },
+    {
+      "id": "change_batch_paging",
+      "operation": "reference_updating_rename",
+      "precondition": "large_exact_batch_committed",
+      "expected": {
+        "representation": "one_immutable_digest_and_count",
+        "page_limit": "clamped_to_configured_maximum",
+        "all_items": "exactly_once_in_canonical_order",
+        "retained_until": "commit_resolution_and_event_acknowledged"
+      }
+    },
+    {
+      "id": "partial_batch_host_restart",
+      "operation": "consume_change_batch",
+      "sequence": ["stage_page_1", "host_crash", "replay_page_1", "stage_remaining", "finalize"],
+      "expected": {
+        "duplicate_page": "same_item_indexes_and_digests_are_idempotent",
+        "application_visibility_before_finalize": false,
+        "final_item_count_and_digest": "provider_descriptor",
+        "provider_ack": "after_contiguous_finalize_only"
+      }
+    },
+    {
+      "id": "direct_receipt_before_feed_finalize",
+      "origin": "known_mutation",
+      "sequence": ["commit", "host_receipt_durable", "host_crash", "feed_replay", "finalize"],
+      "expected": {
+        "application_receipts": 1,
+        "application_change_batches": 1,
+        "writer": "provider_feed_finalizer_only",
+        "event_id": "same_across_receipt_and_feed"
+      }
+    },
+    {
+      "id": "reconciliation_retry_identity",
+      "origin": "recovery_reconciliation",
+      "sequence": ["scan_failure", "restart", "scan_failure", "scan_success", "host_replay", "ack"],
+      "expected": {
+        "reconciliation_epoch": "stable_until_ack",
+        "event_id": "stable_once_reserved",
+        "durable_events": 1,
+        "marker_removed": "after_ack_only"
+      }
+    },
+    {
+      "id": "change_watermark_errors",
+      "operation": "ack_change_events",
+      "expected": {
+        "equal_or_older": "idempotent_noop",
+        "ahead_of_head": "invalid_change_ack",
+        "across_gap": "invalid_change_ack",
+        "read_after_head": "empty_page",
+        "read_before_retention": "change_feed_reset_required"
+      }
+    },
+    {
+      "id": "change_batch_capacity",
+      "operation": "reference_updating_rename",
+      "precondition": "known_batch_metadata_capacity_unavailable",
+      "expected": {
+        "error": "runtime_capacity_exhausted",
+        "failure_point": "before_durable_prepare",
+        "canonical_write": false
+      }
+    },
+    {
+      "id": "feed_owner_wait_deadline",
+      "operation": "open_change_feed",
+      "precondition": "different_owner_or_feed_gate_contended",
+      "expected": {
+        "different_owner": "change_feed_owned",
+        "gate_deadline": "operation_deadline",
+        "fencing_epoch_advanced": false,
+        "permit_leak": false
+      }
+    },
+    {
+      "id": "feed_ack_wait_cancellation",
+      "operation": "ack_change_events",
+      "precondition": "feed_gate_contended_then_cancelled",
+      "expected": {
+        "error": "operation_cancelled",
+        "acknowledged_through": "unchanged",
+        "partial_ack": false,
+        "permit_leak": false
+      }
+    },
+    {
+      "id": "feed_transfer_host_crash",
+      "operation": "transfer_change_feed",
+      "sequence": [
+        "host_intent_durable",
+        "provider_transfer_durable",
+        "host_crash_before_receipt",
+        "retry_same_intent",
+        "host_owner_update_durable",
+        "ack_transfer",
+        "host_crash_before_intent_delete",
+        "repeat_ack",
+        "delete_host_intent"
+      ],
+      "expected": {
+        "provider_transfers": 1,
+        "transfer_id_and_receipt": "same_on_retry",
+        "current_owner_handle": "fenced",
+        "next_owner_handle": "current_epoch",
+        "repeated_ack": "idempotent_success",
+        "new_transfer_before_ack": "rejected",
+        "mismatched_retry": "change_feed_transfer_mismatch"
+      }
+    },
+    {
+      "id": "feed_baseline_host_crash",
+      "operation": "establish_change_feed_baseline",
+      "sequence": [
+        "host_owner_intent_durable",
+        "provider_baseline_durable",
+        "post_baseline_external_event_durable",
+        "host_crash_before_feed_state",
+        "reopen_same_owner",
+        "repeat_baseline"
+      ],
+      "expected": {
+        "watermark_and_snapshot": "same_on_retry",
+        "fencing_epoch": "current_reopened_handle",
+        "acknowledged_through": "equals_feed_head",
+        "first_post_baseline_watermark": "checked_feed_head_plus_one",
+        "pre_baseline_event_replay": false,
+        "post_baseline_event": "retained_as_first_unprocessed_event"
+      }
+    }
+  ]
+}
