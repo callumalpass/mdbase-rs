@@ -979,10 +979,10 @@ fn runtime_read_cursor_pins_generation_replays_and_expires_on_release() {
 
 #[test]
 fn runtime_deadline_after_commit_boundary_returns_pending_while_settlement_finishes() {
-    struct ResetDelay;
+    struct ResetDelay(CommitId);
     impl Drop for ResetDelay {
         fn drop(&mut self) {
-            crate::transactions::set_runtime_settlement_delay(Duration::ZERO);
+            crate::transactions::set_runtime_settlement_delay(&self.0, Duration::ZERO);
         }
     }
 
@@ -1000,8 +1000,11 @@ fn runtime_deadline_after_commit_boundary_returns_pending_while_settlement_finis
         PreparationOutcome::Prepared(prepared) => prepared,
         other => panic!("expected prepared mutation, got {other:?}"),
     };
-    crate::transactions::set_runtime_settlement_delay(Duration::from_millis(100));
-    let _reset = ResetDelay;
+    crate::transactions::set_runtime_settlement_delay(
+        prepared.commit_id(),
+        Duration::from_millis(100),
+    );
+    let _reset = ResetDelay(prepared.commit_id().clone());
     let cancellation = crate::OperationCancellation::new();
     let context = OperationContext::new(
         &cancellation,
@@ -1016,9 +1019,20 @@ fn runtime_deadline_after_commit_boundary_returns_pending_while_settlement_finis
     );
     assert!(started.elapsed() < Duration::from_millis(80));
 
-    let resolved = runtime
-        .resolve_commit(prepared.commit_id(), &OperationContext::legacy())
-        .unwrap();
+    let resolution_deadline = Instant::now() + Duration::from_secs(5);
+    let resolved = loop {
+        let resolved = runtime
+            .resolve_commit(prepared.commit_id(), &OperationContext::legacy())
+            .unwrap();
+        if matches!(resolved, Some(DurableCommitState::Committed { .. })) {
+            break resolved;
+        }
+        assert!(
+            Instant::now() < resolution_deadline,
+            "durable settlement did not finish: {resolved:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert!(matches!(
         resolved,
         Some(DurableCommitState::Committed { .. })

@@ -22,18 +22,22 @@ const MAX_RUNTIME_CHANGE_ITEMS: usize = 100_000;
 const MAX_RUNTIME_METADATA_BYTES: usize = 16 * 1024 * 1024;
 
 #[cfg(test)]
-static RUNTIME_SETTLEMENT_DELAY_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static RUNTIME_SETTLEMENT_DELAYS: std::sync::Mutex<Vec<(String, u64)>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 static RUNTIME_CRASH_POINT: std::sync::Mutex<Option<(String, u8)>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
-pub(crate) fn set_runtime_settlement_delay(delay: std::time::Duration) {
-    RUNTIME_SETTLEMENT_DELAY_MS.store(
-        delay.as_millis().min(u128::from(u64::MAX)) as u64,
-        std::sync::atomic::Ordering::SeqCst,
-    );
+pub(crate) fn set_runtime_settlement_delay(id: &CommitId, delay: std::time::Duration) {
+    let mut configured = RUNTIME_SETTLEMENT_DELAYS.lock().unwrap();
+    configured.retain(|candidate| candidate.0 != id.as_str());
+    if !delay.is_zero() {
+        configured.push((
+            id.as_str().to_string(),
+            delay.as_millis().min(u128::from(u64::MAX)) as u64,
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -563,7 +567,14 @@ fn settle(
 ) -> Result<(), TransactionError> {
     #[cfg(test)]
     {
-        let delay = RUNTIME_SETTLEMENT_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst);
+        let delay = RUNTIME_SETTLEMENT_DELAYS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|candidate| candidate.0 == journal.id)
+            .map(|candidate| candidate.1)
+            .next()
+            .unwrap_or(0);
         if delay > 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay));
         }
