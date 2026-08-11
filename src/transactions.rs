@@ -616,7 +616,7 @@ impl WriteLock {
                 .map_err(|error| TransactionError::OperationBoundary { code: error.code() })?;
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(Self { file }),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(error) if lock_is_contended(&error) => {
                     std::thread::sleep(
                         context
                             .deadline()
@@ -647,6 +647,22 @@ impl WriteLock {
             .open(&path)
             .map_err(|source| io_error(path.clone(), source))?;
         Ok((file, path))
+    }
+}
+
+fn lock_is_contended(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // LockFileEx reports these Win32 lock races without mapping them to
+        // ErrorKind::WouldBlock in every supported Rust toolchain.
+        matches!(error.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 

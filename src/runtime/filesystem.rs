@@ -660,7 +660,9 @@ impl FilesystemRuntime {
         context: &OperationContext,
     ) -> Result<CommitAttempt, ProviderError> {
         {
-            let mut active = self.settlement_lock(context)?;
+            // Committing is already durable. Internal settlement ownership can
+            // no longer be cancelled by the application deadline.
+            let mut active = self.settlement_lock(&OperationContext::legacy())?;
             if active.is_some() {
                 return Ok(CommitAttempt::SettlementPending { commit_id });
             }
@@ -726,7 +728,10 @@ impl FilesystemRuntime {
             if context.check().is_err() {
                 return Ok(CommitAttempt::SettlementPending { commit_id });
             }
-            std::thread::sleep(context.next_wait()?);
+            let Ok(wait) = context.next_wait() else {
+                return Ok(CommitAttempt::SettlementPending { commit_id });
+            };
+            std::thread::sleep(wait);
         }
     }
 
