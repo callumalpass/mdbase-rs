@@ -51,6 +51,8 @@ pub(crate) enum CollectionScanError {
 /// Failure while constructing an authoritative collection snapshot.
 #[derive(Debug, Error)]
 pub(crate) enum SnapshotError {
+    #[error("collection operation cancelled")]
+    Cancelled,
     #[error(transparent)]
     Scan(#[from] CollectionScanError),
     #[error("collection entry is outside the configured root: {}", path.display())]
@@ -78,6 +80,7 @@ pub(crate) enum SnapshotError {
 impl SnapshotError {
     pub(crate) fn path(&self) -> Option<&Path> {
         match self {
+            Self::Cancelled => None,
             Self::Scan(CollectionScanError::ReadDirectory { path, .. })
             | Self::Scan(CollectionScanError::InspectEntry { path, .. })
             | Self::Scan(CollectionScanError::OutsideRoot { path })

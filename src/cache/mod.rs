@@ -23,6 +23,8 @@ pub(crate) enum CacheError {
     Scan(#[from] crate::snapshot::CollectionScanError),
     #[error("collection path is outside the configured root: {0}")]
     OutsideRoot(String),
+    #[error("collection operation cancelled")]
+    Cancelled,
 }
 
 impl Collection {

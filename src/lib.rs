@@ -13,6 +13,7 @@ pub mod errors;
 
 pub mod api;
 pub mod cache;
+pub mod cancellation;
 pub(crate) mod compat;
 pub mod config;
 pub mod data_contracts;
@@ -36,6 +37,8 @@ pub mod v03;
 pub mod validation;
 pub mod views;
 pub mod watch;
+
+pub use cancellation::{OperationCancellation, OperationCancelled};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
