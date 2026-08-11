@@ -14,6 +14,10 @@ pub enum WatchKind {
     RecordRenamed,
     ConfigChanged,
     TypeChanged,
+    ContractChanged,
+    SchemaChanged,
+    ViewChanged,
+    LockChanged,
     /// A collection reload failed. This extension preserves the diagnostic
     /// carried by the transport event without pretending a record changed.
     CollectionInvalidated,
@@ -114,6 +118,10 @@ fn kind(event_type: &str) -> WatchKind {
         "mdbase.record.renamed" => WatchKind::RecordRenamed,
         "mdbase.config.changed" => WatchKind::ConfigChanged,
         "mdbase.type.changed" => WatchKind::TypeChanged,
+        "mdbase.contract.changed" => WatchKind::ContractChanged,
+        "mdbase.schema.changed" => WatchKind::SchemaChanged,
+        "mdbase.view.changed" => WatchKind::ViewChanged,
+        "mdbase.lock.changed" => WatchKind::LockChanged,
         _ => WatchKind::CollectionInvalidated,
     }
 }

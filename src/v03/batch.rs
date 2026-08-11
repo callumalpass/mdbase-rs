@@ -6,7 +6,353 @@ use serde_json::{json, Value};
 use walkdir::WalkDir;
 
 use super::{Diagnostic, OperationResult, Operations};
+use crate::runtime::{CollectionSnapshot, OperationContext, ProviderError};
 use crate::Collection;
+
+pub(crate) enum RuntimeSinglePreparation {
+    NoMutation(OperationResult),
+    Prepared(Box<RuntimeMutationPlan>),
+}
+
+pub(crate) struct RuntimeMutationPlan {
+    pub(crate) result: OperationResult,
+    pub(crate) baseline: crate::transactions::FileBaseline,
+    pub(crate) desired: crate::transactions::FileBaseline,
+    pub(crate) before: CollectionSnapshot,
+    pub(crate) after: CollectionSnapshot,
+}
+
+pub(crate) fn prepare_single_runtime(
+    collection: &Collection,
+    operation: &str,
+    input: &Value,
+    context: &OperationContext,
+) -> Result<RuntimeSinglePreparation, ProviderError> {
+    context.check()?;
+    if matches!(operation, "create" | "update" | "delete") {
+        return prepare_sparse_runtime(collection, operation, input, context);
+    }
+
+    let before = collection.snapshot()?;
+    context.check()?;
+    let shadow = shadow_collection_context(collection, context)?;
+    let shadow_input = match adapt_mtime_precondition(collection, &shadow.collection, input) {
+        Ok(input) => input,
+        Err(diagnostic) => {
+            return Ok(RuntimeSinglePreparation::NoMutation(failed(vec![
+                *diagnostic,
+            ])))
+        }
+    };
+    context.check()?;
+    let shadow_operations = shadow
+        .collection
+        .v03_operations()
+        .map_err(|diagnostic| ProviderError::CollectionOpen(diagnostic.message.clone()))?;
+    let result = execute_staged_operation(&shadow_operations, operation, &shadow_input);
+    context.check()?;
+    if !result.valid {
+        return Ok(RuntimeSinglePreparation::NoMutation(result));
+    }
+    let desired = collect_collection_files_context(&shadow.collection, context)?;
+    if desired == shadow.baseline {
+        return Ok(RuntimeSinglePreparation::NoMutation(result));
+    }
+    let after = shadow.collection.snapshot()?;
+    context.check()?;
+    Ok(RuntimeSinglePreparation::Prepared(Box::new(
+        RuntimeMutationPlan {
+            result,
+            baseline: shadow.baseline,
+            desired,
+            before,
+            after,
+        },
+    )))
+}
+
+fn execute_staged_operation(
+    operations: &Operations<'_>,
+    operation: &str,
+    input: &Value,
+) -> OperationResult {
+    match operation {
+        "create" | "update" | "delete" | "rename" => {
+            operations.execute_mutation_direct(operation, input)
+        }
+        "batch" => operations.batch(input),
+        "create_view_source" => operations.create_view_source(input),
+        "update_view_source" => operations.update_view_source(input),
+        "delete_view_source" => operations.delete_view_source(input),
+        "create_type" => operations.create_type(input),
+        "update_type" => operations.update_type(input),
+        "apply_type_pack" => execute_type_pack(operations.collection(), input),
+        "apply_collection_setup" => execute_collection_setup(operations.collection(), input),
+        _ => failed(vec![Diagnostic::error(
+            "invalid_request",
+            format!("Unsupported mutation operation '{operation}'."),
+            None,
+        )]),
+    }
+}
+
+fn execute_type_pack(collection: &Collection, input: &Value) -> OperationResult {
+    let provision = input
+        .get("provision")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<super::TypePackProvision>(value).ok());
+    let options = input
+        .get("options")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<super::TypePackApplyOptions>(value).ok());
+    match (provision, options) {
+        (Some(provision), Some(options)) => collection.apply_type_pack(&provision, &options),
+        _ => invalid_request("Type-pack apply input requires valid provision and options."),
+    }
+}
+
+fn execute_collection_setup(collection: &Collection, input: &Value) -> OperationResult {
+    let setup = input
+        .get("setup")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<super::CollectionSetup>(value).ok());
+    let options = input
+        .get("options")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<super::CollectionSetupApplyOptions>(value).ok());
+    match (setup, options) {
+        (Some(setup), Some(options)) => collection.apply_collection_setup(&setup, &options),
+        _ => invalid_request("Collection setup apply input requires valid setup and options."),
+    }
+}
+
+fn prepare_sparse_runtime(
+    collection: &Collection,
+    operation: &str,
+    input: &Value,
+    context: &OperationContext,
+) -> Result<RuntimeSinglePreparation, ProviderError> {
+    let input_path = input.get("path").and_then(Value::as_str);
+    let shadow = sparse_shadow_collection(collection, input_path, context)?;
+    let shadow_input = match adapt_mtime_precondition(collection, &shadow.collection, input) {
+        Ok(input) => input,
+        Err(diagnostic) => {
+            return Ok(RuntimeSinglePreparation::NoMutation(failed(vec![
+                *diagnostic,
+            ])))
+        }
+    };
+    context.check()?;
+    let shadow_operations = shadow
+        .collection
+        .v03_operations()
+        .map_err(|diagnostic| ProviderError::CollectionOpen(diagnostic.message.clone()))?;
+    let mut result = shadow_operations.execute_mutation_direct(operation, &shadow_input);
+    context.check()?;
+    if !result.valid {
+        return Ok(RuntimeSinglePreparation::NoMutation(result));
+    }
+    if input
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(RuntimeSinglePreparation::NoMutation(result));
+    }
+
+    let path = result
+        .result
+        .get("path")
+        .or_else(|| input.get("path"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ProviderError::CollectionOpen(
+                "sparse mutation result did not identify its record path".to_string(),
+            )
+        })?
+        .to_string();
+    let mut baseline = crate::transactions::FileBaseline::new();
+    if let Ok(bytes) = fs::read(collection.root.join(&path)) {
+        baseline.insert(path.clone(), bytes);
+    }
+    if operation == "create" && baseline.contains_key(&path) && input_path != Some(path.as_str()) {
+        return Ok(RuntimeSinglePreparation::NoMutation(failed(vec![
+            Diagnostic::error(
+                "path_conflict",
+                format!("File already exists: {path}"),
+                Some(path),
+            ),
+        ])));
+    }
+    let mut desired = crate::transactions::FileBaseline::new();
+    if let Ok(bytes) = fs::read(shadow.collection.root.join(&path)) {
+        desired.insert(path.clone(), bytes);
+    }
+    if baseline == desired {
+        return Ok(RuntimeSinglePreparation::NoMutation(result));
+    }
+
+    if operation == "delete"
+        && input
+            .get("check_backlinks")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        context.check()?;
+        let mut preview_input = input.as_object().cloned().unwrap_or_default();
+        preview_input.insert("dry_run".to_string(), Value::Bool(true));
+        let preview = collection
+            .v03_operations()
+            .map_err(|diagnostic| ProviderError::CollectionOpen(diagnostic.message.clone()))?
+            .execute_mutation_direct("delete", &Value::Object(preview_input));
+        context.check()?;
+        if !preview.valid {
+            return Ok(RuntimeSinglePreparation::NoMutation(preview));
+        }
+        if let Some(broken_links) = preview.result.get("broken_links") {
+            result.result["broken_links"] = broken_links.clone();
+        }
+    }
+
+    if matches!(operation, "create" | "update") && collection.settings.default_validation == "error"
+    {
+        let frontmatter = result
+            .result
+            .get("frontmatter")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let type_names = collection.determine_types_for_path(&frontmatter, Some(&path));
+        let issues = collection
+            .check_uniqueness_indexed(&frontmatter, &type_names, &path)
+            .map_err(|error| ProviderError::Transaction {
+                code: "cache_maintenance_failed",
+                message: error.to_string(),
+            })?;
+        context.check()?;
+        if !issues.is_empty() {
+            let diagnostics = issues
+                .into_iter()
+                .map(|issue| {
+                    let mut diagnostic = Diagnostic::error(&issue.code, issue.message, issue.path);
+                    diagnostic.field = issue.field;
+                    diagnostic
+                })
+                .collect();
+            return Ok(RuntimeSinglePreparation::NoMutation(failed(diagnostics)));
+        }
+    }
+
+    let before = targeted_snapshot(collection, &path)?;
+    let after = targeted_snapshot(&shadow.collection, &path)?;
+    context.check()?;
+    Ok(RuntimeSinglePreparation::Prepared(Box::new(
+        RuntimeMutationPlan {
+            result,
+            baseline,
+            desired,
+            before,
+            after,
+        },
+    )))
+}
+
+fn targeted_snapshot(
+    collection: &Collection,
+    path: &str,
+) -> Result<CollectionSnapshot, ProviderError> {
+    let records = match collection.snapshot_record(path) {
+        Ok(record) => vec![record],
+        Err(ProviderError::CollectionOpen(_)) => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    Ok(CollectionSnapshot {
+        revision: String::new(),
+        resource_revision: String::new(),
+        spec_version: super::SPEC_VERSION.to_string(),
+        resources: Vec::new(),
+        records,
+    })
+}
+
+fn sparse_shadow_collection(
+    collection: &Collection,
+    target: Option<&str>,
+    context: &OperationContext,
+) -> Result<ShadowCollection, ProviderError> {
+    context.check()?;
+    let directory =
+        tempfile::tempdir().map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+    copy_sparse_controls(collection, directory.path(), context)?;
+    let mut baseline = crate::transactions::FileBaseline::new();
+    if let Some(target) = target {
+        let source = collection.root.join(target);
+        if source.is_file() {
+            let bytes = fs::read(&source)
+                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+            let destination = directory.path().join(target);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+            }
+            fs::write(&destination, &bytes)
+                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+            baseline.insert(target.replace('\\', "/"), bytes);
+        }
+    }
+    context.check()?;
+    let shadow = Collection::open(directory.path())
+        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+    Ok(ShadowCollection {
+        directory,
+        collection: shadow,
+        baseline,
+    })
+}
+
+fn copy_sparse_controls(
+    collection: &Collection,
+    destination: &Path,
+    context: &OperationContext,
+) -> Result<(), ProviderError> {
+    for relative in ["mdbase.yaml", "mdbase.lock.yaml"] {
+        let source = collection.root.join(relative);
+        if source.is_file() {
+            fs::copy(&source, destination.join(relative))
+                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+        }
+    }
+    for folder in [
+        collection.settings.types_folder.as_str(),
+        collection.settings.contracts_folder.as_str(),
+        "_schemas",
+    ] {
+        let source = collection.root.join(folder);
+        if !source.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(&source).follow_links(false) {
+            context.check()?;
+            let entry = entry.map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+            let relative = entry
+                .path()
+                .strip_prefix(&collection.root)
+                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+            let target = destination.join(relative);
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&target)
+                    .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+            } else if entry.file_type().is_file() {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+                }
+                fs::copy(entry.path(), &target)
+                    .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+            }
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn execute_single(
     collection: &Collection,
@@ -208,20 +554,52 @@ pub(crate) struct ShadowCollection {
 pub(crate) fn shadow_collection(
     collection: &Collection,
 ) -> Result<ShadowCollection, Box<Diagnostic>> {
+    shadow_collection_inner(collection, None).map_err(|error| match error {
+        RuntimeBatchError::Diagnostic(diagnostic) => diagnostic,
+        RuntimeBatchError::Provider(error) => {
+            Box::new(Diagnostic::error(error.code(), error.to_string(), None))
+        }
+    })
+}
+
+fn shadow_collection_context(
+    collection: &Collection,
+    context: &OperationContext,
+) -> Result<ShadowCollection, ProviderError> {
+    shadow_collection_inner(collection, Some(context)).map_err(|error| match error {
+        RuntimeBatchError::Diagnostic(diagnostic) => {
+            ProviderError::CollectionOpen(diagnostic.message.clone())
+        }
+        RuntimeBatchError::Provider(error) => error,
+    })
+}
+
+enum RuntimeBatchError {
+    Diagnostic(Box<Diagnostic>),
+    Provider(ProviderError),
+}
+
+fn shadow_collection_inner(
+    collection: &Collection,
+    context: Option<&OperationContext>,
+) -> Result<ShadowCollection, RuntimeBatchError> {
+    if let Some(context) = context {
+        context.check().map_err(RuntimeBatchError::Provider)?;
+    }
     let directory = tempfile::tempdir().map_err(|error| {
-        Box::new(Diagnostic::error(
+        RuntimeBatchError::Diagnostic(Box::new(Diagnostic::error(
             "batch_preflight_failed",
             format!("Could not create batch preflight workspace: {error}"),
             None,
-        ))
+        )))
     })?;
-    let baseline = copy_collection(collection, directory.path())?;
+    let baseline = copy_collection(collection, directory.path(), context)?;
     let shadow = Collection::open(directory.path()).map_err(|error| {
-        Box::new(Diagnostic::error(
+        RuntimeBatchError::Diagnostic(Box::new(Diagnostic::error(
             "batch_preflight_failed",
             format!("Could not open batch preflight collection: {error:?}"),
             None,
-        ))
+        )))
     })?;
     Ok(ShadowCollection {
         directory,
@@ -233,7 +611,8 @@ pub(crate) fn shadow_collection(
 fn copy_collection(
     collection: &Collection,
     destination: &Path,
-) -> Result<crate::transactions::FileBaseline, Box<Diagnostic>> {
+    context: Option<&OperationContext>,
+) -> Result<crate::transactions::FileBaseline, RuntimeBatchError> {
     let source = &collection.root;
     let mut baseline = BTreeMap::new();
     for entry in WalkDir::new(source)
@@ -241,34 +620,43 @@ fn copy_collection(
         .into_iter()
         .filter_entry(|entry| should_descend(collection, entry.path()))
     {
+        if let Some(context) = context {
+            context.check().map_err(RuntimeBatchError::Provider)?;
+        }
         let entry = entry.map_err(|error| {
-            Box::new(Diagnostic::error(
+            RuntimeBatchError::Diagnostic(Box::new(Diagnostic::error(
                 "batch_preflight_failed",
                 format!("Could not inspect collection for batch preflight: {error}"),
                 None,
-            ))
+            )))
         })?;
         let relative = entry.path().strip_prefix(source).map_err(|error| {
-            Box::new(Diagnostic::error(
+            RuntimeBatchError::Diagnostic(Box::new(Diagnostic::error(
                 "batch_preflight_failed",
                 error.to_string(),
                 None,
-            ))
+            )))
         })?;
         if relative.as_os_str().is_empty() {
             continue;
         }
         let target = destination.join(relative);
         if entry.file_type().is_dir() {
-            fs::create_dir_all(&target).map_err(|error| Box::new(copy_error(relative, error)))?;
+            fs::create_dir_all(&target).map_err(|error| {
+                RuntimeBatchError::Diagnostic(Box::new(copy_error(relative, error)))
+            })?;
         } else if entry.file_type().is_file() && should_copy_file(collection, relative) {
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| Box::new(copy_error(relative, error)))?;
+                fs::create_dir_all(parent).map_err(|error| {
+                    RuntimeBatchError::Diagnostic(Box::new(copy_error(relative, error)))
+                })?;
             }
-            let bytes =
-                fs::read(entry.path()).map_err(|error| Box::new(copy_error(relative, error)))?;
-            fs::write(&target, &bytes).map_err(|error| Box::new(copy_error(relative, error)))?;
+            let bytes = fs::read(entry.path()).map_err(|error| {
+                RuntimeBatchError::Diagnostic(Box::new(copy_error(relative, error)))
+            })?;
+            fs::write(&target, &bytes).map_err(|error| {
+                RuntimeBatchError::Diagnostic(Box::new(copy_error(relative, error)))
+            })?;
             baseline.insert(portable_path(relative), bytes);
         }
     }
@@ -278,6 +666,30 @@ fn copy_collection(
 pub(crate) fn collect_collection_files(
     collection: &Collection,
 ) -> Result<crate::transactions::FileBaseline, Box<Diagnostic>> {
+    collect_collection_files_inner(collection, None).map_err(|error| match error {
+        RuntimeBatchError::Diagnostic(diagnostic) => diagnostic,
+        RuntimeBatchError::Provider(error) => {
+            Box::new(Diagnostic::error(error.code(), error.to_string(), None))
+        }
+    })
+}
+
+fn collect_collection_files_context(
+    collection: &Collection,
+    context: &OperationContext,
+) -> Result<crate::transactions::FileBaseline, ProviderError> {
+    collect_collection_files_inner(collection, Some(context)).map_err(|error| match error {
+        RuntimeBatchError::Diagnostic(diagnostic) => {
+            ProviderError::CollectionOpen(diagnostic.message.clone())
+        }
+        RuntimeBatchError::Provider(error) => error,
+    })
+}
+
+fn collect_collection_files_inner(
+    collection: &Collection,
+    context: Option<&OperationContext>,
+) -> Result<crate::transactions::FileBaseline, RuntimeBatchError> {
     let mut files = BTreeMap::new();
     let source = &collection.root;
     for entry in WalkDir::new(source)
@@ -285,23 +697,27 @@ pub(crate) fn collect_collection_files(
         .into_iter()
         .filter_entry(|entry| should_descend(collection, entry.path()))
     {
+        if let Some(context) = context {
+            context.check().map_err(RuntimeBatchError::Provider)?;
+        }
         let entry = entry.map_err(|error| {
-            Box::new(Diagnostic::error(
+            RuntimeBatchError::Diagnostic(Box::new(Diagnostic::error(
                 "batch_preflight_failed",
                 format!("Could not inspect preflight result: {error}"),
                 None,
-            ))
+            )))
         })?;
         let relative = entry.path().strip_prefix(source).map_err(|error| {
-            Box::new(Diagnostic::error(
+            RuntimeBatchError::Diagnostic(Box::new(Diagnostic::error(
                 "batch_preflight_failed",
                 error.to_string(),
                 None,
-            ))
+            )))
         })?;
         if entry.file_type().is_file() && should_copy_file(collection, relative) {
-            let bytes =
-                fs::read(entry.path()).map_err(|error| Box::new(copy_error(relative, error)))?;
+            let bytes = fs::read(entry.path()).map_err(|error| {
+                RuntimeBatchError::Diagnostic(Box::new(copy_error(relative, error)))
+            })?;
             files.insert(portable_path(relative), bytes);
         }
     }
@@ -345,6 +761,11 @@ fn should_copy_file(collection: &Collection, relative: &Path) -> bool {
         || relative.starts_with(Path::new(&collection.settings.contracts_folder))
     {
         return extension == Some("md");
+    }
+    if extension == Some("base") {
+        return crate::views::compatibility_source_paths(collection)
+            .iter()
+            .any(|path| path == &collection.root.join(relative));
     }
     let relative = portable_path(relative);
     !collection.is_excluded(&relative)
@@ -555,5 +976,80 @@ mod tests {
         assert!(result.valid, "{:?}", result.diagnostics);
         assert!(stage.path().join("notes/staged.md").is_file());
         assert_eq!(result.result["path"], json!("notes/staged.md"));
+    }
+
+    #[test]
+    fn runtime_single_update_stages_only_the_affected_record() {
+        let source = tempfile::tempdir().unwrap();
+        write(
+            &source.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  default_validation: error\n",
+        );
+        write(
+            &source.path().join("target.md"),
+            "---\nid: target\ntitle: Before\n---\nBody\n",
+        );
+        write(
+            &source.path().join("unrelated.md"),
+            "---\nid: unrelated\ntitle: Untouched\n---\n",
+        );
+        let collection = Collection::open(source.path()).unwrap();
+        crate::cache::runtime::rebuild(
+            &collection,
+            &crate::runtime::CollectionGeneration::initial(),
+        )
+        .unwrap();
+
+        let prepared = prepare_single_runtime(
+            &collection,
+            "update",
+            &json!({"path": "target.md", "fields": {"title": "After"}}),
+            &crate::runtime::OperationContext::legacy(),
+        )
+        .unwrap();
+        let RuntimeSinglePreparation::Prepared(plan) = prepared else {
+            panic!("expected a staged mutation")
+        };
+        assert_eq!(plan.baseline.keys().collect::<Vec<_>>(), ["target.md"]);
+        assert_eq!(plan.desired.keys().collect::<Vec<_>>(), ["target.md"]);
+        assert!(!plan.baseline.contains_key("unrelated.md"));
+        assert_eq!(
+            fs::read_to_string(source.path().join("target.md")).unwrap(),
+            "---\nid: target\ntitle: Before\n---\nBody\n"
+        );
+    }
+
+    #[test]
+    fn runtime_single_dry_run_never_mutates_the_live_record() {
+        let source = tempfile::tempdir().unwrap();
+        write(
+            &source.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  default_validation: error\n",
+        );
+        let original = "---\nid: target\ntitle: Before\n---\nBody\n";
+        write(&source.path().join("target.md"), original);
+        let collection = Collection::open(source.path()).unwrap();
+        crate::cache::runtime::rebuild(
+            &collection,
+            &crate::runtime::CollectionGeneration::initial(),
+        )
+        .unwrap();
+
+        let prepared = prepare_single_runtime(
+            &collection,
+            "update",
+            &json!({
+                "path": "target.md",
+                "fields": {"title": "After"},
+                "dry_run": true
+            }),
+            &crate::runtime::OperationContext::legacy(),
+        )
+        .unwrap();
+        assert!(matches!(prepared, RuntimeSinglePreparation::NoMutation(_)));
+        assert_eq!(
+            fs::read_to_string(source.path().join("target.md")).unwrap(),
+            original
+        );
     }
 }

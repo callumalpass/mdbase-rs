@@ -19,10 +19,19 @@ pub enum OperationKind {
     UpdateViewSource,
     DeleteViewSource,
     Validate,
+    Batch,
     Create,
     Update,
     Delete,
     Rename,
+    ListTypes,
+    ReadType,
+    CreateType,
+    UpdateType,
+    AssessTypePack,
+    ApplyTypePack,
+    AssessCollectionSetup,
+    ApplyCollectionSetup,
 }
 
 impl OperationKind {
@@ -36,6 +45,11 @@ impl OperationKind {
                 | Self::CreateViewSource
                 | Self::UpdateViewSource
                 | Self::DeleteViewSource
+                | Self::Batch
+                | Self::CreateType
+                | Self::UpdateType
+                | Self::ApplyTypePack
+                | Self::ApplyCollectionSetup
         )
     }
 
@@ -50,10 +64,19 @@ impl OperationKind {
             Self::UpdateViewSource => "update_view_source",
             Self::DeleteViewSource => "delete_view_source",
             Self::Validate => "validate",
+            Self::Batch => "batch",
             Self::Create => "create",
             Self::Update => "update",
             Self::Delete => "delete",
             Self::Rename => "rename",
+            Self::ListTypes => "list_types",
+            Self::ReadType => "read_type",
+            Self::CreateType => "create_type",
+            Self::UpdateType => "update_type",
+            Self::AssessTypePack => "assess_type_pack",
+            Self::ApplyTypePack => "apply_type_pack",
+            Self::AssessCollectionSetup => "assess_collection_setup",
+            Self::ApplyCollectionSetup => "apply_collection_setup",
         }
     }
 }
@@ -72,10 +95,19 @@ impl FromStr for OperationKind {
             "update_view_source" => Ok(Self::UpdateViewSource),
             "delete_view_source" => Ok(Self::DeleteViewSource),
             "validate" => Ok(Self::Validate),
+            "batch" => Ok(Self::Batch),
             "create" => Ok(Self::Create),
             "update" => Ok(Self::Update),
             "delete" => Ok(Self::Delete),
             "rename" => Ok(Self::Rename),
+            "list_types" => Ok(Self::ListTypes),
+            "read_type" => Ok(Self::ReadType),
+            "create_type" => Ok(Self::CreateType),
+            "update_type" => Ok(Self::UpdateType),
+            "assess_type_pack" => Ok(Self::AssessTypePack),
+            "apply_type_pack" => Ok(Self::ApplyTypePack),
+            "assess_collection_setup" => Ok(Self::AssessCollectionSetup),
+            "apply_collection_setup" => Ok(Self::ApplyCollectionSetup),
             other => Err(ProviderError::UnsupportedOperation(other.to_string())),
         }
     }

@@ -24,6 +24,7 @@ pub(crate) fn reindex_file(
 ) -> Result<(), CacheError> {
     // 1. Read file contents
     let content = std::fs::read_to_string(abs_path)?;
+    let source_revision = crate::v03::revision(content.as_bytes());
 
     // 2. Get filesystem metadata
     let metadata = std::fs::metadata(abs_path)?;
@@ -95,17 +96,44 @@ pub(crate) fn reindex_file(
     }
 
     // 10. Extract and insert links
-    insert_links(conn, rel_path, &effective, &body)?;
+    insert_links(conn, rel_path, &source_revision, &effective, &body)?;
 
     // 11. Insert unique values
     insert_unique_values(conn, collection, rel_path, &effective, &type_names)?;
+
+    // 12. Index the configured collection identity independently of type
+    // membership. Runtime mutation validation uses this as an O(log n)
+    // conflict check instead of reopening every record in the collection.
+    if let Some(value) = effective
+        .get(&collection.settings.id_field)
+        .and_then(canonical_unique_value)
+    {
+        conn.execute(
+            "INSERT OR REPLACE INTO identity_values (value, path) VALUES (?1, ?2)",
+            rusqlite::params![value, rel_path],
+        )?;
+    }
     Ok(())
+}
+
+pub(crate) fn canonical_unique_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) if value.is_empty() => None,
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        other => serde_json::to_string(other)
+            .ok()
+            .filter(|value| !value.is_empty()),
+    }
 }
 
 /// Extract links from body and frontmatter and insert into the `links` table.
 fn insert_links(
     conn: &Connection,
     rel_path: &str,
+    source_revision: &str,
     frontmatter: &serde_json::Value,
     body: &str,
 ) -> Result<(), CacheError> {
@@ -113,9 +141,9 @@ fn insert_links(
     let body_links = extract_links_from_body(body);
     for raw in &body_links {
         conn.execute(
-            "INSERT INTO links (source_path, target_path, location, field, raw_target) \
-             VALUES (?1, ?2, ?3, NULL, ?4)",
-            rusqlite::params![rel_path, raw, "body", raw],
+            "INSERT INTO links (source_path, target_path, source_revision, resolved, location, field, raw_target) \
+             VALUES (?1, ?2, ?3, 0, ?4, NULL, ?5)",
+            rusqlite::params![rel_path, raw, source_revision, "body", raw],
         )?;
     }
 
@@ -123,9 +151,9 @@ fn insert_links(
     let body_embeds = extract_embeds_from_body(body);
     for raw in &body_embeds {
         conn.execute(
-            "INSERT INTO links (source_path, target_path, location, field, raw_target) \
-             VALUES (?1, ?2, ?3, NULL, ?4)",
-            rusqlite::params![rel_path, raw, "body", raw],
+            "INSERT INTO links (source_path, target_path, source_revision, resolved, location, field, raw_target) \
+             VALUES (?1, ?2, ?3, 0, ?4, NULL, ?5)",
+            rusqlite::params![rel_path, raw, source_revision, "body", raw],
         )?;
     }
 
@@ -136,9 +164,9 @@ fn insert_links(
             extract_links_from_fm_value(val, &mut targets);
             for raw in &targets {
                 conn.execute(
-                    "INSERT INTO links (source_path, target_path, location, field, raw_target) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![rel_path, raw, "frontmatter", field_name, raw],
+                    "INSERT INTO links (source_path, target_path, source_revision, resolved, location, field, raw_target) \
+                     VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
+                    rusqlite::params![rel_path, raw, source_revision, "frontmatter", field_name, raw],
                 )?;
             }
         }
@@ -213,10 +241,103 @@ pub(crate) fn remove_file(conn: &Connection, rel_path: &str) -> Result<(), Cache
         rusqlite::params![rel_path],
     )?;
     conn.execute(
+        "DELETE FROM identity_values WHERE path = ?1",
+        rusqlite::params![rel_path],
+    )?;
+    conn.execute(
         "DELETE FROM files WHERE path = ?1",
         rusqlite::params![rel_path],
     )?;
     Ok(())
+}
+
+pub(crate) fn resolve_all_links(
+    conn: &Connection,
+    collection: &Collection,
+) -> Result<(), CacheError> {
+    resolve_links(conn, collection, None)
+}
+
+pub(crate) fn resolve_links_for_sources(
+    conn: &Connection,
+    collection: &Collection,
+    sources: &HashSet<String>,
+) -> Result<(), CacheError> {
+    resolve_links(conn, collection, Some(sources))
+}
+
+fn resolve_links(
+    conn: &Connection,
+    collection: &Collection,
+    sources: Option<&HashSet<String>>,
+) -> Result<(), CacheError> {
+    let mut files = conn.prepare(
+        "SELECT path, COALESCE(effective_json, frontmatter_json) FROM files WHERE parse_error = 0",
+    )?;
+    let rows = files.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut resolution_records = Vec::new();
+    for row in rows {
+        let (path, frontmatter) = row?;
+        resolution_records.push(crate::expressions::evaluator::ResolvedFileData {
+            path,
+            frontmatter: serde_json::from_str(&frontmatter)?,
+            body: String::new(),
+        });
+    }
+    drop(files);
+    let resolution_index = collection.build_link_resolution_index(&resolution_records);
+
+    let mut links = conn.prepare("SELECT rowid, source_path, raw_target FROM links")?;
+    let rows = links.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut updates = Vec::new();
+    for row in rows {
+        let (rowid, source, raw) = row?;
+        if sources.is_some_and(|sources| !sources.contains(&source)) {
+            continue;
+        }
+        let resolved = collection.resolve_link_target(&raw, &source, &resolution_index);
+        updates.push((rowid, raw, resolved));
+    }
+    drop(links);
+    for (rowid, raw, resolved) in updates {
+        conn.execute(
+            "UPDATE links SET target_path = ?1, resolved = ?2 WHERE rowid = ?3",
+            rusqlite::params![
+                resolved.as_deref().unwrap_or(&raw),
+                i64::from(resolved.is_some()),
+                rowid
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn load_backlinks(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, Vec<String>>, CacheError> {
+    let mut statement = conn.prepare(
+        "SELECT target_path, source_path FROM links WHERE resolved = 1 ORDER BY target_path, source_path",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut backlinks = std::collections::HashMap::<String, Vec<String>>::new();
+    for row in rows {
+        let (target, source) = row?;
+        let sources = backlinks.entry(target).or_default();
+        if sources.last() != Some(&source) {
+            sources.push(source);
+        }
+    }
+    Ok(backlinks)
 }
 
 /// Full rebuild: delete everything and reindex all files.
@@ -228,7 +349,7 @@ pub(crate) fn reindex_all(
     let files = collection.scan_collection_files_checked()?;
     let transaction = conn.transaction()?;
     transaction.execute_batch(
-        "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_values; DELETE FROM files; DELETE FROM meta;",
+        "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_values; DELETE FROM identity_values; DELETE FROM files; DELETE FROM meta;",
     )?;
 
     for abs_path in &files {
@@ -239,6 +360,8 @@ pub(crate) fn reindex_all(
             .replace('\\', "/");
         reindex_file(&transaction, collection, abs_path, &rel_path)?;
     }
+
+    resolve_all_links(&transaction, collection)?;
 
     transaction.execute(
         "INSERT INTO meta (key, value) VALUES ('query_snapshot', ?1)",

@@ -156,11 +156,13 @@ impl Collection {
         &self,
         conn: &Connection,
         cancellation: &OperationCancellation,
+        include_bodies: bool,
     ) -> Result<Vec<FileRecord>, CacheError> {
-        let mut stmt = conn.prepare(
-            "SELECT f.path, f.frontmatter_json, f.effective_json, f.body, f.size, f.mtime_ns, f.ctime_ns \
+        let body = if include_bodies { "f.body" } else { "''" };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT f.path, f.frontmatter_json, f.effective_json, {body}, f.size, f.mtime_ns, f.ctime_ns \
              FROM files f WHERE f.parse_error = 0"
-        )?;
+        ))?;
 
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -231,6 +233,29 @@ impl Collection {
         limit: Option<u64>,
         cancellation: &OperationCancellation,
     ) -> Option<MetadataPage> {
+        self.load_query_metadata_page_inner(types, order_by, offset, limit, cancellation, true)
+    }
+
+    pub(crate) fn load_runtime_query_metadata_page_profiled_cancellable(
+        &self,
+        types: &[String],
+        order_by: &[(&str, bool)],
+        offset: u64,
+        limit: Option<u64>,
+        cancellation: &OperationCancellation,
+    ) -> Option<MetadataPage> {
+        self.load_query_metadata_page_inner(types, order_by, offset, limit, cancellation, false)
+    }
+
+    fn load_query_metadata_page_inner(
+        &self,
+        types: &[String],
+        order_by: &[(&str, bool)],
+        offset: u64,
+        limit: Option<u64>,
+        cancellation: &OperationCancellation,
+        refresh_from_filesystem: bool,
+    ) -> Option<MetadataPage> {
         let mut clauses = Vec::new();
         for (field, descending) in order_by {
             let direction = if *descending { "DESC" } else { "ASC" };
@@ -258,12 +283,14 @@ impl Collection {
         perf.try_open_cache_ms = elapsed_ms(open_started);
         perf.cache_used = true;
 
-        let refresh_started = Instant::now();
-        self.refresh_cache(&mut conn, cancellation).ok()?;
-        if cancellation.is_cancelled() {
-            return None;
+        if refresh_from_filesystem {
+            let refresh_started = Instant::now();
+            self.refresh_cache(&mut conn, cancellation).ok()?;
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            perf.refresh_cache_ms = elapsed_ms(refresh_started);
         }
-        perf.refresh_cache_ms = elapsed_ms(refresh_started);
 
         let load_started = Instant::now();
         let normalized_types = types
@@ -378,6 +405,7 @@ impl Collection {
         &self,
         files: &[PathBuf],
         cancellation: &OperationCancellation,
+        include_bodies: bool,
     ) -> Result<Vec<FileRecord>, SnapshotError> {
         let mut records = Vec::new();
 
@@ -435,7 +463,11 @@ impl Collection {
                 rel_path,
                 raw_frontmatter,
                 effective_frontmatter: effective,
-                body: doc.body,
+                body: if include_bodies {
+                    doc.body
+                } else {
+                    String::new()
+                },
                 type_names,
                 file_size,
                 file_mtime_iso,
@@ -466,6 +498,49 @@ impl Collection {
         include_link_graph: bool,
         cancellation: &OperationCancellation,
     ) -> Result<(CollectionSnapshot, Option<LoadQueryPerf>), SnapshotError> {
+        self.load_query_data_inner(profile, include_link_graph, true, cancellation, true)
+    }
+
+    pub(crate) fn load_runtime_query_data_profiled_cancellable(
+        &self,
+        profile: bool,
+        include_link_graph: bool,
+        include_bodies: bool,
+        cancellation: &OperationCancellation,
+    ) -> Result<(CollectionSnapshot, Option<LoadQueryPerf>), SnapshotError> {
+        self.load_query_data_inner(
+            profile,
+            include_link_graph,
+            include_bodies,
+            cancellation,
+            false,
+        )
+    }
+
+    pub(crate) fn load_query_data_profiled_cancellable_with_bodies(
+        &self,
+        profile: bool,
+        include_link_graph: bool,
+        include_bodies: bool,
+        cancellation: &OperationCancellation,
+    ) -> Result<(CollectionSnapshot, Option<LoadQueryPerf>), SnapshotError> {
+        self.load_query_data_inner(
+            profile,
+            include_link_graph,
+            include_bodies,
+            cancellation,
+            true,
+        )
+    }
+
+    fn load_query_data_inner(
+        &self,
+        profile: bool,
+        include_link_graph: bool,
+        include_bodies: bool,
+        cancellation: &OperationCancellation,
+        refresh_from_filesystem: bool,
+    ) -> Result<(CollectionSnapshot, Option<LoadQueryPerf>), SnapshotError> {
         cancellation.check().map_err(|_| SnapshotError::Cancelled)?;
         let total_start = Instant::now();
         let mut perf = LoadQueryPerf {
@@ -478,30 +553,53 @@ impl Collection {
         perf.try_open_cache_ms = elapsed_ms(try_open_start);
 
         let mut cached_records = None;
+        let mut coordinated_cache_error = None;
         match cache {
             Ok(Some(mut conn)) => {
-                let refresh_start = Instant::now();
-                let refresh = self.refresh_cache(&mut conn, cancellation);
-                perf.refresh_cache_ms = elapsed_ms(refresh_start);
+                let refresh = if refresh_from_filesystem {
+                    let refresh_start = Instant::now();
+                    let result = self.refresh_cache(&mut conn, cancellation);
+                    perf.refresh_cache_ms = elapsed_ms(refresh_start);
+                    result.map(|_| ())
+                } else {
+                    Ok(())
+                };
                 cancellation.check().map_err(|_| SnapshotError::Cancelled)?;
                 match refresh {
                     Ok(_) => {
                         let load_start = Instant::now();
-                        let loaded = self.load_file_records_from_cache(&conn, cancellation);
+                        let loaded =
+                            self.load_file_records_from_cache(&conn, cancellation, include_bodies);
                         perf.load_records_ms = elapsed_ms(load_start);
                         match loaded {
                             Ok(records) => {
                                 perf.cache_used = true;
                                 cached_records = Some(records);
                             }
-                            Err(_) => perf.cache_fallback = true,
+                            Err(error) => {
+                                perf.cache_fallback = true;
+                                coordinated_cache_error = Some(error.to_string());
+                            }
                         }
                     }
-                    Err(_) => perf.cache_fallback = true,
+                    Err(error) => {
+                        perf.cache_fallback = true;
+                        coordinated_cache_error = Some(error.to_string());
+                    }
                 }
             }
-            Ok(None) => {}
-            Err(_) => perf.cache_fallback = true,
+            Ok(None) => coordinated_cache_error = Some("cache database is missing".to_string()),
+            Err(error) => {
+                perf.cache_fallback = true;
+                coordinated_cache_error = Some(error.to_string());
+            }
+        }
+
+        if !refresh_from_filesystem && cached_records.is_none() {
+            return Err(SnapshotError::Cache(
+                coordinated_cache_error
+                    .unwrap_or_else(|| "cache records could not be loaded".to_string()),
+            ));
         }
 
         let file_records = if let Some(records) = cached_records {
@@ -512,7 +610,7 @@ impl Collection {
             perf.scan_files_ms = elapsed_ms(scan_start);
 
             let load_start = Instant::now();
-            let records = self.load_file_records_from_disk(&files, cancellation)?;
+            let records = self.load_file_records_from_disk(&files, cancellation, include_bodies)?;
             perf.load_records_ms = elapsed_ms(load_start);
             records
         };
@@ -537,8 +635,15 @@ impl Collection {
 
             let backlinks_start = Instant::now();
             let all_files_arc = Arc::new(all_files_data);
-            let (backlinks_index, backlinks_perf) =
-                self.build_backlinks_index_profiled(&all_files_arc, profile);
+            let cached_backlinks = (perf.cache_used && !refresh_from_filesystem).then(|| {
+                sqlite::open_cache_db(&self.root, &self.settings.cache_folder)
+                    .map_err(CacheError::from)
+                    .and_then(|connection| indexer::load_backlinks(&connection))
+            });
+            let (backlinks_index, backlinks_perf) = match cached_backlinks {
+                Some(Ok(backlinks)) => (backlinks, None),
+                _ => self.build_backlinks_index_profiled(&all_files_arc, profile),
+            };
             cancellation.check().map_err(|_| SnapshotError::Cancelled)?;
             let backlinks_arc = Arc::new(backlinks_index);
             perf.build_backlinks_ms = elapsed_ms(backlinks_start);

@@ -13,7 +13,19 @@ use crate::api::CollectionPath;
 use crate::operations::{
     atomic_create, atomic_write, ensure_no_symlink_components, ensure_safe_relative_path,
 };
+use crate::runtime::OperationContext;
 use crate::{Collection, SpecProfile};
+
+mod runtime;
+pub(crate) use runtime::{
+    ack_runtime_change_event, ack_runtime_resolution, attach_runtime_prepared,
+    cancel_runtime_prepared, commit_runtime_prepared, list_unacked_runtime_events,
+    prepare_runtime_transaction, reset_runtime_support_for_fork, resolve_runtime_claim,
+    resolve_runtime_commit, settle_runtime_commit, RuntimeCommitAttempt, RuntimePrepareInput,
+    RuntimePrepareOutcome, RuntimeResolution,
+};
+#[cfg(test)]
+pub(crate) use runtime::{set_runtime_crash_point, set_runtime_settlement_delay};
 
 pub(crate) type FileBaseline = BTreeMap<String, Vec<u8>>;
 
@@ -41,6 +53,12 @@ pub(crate) enum TransactionError {
     ConcurrentModification(String),
     #[error("transaction requires manual recovery: {0}")]
     ManualRecovery(String),
+    #[error("host mutation claim was reused with different canonical input")]
+    ClaimMismatch,
+    #[error("runtime transaction metadata capacity is exhausted")]
+    RuntimeCapacityExhausted,
+    #[error("transaction did not cross its durable boundary: {code}")]
+    OperationBoundary { code: &'static str },
     #[cfg(test)]
     #[error("simulated process interruption")]
     SimulatedCrash,
@@ -54,6 +72,9 @@ impl TransactionError {
             Self::UnsafePath(_) => "path_traversal",
             Self::ConcurrentModification(_) => "concurrent_modification",
             Self::ManualRecovery(_) => "manual_recovery_required",
+            Self::ClaimMismatch => "claim_mismatch",
+            Self::RuntimeCapacityExhausted => "runtime_capacity_exhausted",
+            Self::OperationBoundary { code } => code,
             #[cfg(test)]
             Self::SimulatedCrash => "simulated_crash",
         }
@@ -73,6 +94,7 @@ enum Phase {
 enum TransactionScope {
     #[default]
     Records,
+    Resources,
     SystemMigration,
 }
 
@@ -266,10 +288,7 @@ pub(crate) fn recover_pending(collection: &Collection) -> Result<bool, Transacti
         })
         .collect::<Result<Vec<_>, _>>()?;
     directories.sort();
-    if directories.is_empty() {
-        return Ok(false);
-    }
-
+    let mut changed = false;
     for directory in directories {
         let metadata = fs::symlink_metadata(&directory)
             .map_err(|source| io_error(directory.clone(), source))?;
@@ -279,14 +298,20 @@ pub(crate) fn recover_pending(collection: &Collection) -> Result<bool, Transacti
                 directory.display()
             )));
         }
-        recover_one(collection, &directory)?;
+        changed |= recover_one(collection, &directory)?;
     }
-    Ok(true)
+    Ok(changed)
 }
 
-fn recover_one(collection: &Collection, directory: &Path) -> Result<(), TransactionError> {
+fn recover_one(collection: &Collection, directory: &Path) -> Result<bool, TransactionError> {
     let journal_path = directory.join(JOURNAL_FILE);
     let bytes = fs::read(&journal_path).map_err(|source| io_error(journal_path.clone(), source))?;
+    let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64));
+    if version == Some(2) {
+        return runtime::recover_runtime_one(collection, directory, &bytes);
+    }
     let mut journal: Journal = serde_json::from_slice(&bytes)
         .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
     if journal.version != 1
@@ -325,11 +350,11 @@ fn recover_one(collection: &Collection, directory: &Path) -> Result<(), Transact
     match journal.phase {
         Phase::Prepared if journal.applied == 0 => {
             cleanup_transaction(directory);
-            return Ok(());
+            return Ok(true);
         }
         Phase::Committed => {
             cleanup_transaction(directory);
-            return Ok(());
+            return Ok(true);
         }
         Phase::Prepared | Phase::Committing => {}
     }
@@ -381,7 +406,7 @@ fn recover_one(collection: &Collection, directory: &Path) -> Result<(), Transact
     journal.phase = Phase::Committed;
     persist_journal(directory, &journal)?;
     cleanup_transaction(directory);
-    Ok(())
+    Ok(true)
 }
 
 fn recheck_preconditions(
@@ -446,6 +471,31 @@ fn validate_entry_path(
         TransactionScope::Records => collection
             .validate_record_path(path)
             .map_err(|error| TransactionError::UnsafePath(error.to_string()))?,
+        TransactionScope::Resources => {
+            let logical = CollectionPath::new(path)
+                .map_err(|error| TransactionError::UnsafePath(error.to_string()))?;
+            let resource = Path::new(logical.as_str());
+            let hidden_or_reserved = resource.components().any(|component| {
+                let value = component.as_os_str().to_string_lossy();
+                value.starts_with('.') || matches!(value.as_ref(), "node_modules" | "target")
+            });
+            let managed = matches!(
+                logical.as_str(),
+                "mdbase.yaml" | "mdbase.lock.yaml" | "mdbase.provisions.yaml"
+            ) || resource.starts_with(&collection.settings.types_folder)
+                || resource.starts_with(&collection.settings.contracts_folder)
+                || resource.extension().and_then(|value| value.to_str()) == Some("base")
+                || (resource.extension().and_then(|value| value.to_str()) == Some("json")
+                    && resource.components().any(|component| {
+                        matches!(component.as_os_str().to_str(), Some("schemas" | "_schemas"))
+                    }));
+            if hidden_or_reserved || !managed {
+                return Err(TransactionError::UnsafePath(format!(
+                    "'{path}' is not a managed collection resource"
+                )));
+            }
+            logical
+        }
         TransactionScope::SystemMigration => CollectionPath::new(path)
             .map_err(|error| TransactionError::UnsafePath(error.to_string()))?,
     };
@@ -549,6 +599,37 @@ impl Drop for StagingGuard {
 
 impl WriteLock {
     pub(crate) fn acquire(collection: &Collection) -> Result<Self, TransactionError> {
+        let (file, path) = Self::open(collection)?;
+        file.lock_exclusive()
+            .map_err(|source| io_error(path, source))?;
+        Ok(Self { file })
+    }
+
+    pub(crate) fn acquire_context(
+        collection: &Collection,
+        context: &OperationContext,
+    ) -> Result<Self, TransactionError> {
+        let (file, path) = Self::open(collection)?;
+        loop {
+            context
+                .check()
+                .map_err(|error| TransactionError::OperationBoundary { code: error.code() })?;
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { file }),
+                Err(error) if lock_is_contended(&error) => {
+                    std::thread::sleep(
+                        context
+                            .deadline()
+                            .remaining()
+                            .min(std::time::Duration::from_millis(10)),
+                    );
+                }
+                Err(source) => return Err(io_error(path, source)),
+            }
+        }
+    }
+
+    fn open(collection: &Collection) -> Result<(File, PathBuf), TransactionError> {
         ensure_no_symlink_components(
             &collection.root,
             ".mdbase/write.lock",
@@ -565,9 +646,23 @@ impl WriteLock {
             .truncate(false)
             .open(&path)
             .map_err(|source| io_error(path.clone(), source))?;
-        file.lock_exclusive()
-            .map_err(|source| io_error(path, source))?;
-        Ok(Self { file })
+        Ok((file, path))
+    }
+}
+
+fn lock_is_contended(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // LockFileEx reports these Win32 lock races without mapping them to
+        // ErrorKind::WouldBlock in every supported Rust toolchain.
+        matches!(error.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 

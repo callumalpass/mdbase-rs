@@ -32,6 +32,10 @@ impl<'a> Operations<'a> {
         Ok(Self { collection })
     }
 
+    pub(crate) fn collection(&self) -> &'a Collection {
+        self.collection
+    }
+
     pub fn read(&self, input: &Value) -> OperationResult {
         let mut result = self.normalize("read", input, self.collection.read(input));
         self.attach_match_diagnostics(&mut result);
@@ -90,6 +94,14 @@ impl<'a> Operations<'a> {
         cancellation: &crate::OperationCancellation,
     ) -> Result<OperationResult, crate::OperationCancelled> {
         super::query::execute_cancellable(self.collection, input, cancellation)
+    }
+
+    pub(crate) fn query_runtime_cancellable(
+        &self,
+        input: &Value,
+        cancellation: &crate::OperationCancellation,
+    ) -> Result<OperationResult, crate::OperationCancelled> {
+        super::query::execute_runtime_cancellable(self.collection, input, cancellation)
     }
 
     /// Discover canonical and configured compatibility view sources.

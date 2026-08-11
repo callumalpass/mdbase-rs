@@ -38,7 +38,7 @@ pub mod validation;
 pub mod views;
 pub mod watch;
 
-pub use cancellation::{OperationCancellation, OperationCancelled};
+pub use cancellation::{OperationCancellation, OperationCancelled, OperationStopReason};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
