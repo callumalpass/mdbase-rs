@@ -405,7 +405,7 @@ struct RecordState {
 
 impl Snapshot {
     fn load(root: &Path) -> Result<Self, WatchError> {
-        let collection = Collection::open(root)
+        let collection = Collection::open_for_observation(root)
             .map_err(|error| WatchError::Collection(collection_error(&error)))?;
         let canonical = collection
             .snapshot()
@@ -520,7 +520,7 @@ impl Snapshot {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
-        let collection = Collection::open(root)
+        let collection = Collection::open_for_observation(root)
             .map_err(|error| WatchError::Collection(collection_error(&error)))?;
         let mut before = BTreeMap::new();
         let mut replacements = Vec::new();
@@ -873,6 +873,61 @@ mod tests {
             snapshot.invalidation_paths(directory.path(), &changed("mdbase.yaml")),
             None
         );
+    }
+
+    #[test]
+    fn watcher_observation_never_settles_a_runtime_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        let runtime =
+            crate::runtime::FilesystemRuntime::open(directory.path(), Duration::from_secs(60))
+                .unwrap();
+        let request = crate::runtime::OperationRequest::new(
+            crate::runtime::OperationKind::Create,
+            json!({
+                "path": "pending.md",
+                "frontmatter": {"id": "pending"},
+                "body": "pending body"
+            }),
+        );
+        let prepared = match runtime
+            .prepare(
+                &request,
+                &crate::runtime::HostClaimId::generate(),
+                &crate::runtime::OperationContext::legacy(),
+            )
+            .unwrap()
+        {
+            crate::runtime::PreparationOutcome::Prepared(prepared) => prepared,
+            other => panic!("expected prepared mutation, got {other:?}"),
+        };
+        crate::transactions::set_runtime_crash_point(prepared.commit_id(), 1);
+        assert!(runtime
+            .commit(&prepared, &crate::runtime::OperationContext::legacy())
+            .is_err());
+
+        let journal_path = directory
+            .path()
+            .join(".mdbase/transactions")
+            .join(prepared.commit_id().as_str())
+            .join("journal.json");
+        let phase = || {
+            serde_json::from_slice::<Value>(&fs::read(&journal_path).unwrap()).unwrap()["phase"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(phase(), "committing");
+        assert!(!directory.path().join("pending.md").exists());
+
+        let observed = Snapshot::load(directory.path()).unwrap();
+        assert!(observed.records.is_empty());
+        assert_eq!(phase(), "committing");
+        assert!(!directory.path().join("pending.md").exists());
     }
 
     #[test]

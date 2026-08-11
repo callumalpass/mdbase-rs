@@ -169,6 +169,23 @@ impl Collection {
 
     /// Open a collection from a root directory.
     pub fn open(root: &Path) -> Result<Self, serde_json::Value> {
+        Self::open_with_recovery(root, true)
+    }
+
+    /// Load collection state for an observer that must never own recovery.
+    ///
+    /// Watchers use this path while a coordinated runtime remains the sole
+    /// owner of durable transaction settlement. The returned collection is a
+    /// point-in-time reader; callers must tolerate a later reconciliation when
+    /// an in-flight transaction reaches its final state.
+    pub(crate) fn open_for_observation(root: &Path) -> Result<Self, serde_json::Value> {
+        Self::open_with_recovery(root, false)
+    }
+
+    fn open_with_recovery(
+        root: &Path,
+        recover_pending_transactions: bool,
+    ) -> Result<Self, serde_json::Value> {
         let config_result = config::load_config_for_open(root);
         if config_result.get("valid") != Some(&serde_json::Value::Bool(true)) {
             return Err(config_result);
@@ -300,17 +317,17 @@ impl Collection {
         // loading types first could otherwise make the recovery journal
         // unreachable. Re-open from scratch if recovery changed any files so
         // config and settings are parsed from the completed transaction.
-        let recovery_collection = Collection {
-            root: root.to_path_buf(),
-            spec_profile,
-            settings: settings.clone(),
-            config_extensions: config_extensions.clone(),
-            types: HashMap::new(),
-            type_plans: HashMap::new(),
-            type_warnings: Vec::new(),
-            data_contracts: data_contracts::DataContractRegistry::empty(),
-        };
-        let recovered =
+        let recovered = if recover_pending_transactions {
+            let recovery_collection = Collection {
+                root: root.to_path_buf(),
+                spec_profile,
+                settings: settings.clone(),
+                config_extensions: config_extensions.clone(),
+                types: HashMap::new(),
+                type_plans: HashMap::new(),
+                type_warnings: Vec::new(),
+                data_contracts: data_contracts::DataContractRegistry::empty(),
+            };
             crate::transactions::recover_pending(&recovery_collection).map_err(|error| {
                 serde_json::json!({
                     "valid": false,
@@ -319,9 +336,12 @@ impl Collection {
                         "message": error.to_string(),
                     }
                 })
-            })?;
+            })?
+        } else {
+            false
+        };
         if recovered {
-            return Self::open(root);
+            return Self::open_with_recovery(root, recover_pending_transactions);
         }
 
         // Load types
