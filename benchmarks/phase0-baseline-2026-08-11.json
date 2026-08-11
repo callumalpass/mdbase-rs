@@ -5,7 +5,7 @@
   "generated_at": "2026-08-11T12:35:46.407392906+00:00",
   "source": {
     "mdbase_rs": "7064d6247d841cdd0d3cbd51f56394a47c449800",
-    "mdbase_connect": "1992f7105cba6192349b448438cc224d92b3f373"
+    "mdbase_connect": "d4138fb93ea0606d141139c96062136fee1cd409"
   },
   "host": {"os": "linux", "arch": "x86_64", "parallelism": 16},
   "configuration": {
@@ -36,7 +36,7 @@
       "single_collection_elapsed_ms": 9824.343597,
       "two_collection_requests": 160,
       "two_collection_elapsed_ms": 205.062929,
-      "rss_soak": {"requests": 1600, "baseline_kb": 31212, "peak_kb": 31212, "after_kb": 31212, "baseline_pss_kb": 28598, "peak_pss_kb": 28598, "after_pss_kb": 28598, "errors": 0},
+      "rss_soak": {"requests": 1600, "baseline_kb": 31212, "sampled_peak_kb": 31212, "after_kb": 31212, "baseline_pss_kb": 28598, "sampled_peak_pss_kb": 28598, "after_pss_kb": 28598, "errors": 0},
       "correctness": {"reference_rename": true, "watcher_events": 5, "errors": 0}
     },
     {
@@ -56,13 +56,13 @@
       "single_collection_elapsed_ms": 40017.256398,
       "two_collection_requests": 160,
       "two_collection_elapsed_ms": 640.836684,
-      "rss_soak": {"requests": 1600, "baseline_kb": 98800, "peak_kb": 98800, "after_kb": 98800, "baseline_pss_kb": 96186, "peak_pss_kb": 96186, "after_pss_kb": 96186, "errors": 0},
+      "rss_soak": {"requests": 1600, "baseline_kb": 98800, "sampled_peak_kb": 98800, "after_kb": 98800, "baseline_pss_kb": 96186, "sampled_peak_pss_kb": 96186, "after_pss_kb": 96186, "errors": 0},
       "correctness": {"reference_rename": true, "watcher_events": 5, "errors": 0}
     }
   ],
   "gaps": [
     "No Connect relay/admission/NATS or daemon-level observation.",
-    "RSS/PSS is Linux /proc telemetry and non-gating.",
+    "RSS/PSS is Linux /proc between-request telemetry, misses transient in-operation peaks, and is non-gating.",
     "Saved-view workload remains covered by the existing release profiler."
   ]
 }

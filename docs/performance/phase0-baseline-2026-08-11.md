@@ -10,7 +10,7 @@ summary is `benchmarks/phase0-baseline-2026-08-11.json`).
 Source pins for this run:
 
 - mdbase-rs: `7064d6247d841cdd0d3cbd51f56394a47c449800`
-- mdbase-connect: `1992f7105cba6192349b448438cc224d92b3f373`
+- mdbase-connect reference baseline: `d4138fb93ea0606d141139c96062136fee1cd409`
 - host: Linux x86_64, 16 logical CPUs
 
 ## Workload summary
@@ -34,11 +34,12 @@ cache-refresh timing: mean 24.24 ms (2,000) and 127.22 ms (10,000).
 | 10,000 | mixed provider work, one collection | 4 | 160 | 40,017.26 | 4.00 | 0 |
 | 10,000 | two active collections | 4 | 160 | 640.84 | 249.67 | 0 |
 
-The 1,600-request read/query soak completed with zero errors. RSS/PSS was
-31,212/28,598 KiB at baseline and peak for 2,000 records, ending at
+The 1,600-request read/query soak completed with zero errors. Between-request
+RSS/PSS samples were 31,212/28,598 KiB at baseline and sampled peak for 2,000 records, ending at
 31,212/28,598 KiB. For 10,000 records it was 98,800/96,186 KiB at baseline and
-peak, ending at 98,800/96,186 KiB. `/proc` values are observations only, not
-acceptance budgets.
+sampled peak, ending at 98,800/96,186 KiB. These samples do not capture transient
+allocations inside an operation; `/proc` values are observations only, not acceptance
+budgets.
 
 ## Correctness gates
 
@@ -57,4 +58,4 @@ acceptance budgets.
 - The existing saved-view profile is not duplicated; query phase/cache-refresh
   timings are retained. Run the existing release profiler separately for view
   observations.
-- RSS/PSS support is Linux `/proc`-dependent and remains non-gating.
+- RSS/PSS support is Linux `/proc`-dependent, sampled between requests, and remains non-gating.

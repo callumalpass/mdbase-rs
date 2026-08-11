@@ -155,10 +155,10 @@ struct RssSummary {
     elapsed_ms: f64,
     requests_per_sec: f64,
     baseline_rss_kb: Option<u64>,
-    peak_rss_kb: Option<u64>,
+    sampled_peak_rss_kb: Option<u64>,
     after_rss_kb: Option<u64>,
     baseline_pss_kb: Option<u64>,
-    peak_pss_kb: Option<u64>,
+    sampled_peak_pss_kb: Option<u64>,
     after_pss_kb: Option<u64>,
     checkpoints: Vec<RssCheckpoint>,
     errors: usize,
@@ -256,7 +256,7 @@ fn run() -> Result<(), String> {
         workloads,
         gaps: vec![
             "This local runner does not exercise Connect relay/admission or NATS; those remain integration evidence.".into(),
-            "RSS/PSS observations use Linux /proc when available and are informational, not thresholds.".into(),
+            "RSS/PSS observations use Linux /proc between requests, miss transient in-operation peaks, and are informational rather than thresholds.".into(),
             "The existing profile engine's saved-view workload is not duplicated here; query phase timings and cache refresh are retained.".into(),
         ],
     };
@@ -914,10 +914,10 @@ fn profile_rss_soak(
         elapsed_ms,
         requests_per_sec: requests as f64 / (elapsed_ms / 1_000.0).max(f64::MIN_POSITIVE),
         baseline_rss_kb: baseline.map(|value| value.0),
-        peak_rss_kb: peak.map(|value| value.0),
+        sampled_peak_rss_kb: peak.map(|value| value.0),
         after_rss_kb: after.map(|value| value.0),
         baseline_pss_kb: baseline.map(|value| value.1),
-        peak_pss_kb: peak.map(|value| value.1),
+        sampled_peak_pss_kb: peak.map(|value| value.1),
         after_pss_kb: after.map(|value| value.1),
         checkpoints,
         errors,
@@ -1131,14 +1131,14 @@ fn render_markdown(report: &Report) -> String {
         }
         if let Some(rss) = &workload.rss_soak {
             output.push_str(&format!(
-                "- RSS soak: {} requests, {:.2} ms, baseline/peak/after RSS {:?}/{:?}/{:?} KiB; baseline/peak/after PSS {:?}/{:?}/{:?} KiB; {} errors.\n",
+                "- RSS soak: {} requests, {:.2} ms, baseline/sampled-between-request peak/after RSS {:?}/{:?}/{:?} KiB; baseline/sampled-between-request peak/after PSS {:?}/{:?}/{:?} KiB; {} errors.\n",
                 rss.requests,
                 rss.elapsed_ms,
                 rss.baseline_rss_kb,
-                rss.peak_rss_kb,
+                rss.sampled_peak_rss_kb,
                 rss.after_rss_kb,
                 rss.baseline_pss_kb,
-                rss.peak_pss_kb,
+                rss.sampled_peak_pss_kb,
                 rss.after_pss_kb,
                 rss.errors
             ));
