@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "summary_only": true,
+  "tool": "mdbase-phase0-baseline",
+  "generated_at": "2026-08-11T12:35:46.407392906+00:00",
+  "source": {
+    "mdbase_rs": "7064d6247d841cdd0d3cbd51f56394a47c449800",
+    "mdbase_connect": "1992f7105cba6192349b448438cc224d92b3f373"
+  },
+  "host": {"os": "linux", "arch": "x86_64", "parallelism": 16},
+  "configuration": {
+    "record_sizes": [2000, 10000],
+    "reference_records": 100,
+    "query_limit": 200,
+    "pagination_limit": 200,
+    "mixed_threads": 4,
+    "mixed_rounds_per_thread": 40,
+    "rss_requests": 1600,
+    "thresholds_enforced": false
+  },
+  "workloads": [
+    {
+      "records": 2000,
+      "setup_ms": 47.489106,
+      "query_200_p95_ms": 65.627360,
+      "query_cache_refresh_mean_ms": 24.241,
+      "pagination": {"rows": 2100, "pages": 11, "p95_ms": 113.107248},
+      "cache_rebuild_mean_ms": 56.728706,
+      "update_mean_ms": 27.145550,
+      "create_mean_ms": 2.450647,
+      "delete_mean_ms": 1.148309,
+      "rename_update_refs_mean_ms": 164.015592,
+      "provider_mutation_mean_ms": 101.127169,
+      "watcher_sync_mean_ms": 87.125903,
+      "single_collection_requests": 160,
+      "single_collection_elapsed_ms": 9824.343597,
+      "two_collection_requests": 160,
+      "two_collection_elapsed_ms": 205.062929,
+      "rss_soak": {"requests": 1600, "baseline_kb": 31212, "peak_kb": 31212, "after_kb": 31212, "baseline_pss_kb": 28598, "peak_pss_kb": 28598, "after_pss_kb": 28598, "errors": 0},
+      "correctness": {"reference_rename": true, "watcher_events": 5, "errors": 0}
+    },
+    {
+      "records": 10000,
+      "setup_ms": 245.028795,
+      "query_200_p95_ms": 289.185743,
+      "query_cache_refresh_mean_ms": 127.216333,
+      "pagination": {"rows": 10100, "pages": 51, "p95_ms": 2212.742438},
+      "cache_rebuild_mean_ms": 257.690604,
+      "update_mean_ms": 119.343892,
+      "create_mean_ms": 2.335201,
+      "delete_mean_ms": 1.111219,
+      "rename_update_refs_mean_ms": 298.290352,
+      "provider_mutation_mean_ms": 414.994955,
+      "watcher_sync_mean_ms": 402.044619,
+      "single_collection_requests": 160,
+      "single_collection_elapsed_ms": 40017.256398,
+      "two_collection_requests": 160,
+      "two_collection_elapsed_ms": 640.836684,
+      "rss_soak": {"requests": 1600, "baseline_kb": 98800, "peak_kb": 98800, "after_kb": 98800, "baseline_pss_kb": 96186, "peak_pss_kb": 96186, "after_pss_kb": 96186, "errors": 0},
+      "correctness": {"reference_rename": true, "watcher_events": 5, "errors": 0}
+    }
+  ],
+  "gaps": [
+    "No Connect relay/admission/NATS or daemon-level observation.",
+    "RSS/PSS is Linux /proc telemetry and non-gating.",
+    "Saved-view workload remains covered by the existing release profiler."
+  ]
+}
