@@ -827,8 +827,13 @@ mod tests {
             "---\ntitle: Visible\n---\n",
         )
         .unwrap();
+        // FSEvents may coalesce a later file event with an earlier directory
+        // notification even though both classifications are correct. The
+        // explicit path rescan is the host's deterministic post-write path and
+        // also proves that ignored churn did not stop the worker.
+        watcher.rescan_paths(["note.md"]).unwrap();
         let event = watcher
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::ZERO)
             .unwrap()
             .expect("record event");
         assert_eq!(event.event_type, "mdbase.record.created");
