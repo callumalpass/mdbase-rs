@@ -271,7 +271,7 @@ fn materialize_snapshot_record(
     }
 }
 
-fn is_schema_resource_path(path: &str) -> bool {
+pub(crate) fn is_schema_resource_path(path: &str) -> bool {
     let mut components = path.split('/');
     components
         .clone()

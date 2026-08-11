@@ -39,6 +39,7 @@ pub use outcome::{
     ResourceChangeKind, RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeMeasurements,
 };
 pub use provider::{CollectionProvider, FilesystemProvider};
+pub(crate) use snapshot::is_schema_resource_path;
 pub use snapshot::{
     CollectionSnapshot, CollectionSnapshotRecord, CollectionSnapshotResource,
     CollectionSnapshotResourceKind,
