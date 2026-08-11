@@ -382,6 +382,9 @@ struct Snapshot {
     types_folder: String,
     contracts_folder: String,
     cache_folder: String,
+    migrations_folder: String,
+    exclude: Vec<String>,
+    include_subfolders: bool,
     record_extensions: BTreeSet<String>,
 }
 
@@ -446,6 +449,9 @@ impl Snapshot {
             types_folder: collection.settings.types_folder.clone(),
             contracts_folder: collection.settings.contracts_folder.clone(),
             cache_folder: collection.settings.cache_folder.clone(),
+            migrations_folder: collection.settings.migrations_folder.clone(),
+            exclude: collection.settings.exclude.clone(),
+            include_subfolders: collection.settings.include_subfolders,
             record_extensions: std::iter::once("md".to_string())
                 .chain(
                     collection
@@ -470,33 +476,40 @@ impl Snapshot {
                 return None;
             }
             if normalized == "mdbase.yaml"
+                || normalized == "mdbase.lock.yaml"
+                || normalized == "mdbase.provisions.yaml"
                 || normalized == self.types_folder
                 || normalized.starts_with(&format!("{}/", self.types_folder))
                 || normalized == self.contracts_folder
                 || normalized.starts_with(&format!("{}/", self.contracts_folder))
+                || self.resources.contains_key(&normalized)
+                || crate::runtime::is_schema_resource_path(&normalized)
+                || relative.extension().and_then(|value| value.to_str()) == Some("base")
             {
                 return None;
             }
-            if normalized == self.cache_folder
-                || normalized.starts_with(&format!("{}/", self.cache_folder))
-                || normalized == ".git"
-                || normalized.starts_with(".git/")
-                || normalized == "node_modules"
-                || normalized.starts_with("node_modules/")
-            {
+            if self.is_ignored_path(&normalized) {
                 continue;
             }
             let extension = relative.extension().and_then(|value| value.to_str());
             if extension.is_some_and(|extension| self.record_extensions.contains(extension)) {
                 records.insert(PathBuf::from(normalized));
-            } else {
-                // Any non-ignored, non-record path can be a contract, schema,
-                // view, lock, or future resource. Reconcile the resource map
-                // rather than teaching hosts another inference table.
-                return None;
             }
         }
         Some(records)
+    }
+
+    fn is_ignored_path(&self, path: &str) -> bool {
+        crate::record_path::has_hidden_component(path)
+            || path == self.cache_folder
+            || path.starts_with(&format!("{}/", self.cache_folder))
+            || path == self.migrations_folder
+            || path.starts_with(&format!("{}/", self.migrations_folder))
+            || self
+                .exclude
+                .iter()
+                .any(|pattern| crate::matching::glob::match_glob_pattern(pattern, path))
+            || (!self.include_subfolders && path.contains('/'))
     }
 
     fn refresh_paths(
@@ -784,6 +797,82 @@ mod tests {
         ] {
             assert!(invalidates_snapshot(&Event::new(kind)), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn hidden_and_binary_changes_do_not_reload_the_record_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join(".obsidian")).unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(60)).unwrap();
+
+        fs::write(
+            directory.path().join(".obsidian/workspace.json"),
+            "{\"active\":true}\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("attachment.pdf"), b"binary fixture").unwrap();
+
+        assert!(watcher
+            .recv_timeout(Duration::from_millis(300))
+            .unwrap()
+            .is_none());
+
+        fs::write(
+            directory.path().join("note.md"),
+            "---\ntitle: Visible\n---\n",
+        )
+        .unwrap();
+        let event = watcher
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .expect("record event");
+        assert_eq!(event.event_type, "mdbase.record.created");
+        assert_eq!(event.payload["path"], "note.md");
+    }
+
+    #[test]
+    fn filesystem_invalidation_routes_only_semantic_collection_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        let snapshot = Snapshot::load(directory.path()).unwrap();
+        let changed = |path: &str| {
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                .add_path(directory.path().join(path))
+        };
+
+        assert_eq!(
+            snapshot.invalidation_paths(directory.path(), &changed(".obsidian/workspace.json")),
+            Some(BTreeSet::new())
+        );
+        assert_eq!(
+            snapshot.invalidation_paths(directory.path(), &changed("attachments/photo.png")),
+            Some(BTreeSet::new())
+        );
+        assert_eq!(
+            snapshot.invalidation_paths(directory.path(), &changed("notes/today.md")),
+            Some(BTreeSet::from([PathBuf::from("notes/today.md")]))
+        );
+        assert_eq!(
+            snapshot.invalidation_paths(directory.path(), &changed("schemas/note.json")),
+            None
+        );
+        assert_eq!(
+            snapshot.invalidation_paths(directory.path(), &changed("views/tasks.base")),
+            None
+        );
+        assert_eq!(
+            snapshot.invalidation_paths(directory.path(), &changed("mdbase.yaml")),
+            None
+        );
     }
 
     #[test]
