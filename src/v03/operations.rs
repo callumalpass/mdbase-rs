@@ -32,6 +32,10 @@ impl<'a> Operations<'a> {
         Ok(Self { collection })
     }
 
+    pub(crate) fn collection(&self) -> &'a Collection {
+        self.collection
+    }
+
     pub fn read(&self, input: &Value) -> OperationResult {
         let mut result = self.normalize("read", input, self.collection.read(input));
         self.attach_match_diagnostics(&mut result);

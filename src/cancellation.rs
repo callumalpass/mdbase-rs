@@ -27,7 +27,7 @@ impl OperationCancellation {
     pub fn with_deadline(&self, deadline: Instant) -> Self {
         Self {
             cancelled: self.cancelled.clone(),
-            deadline: Some(deadline),
+            deadline: Some(self.deadline.map_or(deadline, |current| current.min(deadline))),
         }
     }
 
@@ -104,5 +104,13 @@ mod tests {
         assert_eq!(bounded.stop_reason(), Some(OperationStopReason::Deadline));
         assert_eq!(bounded.check(), Err(OperationCancelled));
         assert_eq!(root.stop_reason(), None);
+    }
+
+    #[test]
+    fn deriving_a_deadline_never_extends_an_existing_budget() {
+        let root = OperationCancellation::new().with_deadline(Instant::now());
+        let derived = root.with_deadline(Instant::now() + std::time::Duration::from_secs(60));
+
+        assert_eq!(derived.stop_reason(), Some(OperationStopReason::Deadline));
     }
 }

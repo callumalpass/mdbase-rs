@@ -389,6 +389,47 @@ fn runtime_prepare_is_durable_but_does_not_change_canonical_files() {
 }
 
 #[test]
+fn runtime_commits_type_resources_without_a_host_side_mutation_path() {
+    let directory = collection();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    let request = OperationRequest::new(
+        OperationKind::CreateType,
+        json!({
+            "document": "---\nkind: mdbase.type\nname: project\nversion: 1\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n"
+        }),
+    );
+    let claim = HostClaimId::generate();
+    let prepared = match runtime
+        .prepare(&request, &claim, &OperationContext::legacy())
+        .unwrap()
+    {
+        PreparationOutcome::Prepared(prepared) => prepared,
+        other => panic!("expected a prepared type mutation, got {other:?}"),
+    };
+    assert!(!directory.path().join("_types/project.md").exists());
+
+    let outcome = match runtime
+        .commit(&prepared, &OperationContext::legacy())
+        .unwrap()
+    {
+        CommitAttempt::Committed(outcome) => outcome,
+        other => panic!("expected a committed type mutation, got {other:?}"),
+    };
+    assert!(outcome.result.valid, "{:?}", outcome.result.diagnostics);
+    assert!(directory.path().join("_types/project.md").is_file());
+    let ChangeSet::Exact(changes) = outcome.changes else {
+        panic!("type mutation must return exact resource changes")
+    };
+    assert!(matches!(
+        changes.items(),
+        [CanonicalChange::Resource(ResourceChange {
+            kind: ResourceChangeKind::TypeDefinition,
+            ..
+        })]
+    ));
+}
+
+#[test]
 fn runtime_prepared_claim_reattaches_after_restart_without_recovery_loop() {
     let directory = collection();
     let claim = HostClaimId::generate();

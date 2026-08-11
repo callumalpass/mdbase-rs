@@ -80,14 +80,49 @@ fn execute_staged_operation(
         "create" | "update" | "delete" | "rename" => {
             operations.execute_mutation_direct(operation, input)
         }
+        "batch" => operations.batch(input),
         "create_view_source" => operations.create_view_source(input),
         "update_view_source" => operations.update_view_source(input),
         "delete_view_source" => operations.delete_view_source(input),
+        "create_type" => operations.create_type(input),
+        "update_type" => operations.update_type(input),
+        "apply_type_pack" => execute_type_pack(operations.collection(), input),
+        "apply_collection_setup" => execute_collection_setup(operations.collection(), input),
         _ => failed(vec![Diagnostic::error(
             "invalid_request",
             format!("Unsupported mutation operation '{operation}'."),
             None,
         )]),
+    }
+}
+
+fn execute_type_pack(collection: &Collection, input: &Value) -> OperationResult {
+    let provision = input
+        .get("provision")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<super::TypePackProvision>(value).ok());
+    let options = input
+        .get("options")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<super::TypePackApplyOptions>(value).ok());
+    match (provision, options) {
+        (Some(provision), Some(options)) => collection.apply_type_pack(&provision, &options),
+        _ => invalid_request("Type-pack apply input requires valid provision and options."),
+    }
+}
+
+fn execute_collection_setup(collection: &Collection, input: &Value) -> OperationResult {
+    let setup = input
+        .get("setup")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<super::CollectionSetup>(value).ok());
+    let options = input
+        .get("options")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<super::CollectionSetupApplyOptions>(value).ok());
+    match (setup, options) {
+        (Some(setup), Some(options)) => collection.apply_collection_setup(&setup, &options),
+        _ => invalid_request("Collection setup apply input requires valid setup and options."),
     }
 }
 

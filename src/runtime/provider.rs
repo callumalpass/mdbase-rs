@@ -685,11 +685,100 @@ fn execute_collection(
         OperationKind::UpdateViewSource => operations.update_view_source(&request.input),
         OperationKind::DeleteViewSource => operations.delete_view_source(&request.input),
         OperationKind::Validate => operations.validate(&request.input),
+        OperationKind::Batch => operations.batch(&request.input),
         OperationKind::Create => operations.create(&request.input),
         OperationKind::Update => operations.update(&request.input),
         OperationKind::Delete => operations.delete(&request.input),
         OperationKind::Rename => operations.rename(&request.input),
+        OperationKind::ListTypes => operations.list_types(&request.input),
+        OperationKind::ReadType => operations.read_type(&request.input),
+        OperationKind::CreateType => operations.create_type(&request.input),
+        OperationKind::UpdateType => operations.update_type(&request.input),
+        OperationKind::AssessTypePack => execute_type_pack(collection, &request.input, false),
+        OperationKind::ApplyTypePack => execute_type_pack(collection, &request.input, true),
+        OperationKind::AssessCollectionSetup => {
+            execute_collection_setup(collection, &request.input, false)
+        }
+        OperationKind::ApplyCollectionSetup => {
+            execute_collection_setup(collection, &request.input, true)
+        }
     })
+}
+
+fn execute_type_pack(collection: &Collection, input: &Value, apply: bool) -> OperationResult {
+    let Some(provision) = input.get("provision").cloned() else {
+        return crate::runtime::invalid_operation_result(
+            "invalid_request",
+            "type-pack input requires provision",
+        );
+    };
+    let provision = match serde_json::from_value::<crate::v03::TypePackProvision>(provision) {
+        Ok(provision) => provision,
+        Err(error) => {
+            return crate::runtime::invalid_operation_result(
+                "invalid_request",
+                format!("type-pack provision is invalid: {error}"),
+            )
+        }
+    };
+    let options = input
+        .get("options")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if apply {
+        match serde_json::from_value::<crate::v03::TypePackApplyOptions>(options) {
+            Ok(options) => collection.apply_type_pack(&provision, &options),
+            Err(error) => crate::runtime::invalid_operation_result(
+                "invalid_request",
+                format!("type-pack apply options are invalid: {error}"),
+            ),
+        }
+    } else {
+        match serde_json::from_value::<crate::v03::TypePackAssessmentOptions>(options) {
+            Ok(options) => collection.assess_type_pack(&provision, &options),
+            Err(error) => crate::runtime::invalid_operation_result(
+                "invalid_request",
+                format!("type-pack assessment options are invalid: {error}"),
+            ),
+        }
+    }
+}
+
+fn execute_collection_setup(
+    collection: &Collection,
+    input: &Value,
+    apply: bool,
+) -> OperationResult {
+    let Some(setup) = input.get("setup").cloned() else {
+        return crate::runtime::invalid_operation_result(
+            "invalid_request",
+            "collection setup input requires setup",
+        );
+    };
+    let setup = match serde_json::from_value::<crate::v03::CollectionSetup>(setup) {
+        Ok(setup) => setup,
+        Err(error) => {
+            return crate::runtime::invalid_operation_result(
+                "invalid_request",
+                format!("collection setup is invalid: {error}"),
+            )
+        }
+    };
+    if apply {
+        let options = input
+            .get("options")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        match serde_json::from_value::<crate::v03::CollectionSetupApplyOptions>(options) {
+            Ok(options) => collection.apply_collection_setup(&setup, &options),
+            Err(error) => crate::runtime::invalid_operation_result(
+                "invalid_request",
+                format!("collection setup apply options are invalid: {error}"),
+            ),
+        }
+    } else {
+        collection.assess_collection_setup(&setup)
+    }
 }
 
 fn cache_error(error: crate::cache::CacheError) -> ProviderError {
