@@ -20,9 +20,9 @@ mod runtime;
 pub(crate) use runtime::{
     ack_runtime_change_event, ack_runtime_resolution, attach_runtime_prepared,
     cancel_runtime_prepared, commit_runtime_prepared, list_unacked_runtime_events,
-    prepare_runtime_transaction, resolve_runtime_claim, resolve_runtime_commit,
-    settle_runtime_commit, RuntimeCommitAttempt, RuntimePrepareInput, RuntimePrepareOutcome,
-    RuntimeResolution,
+    prepare_runtime_transaction, reset_runtime_support_for_fork, resolve_runtime_claim,
+    resolve_runtime_commit, settle_runtime_commit, RuntimeCommitAttempt, RuntimePrepareInput,
+    RuntimePrepareOutcome, RuntimeResolution,
 };
 #[cfg(test)]
 pub(crate) use runtime::{set_runtime_crash_point, set_runtime_settlement_delay};

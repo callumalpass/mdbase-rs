@@ -27,7 +27,10 @@ impl OperationCancellation {
     pub fn with_deadline(&self, deadline: Instant) -> Self {
         Self {
             cancelled: self.cancelled.clone(),
-            deadline: Some(self.deadline.map_or(deadline, |current| current.min(deadline))),
+            deadline: Some(
+                self.deadline
+                    .map_or(deadline, |current| current.min(deadline)),
+            ),
         }
     }
 

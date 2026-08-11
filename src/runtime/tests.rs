@@ -726,6 +726,93 @@ fn runtime_change_feed_replays_across_restart_and_transfer_is_idempotent() {
 }
 
 #[test]
+fn collection_fork_resets_host_claims_and_feed_without_touching_markdown() {
+    let directory = collection();
+    let committed_claim = HostClaimId::generate();
+    let prepared_claim = HostClaimId::generate();
+    {
+        let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+        let owner = ChangeFeedOwnerId::generate();
+        let feed = runtime
+            .open_change_feed(&owner, &OperationContext::legacy())
+            .unwrap();
+        runtime
+            .establish_change_feed_baseline(&feed, &OperationContext::legacy())
+            .unwrap();
+
+        let committed = OperationRequest::new(
+            OperationKind::Create,
+            json!({"path": "committed.md", "frontmatter": {"title": "Committed"}}),
+        );
+        let prepared = match runtime
+            .prepare(&committed, &committed_claim, &OperationContext::legacy())
+            .unwrap()
+        {
+            PreparationOutcome::Prepared(prepared) => prepared,
+            other => panic!("expected prepared mutation, got {other:?}"),
+        };
+        assert!(matches!(
+            runtime
+                .commit(&prepared, &OperationContext::legacy())
+                .unwrap(),
+            CommitAttempt::Committed(_)
+        ));
+
+        let uncommitted = OperationRequest::new(
+            OperationKind::Create,
+            json!({"path": "prepared.md", "frontmatter": {"title": "Prepared"}}),
+        );
+        assert!(matches!(
+            runtime
+                .prepare(&uncommitted, &prepared_claim, &OperationContext::legacy())
+                .unwrap(),
+            PreparationOutcome::Prepared(_)
+        ));
+    }
+
+    let provider = FilesystemProvider::open(directory.path()).unwrap();
+    provider
+        .reset_runtime_support_for_fork(&OperationContext::legacy())
+        .unwrap();
+    drop(provider);
+
+    assert!(directory.path().join("committed.md").is_file());
+    assert!(!directory.path().join("prepared.md").exists());
+    let fork = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    assert!(fork
+        .resolve_claim(&committed_claim, &OperationContext::legacy())
+        .unwrap()
+        .is_none());
+    assert!(fork
+        .resolve_claim(&prepared_claim, &OperationContext::legacy())
+        .unwrap()
+        .is_none());
+    let feed = fork
+        .open_change_feed(&ChangeFeedOwnerId::generate(), &OperationContext::legacy())
+        .unwrap();
+    let baseline = fork
+        .establish_change_feed_baseline(&feed, &OperationContext::legacy())
+        .unwrap();
+    assert_eq!(baseline.acknowledged_through.get(), 0);
+    let page = fork
+        .read_change_events(
+            &feed,
+            None,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    assert!(page.events.is_empty());
+    let read = fork
+        .read(
+            &OperationRequest::new(OperationKind::Read, json!({"path": "committed.md"})),
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    assert_eq!(read.result.result["frontmatter"]["title"], "Committed");
+}
+
+#[test]
 fn runtime_normalizes_external_changes_and_deduplicates_known_writes() {
     let directory = collection();
     let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();

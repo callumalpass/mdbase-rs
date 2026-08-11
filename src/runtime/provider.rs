@@ -449,6 +449,23 @@ impl FilesystemProvider {
         Ok(())
     }
 
+    /// Reset copied, host-owned runtime support before assigning a collection
+    /// fork a new identity. Canonical Markdown is preserved and will seed a
+    /// fresh generation, cache, feed owner, and host-claim namespace on open.
+    pub fn reset_runtime_support_for_fork(
+        &self,
+        context: &OperationContext,
+    ) -> Result<(), ProviderError> {
+        context.check()?;
+        self.with_collection_boundary_context(context, |collection| {
+            context.check()?;
+            let settlement = OperationContext::legacy();
+            crate::transactions::reset_runtime_support_for_fork(collection, &settlement)
+                .map_err(super::filesystem::transaction_error)?;
+            super::feed::reset_for_fork(collection)
+        })
+    }
+
     pub(crate) fn ensure_runtime_cache(
         &self,
         generation: &super::CollectionGeneration,

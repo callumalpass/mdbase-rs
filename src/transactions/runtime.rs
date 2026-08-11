@@ -432,6 +432,68 @@ pub(crate) fn list_unacked_runtime_events(
     Ok(resolutions)
 }
 
+/// Remove copied runtime transaction support after collection recovery has
+/// made canonical Markdown stable. A fork receives a new application identity,
+/// so old host claims and acknowledgement obligations must not cross into it.
+pub(crate) fn reset_runtime_support_for_fork(
+    collection: &Collection,
+    context: &OperationContext,
+) -> Result<(), TransactionError> {
+    context_check(context)?;
+    let _lock = WriteLock::acquire_context(collection, context)?;
+    context_check(context)?;
+    let root = collection.root.join(TRANSACTIONS_DIR);
+    let mut directories = match fs::read_dir(&root) {
+        Ok(entries) => entries
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .map_err(|source| io_error(root.clone(), source))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(io_error(root, source)),
+    };
+    directories.sort();
+    for directory in directories {
+        let metadata = fs::symlink_metadata(&directory)
+            .map_err(|source| io_error(directory.clone(), source))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(TransactionError::ManualRecovery(format!(
+                "'{}' is not a regular transaction directory",
+                directory.display()
+            )));
+        }
+        let journal_path = directory.join(JOURNAL_FILE);
+        let bytes =
+            fs::read(&journal_path).map_err(|source| io_error(journal_path.clone(), source))?;
+        let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64));
+        if version != Some(u64::from(RUNTIME_JOURNAL_VERSION)) {
+            return Err(TransactionError::ManualRecovery(format!(
+                "non-runtime transaction '{}' remained after collection recovery",
+                directory.display()
+            )));
+        }
+        let mut journal: RuntimeJournal = serde_json::from_slice(&bytes)
+            .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
+        validate_journal(collection, &directory, &journal)?;
+        if journal.phase == RuntimePhase::Committing {
+            settle(collection, &directory, &mut journal)?;
+        }
+        if journal.phase == RuntimePhase::NeedsManualRecovery {
+            return Err(TransactionError::ManualRecovery(format!(
+                "runtime transaction '{}' must be repaired before the collection can be forked",
+                journal.id
+            )));
+        }
+        fs::remove_dir_all(&directory).map_err(|source| io_error(directory.clone(), source))?;
+    }
+    sync_dir(&root)?;
+    Ok(())
+}
+
 fn update_ack(
     collection: &Collection,
     id: &CommitId,

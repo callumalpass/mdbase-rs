@@ -1,6 +1,6 @@
 use std::fs;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -316,6 +316,47 @@ pub(crate) fn commit_baseline(
         acknowledged_through: ChangeWatermark::from_stored(through),
         feed_head: ChangeWatermark::from_stored(journal.head),
     })
+}
+
+/// Discard copied consumer history after durable transactions have been
+/// recovered and detached from their original host claims.
+pub(crate) fn reset_for_fork(collection: &Collection) -> Result<(), ProviderError> {
+    let path = feed_path(collection);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(ProviderError::Transaction {
+                code: "change_feed_invalid",
+                message: "runtime change feed is not a regular file".to_string(),
+            });
+        }
+        Ok(_) => fs::remove_file(&path).map_err(|error| ProviderError::Transaction {
+            code: "change_feed_reset_failed",
+            message: error.to_string(),
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(ProviderError::Transaction {
+                code: "change_feed_reset_failed",
+                message: error.to_string(),
+            });
+        }
+    }
+    sync_feed_directory(path.parent().expect("feed path has a parent"))
+}
+
+#[cfg(not(windows))]
+fn sync_feed_directory(path: &Path) -> Result<(), ProviderError> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| ProviderError::Transaction {
+            code: "change_feed_reset_failed",
+            message: error.to_string(),
+        })
+}
+
+#[cfg(windows)]
+fn sync_feed_directory(_path: &Path) -> Result<(), ProviderError> {
+    Ok(())
 }
 
 pub(crate) fn read(
