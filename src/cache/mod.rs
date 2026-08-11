@@ -1,6 +1,7 @@
 //! SQLite cache (S13).
 
 pub mod indexer;
+pub(crate) mod runtime;
 pub mod sqlite;
 pub mod staleness;
 

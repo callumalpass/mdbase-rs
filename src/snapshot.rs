@@ -53,6 +53,8 @@ pub(crate) enum CollectionScanError {
 pub(crate) enum SnapshotError {
     #[error("collection operation cancelled")]
     Cancelled,
+    #[error("coordinated runtime cache is unavailable: {0}")]
+    Cache(String),
     #[error(transparent)]
     Scan(#[from] CollectionScanError),
     #[error("collection entry is outside the configured root: {}", path.display())]
@@ -80,7 +82,7 @@ pub(crate) enum SnapshotError {
 impl SnapshotError {
     pub(crate) fn path(&self) -> Option<&Path> {
         match self {
-            Self::Cancelled => None,
+            Self::Cancelled | Self::Cache(_) => None,
             Self::Scan(CollectionScanError::ReadDirectory { path, .. })
             | Self::Scan(CollectionScanError::InspectEntry { path, .. })
             | Self::Scan(CollectionScanError::OutsideRoot { path })

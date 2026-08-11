@@ -385,6 +385,61 @@ impl Collection {
         issues
     }
 
+    /// Check uniqueness against the coordinated runtime index. The runtime
+    /// binds this index to its readable generation before preparing a mutation,
+    /// so validation never walks or reopens unrelated collection records.
+    pub(crate) fn check_uniqueness_indexed(
+        &self,
+        frontmatter: &serde_json::Value,
+        type_names: &[String],
+        exclude_path: &str,
+    ) -> Result<Vec<Issue>, crate::cache::CacheError> {
+        let conflicts = crate::cache::runtime::uniqueness_conflicts(
+            self,
+            frontmatter,
+            type_names,
+            &exclude_path.replace('\\', "/"),
+        )?;
+        Ok(conflicts
+            .into_iter()
+            .map(|conflict| match conflict.kind {
+                crate::cache::runtime::UniqueConflictKind::Identity => Issue {
+                    code: "duplicate_id".to_string(),
+                    message: format!(
+                        "Duplicate {} value '{}' (also in {})",
+                        self.settings.id_field, conflict.value, conflict.path
+                    ),
+                    path: Some(exclude_path.to_string()),
+                    field: Some(self.settings.id_field.clone()),
+                    severity: Severity::Error,
+                    expected: None,
+                    actual: None,
+                    type_name: type_names.first().cloned(),
+                    line: None,
+                    column: None,
+                },
+                crate::cache::runtime::UniqueConflictKind::Field {
+                    type_name,
+                    field_name,
+                } => Issue {
+                    code: "duplicate_value".to_string(),
+                    message: format!(
+                        "Duplicate unique value '{}' for field '{}' (also in {})",
+                        conflict.value, field_name, conflict.path
+                    ),
+                    path: Some(exclude_path.to_string()),
+                    field: Some(field_name),
+                    severity: Severity::Error,
+                    expected: None,
+                    actual: None,
+                    type_name: Some(type_name),
+                    line: None,
+                    column: None,
+                },
+            })
+            .collect())
+    }
+
     /// Validate files (§9).
     pub fn validate_op(&self, input: &serde_json::Value) -> serde_json::Value {
         let path = input.get("path").and_then(|v| v.as_str());

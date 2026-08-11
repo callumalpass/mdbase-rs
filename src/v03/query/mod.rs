@@ -8,4 +8,6 @@ mod preflight;
 mod result;
 
 pub use execute::QueryPerformance;
-pub(crate) use execute::{execute, execute_cancellable, execute_profiled};
+pub(crate) use execute::{
+    execute, execute_cancellable, execute_profiled, execute_runtime_cancellable,
+};

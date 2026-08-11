@@ -447,7 +447,7 @@ fn expression_requires_link_graph(expression: &Expr) -> bool {
 fn expression_requires_file_body_metadata(expression: &Expr) -> bool {
     match expression {
         Expr::Dot(object, field) => {
-            (["tags", "links", "embeds"].contains(&field.as_str())
+            (["body", "tags", "links", "embeds"].contains(&field.as_str())
                 && matches!(object.as_ref(), Expr::Ident(name) if name == "file"))
                 || expression_requires_file_body_metadata(object)
         }
@@ -479,7 +479,14 @@ fn expression_requires_file_body_metadata(expression: &Expr) -> bool {
 fn file_body_field(field: &str) -> bool {
     matches!(
         field,
-        "file.tags" | "file.links" | "file.embeds" | "tags" | "links" | "embeds"
+        "file.body"
+            | "file.tags"
+            | "file.links"
+            | "file.embeds"
+            | "body"
+            | "tags"
+            | "links"
+            | "embeds"
     )
 }
 

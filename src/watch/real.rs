@@ -1,7 +1,8 @@
 use super::{PortableWatchEvent, WatchEvent};
+use crate::runtime::CollectionSnapshotResourceKind;
 use crate::Collection;
 use notify::{
-    event::{MetadataKind, ModifyKind, RenameMode},
+    event::{MetadataKind, ModifyKind},
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use serde_json::{json, Map, Value};
@@ -11,7 +12,6 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use walkdir::WalkDir;
 
 #[derive(Debug, Error)]
 pub enum WatchError {
@@ -377,13 +377,18 @@ fn now() -> String {
 
 #[derive(Clone)]
 struct Snapshot {
-    config_revision: String,
-    types: BTreeMap<String, String>,
+    resources: BTreeMap<String, ResourceState>,
     records: BTreeMap<String, RecordState>,
     types_folder: String,
     contracts_folder: String,
     cache_folder: String,
     record_extensions: BTreeSet<String>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct ResourceState {
+    kind: CollectionSnapshotResourceKind,
+    revision: String,
 }
 
 #[derive(Clone)]
@@ -392,30 +397,51 @@ struct RecordState {
     raw_frontmatter: Map<String, Value>,
     effective_frontmatter: Value,
     types: Value,
+    body: String,
 }
 
 impl Snapshot {
     fn load(root: &Path) -> Result<Self, WatchError> {
         let collection = Collection::open(root)
             .map_err(|error| WatchError::Collection(collection_error(&error)))?;
-        let config_revision = file_revision(&root.join("mdbase.yaml"))?;
-        let types = type_revisions(root, &collection.settings.types_folder)?;
+        let canonical = collection
+            .snapshot()
+            .map_err(|error| WatchError::Collection(error.to_string()))?;
+        let resources = canonical
+            .resources
+            .into_iter()
+            .map(|resource| {
+                (
+                    resource.path,
+                    ResourceState {
+                        kind: resource.kind,
+                        revision: resource.revision,
+                    },
+                )
+            })
+            .collect();
         let mut records = BTreeMap::new();
-        let mut files = collection.scan_collection_files();
-        files.sort();
-        for path in files {
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if let Some(record) = load_record(&collection, &relative)? {
-                records.insert(relative, record);
-            }
+        for record in canonical
+            .records
+            .into_iter()
+            .filter(|record| record.frontmatter_error.is_none())
+        {
+            let effective = collection
+                .apply_defaults(&Value::Object(record.frontmatter.clone()), &record.types);
+            let effective = collection.coerce_types(&effective, &record.types);
+            records.insert(
+                record.path,
+                RecordState {
+                    revision: record.revision,
+                    raw_frontmatter: record.frontmatter,
+                    effective_frontmatter: effective,
+                    types: json!(record.types),
+                    body: record.body,
+                },
+            );
         }
         Ok(Self {
-            config_revision,
-            types,
+            resources,
             records,
             types_folder: collection.settings.types_folder.clone(),
             contracts_folder: collection.settings.contracts_folder.clone(),
@@ -437,7 +463,6 @@ impl Snapshot {
             return None;
         }
         let mut records = BTreeSet::new();
-        let mut may_change_record_tree = false;
         for path in &event.paths {
             let relative = path.strip_prefix(root).unwrap_or(path);
             let normalized = relative.to_string_lossy().replace('\\', "/");
@@ -464,22 +489,14 @@ impl Snapshot {
             let extension = relative.extension().and_then(|value| value.to_str());
             if extension.is_some_and(|extension| self.record_extensions.contains(extension)) {
                 records.insert(PathBuf::from(normalized));
-            } else if matches!(
-                event.kind,
-                EventKind::Create(notify::event::CreateKind::Folder)
-                    | EventKind::Remove(notify::event::RemoveKind::Folder)
-                    | EventKind::Modify(ModifyKind::Name(
-                        RenameMode::Any | RenameMode::To | RenameMode::Both | RenameMode::Other
-                    ))
-            ) {
-                may_change_record_tree = true;
+            } else {
+                // Any non-ignored, non-record path can be a contract, schema,
+                // view, lock, or future resource. Reconcile the resource map
+                // rather than teaching hosts another inference table.
+                return None;
             }
         }
-        if records.is_empty() && may_change_record_tree {
-            None
-        } else {
-            Some(records)
-        }
+        Some(records)
     }
 
     fn refresh_paths(
@@ -523,31 +540,22 @@ impl Snapshot {
 
     fn diff(&self, next: &Self) -> Vec<PendingEvent> {
         let mut events = Vec::new();
-        if self.config_revision != next.config_revision {
-            events.push(PendingEvent::new(
-                "mdbase.config.changed",
-                json!({
-                    "previous_revision": self.config_revision,
-                    "revision": next.config_revision,
-                }),
-            ));
-        }
-
         for path in self
-            .types
+            .resources
             .keys()
-            .chain(next.types.keys())
+            .chain(next.resources.keys())
             .collect::<BTreeSet<_>>()
         {
-            let before = self.types.get(path);
-            let after = next.types.get(path);
+            let before = self.resources.get(path);
+            let after = next.resources.get(path);
             if before != after {
+                let kind = after.or(before).expect("resource exists on one side").kind;
                 events.push(PendingEvent::new(
-                    "mdbase.type.changed",
+                    resource_event_type(kind),
                     json!({
                         "path": path,
-                        "previous_revision": before,
-                        "revision": after,
+                        "previous_revision": before.map(|resource| &resource.revision),
+                        "revision": after.map(|resource| &resource.revision),
                     }),
                 ));
             }
@@ -556,6 +564,17 @@ impl Snapshot {
         events.extend(record_events(&self.records, &next.records));
 
         events
+    }
+}
+
+fn resource_event_type(kind: CollectionSnapshotResourceKind) -> &'static str {
+    match kind {
+        CollectionSnapshotResourceKind::Configuration => "mdbase.config.changed",
+        CollectionSnapshotResourceKind::Type => "mdbase.type.changed",
+        CollectionSnapshotResourceKind::Contract => "mdbase.contract.changed",
+        CollectionSnapshotResourceKind::Schema => "mdbase.schema.changed",
+        CollectionSnapshotResourceKind::View => "mdbase.view.changed",
+        CollectionSnapshotResourceKind::Lock => "mdbase.lock.changed",
     }
 }
 
@@ -594,6 +613,9 @@ fn record_events(
                     "to": to,
                     "before": previous.effective_frontmatter,
                     "after": current.effective_frontmatter,
+                    "raw_before": previous.raw_frontmatter,
+                    "raw_after": current.raw_frontmatter,
+                    "body_changed": previous.body != current.body,
                     "previous_revision": previous.revision,
                     "revision": current.revision,
                     "previous_types": previous.types,
@@ -610,6 +632,8 @@ fn record_events(
             json!({
                 "path": path,
                 "before": previous.effective_frontmatter,
+                "raw_before": previous.raw_frontmatter,
+                "body_changed": true,
                 "previous_revision": previous.revision,
                 "types": previous.types,
             }),
@@ -622,6 +646,8 @@ fn record_events(
             json!({
                 "path": path,
                 "after": current.effective_frontmatter,
+                "raw_after": current.raw_frontmatter,
+                "body_changed": true,
                 "changed_fields": current.raw_frontmatter.keys().collect::<Vec<_>>(),
                 "revision": current.revision,
                 "types": current.types,
@@ -639,6 +665,9 @@ fn record_events(
                     "path": path,
                     "before": previous.effective_frontmatter,
                     "after": current.effective_frontmatter,
+                    "raw_before": previous.raw_frontmatter,
+                    "raw_after": current.raw_frontmatter,
+                    "body_changed": previous.body != current.body,
                     "changed_fields": changed_fields(previous, current),
                     "previous_revision": previous.revision,
                     "revision": current.revision,
@@ -668,21 +697,22 @@ fn load_record(collection: &Collection, path: &str) -> Result<Option<RecordState
         None if is_invalid_yaml_frontmatter(&read) => return Ok(None),
         None => return Err(WatchError::Collection(collection_error(&read))),
     };
-    let raw_frontmatter = read
-        .get("frontmatter")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    let canonical = collection
+        .snapshot_record(path)
+        .map_err(|error| WatchError::Collection(error.to_string()))?;
+    let raw_frontmatter = canonical.frontmatter;
     let effective_frontmatter = read
         .get("effective_frontmatter")
         .cloned()
         .unwrap_or_else(|| Value::Object(raw_frontmatter.clone()));
     let types = read.get("types").cloned().unwrap_or_else(|| json!([]));
+    let body = canonical.body;
     Ok(Some(RecordState {
         revision,
         raw_frontmatter,
         effective_frontmatter,
         types,
+        body,
     }))
 }
 
@@ -716,34 +746,6 @@ fn changed_fields(previous: &RecordState, current: &RecordState) -> Vec<String> 
         .filter(|key| previous.raw_frontmatter.get(*key) != current.raw_frontmatter.get(*key))
         .cloned()
         .collect()
-}
-
-fn type_revisions(root: &Path, types_folder: &str) -> Result<BTreeMap<String, String>, WatchError> {
-    let mut result = BTreeMap::new();
-    let types_root = root.join(types_folder);
-    if !types_root.exists() {
-        return Ok(result);
-    }
-    for entry in WalkDir::new(&types_root).sort_by_file_name() {
-        let entry = entry.map_err(|error| WatchError::Collection(error.to_string()))?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        result.insert(relative, file_revision(path)?);
-    }
-    Ok(result)
-}
-
-fn file_revision(path: &Path) -> Result<String, WatchError> {
-    std::fs::read(path)
-        .map(|bytes| crate::v03::revision(&bytes))
-        .map_err(|error| WatchError::Collection(error.to_string()))
 }
 
 fn collection_error(error: &Value) -> String {
@@ -832,6 +834,67 @@ mod tests {
             .expect("rescan must queue the record event before returning");
         assert_eq!(event.event_type, "mdbase.record.created");
         assert_eq!(event.payload["path"], "note.md");
+    }
+
+    #[test]
+    fn watcher_emits_contract_schema_and_view_resource_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\nx-obsidian:\n  bases:\n    include:\n      - views/**/*.base\n",
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("_contracts")).unwrap();
+        fs::create_dir(directory.path().join("_schemas")).unwrap();
+        fs::create_dir(directory.path().join("views")).unwrap();
+        fs::write(
+            directory.path().join("_contracts/task.md"),
+            "---\nkind: mdbase.contract\ncontract_type: record\nid: example.task\nversion: 1.0.0\nrecord_schema:\n  dialect: json-schema-2020-12\n  ref: ../_schemas/task.json\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("_schemas/task.json"),
+            "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("views/tasks.base"),
+            "views:\n  - type: table\n    name: Tasks\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(20)).unwrap();
+
+        fs::write(
+            directory.path().join("_contracts/task.md"),
+            "---\nkind: mdbase.contract\ncontract_type: record\nid: example.task\nversion: 1.0.1\nrecord_schema:\n  dialect: json-schema-2020-12\n  ref: ../_schemas/task.json\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("_schemas/task.json"),
+            "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"additionalProperties\":false}\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("views/tasks.base"),
+            "views:\n  - type: table\n    name: Changed\n",
+        )
+        .unwrap();
+        watcher.rescan().unwrap();
+
+        let mut kinds = BTreeSet::new();
+        while let Some(event) = watcher.recv_timeout(Duration::ZERO).unwrap() {
+            kinds.insert(event.event_type);
+        }
+        assert_eq!(
+            kinds,
+            [
+                "mdbase.contract.changed".to_string(),
+                "mdbase.schema.changed".to_string(),
+                "mdbase.view.changed".to_string(),
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]

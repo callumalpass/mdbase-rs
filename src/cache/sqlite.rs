@@ -32,6 +32,14 @@ fn init_schema(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "files", "ctime_ns")? {
         conn.execute_batch("ALTER TABLE files ADD COLUMN ctime_ns INTEGER;")?;
     }
+    if !table_has_column(conn, "links", "source_revision")? {
+        conn.execute_batch(
+            "ALTER TABLE links ADD COLUMN source_revision TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    if !table_has_column(conn, "links", "resolved")? {
+        conn.execute_batch("ALTER TABLE links ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0;")?;
+    }
     Ok(())
 }
 

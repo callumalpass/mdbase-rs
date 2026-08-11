@@ -51,7 +51,7 @@ pub(crate) fn execute_profiled(
     collection: &Collection,
     input: &Value,
 ) -> (OperationResult, QueryPerformance) {
-    execute_profiled_cancellable(collection, input, &OperationCancellation::new())
+    execute_profiled_cancellable(collection, input, &OperationCancellation::new(), false)
         .expect("a fresh cancellation token cannot be cancelled")
 }
 
@@ -60,13 +60,22 @@ pub(crate) fn execute_cancellable(
     input: &Value,
     cancellation: &OperationCancellation,
 ) -> Result<OperationResult, OperationCancelled> {
-    execute_profiled_cancellable(collection, input, cancellation).map(|(result, _)| result)
+    execute_profiled_cancellable(collection, input, cancellation, false).map(|(result, _)| result)
+}
+
+pub(crate) fn execute_runtime_cancellable(
+    collection: &Collection,
+    input: &Value,
+    cancellation: &OperationCancellation,
+) -> Result<OperationResult, OperationCancelled> {
+    execute_profiled_cancellable(collection, input, cancellation, true).map(|(result, _)| result)
 }
 
 fn execute_profiled_cancellable(
     collection: &Collection,
     input: &Value,
     cancellation: &OperationCancellation,
+    runtime_cache: bool,
 ) -> Result<(OperationResult, QueryPerformance), OperationCancelled> {
     let total_started = Instant::now();
     let mut performance = QueryPerformance::default();
@@ -158,13 +167,23 @@ fn execute_profiled_cancellable(
             })
             .collect::<Vec<_>>();
         let phase = Instant::now();
-        let loaded = collection.load_query_metadata_page_profiled_cancellable(
-            &compiled.query.types,
-            &order_by,
-            compiled.query.offset,
-            compiled.query.limit,
-            cancellation,
-        );
+        let loaded = if runtime_cache {
+            collection.load_runtime_query_metadata_page_profiled_cancellable(
+                &compiled.query.types,
+                &order_by,
+                compiled.query.offset,
+                compiled.query.limit,
+                cancellation,
+            )
+        } else {
+            collection.load_query_metadata_page_profiled_cancellable(
+                &compiled.query.types,
+                &order_by,
+                compiled.query.offset,
+                compiled.query.limit,
+                cancellation,
+            )
+        };
         cancellation.check()?;
         if let Some(page) = loaded {
             performance.load_us = micros(phase.elapsed());
@@ -190,25 +209,45 @@ fn execute_profiled_cancellable(
     let phase = Instant::now();
     let needs_link_graph = compiled.requires_link_graph();
     let needs_file_body_metadata = compiled.requires_file_body_metadata();
-    let (snapshot, load_profile) =
-        match collection.load_query_data_profiled_cancellable(true, needs_link_graph, cancellation)
-        {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                cancellation.check()?;
-                let path = error.path().map(|path| {
-                    path.strip_prefix(&collection.root)
-                        .unwrap_or(path)
-                        .to_string_lossy()
-                        .replace('\\', "/")
-                });
-                finish!(diagnostics::failed(vec![Diagnostic::error(
-                    "collection_snapshot_failed",
-                    error.to_string(),
-                    path,
-                )]));
-            }
-        };
+    let needs_bodies = compiled.query.include_body
+        || needs_link_graph
+        || needs_file_body_metadata
+        || collection
+            .type_plans
+            .values()
+            .any(|plan| !plan.computed.is_empty());
+    let loaded = if runtime_cache {
+        collection.load_runtime_query_data_profiled_cancellable(
+            true,
+            needs_link_graph,
+            needs_bodies,
+            cancellation,
+        )
+    } else {
+        collection.load_query_data_profiled_cancellable_with_bodies(
+            true,
+            needs_link_graph,
+            needs_bodies,
+            cancellation,
+        )
+    };
+    let (snapshot, load_profile) = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            cancellation.check()?;
+            let path = error.path().map(|path| {
+                path.strip_prefix(&collection.root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            });
+            finish!(diagnostics::failed(vec![Diagnostic::error(
+                "collection_snapshot_failed",
+                error.to_string(),
+                path,
+            )]));
+        }
+    };
     let records = snapshot.records;
     let all_files = snapshot.all_files;
     let backlinks = snapshot.backlinks;

@@ -92,6 +92,14 @@ impl<'a> Operations<'a> {
         super::query::execute_cancellable(self.collection, input, cancellation)
     }
 
+    pub(crate) fn query_runtime_cancellable(
+        &self,
+        input: &Value,
+        cancellation: &crate::OperationCancellation,
+    ) -> Result<OperationResult, crate::OperationCancelled> {
+        super::query::execute_runtime_cancellable(self.collection, input, cancellation)
+    }
+
     /// Discover canonical and configured compatibility view sources.
     pub fn list_views(&self, input: &Value) -> OperationResult {
         crate::views::list(self.collection, input)
