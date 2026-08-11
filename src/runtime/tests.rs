@@ -909,6 +909,17 @@ fn runtime_read_cursor_pins_generation_replays_and_expires_on_release() {
         1
     );
     let cursor = first.next.expect("three records require another page");
+    let encoded = cursor.as_token().to_string();
+    let decoded = ReadCursor::from_token(encoded.clone()).unwrap();
+    assert_eq!(decoded, cursor);
+    let mut tampered = encoded.clone().into_bytes();
+    let last = tampered.last_mut().unwrap();
+    *last = if *last == b'a' { b'b' } else { b'a' };
+    let tampered = ReadCursor::from_token(String::from_utf8(tampered).unwrap()).unwrap();
+    assert!(matches!(
+        runtime.read_page(&tampered, &OperationContext::legacy()),
+        Err(ProviderError::InvalidReadCursor)
+    ));
     let pinned_generation = first.outcome.generation;
 
     let claim = HostClaimId::generate();
@@ -950,6 +961,12 @@ fn runtime_read_cursor_pins_generation_replays_and_expires_on_release() {
         .unwrap();
     assert!(matches!(
         runtime.read_page(&next, &OperationContext::legacy()),
+        Err(ProviderError::GenerationExpired)
+    ));
+    drop(runtime);
+    let reopened = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    assert!(matches!(
+        reopened.read_page(&decoded, &OperationContext::legacy()),
         Err(ProviderError::GenerationExpired)
     ));
 }

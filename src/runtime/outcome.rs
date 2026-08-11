@@ -559,9 +559,25 @@ pub struct RuntimeChangeEventPage {
 /// Opaque token for one replayable position in a generation-pinned read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadCursor {
-    pub(crate) id: String,
-    pub(crate) generation: CollectionGeneration,
-    pub(crate) next_index: usize,
+    token: String,
+}
+
+impl ReadCursor {
+    pub fn from_token(token: impl Into<String>) -> Result<Self, ProviderError> {
+        let token = token.into();
+        if token.is_empty() || token.len() > 256 || !token.is_ascii() {
+            return Err(ProviderError::InvalidReadCursor);
+        }
+        Ok(Self { token })
+    }
+
+    pub fn as_token(&self) -> &str {
+        &self.token
+    }
+
+    pub(crate) fn issued(token: String) -> Self {
+        Self { token }
+    }
 }
 
 /// One bounded page from a generation-pinned read.

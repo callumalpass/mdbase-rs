@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::{
     ChangeSet, CollectionGeneration, ExecutionOutcome, OperationContext, ProviderError, ReadCursor,
@@ -19,6 +20,8 @@ const HARD_LIFETIME: Duration = Duration::from_secs(5 * 60);
 pub(crate) struct CursorStore {
     entries: HashMap<String, PinnedRead>,
     retained_bytes: usize,
+    signing_key: [u8; 32],
+    runtime_epoch: String,
 }
 
 struct PinnedRead {
@@ -32,10 +35,12 @@ struct PinnedRead {
 }
 
 impl CursorStore {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(runtime_epoch: impl Into<String>) -> Self {
         Self {
             entries: HashMap::new(),
             retained_bytes: 0,
+            signing_key: cursor_signing_key(),
+            runtime_epoch: runtime_epoch.into(),
         }
     }
 
@@ -99,14 +104,7 @@ impl CursorStore {
                 last_access: now,
             },
         );
-        self.page(
-            &ReadCursor {
-                id,
-                generation,
-                next_index: 0,
-            },
-            context,
-        )
+        self.page(&self.issue(&id, 0), context)
     }
 
     pub(crate) fn page(
@@ -116,30 +114,27 @@ impl CursorStore {
     ) -> Result<ReadPage, ProviderError> {
         context.check()?;
         self.remove_expired();
-        let Some(pinned) = self.entries.get_mut(&cursor.id) else {
+        let (id, next_index) = self.authenticate(cursor)?;
+        let Some(pinned) = self.entries.get_mut(&id) else {
             return Err(ProviderError::GenerationExpired);
         };
-        if pinned.generation != cursor.generation || cursor.next_index > pinned.results.len() {
+        if next_index > pinned.results.len() {
             return Err(ProviderError::InvalidReadCursor);
         }
-        let end = cursor
-            .next_index
+        let end = next_index
             .saturating_add(pinned.page_items)
             .min(pinned.results.len());
         let mut result = pinned.template.clone();
-        result.result["results"] = Value::Array(pinned.results[cursor.next_index..end].to_vec());
+        result.result["results"] = Value::Array(pinned.results[next_index..end].to_vec());
         set_has_more(&mut result, end < pinned.results.len());
         pinned.last_access = Instant::now();
-        let next = (end < pinned.results.len()).then(|| ReadCursor {
-            id: cursor.id.clone(),
-            generation: cursor.generation.clone(),
-            next_index: end,
-        });
+        let generation = pinned.generation.clone();
+        let next = (end < pinned.results.len()).then(|| self.issue(&id, end));
         context.check()?;
         Ok(ReadPage {
             outcome: ExecutionOutcome {
                 result,
-                generation: pinned.generation.clone(),
+                generation,
                 changes: ChangeSet::None,
                 commit_id: None,
                 change_event: None,
@@ -149,17 +144,44 @@ impl CursorStore {
     }
 
     pub(crate) fn release(&mut self, cursor: ReadCursor) -> Result<(), ProviderError> {
-        match self.entries.get(&cursor.id) {
-            Some(pinned) if pinned.generation != cursor.generation => {
-                return Err(ProviderError::InvalidReadCursor)
-            }
-            Some(_) => {}
-            None => return Ok(()),
-        }
-        if let Some(removed) = self.entries.remove(&cursor.id) {
+        let (id, _) = self.authenticate(&cursor)?;
+        if let Some(removed) = self.entries.remove(&id) {
             self.retained_bytes = self.retained_bytes.saturating_sub(removed.retained_bytes);
         }
         Ok(())
+    }
+
+    fn issue(&self, id: &str, next_index: usize) -> ReadCursor {
+        let message = format!("v1:{}:{id}:{next_index}", self.runtime_epoch);
+        ReadCursor::issued(format!(
+            "{message}:{}",
+            cursor_mac(&self.signing_key, message.as_bytes())
+        ))
+    }
+
+    fn authenticate(&self, cursor: &ReadCursor) -> Result<(String, usize), ProviderError> {
+        let parts = cursor.as_token().split(':').collect::<Vec<_>>();
+        if parts.len() != 5 || parts[0] != "v1" || parts[4].len() != 64 {
+            return Err(ProviderError::InvalidReadCursor);
+        }
+        if parts[1] != self.runtime_epoch {
+            return Err(ProviderError::GenerationExpired);
+        }
+        let id = uuid::Uuid::parse_str(parts[2])
+            .map_err(|_| ProviderError::InvalidReadCursor)?
+            .to_string();
+        if id != parts[2] {
+            return Err(ProviderError::InvalidReadCursor);
+        }
+        let next_index = parts[3]
+            .parse::<usize>()
+            .map_err(|_| ProviderError::InvalidReadCursor)?;
+        let message = format!("v1:{}:{id}:{next_index}", self.runtime_epoch);
+        let expected = cursor_mac(&self.signing_key, message.as_bytes());
+        if !constant_time_equal(expected.as_bytes(), parts[4].as_bytes()) {
+            return Err(ProviderError::InvalidReadCursor);
+        }
+        Ok((id, next_index))
     }
 
     fn remove_expired(&mut self) {
@@ -179,6 +201,43 @@ impl CursorStore {
             }
         }
     }
+}
+
+fn cursor_signing_key() -> [u8; 32] {
+    let mut key = [0_u8; 32];
+    key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    key
+}
+
+fn cursor_mac(key: &[u8; 32], message: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let mut inner_pad = [0x36_u8; BLOCK];
+    let mut outer_pad = [0x5c_u8; BLOCK];
+    for (index, byte) in key.iter().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner);
+    format!("{:x}", outer.finalize())
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 fn set_has_more(result: &mut OperationResult, has_more: bool) {

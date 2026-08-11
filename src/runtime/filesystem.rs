@@ -77,6 +77,7 @@ impl FilesystemRuntime {
         )?;
         provider.initialize_runtime_cache(&reconciled.generation)?;
         let watcher = CollectionWatcher::open(root, debounce)?;
+        let runtime_epoch = reconciled.generation.runtime_epoch().to_string();
         Ok(Self {
             provider,
             watcher: Arc::new(Mutex::new(watcher)),
@@ -89,7 +90,7 @@ impl FilesystemRuntime {
                 active: Mutex::new(None),
                 changed: Condvar::new(),
             }),
-            cursors: Mutex::new(super::cursor::CursorStore::new()),
+            cursors: Mutex::new(super::cursor::CursorStore::new(runtime_epoch)),
         })
     }
 
