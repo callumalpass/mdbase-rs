@@ -293,7 +293,7 @@ impl Options {
                     .map_err(|error| format!("invalid --records value '{raw}': {error}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if record_sizes.iter().any(|size| *size == 0) {
+        if record_sizes.contains(&0) {
             return Err("--records values must be positive".into());
         }
         let mixed_threads = parse_usize(&value, "--mixed-threads", 4)?;
@@ -346,26 +346,17 @@ fn run_workload(records: usize, options: &Options) -> Result<WorkloadReport, Str
         watcher_events_observed: 0,
         errors: Vec::new(),
     };
-    let mut operations = Vec::new();
-    operations.push(profile_open(&fixture.root, 3)?);
-    operations.push(profile_query_200(&collection, &mut correctness)?);
-    operations.push(profile_pagination(&collection, &mut correctness)?);
-    operations.push(profile_cache(&collection)?);
-    operations.push(profile_read(
-        &collection,
-        &fixture.task_paths,
-        20,
-        options.seed,
-    )?);
-    operations.push(profile_update(
-        &collection,
-        &fixture.task_paths,
-        5,
-        &mut correctness,
-    )?);
-    operations.push(profile_create(&collection, 5, &mut correctness)?);
-    operations.push(profile_delete(&collection, 5, &mut correctness)?);
-    operations.push(profile_rename(&collection, &fixture, &mut correctness)?);
+    let mut operations = vec![
+        profile_open(&fixture.root, 3)?,
+        profile_query_200(&collection, &mut correctness)?,
+        profile_pagination(&collection, &mut correctness)?,
+        profile_cache(&collection)?,
+        profile_read(&collection, &fixture.task_paths, 20, options.seed)?,
+        profile_update(&collection, &fixture.task_paths, 5, &mut correctness)?,
+        profile_create(&collection, 5, &mut correctness)?,
+        profile_delete(&collection, 5, &mut correctness)?,
+        profile_rename(&collection, &fixture, &mut correctness)?,
+    ];
 
     let (runtime_operation, runtime_sync, events) = profile_provider_and_watcher(&fixture, 5)?;
     correctness.watcher_events_observed = events;
@@ -977,9 +968,11 @@ fn with_query_phases(
     summary
 }
 
+type QueryPhaseField = fn(&mdbase::v03::QueryPerformance) -> u64;
+
 fn query_phases(profiles: &[mdbase::v03::QueryPerformance]) -> BTreeMap<String, Vec<f64>> {
     let mut phases = BTreeMap::new();
-    let fields: [(&str, fn(&mdbase::v03::QueryPerformance) -> u64); 8] = [
+    let fields: [(&str, QueryPhaseField); 8] = [
         ("schema", |profile| profile.schema_us),
         ("cache_refresh", |profile| profile.cache_refresh_us),
         ("records_load", |profile| profile.records_load_us),
@@ -1116,7 +1109,7 @@ fn render_markdown(report: &Report) -> String {
                 operation.ops_per_sec
             ));
         }
-        output.push_str("\n");
+        output.push('\n');
         for concurrent in &workload.concurrent {
             output.push_str(&format!(
                 "- Concurrent `{}`: {} collections, {} threads, {} requests, {:.2} ms, {:.1} req/s, {} errors.\n",
