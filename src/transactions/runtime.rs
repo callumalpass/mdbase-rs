@@ -552,6 +552,10 @@ pub(super) fn recover_runtime_one(
         RuntimePhase::Committing => match settle(collection, directory, &mut journal) {
             Ok(()) => Ok(true),
             Err(error) => {
+                #[cfg(test)]
+                if matches!(error, TransactionError::SimulatedCrash) {
+                    return Err(error);
+                }
                 journal.phase = RuntimePhase::NeedsManualRecovery;
                 let _ = persist_runtime_journal(directory, &journal);
                 Err(error)

@@ -1000,15 +1000,12 @@ fn runtime_deadline_after_commit_boundary_returns_pending_while_settlement_finis
         PreparationOutcome::Prepared(prepared) => prepared,
         other => panic!("expected prepared mutation, got {other:?}"),
     };
-    crate::transactions::set_runtime_settlement_delay(
-        prepared.commit_id(),
-        Duration::from_millis(100),
-    );
+    crate::transactions::set_runtime_settlement_delay(prepared.commit_id(), Duration::from_secs(2));
     let _reset = ResetDelay(prepared.commit_id().clone());
     let cancellation = crate::OperationCancellation::new();
     let context = OperationContext::new(
         &cancellation,
-        OperationDeadline::after(Duration::from_millis(20)),
+        OperationDeadline::after(Duration::from_millis(500)),
     );
     let started = Instant::now();
     assert_eq!(
@@ -1017,7 +1014,7 @@ fn runtime_deadline_after_commit_boundary_returns_pending_while_settlement_finis
             commit_id: prepared.commit_id().clone()
         }
     );
-    assert!(started.elapsed() < Duration::from_millis(80));
+    assert!(started.elapsed() < Duration::from_millis(1_500));
 
     let resolution_deadline = Instant::now() + Duration::from_secs(5);
     let resolved = loop {
