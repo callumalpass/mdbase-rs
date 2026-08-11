@@ -36,7 +36,7 @@ pub use outcome::{
     ChangeWatermark, CollectionGeneration, CommitAttempt, CommitId, CommitRejection,
     DurableCommitState, ExecutionOutcome, HostClaimId, PreparationOutcome, PreparedMutation,
     ReadCursor, ReadPage, RebuildReason, RecordChange, RecordChangeKind, ResourceChange,
-    ResourceChangeKind, RuntimeChangeEvent, RuntimeChangeEventPage,
+    ResourceChangeKind, RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeMeasurements,
 };
 pub use provider::{CollectionProvider, FilesystemProvider};
 pub use snapshot::{

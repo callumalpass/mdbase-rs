@@ -11,6 +11,17 @@ use crate::v03::OperationResult;
 
 use super::ProviderError;
 
+/// Privacy-safe accounting for rebuildable state retained by one runtime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeMeasurements {
+    /// Parsed collection type definitions retained by the provider.
+    pub loaded_type_definitions: usize,
+    /// Active generation-pinned query snapshots.
+    pub active_read_snapshots: usize,
+    /// Serialized result bytes retained by active query snapshots.
+    pub retained_read_snapshot_bytes: usize,
+}
+
 /// Opaque process-epoch and sequence identifying one readable runtime state.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct CollectionGeneration {

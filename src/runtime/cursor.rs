@@ -151,6 +151,11 @@ impl CursorStore {
         Ok(())
     }
 
+    pub(crate) fn measurements(&mut self) -> (usize, usize) {
+        self.remove_expired();
+        (self.entries.len(), self.retained_bytes)
+    }
+
     fn issue(&self, id: &str, next_index: usize) -> ReadCursor {
         let message = format!("v1:{}:{id}:{next_index}", self.runtime_epoch);
         ReadCursor::issued(format!(

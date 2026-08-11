@@ -128,6 +128,13 @@ impl FilesystemProvider {
         &self.root
     }
 
+    pub(crate) fn loaded_type_definitions(&self) -> Result<usize, ProviderError> {
+        self.collection_cache
+            .read()
+            .map(|cached| cached.collection.types.len())
+            .map_err(|_| ProviderError::LockPoisoned)
+    }
+
     /// Capture collection resources and canonical records at one read boundary.
     ///
     /// The provider gate prevents an mdbase mutation from interleaving with

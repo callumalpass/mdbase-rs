@@ -909,6 +909,9 @@ fn runtime_read_cursor_pins_generation_replays_and_expires_on_release() {
         1
     );
     let cursor = first.next.expect("three records require another page");
+    let retained = runtime.measurements().unwrap();
+    assert_eq!(retained.active_read_snapshots, 1);
+    assert!(retained.retained_read_snapshot_bytes > 0);
     let encoded = cursor.as_token().to_string();
     let decoded = ReadCursor::from_token(encoded.clone()).unwrap();
     assert_eq!(decoded, cursor);
@@ -959,6 +962,9 @@ fn runtime_read_cursor_pins_generation_replays_and_expires_on_release() {
     runtime
         .release_read(next.clone(), &OperationContext::legacy())
         .unwrap();
+    let released = runtime.measurements().unwrap();
+    assert_eq!(released.active_read_snapshots, 0);
+    assert_eq!(released.retained_read_snapshot_bytes, 0);
     assert!(matches!(
         runtime.read_page(&next, &OperationContext::legacy()),
         Err(ProviderError::GenerationExpired)

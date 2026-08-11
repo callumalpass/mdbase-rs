@@ -98,6 +98,20 @@ impl FilesystemRuntime {
         self.provider.clone()
     }
 
+    /// Return privacy-safe accounting for rebuildable state retained in memory.
+    pub fn measurements(&self) -> Result<super::RuntimeMeasurements, ProviderError> {
+        let (active_read_snapshots, retained_read_snapshot_bytes) = self
+            .cursors
+            .lock()
+            .map_err(|_| ProviderError::LockPoisoned)?
+            .measurements();
+        Ok(super::RuntimeMeasurements {
+            loaded_type_definitions: self.provider.loaded_type_definitions()?,
+            active_read_snapshots,
+            retained_read_snapshot_bytes,
+        })
+    }
+
     pub fn execute(&self, request: &OperationRequest) -> Result<OperationResult, ProviderError> {
         self.execute_with_context(request, &OperationContext::legacy())
     }
