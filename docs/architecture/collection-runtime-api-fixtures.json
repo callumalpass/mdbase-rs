@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "status": "api_review_fixture",
+  "invariants": {
+    "prepare_commit_id": "durable_and_visible_before_commit",
+    "commit_resolution": "restart_queryable_for_claimed_host_request",
+    "known_change_delivery": "exact_and_bounded",
+    "generation_scope": "one_runtime_epoch"
+  },
+  "cases": [
+    {
+      "id": "create",
+      "operation": "create",
+      "input": {"path": "notes/a.md"},
+      "expected": {
+        "result": "valid_record_result",
+        "changes": [{"kind": "created", "path": "notes/a.md", "before_revision": null, "after_revision": "opaque"}],
+        "commit_id": "present",
+        "generation": "advance_once"
+      }
+    },
+    {
+      "id": "update",
+      "operation": "update",
+      "input": {"path": "notes/a.md", "if_revision": "sha256:before"},
+      "expected": {
+        "result": "valid_record_result",
+        "changes": [{"kind": "updated", "path": "notes/a.md", "before_revision": "sha256:before", "after_revision": "opaque"}],
+        "commit_id": "present",
+        "generation": "advance_once"
+      }
+    },
+    {
+      "id": "delete",
+      "operation": "delete",
+      "input": {"path": "notes/a.md", "if_revision": "sha256:before"},
+      "expected": {
+        "result": "valid_delete_result",
+        "changes": [{"kind": "deleted", "path": "notes/a.md", "before_revision": "sha256:before", "after_revision": null}],
+        "commit_id": "present",
+        "generation": "advance_once"
+      }
+    },
+    {
+      "id": "rename_with_reference_updates",
+      "operation": "rename",
+      "input": {"from": "notes/a.md", "to": "archive/a.md", "update_references": true},
+      "expected": {
+        "result": "valid_rename_result",
+        "changes": [
+          {"kind": "renamed", "from": "notes/a.md", "path": "archive/a.md", "before_revision": "opaque", "after_revision": "opaque"},
+          {"kind": "updated", "path": "notes/link.md", "before_revision": "opaque", "after_revision": "opaque"}
+        ],
+        "commit_id": "present",
+        "generation": "advance_once"
+      }
+    },
+    {
+      "id": "view_source_mutation",
+      "operation": "update_view_source",
+      "input": {"path": "views/library.base", "if_revision": "sha256:before"},
+      "expected": {
+        "result": "valid_view_result",
+        "changes": [{"kind": "view_source", "path": "views/library.base", "before_revision": "sha256:before", "after_revision": "opaque"}],
+        "commit_id": "present",
+        "generation": "advance_once"
+      }
+    },
+    {
+      "id": "external_edit",
+      "origin": "filesystem",
+      "input": {"path": "notes/external.md", "kind": "updated"},
+      "expected": {
+        "changes": [{"kind": "updated", "path": "notes/external.md", "before_revision": "opaque", "after_revision": "opaque"}],
+        "commit_id": null,
+        "generation": "advance_once"
+      }
+    }
+  ]
+}
