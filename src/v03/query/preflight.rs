@@ -17,8 +17,7 @@ impl CompiledQuery {
     /// A metadata-only query can order and paginate before materializing
     /// frontmatter, computed fields, body metadata, and expression contexts.
     pub fn supports_metadata_page_plan(&self) -> bool {
-        self.query.types.is_empty()
-            && self.query.context.is_none()
+        self.query.context.is_none()
             && self.projections.is_empty()
             && self.where_expression.is_none()
             && self.query.select.is_none()

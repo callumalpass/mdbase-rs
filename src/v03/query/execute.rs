@@ -12,7 +12,7 @@ use super::result::{build_groups, compare_values, serialize_candidate, sort_cand
 use crate::expressions::evaluator::resolve_execution_timezone;
 use crate::query::cache_source::FileRecord;
 use crate::v03::{cel, validate_query, Diagnostic, OperationResult};
-use crate::Collection;
+use crate::{Collection, OperationCancellation, OperationCancelled};
 
 /// Payload-free phase timings and counters for one canonical v0.3 query.
 ///
@@ -51,14 +51,33 @@ pub(crate) fn execute_profiled(
     collection: &Collection,
     input: &Value,
 ) -> (OperationResult, QueryPerformance) {
+    execute_profiled_cancellable(collection, input, &OperationCancellation::new())
+        .expect("a fresh cancellation token cannot be cancelled")
+}
+
+pub(crate) fn execute_cancellable(
+    collection: &Collection,
+    input: &Value,
+    cancellation: &OperationCancellation,
+) -> Result<OperationResult, OperationCancelled> {
+    execute_profiled_cancellable(collection, input, cancellation).map(|(result, _)| result)
+}
+
+fn execute_profiled_cancellable(
+    collection: &Collection,
+    input: &Value,
+    cancellation: &OperationCancellation,
+) -> Result<(OperationResult, QueryPerformance), OperationCancelled> {
     let total_started = Instant::now();
     let mut performance = QueryPerformance::default();
     macro_rules! finish {
         ($result:expr) => {{
             performance.total_us = micros(total_started.elapsed());
-            return ($result, performance);
+            return Ok(($result, performance));
         }};
     }
+
+    cancellation.check()?;
 
     let phase = Instant::now();
     let schema_diagnostics = validate_query(input)
@@ -66,6 +85,7 @@ pub(crate) fn execute_profiled(
         .map(diagnostics::invalid_schema)
         .collect::<Vec<_>>();
     performance.schema_us = micros(phase.elapsed());
+    cancellation.check()?;
     if !schema_diagnostics.is_empty() {
         finish!(diagnostics::failed(schema_diagnostics));
     }
@@ -86,6 +106,7 @@ pub(crate) fn execute_profiled(
         Err(diagnostics) => finish!(diagnostics::failed(diagnostics)),
     };
     performance.preflight_us = micros(phase.elapsed());
+    cancellation.check()?;
 
     let phase = Instant::now();
     let timezone = match resolve_execution_timezone(
@@ -112,6 +133,7 @@ pub(crate) fn execute_profiled(
         }
     };
     performance.clock_us = micros(phase.elapsed());
+    cancellation.check()?;
 
     // A failing CEL type matcher contributes query diagnostics for every
     // candidate. Keep the full evaluation plan in that uncommon case so the
@@ -136,11 +158,14 @@ pub(crate) fn execute_profiled(
             })
             .collect::<Vec<_>>();
         let phase = Instant::now();
-        let loaded = collection.load_query_metadata_page_profiled(
+        let loaded = collection.load_query_metadata_page_profiled_cancellable(
+            &compiled.query.types,
             &order_by,
             compiled.query.offset,
             compiled.query.limit,
+            cancellation,
         );
+        cancellation.check()?;
         if let Some(page) = loaded {
             performance.load_us = micros(phase.elapsed());
             apply_load_performance(&mut performance, &page.performance);
@@ -165,23 +190,25 @@ pub(crate) fn execute_profiled(
     let phase = Instant::now();
     let needs_link_graph = compiled.requires_link_graph();
     let needs_file_body_metadata = compiled.requires_file_body_metadata();
-    let (snapshot, load_profile) = match collection.load_query_data_profiled(true, needs_link_graph)
-    {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            let path = error.path().map(|path| {
-                path.strip_prefix(&collection.root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            });
-            finish!(diagnostics::failed(vec![Diagnostic::error(
-                "collection_snapshot_failed",
-                error.to_string(),
-                path,
-            )]));
-        }
-    };
+    let (snapshot, load_profile) =
+        match collection.load_query_data_profiled_cancellable(true, needs_link_graph, cancellation)
+        {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                cancellation.check()?;
+                let path = error.path().map(|path| {
+                    path.strip_prefix(&collection.root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                });
+                finish!(diagnostics::failed(vec![Diagnostic::error(
+                    "collection_snapshot_failed",
+                    error.to_string(),
+                    path,
+                )]));
+            }
+        };
     let records = snapshot.records;
     let all_files = snapshot.all_files;
     let backlinks = snapshot.backlinks;
@@ -191,10 +218,23 @@ pub(crate) fn execute_profiled(
     } else {
         performance.records_loaded = records.len();
     }
+    cancellation.check()?;
 
     if metadata_page_plan {
         let phase = Instant::now();
-        let mut ordered = records.iter().collect::<Vec<_>>();
+        let mut ordered = records
+            .iter()
+            .filter(|record| {
+                compiled.query.types.is_empty()
+                    || record.type_names.iter().any(|actual| {
+                        compiled
+                            .query
+                            .types
+                            .iter()
+                            .any(|wanted| actual.eq_ignore_ascii_case(wanted))
+                    })
+            })
+            .collect::<Vec<_>>();
         ordered.sort_by(|left, right| {
             for order in &compiled.query.order_by {
                 let comparison = compare_values(
@@ -251,11 +291,13 @@ pub(crate) fn execute_profiled(
         Err(diagnostic) => finish!(diagnostics::failed(vec![*diagnostic])),
     };
     performance.context_us = micros(phase.elapsed());
+    cancellation.check()?;
 
     let phase = Instant::now();
     let mut query_diagnostics = Vec::new();
     let mut candidates = Vec::new();
     for record in &records {
+        cancellation.check()?;
         let (types, match_failures) = collection
             .determine_types_for_path_checked(&record.raw_frontmatter, Some(&record.rel_path));
         query_diagnostics.extend(match_failures.into_iter().map(|(type_name, failure)| {
@@ -388,14 +430,17 @@ pub(crate) fn execute_profiled(
     }
     performance.evaluate_us = micros(phase.elapsed());
     performance.candidates = candidates.len();
+    cancellation.check()?;
 
     let phase = Instant::now();
     sort_candidates(&mut candidates, &compiled.query.order_by);
     performance.sort_us = micros(phase.elapsed());
+    cancellation.check()?;
 
     let phase = Instant::now();
     let groups = build_groups(&candidates, &compiled, &clock, &mut query_diagnostics);
     performance.groups_us = micros(phase.elapsed());
+    cancellation.check()?;
     let total_count = candidates.len();
     let offset = usize::try_from(compiled.query.offset)
         .unwrap_or(usize::MAX)
@@ -439,7 +484,7 @@ pub(crate) fn execute_profiled(
         diagnostics: query_diagnostics,
     };
     performance.total_us = micros(total_started.elapsed());
-    (result, performance)
+    Ok((result, performance))
 }
 
 fn micros(duration: std::time::Duration) -> u64 {

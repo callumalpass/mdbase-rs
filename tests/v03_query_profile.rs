@@ -87,6 +87,20 @@ fn query(collection: &Collection, input: Value) -> v03::OperationResult {
 }
 
 #[test]
+fn cancelled_queries_stop_without_becoming_collection_diagnostics() {
+    let (_root, collection) = query_collection();
+    let cancellation = mdbase::OperationCancellation::new();
+    cancellation.cancel();
+
+    let result = collection.v03_operations().unwrap().query_cancellable(
+        &json!({"where": "file.body.lower().contains('body')"}),
+        &cancellation,
+    );
+
+    assert_eq!(result.unwrap_err(), mdbase::OperationCancelled);
+}
+
+#[test]
 fn schema_and_semantic_preflight_fail_before_scanning() {
     let (_root, collection) = query_collection();
 
@@ -308,6 +322,21 @@ fn profiling_exposes_lazy_query_plans_without_payloads() {
     let serialized = serde_json::to_string(&metadata_profile).unwrap();
     assert!(!serialized.contains("tasks/a.md"));
     assert!(!serialized.contains("Alpha"));
+
+    let (typed_page, typed_page_profile) = operations.query_profiled(&json!({
+        "types": ["task"],
+        "order_by": [{"field": "file.path", "direction": "asc"}],
+        "limit": 1,
+    }));
+    assert!(typed_page.valid, "{typed_page:#?}");
+    assert_eq!(typed_page.result["meta"]["total_count"], 3);
+    assert_eq!(
+        typed_page.result["results"][0]["file"]["path"],
+        "tasks/a.md"
+    );
+    assert_eq!(typed_page_profile.records_loaded, 1);
+    assert_eq!(typed_page_profile.candidates, 3);
+    assert_eq!(typed_page_profile.results, 1);
 
     let (traversal, traversal_profile) = operations.query_profiled(&json!({
         "where": "project.asFile().title == 'Alpha'",
