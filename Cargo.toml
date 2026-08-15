@@ -33,6 +33,7 @@ resolver = "2"
 [features]
 default = []
 tracing = ["dep:tracing"]
+hosted-storage-benchmark = []
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }

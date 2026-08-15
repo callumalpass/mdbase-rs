@@ -6,6 +6,8 @@
 //! corresponding change is available.
 
 mod api;
+#[cfg(feature = "hosted-storage-benchmark")]
+mod benchmark;
 mod catalog;
 mod context;
 mod cursor;
@@ -22,6 +24,11 @@ mod snapshot;
 
 pub use crate::data_contracts::{ResolvedRecordContract, ResolvedRecordContractImplementation};
 pub use api::CollectionRuntime;
+#[cfg(feature = "hosted-storage-benchmark")]
+pub use benchmark::{
+    BenchmarkDiagnostic, BenchmarkFileFacts, BenchmarkProjection, CandidateExpression,
+    CandidateTruth, CompiledCandidate, ProjectionRelationship, QueryRequirements,
+};
 pub use catalog::{
     CanonicalRecordInput, CatalogError, CatalogInput, CompiledCatalog, ResolvedTypeResource,
 };
