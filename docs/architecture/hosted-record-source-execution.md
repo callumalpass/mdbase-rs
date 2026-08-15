@@ -1,8 +1,12 @@
 # Hosted record-source execution contract
 
-Status: accepted companion contract for the cross-repository hosted execution ADR.
+Status: accepted for the delivered catalog/point-record boundary; query/projection
+extensions are benchmark-only pending proposed Connect ADR 0011 and user review.
 
 Canonical decision: `mdbase-connect/docs/decisions/0010-bounded-hosted-record-source-execution.md`
+
+Storage-model proposal:
+`mdbase-connect/docs/decisions/0011-server-trusted-queryable-hosted-execution.md`
 
 Connect baseline: `6ea62cf2593e91a0e0b17e9e931ebf0ec23dc805`  
 mdbase-rs baseline: `818866705dcc4b6dcfd3bbc1ba63f83fdaec406f`
@@ -32,9 +36,10 @@ it produces an immutable `CompiledCatalog` that owns type, contract, schema, sav
 view, and configuration semantics. Resource paths remain canonical collection
 paths; no authority credential or database identity enters the value.
 
-The filesystem provider builds the input from files. The hosted provider builds it
-from one consistent encrypted PostgreSQL snapshot. Both produce the same catalog
-digest and diagnostics for the same resources.
+The filesystem provider builds the input from files. A hosted provider builds it
+from one consistent authority snapshot, regardless of whether the benchmarked
+physical representation is encrypted, hybrid, or provider-readable. Both produce
+the same catalog digest and diagnostics for the same resources.
 
 ### Canonical record input
 
@@ -80,8 +85,10 @@ It never truncates or requests collection materialization. Cancellation and
 deadlines are checked at bounded intervals.
 
 Custom summaries and link graphs are unsupported until they have an explicit
-bounded implementation. Candidate hints may add false positives but never remove a
-possible match.
+bounded implementation. Candidate hints or a provider-neutral closed candidate IR
+may add false positives but never remove a possible match. Any proposed IR and
+persisted semantic projection remain benchmark-only until the cross-repository
+storage decision is accepted.
 
 ### Mutation planning
 
@@ -117,5 +124,6 @@ preserves completeness. Hosted PostgreSQL hints follow the same rule.
 - no PostgreSQL or CEL-to-SQL adapter in mdbase-rs;
 - no Connect protocol or durable cursor rows;
 - no application-level authorization types;
-- no plaintext hosted indexes; and
+- no authority-specific SQL, physical-index, encryption, or projection-generation
+  policy in mdbase-rs; and
 - no general spill/sort engine in the first bounded operator set.
