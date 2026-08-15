@@ -34,7 +34,19 @@ fn load_config_internal(collection_root: &Path, allow_future_minor: bool) -> ser
         Err(e) => return error_json("invalid_config", &format!("Failed to read config: {}", e)),
     };
 
-    let yaml: serde_yaml::Value = match serde_yaml::from_str(&content) {
+    parse_config_document(&content, allow_future_minor)
+}
+
+/// Parse an exact `mdbase.yaml` document for a provider-owned resource catalog.
+///
+/// Unlike [`load_config`], this performs no filesystem discovery. Providers are
+/// responsible for supplying the document from their own consistent snapshot.
+pub(crate) fn load_config_document_for_open(content: &str) -> serde_json::Value {
+    parse_config_document(content, true)
+}
+
+fn parse_config_document(content: &str, allow_future_minor: bool) -> serde_json::Value {
+    let yaml: serde_yaml::Value = match serde_yaml::from_str(content) {
         Ok(v) => v,
         Err(_) => return error_json("invalid_config", "Failed to parse YAML"),
     };

@@ -91,109 +91,117 @@ pub fn load_types_with_warnings(
             .map_err(|e| format!("Failed to read type file {:?}: {}", path, e))?;
 
         let type_def = parse_type_file(&content, &path, collection_root)?;
-
-        // Validate type name
-        validate_type_name(&type_def.name)?;
-
-        // Check filename matches name (warning if mismatch)
-        let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if file_stem.to_lowercase() != type_def.name.to_lowercase() {
-            warnings.push(format!(
-                "Type name '{}' does not match filename '{}'",
-                type_def.name, file_stem
-            ));
-        }
-
-        // Validate field definitions
-        for (field_name, field_def) in &type_def.fields {
-            // Empty enum values list
-            if field_def.field_type == "enum" {
-                if let Some(ref values) = field_def.values {
-                    if values.is_empty() {
-                        return Err(format!(
-                            "Type '{}' field '{}': enum must have at least one value",
-                            type_def.name, field_name
-                        ));
-                    }
-                }
-            }
-            // Random generation with invalid length
-            if let Some(GeneratedStrategy::Derived { from, .. }) = field_def.generated.as_ref() {
-                // Check if "from" is "file.name" etc (circular with path_pattern)
-                if from.starts_with("file.")
-                    && (type_def.path_pattern.is_some() || type_def.filename_pattern.is_some())
-                {
-                    let pattern = type_def
-                        .path_pattern
-                        .as_deref()
-                        .or(type_def.filename_pattern.as_deref())
-                        .unwrap_or("");
-                    if pattern.contains(&format!("{{{}}}", field_name)) {
-                        return Err(format!(
-                                "Type '{}': circular dependency between path_pattern and generated field '{}'",
-                                type_def.name, field_name
-                            ));
-                    }
-                }
-            }
-            // Validate generated strategies
-            if let Some(ref gen) = field_def.generated {
-                match gen {
-                    GeneratedStrategy::Random(len) => {
-                        if *len == 0 {
-                            return Err(format!(
-                                "Type '{}' field '{}': random generation length must be > 0",
-                                type_def.name, field_name
-                            ));
-                        }
-                    }
-                    GeneratedStrategy::Sequence(_) if field_def.field_type != "integer" => {
-                        return Err(format!(
-                            "Type '{}' field '{}': sequence generation requires integer type",
-                            type_def.name, field_name
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Validate path_pattern field references
-        let pattern = type_def
-            .path_pattern
-            .as_deref()
-            .or(type_def.filename_pattern.as_deref());
-        if let Some(pattern) = pattern {
-            for cap in placeholder_re.captures_iter(pattern) {
-                let field = &cap[1];
-                if !type_def.fields.contains_key(field) {
-                    warnings.push(format!(
-                        "Type '{}': path_pattern references unknown field '{}'",
-                        type_def.name, field
-                    ));
-                } else {
-                    // Check if referenced field is a computed field
-                    if let Some(fd) = type_def.fields.get(field) {
-                        if fd.computed.is_some() {
-                            return Err(format!(
-                                "Type '{}': path_pattern cannot reference computed field '{}'",
-                                type_def.name, field
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Canonicalize name to lowercase
-        let canonical_name = type_def.name.to_lowercase();
-        let mut type_def = type_def;
-        type_def.name = canonical_name.clone();
-
-        types.insert(canonical_name, type_def);
+        validate_and_insert_type(&mut types, &mut warnings, type_def, &path, &placeholder_re)?;
     }
 
     Ok(LoadTypesResult { types, warnings })
+}
+
+/// Compile already-resolved v0.3 type files supplied by a provider catalog.
+pub(crate) fn load_resolved_type_files(
+    type_files: Vec<crate::v03::TypeFile>,
+) -> Result<LoadTypesResult, String> {
+    let mut types = HashMap::new();
+    let mut warnings = Vec::new();
+    let placeholder_re = regex::Regex::new(r"\{(\w+)\}").expect("valid path placeholder regex");
+    for type_file in type_files {
+        let path = std::path::PathBuf::from(&type_file.path);
+        let type_def = v03_type_definition(type_file)?;
+        validate_and_insert_type(&mut types, &mut warnings, type_def, &path, &placeholder_re)?;
+    }
+    Ok(LoadTypesResult { types, warnings })
+}
+
+fn validate_and_insert_type(
+    types: &mut HashMap<String, TypeDef>,
+    warnings: &mut Vec<String>,
+    type_def: TypeDef,
+    path: &Path,
+    placeholder_re: &regex::Regex,
+) -> Result<(), String> {
+    validate_type_name(&type_def.name)?;
+
+    let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    if file_stem.to_lowercase() != type_def.name.to_lowercase() {
+        warnings.push(format!(
+            "Type name '{}' does not match filename '{}'",
+            type_def.name, file_stem
+        ));
+    }
+
+    for (field_name, field_def) in &type_def.fields {
+        if field_def.field_type == "enum" && field_def.values.as_ref().is_some_and(Vec::is_empty) {
+            return Err(format!(
+                "Type '{}' field '{}': enum must have at least one value",
+                type_def.name, field_name
+            ));
+        }
+        if let Some(GeneratedStrategy::Derived { from, .. }) = field_def.generated.as_ref() {
+            if from.starts_with("file.")
+                && (type_def.path_pattern.is_some() || type_def.filename_pattern.is_some())
+            {
+                let pattern = type_def
+                    .path_pattern
+                    .as_deref()
+                    .or(type_def.filename_pattern.as_deref())
+                    .unwrap_or("");
+                if pattern.contains(&format!("{{{field_name}}}")) {
+                    return Err(format!(
+                        "Type '{}': circular dependency between path_pattern and generated field '{}'",
+                        type_def.name, field_name
+                    ));
+                }
+            }
+        }
+        if let Some(strategy) = field_def.generated.as_ref() {
+            match strategy {
+                GeneratedStrategy::Random(0) => {
+                    return Err(format!(
+                        "Type '{}' field '{}': random generation length must be > 0",
+                        type_def.name, field_name
+                    ));
+                }
+                GeneratedStrategy::Sequence(_) if field_def.field_type != "integer" => {
+                    return Err(format!(
+                        "Type '{}' field '{}': sequence generation requires integer type",
+                        type_def.name, field_name
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let pattern = type_def
+        .path_pattern
+        .as_deref()
+        .or(type_def.filename_pattern.as_deref());
+    if let Some(pattern) = pattern {
+        for capture in placeholder_re.captures_iter(pattern) {
+            let field = &capture[1];
+            if !type_def.fields.contains_key(field) {
+                warnings.push(format!(
+                    "Type '{}': path_pattern references unknown field '{}'",
+                    type_def.name, field
+                ));
+            } else if type_def
+                .fields
+                .get(field)
+                .is_some_and(|definition| definition.computed.is_some())
+            {
+                return Err(format!(
+                    "Type '{}': path_pattern cannot reference computed field '{}'",
+                    type_def.name, field
+                ));
+            }
+        }
+    }
+
+    let canonical_name = type_def.name.to_lowercase();
+    let mut type_def = type_def;
+    type_def.name = canonical_name.clone();
+    types.insert(canonical_name, type_def);
+    Ok(())
 }
 
 /// Recursively collect all type files (.md, .yaml, .yml) from a directory.
