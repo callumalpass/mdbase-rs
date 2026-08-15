@@ -231,7 +231,7 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
     })
 }
 
-fn materialize_snapshot_record(
+pub(crate) fn materialize_snapshot_record(
     collection: &Collection,
     path: &str,
     document: String,
