@@ -347,10 +347,12 @@ impl CompiledCatalog {
             // analysis, but is not yet an authoritative SQL pruning predicate.
             // CEL coercion and datetime comparison must be represented in the
             // provider IR before a false comparison may discard a record.
-            let _ = lower_expression(&expression, &mut requirements);
+            let lowered = lower_expression(&expression, &mut requirements);
             fully_projected = false;
             requirements.canonical_residual = true;
-            requirements.exact_document = true;
+            if lowered.is_none_or(|lowered| !lowered.complete) {
+                requirements.exact_document = true;
+            }
         }
         let candidate = conjunction(predicates);
         if predicate_nodes(&candidate) > MAX_PREDICATE_NODES {
@@ -433,7 +435,11 @@ impl CompiledCatalog {
             || !query.projections.is_empty()
             || query.select.is_some()
             || !fully_projected;
-        requirements.exact_document |= requirements.canonical_residual;
+        requirements.exact_document |= query.context.is_some()
+            || !query.projections.is_empty()
+            || query.select.is_some()
+            || requirements.structural_body_facts
+            || self.has_diagnostic_type_matchers();
         requirements.diagnostics = true;
 
         if query.limit.is_some_and(|limit| limit > MAX_PAGE_SIZE) {
@@ -729,6 +735,150 @@ impl CompiledCatalog {
         Ok(HostedResidualEvaluation {
             matched,
             record: record_output,
+            diagnostics,
+        })
+    }
+
+    /// Evaluate a projection-complete residual without decrypting exact body
+    /// prose. The plan itself proves that no exact, body, collection-context,
+    /// selection, or named-projection capability is required.
+    pub fn evaluate_hosted_projection_residual(
+        &self,
+        plan: &HostedQueryPlan,
+        projection: &SemanticProjection,
+    ) -> Result<HostedResidualEvaluation, CatalogError> {
+        if plan.version != HOSTED_QUERY_PLAN_VERSION
+            || plan.catalog_revision != self.resource_revision()
+            || plan.semantic_engine_version != env!("CARGO_PKG_VERSION")
+            || plan.integrity_digest()? != plan.plan_digest
+        {
+            return Err(query_error(
+                "hosted_query_plan_mismatch",
+                "Hosted query plan is not bound to the current semantic catalog.",
+            ));
+        }
+        if plan.requirements.exact_document
+            || plan.requirements.body_prose
+            || plan.requirements.structural_body_facts
+            || plan.requirements.collection_context
+            || !projection.facts.semantic_complete
+        {
+            return Err(query_error(
+                "hosted_exact_residual_required",
+                "This query or projection requires exact canonical evaluation.",
+            ));
+        }
+        let query: Query =
+            serde_json::from_value(plan.residual.query.clone()).map_err(|error| {
+                query_error(
+                    "invalid_query",
+                    format!("Query could not be decoded: {error}"),
+                )
+            })?;
+        let compiled = preflight::compile(query).map_err(|diagnostics| {
+            query_error(
+                "invalid_query",
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| diagnostic.message)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        })?;
+        if !compiled.projections.is_empty()
+            || !compiled.selections.is_empty()
+            || compiled.query.include_body
+            || compiled.query.context.is_some()
+            || compiled.requires_link_graph()
+        {
+            return Err(query_error(
+                "hosted_exact_residual_required",
+                "This query requires an exact or collection-context residual.",
+            ));
+        }
+        if !compiled.query.types.is_empty()
+            && !projection.facts.types.iter().any(|actual| {
+                compiled
+                    .query
+                    .types
+                    .iter()
+                    .any(|wanted| wanted.eq_ignore_ascii_case(actual))
+            })
+        {
+            return Ok(HostedResidualEvaluation {
+                matched: false,
+                record: None,
+                diagnostics: Vec::new(),
+            });
+        }
+        let collection = self.collection();
+        let timezone = resolve_execution_timezone(
+            compiled.query.timezone.as_deref(),
+            collection.settings.timezone.as_deref(),
+        )
+        .map_err(|message| query_error("invalid_timezone", message))?;
+        let clock = cel::operation_clock(timezone)
+            .map_err(|error| query_error(&error.code, error.message))?;
+        let file_record = FileRecord {
+            rel_path: projection.facts.path.clone(),
+            raw_frontmatter: Value::Object(projection.facts.persisted_frontmatter.clone()),
+            effective_frontmatter: Value::Object(projection.facts.effective_frontmatter.clone()),
+            body: String::new(),
+            type_names: projection.facts.types.clone(),
+            file_size: projection.facts.file.size,
+            file_mtime_iso: projection.facts.file.mtime.clone(),
+            file_ctime_iso: None,
+        };
+        let effective = Value::Object(projection.facts.effective_frontmatter.clone());
+        let projections = serde_json::Map::new();
+        let context = candidate_context(
+            collection,
+            &file_record,
+            &projection.facts.types,
+            &effective,
+            &projections,
+            None,
+            None,
+            None,
+            Arc::new(collection.types.clone()),
+        );
+        let mut diagnostics = Vec::new();
+        let matched = match compiled.where_expression.as_ref() {
+            None => true,
+            Some(expression) => match cel::evaluate_compiled(expression, &context, &clock) {
+                Ok(Value::Bool(true)) => true,
+                Ok(_) => false,
+                Err(error) => {
+                    diagnostics.push(diagnostics::evaluation(
+                        &projection.facts.path,
+                        "where",
+                        "query_filter",
+                        error,
+                        None,
+                    ));
+                    false
+                }
+            },
+        };
+        let file = file_value(&file_record, &effective, false);
+        let record = matched.then(|| {
+            serialize_candidate(
+                &Candidate {
+                    path: projection.facts.path.clone(),
+                    types: projection.facts.types.clone(),
+                    raw: file_record.raw_frontmatter,
+                    effective,
+                    body: String::new(),
+                    file,
+                    projections,
+                    values: serde_json::Map::new(),
+                },
+                &compiled.query,
+            )
+        });
+        Ok(HostedResidualEvaluation {
+            matched,
+            record,
             diagnostics,
         })
     }
@@ -1275,6 +1425,51 @@ mod tests {
             ),
             CandidateVerdict::CanonicalRequired
         );
+    }
+
+    #[test]
+    fn projection_complete_filter_uses_canonical_residual_without_exact_body() {
+        let catalog = catalog();
+        let plan = catalog
+            .compile_hosted_query(&json!({
+                "types": ["task"],
+                "where": "record.status == 'open'",
+                "limit": 10
+            }))
+            .unwrap();
+        assert!(!plan.requirements.exact_document);
+
+        let matching = catalog
+            .evaluate_hosted_projection_residual(&plan, &projection("open", true))
+            .unwrap();
+        assert!(matching.matched);
+        assert_eq!(
+            matching.record.unwrap()["effective_frontmatter"]["status"],
+            "open"
+        );
+
+        let missing = catalog
+            .evaluate_hosted_projection_residual(&plan, &projection("closed", true))
+            .unwrap();
+        assert!(!missing.matched);
+        assert!(missing.record.is_none());
+    }
+
+    #[test]
+    fn body_structural_filters_require_exact_until_query_context_supports_them() {
+        let catalog = catalog();
+        let plan = catalog
+            .compile_hosted_query(&json!({
+                "where": "file.tags.contains('urgent')",
+                "limit": 10
+            }))
+            .unwrap();
+        assert!(plan.requirements.structural_body_facts);
+        assert!(plan.requirements.exact_document);
+        let error = catalog
+            .evaluate_hosted_projection_residual(&plan, &projection("open", true))
+            .unwrap_err();
+        assert_eq!(error.code, "hosted_exact_residual_required");
     }
 
     #[test]

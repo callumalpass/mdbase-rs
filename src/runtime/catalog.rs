@@ -176,6 +176,15 @@ impl CompiledCatalog {
         &self.resource_revision
     }
 
+    pub(crate) fn has_diagnostic_type_matchers(&self) -> bool {
+        self.collection.types.values().any(|type_definition| {
+            type_definition
+                .match_rules
+                .as_ref()
+                .is_some_and(|rules| rules.match_expr.is_some())
+        })
+    }
+
     pub fn read_record(&self, input: &Value, record: &CanonicalRecordInput) -> OperationResult {
         self.collection
             .v03_operations()
