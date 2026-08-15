@@ -681,4 +681,55 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn generated_candidate_corpus_has_no_false_negatives() {
+        let expressions = [
+            json!({"all": [{"typeIn": ["task"]}, {"fieldEq": ["effective_frontmatter.status", "open"]}]}),
+            json!({"any": [{"fieldContains": ["effective_frontmatter.projects", "project-7"]}, {"bodyContains": "needle"}]}),
+            json!({"fieldLt": ["effective_frontmatter.priority", 50]}),
+            json!({"not": {"bodyContains": "forbidden"}}),
+        ]
+        .map(|value| serde_json::from_value::<CandidateExpression>(value).unwrap());
+        let mut state = 0x5eed_u64;
+        for case in 0..1_024 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let mut projected = projection();
+            projected.types = if state & 1 == 0 {
+                vec!["task".to_string()]
+            } else {
+                vec!["note".to_string()]
+            };
+            projected.effective_frontmatter.insert(
+                "status".to_string(),
+                json!(if state & 2 == 0 { "open" } else { "done" }),
+            );
+            projected
+                .effective_frontmatter
+                .insert("priority".to_string(), json!(((state >> 8) % 100) as i64));
+            projected.effective_frontmatter.insert(
+                "projects".to_string(),
+                if state & 4 == 0 {
+                    json!(["project-7"])
+                } else {
+                    json!(["project-9"])
+                },
+            );
+            let body = match (state >> 4) & 3 {
+                0 => "needle",
+                1 => "forbidden",
+                _ => "ordinary body",
+            };
+            for expression in &expressions {
+                let canonical = expression.evaluate_canonical(&projected, body);
+                let candidate = expression.evaluate_candidate(&projected);
+                assert!(
+                    !canonical || candidate != CandidateTruth::Impossible,
+                    "generated case {case} produced a false negative: {expression:?} / {body}"
+                );
+            }
+        }
+    }
 }
