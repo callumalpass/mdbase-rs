@@ -20,6 +20,7 @@ mod observer;
 mod operation;
 mod outcome;
 mod provider;
+mod record_structure;
 mod snapshot;
 
 pub use crate::data_contracts::{ResolvedRecordContract, ResolvedRecordContractImplementation};
@@ -51,6 +52,11 @@ pub use outcome::{
     ResourceChangeKind, RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeMeasurements,
 };
 pub use provider::{CollectionProvider, FilesystemProvider};
+pub use record_structure::{
+    parse_record_structure, RecordStructure, RecordStructureLink, RecordStructureModel,
+    RecordStructureParser, StructuralLinkKind, StructuralOccurrence, StructuralResolution,
+    StructuralSourceKind, RECORD_STRUCTURE_SCHEMA_VERSION,
+};
 pub(crate) use snapshot::is_schema_resource_path;
 pub use snapshot::{
     CollectionSnapshot, CollectionSnapshotRecord, CollectionSnapshotResource,

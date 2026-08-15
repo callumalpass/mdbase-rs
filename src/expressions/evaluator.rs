@@ -2722,7 +2722,7 @@ fn date_to_epoch_ms(s: &str) -> Option<i64> {
 
 /// Strip inline code spans from body text before extracting links/tags/embeds.
 /// Handles both single backtick `code` and multi-backtick ``code`` spans.
-fn strip_code_blocks_and_inline_code(body: &str) -> String {
+pub(crate) fn strip_code_blocks_and_inline_code(body: &str) -> String {
     // First pass: strip fenced code blocks (``` or ~~~)
     let mut lines_out = Vec::new();
     let mut in_fence = false;

@@ -9,6 +9,7 @@ use crate::types::{inheritance, loader};
 use crate::v03::{Diagnostic, OperationResult, TypeFile};
 use crate::{Collection, Settings, SpecProfile};
 
+use super::record_structure::RecordStructure;
 use super::CollectionSnapshotRecord;
 
 /// Provider-neutral inputs for compiling the record semantics needed by
@@ -228,6 +229,36 @@ impl CompiledCatalog {
 
     pub fn type_warnings(&self) -> &[String] {
         self.collection.type_warnings()
+    }
+
+    /// Extract provider-neutral structural facts from one exact record.
+    ///
+    /// This operation validates the canonical relative path but does not
+    /// enumerate records or resolve occurrences against a catalogue. A host
+    /// may perform that second step against its own consistent snapshot.
+    pub fn parse_record_structure(
+        &self,
+        record: &CanonicalRecordInput,
+    ) -> Result<RecordStructure, CatalogError> {
+        let path = self
+            .collection
+            .validate_record_path(&record.path)
+            .map_err(|error| CatalogError {
+                code: "invalid_path".to_string(),
+                message: format!("The record path is invalid: {error}"),
+            })?;
+        Ok(super::record_structure::parse_record_structure(
+            path.as_str(),
+            &record.document,
+        ))
+    }
+
+    /// Alias emphasizing that this is a projection rather than a resolver.
+    pub fn project_record_structure(
+        &self,
+        record: &CanonicalRecordInput,
+    ) -> Result<RecordStructure, CatalogError> {
+        self.parse_record_structure(record)
     }
 }
 
