@@ -1,8 +1,8 @@
 # Benchmark-only hosted storage semantic seam
 
-Status: frozen prototype contract for proposed Connect ADR 0011. It is not an
-accepted public API and must not be merged as a permanent storage decision before
-user review.
+Status: frozen historical prototype contract. Connect ADR 0011 subsequently
+selected Candidate B; production APIs live in the hosted record-source execution
+contract and must not preserve this prototype mechanically.
 
 ## Inputs and ownership
 

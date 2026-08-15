@@ -1,14 +1,14 @@
 # Hosted record-source execution contract
 
-Status: accepted for the delivered catalog/point-record boundary; query/projection
-extensions are benchmark-only pending proposed Connect ADR 0011 and user review.
+Status: accepted production semantic contract. Candidate B query, projection,
+structural relationship, residual, and mutation seams are under implementation.
 
 Canonical decision: `mdbase-connect/docs/decisions/0010-bounded-hosted-record-source-execution.md`
 
-Storage-model proposal:
+Governing storage-model decision:
 `mdbase-connect/docs/decisions/0011-server-trusted-queryable-hosted-execution.md`
 
-Benchmark-only semantic seam:
+Historical benchmark prototype seam:
 `docs/architecture/hosted-storage-benchmark-seam.md`
 
 Connect baseline: `6ea62cf2593e91a0e0b17e9e931ebf0ec23dc805`  
@@ -20,6 +20,10 @@ mdbase-rs owns canonical resource compilation, exact Markdown parsing, type
 matching, defaults, coercion, computed fields, CEL, projections, contracts, views,
 validation, diagnostics, bounded query accumulation, portable execution outcomes,
 and semantic mutation plans.
+
+The selected hosted authority stores encrypted exact Markdown as the sole canonical
+record and a provider-readable, rebuildable semantic projection. Body prose and
+exact Markdown are absent from that projection.
 
 The integrating authority owns record storage, asynchronous IO, snapshots,
 encryption, authorization, admission, durable cursor storage, quotas, retries, and
@@ -65,9 +69,29 @@ classification accept one record plus a compiled catalog. They do not enumerate 
 load unrelated records unless the requested semantic feature explicitly requires a
 bounded link/reference neighborhood.
 
+### Structural projection
+
+Parsing one canonical record produces a versioned semantic projection and a
+deterministic structural/link digest. The projection contains canonical path and
+file facts, matched types, persisted/effective frontmatter, diagnostics, and
+structurally significant body facts without body prose or exact Markdown.
+
+One shared structural parser supplies projection, validation, backlink, rename,
+delete, and reference semantics. It preserves wikilink, Markdown-link and embed
+kind, normalized target, raw target form where required, alias, anchor, relative
+form, source, body tags, and resolution outcome. Resolution distinguishes resolved,
+missing, ambiguous, and unsafe traversal outcomes; it never collapses multiple
+basename, ID, or title matches into one arbitrary target.
+
+The projection exposes canonical outgoing occurrences. The authority persists
+those rows and derives backlinks from their inverse. Authority record/catalog/
+generation currentness remains outside mdbase-rs, but the semantic engine and
+projection format versions and content digest are explicit outputs.
+
 ### Query compilation and accumulation
 
-`compile_query` returns a private plan plus public `QueryRequirements` describing:
+`compile_query` returns a versioned closed plan plus public `QueryRequirements`
+describing:
 
 - body and body-derived file facts;
 - link/backlink graph needs;
@@ -79,7 +103,7 @@ bounded link/reference neighborhood.
 - diagnostics.
 
 A `BoundedQueryExecution` consumes one canonical record at a time and accounts all
-retained state against caller-supplied budgets. The initial supported algorithms are
+retained state against caller-supplied budgets. The supported bounded algorithms are
 streaming filters/projections, fixed-state counts and built-in summaries, bounded
 top-K, bounded groups, bounded diagnostics, and bounded final serialization.
 
@@ -87,11 +111,11 @@ Exhaustion returns one stable `ExecutionFailure::BudgetExceeded { budget_kind }`
 It never truncates or requests collection materialization. Cancellation and
 deadlines are checked at bounded intervals.
 
-Custom summaries and link graphs are unsupported until they have an explicit
-bounded implementation. Candidate hints or a provider-neutral closed candidate IR
-may add false positives but never remove a possible match. Any proposed IR and
-persisted semantic projection remain benchmark-only until the cross-repository
-storage decision is accepted.
+Custom summaries and recursive graph traversal are unsupported until they have an
+explicit bounded implementation. Candidate plans may add false positives but never
+remove a possible match. Missing, stale, malformed, unavailable, or unsupported
+projection facts evaluate as unknown and remain candidates. Canonical residual
+evaluation reuses filesystem semantics.
 
 ### Mutation planning
 
@@ -99,7 +123,10 @@ A `MutationPlan` contains portable expected generation/resource revision, record
 preconditions, destination uniqueness requirements, bounded reference-neighborhood
 evidence, canonical exact writes/deletes, and the final portable semantic result.
 It contains no host request identity, grant, ciphertext, SQL, receipt, or journal
-state.
+state. Rename/delete/reference plans use the same structural occurrences and
+resolution semantics as projection generation. They preserve aliases and anchors,
+report ambiguity, and include expected neighbor revisions rather than discovering
+or mutating authority storage themselves.
 
 Authorities prepare against a read snapshot and atomically revalidate the plan at
 their own commit boundary. A changed precondition causes bounded reprepare or a
@@ -127,6 +154,6 @@ preserves completeness. Hosted PostgreSQL hints follow the same rule.
 - no PostgreSQL or CEL-to-SQL adapter in mdbase-rs;
 - no Connect protocol or durable cursor rows;
 - no application-level authorization types;
-- no authority-specific SQL, physical-index, encryption, or projection-generation
-  policy in mdbase-rs; and
+- no authority-specific SQL, physical-index, encryption, currentness, generation,
+  lease, checkpoint, or persistence policy in mdbase-rs; and
 - no general spill/sort engine in the first bounded operator set.
