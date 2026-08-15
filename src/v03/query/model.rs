@@ -33,7 +33,7 @@ pub(crate) struct Query {
     pub _extensions: BTreeMap<String, Value>,
 }
 
-pub(super) struct Candidate {
+pub(crate) struct Candidate {
     pub path: String,
     pub types: Vec<String>,
     pub raw: Value,

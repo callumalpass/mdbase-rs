@@ -13,9 +13,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::expressions::ast::{BinOp, Expr, UnaryOp};
+use crate::expressions::evaluator::resolve_execution_timezone;
 use crate::query::cache_source::FileRecord;
-use crate::v03::query::context::{candidate_context, file_value};
-use crate::v03::query::{model::Query, preflight};
+use crate::v03::query::context::{candidate_context, file_value, namespace_value};
+use crate::v03::query::diagnostics;
+use crate::v03::query::model::{Candidate, Query};
+use crate::v03::query::preflight::{self, CompiledSelection};
+use crate::v03::query::result::serialize_candidate;
 use crate::v03::{cel, validate_query, Diagnostic};
 
 use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
@@ -34,12 +38,14 @@ pub struct HostedQueryPlan {
     pub semantic_engine_version: String,
     pub catalog_revision: String,
     pub canonical_query_digest: String,
+    pub plan_digest: String,
     pub candidate: CandidatePredicate,
     pub residual: CanonicalResidual,
     pub order: Vec<HostedOrder>,
     pub groups: Vec<HostedGroup>,
     pub aggregates: Vec<HostedAggregate>,
     pub page_size: u64,
+    pub requested_limit: Option<u64>,
     pub offset: u64,
     pub requirements: HostedQueryRequirements,
     pub budgets: HostedQueryBudgets,
@@ -57,6 +63,8 @@ pub struct CanonicalResidual {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostedResidualEvaluation {
     pub matched: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<Value>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -116,7 +124,7 @@ pub struct HostedOrder {
     pub direction: HostedOrderDirection,
     /// Every provider order ends with stable record identity as an implicit
     /// deterministic tie-break. This flag makes the contract explicit.
-    pub stable_identity_tiebreak: bool,
+    pub canonical_path_tiebreak: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +207,7 @@ pub enum CandidateVerdict {
 struct QueryEnvelope {
     #[serde(default)]
     types: Vec<String>,
+    timezone: Option<String>,
     #[serde(rename = "where")]
     where_expression: Option<String>,
     #[serde(default)]
@@ -218,6 +227,7 @@ struct QueryEnvelope {
     #[serde(default)]
     projections: BTreeMap<String, Value>,
     select: Option<Vec<Value>>,
+    pagination: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +288,11 @@ impl CompiledCatalog {
                     .join("; "),
             )
         })?;
+        resolve_execution_timezone(
+            query.timezone.as_deref(),
+            self.collection().settings.timezone.as_deref(),
+        )
+        .map_err(|message| query_error("invalid_timezone", message))?;
         if query.order_by.len() > MAX_ORDER_TERMS
             || query.group_by.len() > MAX_GROUP_TERMS
             || query.summaries.len() > MAX_SUMMARIES
@@ -309,21 +324,14 @@ impl CompiledCatalog {
                     format!("Query filter did not compile: {}", error.message),
                 )
             })?;
-            match lower_expression(&expression, &mut requirements) {
-                Some(lowered) => {
-                    predicates.push(lowered.predicate);
-                    fully_projected = lowered.complete;
-                    if !lowered.complete {
-                        requirements.canonical_residual = true;
-                        requirements.exact_document = true;
-                    }
-                }
-                None => {
-                    fully_projected = false;
-                    requirements.canonical_residual = true;
-                    requirements.exact_document = true;
-                }
-            }
+            // Comparison lowering is retained as a requirements/classification
+            // analysis, but is not yet an authoritative SQL pruning predicate.
+            // CEL coercion and datetime comparison must be represented in the
+            // provider IR before a false comparison may discard a record.
+            let _ = lower_expression(&expression, &mut requirements);
+            fully_projected = false;
+            requirements.canonical_residual = true;
+            requirements.exact_document = true;
         }
         let candidate = conjunction(predicates);
         if predicate_nodes(&candidate) > MAX_PREDICATE_NODES {
@@ -336,23 +344,20 @@ impl CompiledCatalog {
         let mut order = Vec::with_capacity(query.order_by.len());
         for item in &query.order_by {
             let Some(field) = lower_query_field(&item.field) else {
-                requirements.bounded_top_k = true;
-                requirements.canonical_residual = true;
-                requirements.exact_document = true;
-                continue;
+                return Err(query_error(
+                    "unsupported_hosted_order",
+                    format!(
+                        "Order field '{}' requires a bounded exact sorter that is not available.",
+                        item.field
+                    ),
+                ));
             };
             accumulate_field_requirement(&field, &mut requirements);
             order.push(HostedOrder {
                 field,
                 direction: direction(&item.direction),
-                stable_identity_tiebreak: true,
+                canonical_path_tiebreak: true,
             });
-        }
-        if order.len() != query.order_by.len() && query.limit.is_none() {
-            return Err(query_error(
-                "unbounded_exact_order",
-                "Ordering that is not projection-safe requires an explicit bounded limit.",
-            ));
         }
 
         let mut groups = Vec::with_capacity(query.group_by.len());
@@ -382,8 +387,13 @@ impl CompiledCatalog {
             let provider_safe = is_builtin_summary(&item.function)
                 && !query.summary_functions.contains_key(&item.function);
             if !provider_safe {
-                requirements.canonical_residual = true;
-                requirements.exact_document = true;
+                return Err(query_error(
+                    "unsupported_hosted_summary",
+                    format!(
+                        "Summary function '{}' requires a canonical bounded reducer that is not available.",
+                        item.function
+                    ),
+                ));
             }
             accumulate_field_requirement(&field, &mut requirements);
             aggregates.push(HostedAggregate {
@@ -404,19 +414,37 @@ impl CompiledCatalog {
             || query.select.is_some()
             || !fully_projected;
         requirements.exact_document |= requirements.canonical_residual;
+        requirements.diagnostics = requirements.canonical_residual;
 
-        let page_size = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
+        if query.limit.is_some_and(|limit| limit > MAX_PAGE_SIZE) {
+            return Err(query_error(
+                "hosted_result_budget_exceeded",
+                format!("Requested limit exceeds the hosted page maximum of {MAX_PAGE_SIZE}."),
+            ));
+        }
+        if query
+            .pagination
+            .as_deref()
+            .is_some_and(|value| value != "cursor")
+        {
+            return Err(query_error(
+                "invalid_query",
+                "Hosted query pagination must be 'cursor'.",
+            ));
+        }
+        let page_size = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
         let canonical = serde_jcs::to_vec(input).map_err(|error| {
             query_error(
                 "invalid_query",
                 format!("Query could not be canonicalized: {error}"),
             )
         })?;
-        Ok(HostedQueryPlan {
+        let mut plan = HostedQueryPlan {
             version: HOSTED_QUERY_PLAN_VERSION,
             semantic_engine_version: env!("CARGO_PKG_VERSION").to_string(),
             catalog_revision: self.resource_revision().to_string(),
             canonical_query_digest: format!("sha256:{:x}", Sha256::digest(canonical)),
+            plan_digest: String::new(),
             candidate,
             residual: CanonicalResidual {
                 query: input.clone(),
@@ -426,10 +454,13 @@ impl CompiledCatalog {
             groups,
             aggregates,
             page_size,
+            requested_limit: query.limit,
             offset: query.offset,
             requirements,
             budgets: HostedQueryBudgets::default(),
-        })
+        };
+        plan.plan_digest = plan.integrity_digest()?;
+        Ok(plan)
     }
 
     /// Canonically evaluate one retained exact record against a compiled plan.
@@ -447,6 +478,7 @@ impl CompiledCatalog {
         if plan.version != HOSTED_QUERY_PLAN_VERSION
             || plan.catalog_revision != self.resource_revision()
             || plan.semantic_engine_version != env!("CARGO_PKG_VERSION")
+            || plan.integrity_digest()? != plan.plan_digest
         {
             return Err(query_error(
                 "hosted_query_plan_mismatch",
@@ -497,7 +529,22 @@ impl CompiledCatalog {
         }
 
         let classified = self.classify_record(record)?;
-        let types = classified.types;
+        let raw = Value::Object(classified.frontmatter);
+        let collection = self.collection();
+        let (types, match_failures) =
+            collection.determine_types_for_path_checked(&raw, Some(&record.path));
+        let mut diagnostics = match_failures
+            .into_iter()
+            .map(|(type_name, failure)| {
+                diagnostics::evaluation(
+                    &record.path,
+                    "match.expr",
+                    "match",
+                    failure,
+                    Some(type_name),
+                )
+            })
+            .collect::<Vec<_>>();
         if !compiled.query.types.is_empty()
             && !types.iter().any(|actual| {
                 compiled
@@ -509,31 +556,41 @@ impl CompiledCatalog {
         {
             return Ok(HostedResidualEvaluation {
                 matched: false,
-                diagnostics: Vec::new(),
+                record: None,
+                diagnostics,
             });
         }
-        let read = self.read_record(&serde_json::json!({"path": record.path}), record);
-        let effective = read
-            .result
-            .get("effective_frontmatter")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Default::default()));
+        let effective = collection.apply_defaults(&raw, &types);
+        let effective = collection.coerce_types(&effective, &types);
+        let effective = collection.evaluate_computed_fields(
+            effective,
+            &types,
+            &record.path,
+            Some(&classified.body),
+        );
         let file_record = FileRecord {
             rel_path: record.path.clone(),
-            raw_frontmatter: Value::Object(classified.frontmatter),
+            raw_frontmatter: raw,
             effective_frontmatter: effective.clone(),
             body: classified.body,
             type_names: types.clone(),
-            file_size: record.document.len() as u64,
+            file_size: if record.file_size == 0 {
+                record.document.len() as u64
+            } else {
+                record.file_size
+            },
             file_mtime_iso: record.file_mtime.clone(),
             file_ctime_iso: None,
         };
-        let collection = self.collection();
-        let clock = cel::operation_clock(collection.settings.timezone.as_deref())
+        let timezone = resolve_execution_timezone(
+            compiled.query.timezone.as_deref(),
+            collection.settings.timezone.as_deref(),
+        )
+        .map_err(|message| query_error("invalid_timezone", message))?;
+        let clock = cel::operation_clock(timezone)
             .map_err(|error| query_error(&error.code, error.message))?;
         let type_definitions = Arc::new(collection.types.clone());
         let mut projections = serde_json::Map::new();
-        let mut diagnostics = read.diagnostics;
         for (name, expression) in &compiled.projections {
             let context = candidate_context(
                 collection,
@@ -551,10 +608,12 @@ impl CompiledCatalog {
                     projections.insert(name.clone(), value);
                 }
                 Err(error) => {
-                    diagnostics.push(Diagnostic::error(
-                        error.code,
-                        error.message,
-                        Some(record.path.clone()),
+                    diagnostics.push(diagnostics::evaluation(
+                        &record.path,
+                        &format!("projections.{name}"),
+                        "query_projection",
+                        error,
+                        None,
                     ));
                     projections.insert(name.clone(), Value::Null);
                 }
@@ -577,30 +636,87 @@ impl CompiledCatalog {
                 Ok(Value::Bool(true)) => true,
                 Ok(_) => false,
                 Err(error) => {
-                    diagnostics.push(Diagnostic::error(
-                        error.code,
-                        error.message,
-                        Some(record.path.clone()),
+                    diagnostics.push(diagnostics::evaluation(
+                        &record.path,
+                        "where",
+                        "query_filter",
+                        error,
+                        None,
                     ));
                     false
                 }
             },
         };
-        // Force construction here so body-derived file fields use the exact
-        // record semantics when the expression evaluator requested them.
-        let _ = file_value(
+        let file = file_value(
             &file_record,
             &effective,
             compiled.requires_file_body_metadata(),
         );
+        let record_output = if matched {
+            let mut values = serde_json::Map::new();
+            for selection in &compiled.selections {
+                match selection {
+                    CompiledSelection::Field { source, name } => {
+                        values.insert(
+                            name.clone(),
+                            namespace_value(source, &effective, &projections, &values, &file),
+                        );
+                    }
+                    CompiledSelection::Expression { expression, name } => {
+                        let value = match cel::evaluate_compiled(expression, &context, &clock) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                diagnostics.push(diagnostics::evaluation(
+                                    &record.path,
+                                    &format!("select.{name}"),
+                                    "query_selection",
+                                    error,
+                                    None,
+                                ));
+                                Value::Null
+                            }
+                        };
+                        values.insert(name.clone(), value);
+                    }
+                }
+            }
+            Some(serialize_candidate(
+                &Candidate {
+                    path: record.path.clone(),
+                    types,
+                    raw: file_record.raw_frontmatter,
+                    effective,
+                    body: file_record.body,
+                    file,
+                    projections,
+                    values,
+                },
+                &compiled.query,
+            ))
+        } else {
+            None
+        };
         Ok(HostedResidualEvaluation {
             matched,
+            record: record_output,
             diagnostics,
         })
     }
 }
 
 impl HostedQueryPlan {
+    fn integrity_digest(&self) -> Result<String, CatalogError> {
+        let mut unsigned = self.clone();
+        unsigned.plan_digest.clear();
+        let bytes = serde_jcs::to_vec(&unsigned).map_err(|error| {
+            query_error(
+                "invalid_hosted_query_plan",
+                format!("Hosted query plan could not be canonicalized: {error}"),
+            )
+        })?;
+        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    }
+
     /// Evaluate only whether SQL may discard a projected row. Stale, absent,
     /// incomplete, or semantically uncertain rows always reach canonical work.
     pub fn candidate_verdict(
@@ -608,6 +724,9 @@ impl HostedQueryPlan {
         projection: Option<&SemanticProjection>,
         availability: ProjectionAvailability,
     ) -> CandidateVerdict {
+        if self.integrity_digest().ok().as_deref() != Some(self.plan_digest.as_str()) {
+            return CandidateVerdict::CanonicalRequired;
+        }
         if availability != ProjectionAvailability::Current {
             return CandidateVerdict::CanonicalRequired;
         }
@@ -1092,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_safe_filter_and_rejects_only_current_complete_false_rows() {
+    fn comparison_filters_remain_residual_until_cel_coercion_is_in_the_ir() {
         let plan = catalog()
             .compile_hosted_query(&json!({
                 "types": ["task"],
@@ -1101,14 +1220,14 @@ mod tests {
                 "limit": 50
             }))
             .unwrap();
-        assert!(plan.residual.filter_fully_projected);
+        assert!(!plan.residual.filter_fully_projected);
         assert_eq!(plan.page_size, 50);
         assert_eq!(
             plan.candidate_verdict(
                 Some(&projection("closed", true)),
                 ProjectionAvailability::Current
             ),
-            CandidateVerdict::Reject
+            CandidateVerdict::CanonicalRequired
         );
         assert_eq!(
             plan.candidate_verdict(
@@ -1137,10 +1256,11 @@ mod tests {
     }
 
     #[test]
-    fn partial_conjunction_keeps_only_necessary_safe_condition() {
+    fn partial_conjunction_does_not_prune_before_canonical_comparison() {
         let plan = catalog()
             .compile_hosted_query(&json!({
                 "where": "record.status == 'open' && file.body.contains('needle')",
+                "include_body": true,
                 "limit": 10
             }))
             .unwrap();
@@ -1151,7 +1271,7 @@ mod tests {
                 Some(&projection("closed", true)),
                 ProjectionAvailability::Current
             ),
-            CandidateVerdict::Reject
+            CandidateVerdict::CanonicalRequired
         );
     }
 
@@ -1193,6 +1313,7 @@ mod tests {
         let plan = catalog
             .compile_hosted_query(&json!({
                 "where": "record.status == 'open' && file.body.contains('needle')",
+                "include_body": true,
                 "limit": 10
             }))
             .unwrap();
@@ -1207,11 +1328,11 @@ mod tests {
             document: "---\nstatus: open\n---\nother prose\n".to_string(),
             ..matching.clone()
         };
-        assert!(
-            catalog
-                .evaluate_hosted_residual(&plan, &matching)
-                .unwrap()
-                .matched
+        let evaluation = catalog.evaluate_hosted_residual(&plan, &matching).unwrap();
+        assert!(evaluation.matched);
+        assert_eq!(
+            evaluation.record.as_ref().unwrap()["body"],
+            "secret needle\n"
         );
         assert!(
             !catalog
@@ -1241,14 +1362,70 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, "hosted_query_plan_mismatch");
+
+        let mut plan = catalog
+            .compile_hosted_query(&json!({"types": ["task"], "limit": 5}))
+            .unwrap();
+        plan.candidate = CandidatePredicate::None;
+        let error = catalog
+            .evaluate_hosted_residual(
+                &plan,
+                &CanonicalRecordInput {
+                    stable_id: None,
+                    path: "tasks/one.md".to_string(),
+                    document: "---\nstatus: open\n---\n".to_string(),
+                    file_size: 0,
+                    file_mtime: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "hosted_query_plan_mismatch");
     }
 
     #[test]
-    fn exact_order_requires_a_bound() {
+    fn residual_honors_query_timezone_and_provider_file_size() {
+        let catalog = catalog();
+        let invalid = catalog
+            .compile_hosted_query(&json!({"timezone": "local", "limit": 5}))
+            .unwrap_err();
+        assert_eq!(invalid.code, "invalid_timezone");
+
+        let plan = catalog
+            .compile_hosted_query(&json!({
+                "timezone": "Australia/Melbourne",
+                "where": "file.size == 999",
+                "limit": 5
+            }))
+            .unwrap();
+        let evaluation = catalog
+            .evaluate_hosted_residual(
+                &plan,
+                &CanonicalRecordInput {
+                    stable_id: None,
+                    path: "tasks/one.md".to_string(),
+                    document: "---\nstatus: open\n---\nshort\n".to_string(),
+                    file_size: 999,
+                    file_mtime: None,
+                },
+            )
+            .unwrap();
+        assert!(evaluation.matched);
+    }
+
+    #[test]
+    fn page_maximum_is_a_typed_error_not_a_clamp() {
+        let error = catalog()
+            .compile_hosted_query(&json!({"limit": MAX_PAGE_SIZE + 1}))
+            .unwrap_err();
+        assert_eq!(error.code, "hosted_result_budget_exceeded");
+    }
+
+    #[test]
+    fn exact_order_is_rejected_until_a_bounded_sorter_exists() {
         let error = catalog()
             .compile_hosted_query(&json!({"order_by": [{"field": "file.body"}]}))
             .unwrap_err();
-        assert_eq!(error.code, "unbounded_exact_order");
+        assert_eq!(error.code, "unsupported_hosted_order");
     }
 
     #[test]
@@ -1259,6 +1436,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
+        assert!(first.plan_digest.starts_with("sha256:"));
         assert_eq!(serde_json::to_value(first).unwrap()["version"], 1);
     }
 }

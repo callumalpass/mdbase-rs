@@ -91,7 +91,7 @@ pub(super) fn build_groups(
     )
 }
 
-pub(super) fn serialize_candidate(candidate: &Candidate, query: &Query) -> Value {
+pub(crate) fn serialize_candidate(candidate: &Candidate, query: &Query) -> Value {
     let mut file = candidate.file.clone();
     complete_file_value(&mut file, &candidate.effective, &candidate.body);
     let mut result = Map::from_iter([

@@ -171,7 +171,7 @@ pub(super) fn complete_file_value(file: &mut Value, effective: &Value, body: &st
     }
 }
 
-pub(super) fn namespace_value(
+pub(crate) fn namespace_value(
     field: &str,
     effective: &Value,
     projections: &Map<String, Value>,
