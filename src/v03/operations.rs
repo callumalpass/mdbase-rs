@@ -42,6 +42,72 @@ impl<'a> Operations<'a> {
         result
     }
 
+    /// Evaluate a provider-supplied exact record using this collection's
+    /// compiled catalog without reading or discovering filesystem records.
+    pub(crate) fn read_record(
+        &self,
+        input: &Value,
+        path: &str,
+        document: &str,
+        file_facts: &crate::operations::read::RecordFileFacts,
+    ) -> OperationResult {
+        let parsed = match crate::api::operations::ReadInput::parse(input) {
+            Ok(parsed) => parsed,
+            Err(error) => return self.normalize_without_hydration("read", input, error),
+        };
+        if let Err(error) =
+            crate::operations::ensure_safe_relative_path(&parsed.path, self.collection.spec_profile)
+        {
+            return self.normalize_without_hydration("read", input, error);
+        }
+        let requested = match crate::operations::readable_record_path(self.collection, &parsed.path)
+        {
+            Ok(path) => path,
+            Err(error) => return self.normalize_without_hydration("read", input, error),
+        };
+        if requested.as_str() != path {
+            return failed_result(vec![Diagnostic::error(
+                "record_identity_mismatch",
+                "The supplied record does not match the requested canonical path.",
+                Some(parsed.path),
+            )]);
+        }
+        let evaluated = self.collection.read_document(
+            requested.as_str(),
+            document,
+            file_facts,
+            parsed.include_document,
+        );
+        let mut result = self.normalize_without_hydration("read", input, evaluated);
+        self.attach_match_diagnostics(&mut result);
+        result
+    }
+
+    pub(crate) fn read_record_not_found(&self, input: &Value) -> OperationResult {
+        let parsed = match crate::api::operations::ReadInput::parse(input) {
+            Ok(parsed) => parsed,
+            Err(error) => return self.normalize_without_hydration("read", input, error),
+        };
+        if let Err(error) =
+            crate::operations::ensure_safe_relative_path(&parsed.path, self.collection.spec_profile)
+        {
+            return self.normalize_without_hydration("read", input, error);
+        }
+        let requested = match crate::operations::readable_record_path(self.collection, &parsed.path)
+        {
+            Ok(path) => path,
+            Err(error) => return self.normalize_without_hydration("read", input, error),
+        };
+        self.normalize_without_hydration(
+            "read",
+            input,
+            crate::errors::op_error(
+                crate::errors::FILE_NOT_FOUND,
+                &format!("File not found: {}", requested.as_str()),
+            ),
+        )
+    }
+
     /// Resolve explicit or inferred type membership for one record.
     pub fn get_types(&self, input: &Value) -> OperationResult {
         let Some(path) = input.get("path").and_then(Value::as_str) else {
@@ -393,6 +459,25 @@ impl<'a> Operations<'a> {
     }
 
     fn normalize(&self, operation: &str, input: &Value, legacy: Value) -> OperationResult {
+        self.normalize_inner(operation, input, legacy, true)
+    }
+
+    fn normalize_without_hydration(
+        &self,
+        operation: &str,
+        input: &Value,
+        legacy: Value,
+    ) -> OperationResult {
+        self.normalize_inner(operation, input, legacy, false)
+    }
+
+    fn normalize_inner(
+        &self,
+        operation: &str,
+        input: &Value,
+        legacy: Value,
+        hydrate_from_filesystem: bool,
+    ) -> OperationResult {
         let path = input
             .get("path")
             .and_then(Value::as_str)
@@ -420,7 +505,8 @@ impl<'a> Operations<'a> {
             result.remove(envelope_key);
         }
 
-        if valid
+        if hydrate_from_filesystem
+            && valid
             && !input
                 .get("dry_run")
                 .and_then(Value::as_bool)

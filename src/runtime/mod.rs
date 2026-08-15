@@ -6,6 +6,7 @@
 //! corresponding change is available.
 
 mod api;
+mod catalog;
 mod context;
 mod cursor;
 mod diff;
@@ -19,7 +20,11 @@ mod outcome;
 mod provider;
 mod snapshot;
 
+pub use crate::data_contracts::{ResolvedRecordContract, ResolvedRecordContractImplementation};
 pub use api::CollectionRuntime;
+pub use catalog::{
+    CanonicalRecordInput, CatalogError, CatalogInput, CompiledCatalog, ResolvedTypeResource,
+};
 pub use context::{OperationContext, OperationDeadline};
 pub use filesystem::FilesystemRuntime;
 #[cfg(feature = "tracing")]

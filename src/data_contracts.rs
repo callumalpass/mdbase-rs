@@ -5,7 +5,7 @@ use std::path::Path;
 
 use jsonschema::{Draft, JSONSchema};
 use semver::Version;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -93,6 +93,31 @@ pub struct ContractViewResult {
     pub diagnostics: Vec<ContractViewDiagnostic>,
 }
 
+/// A record contract whose schemas and implementation mappings were resolved
+/// from exact resources at an authority snapshot boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedRecordContract {
+    pub id: String,
+    pub version: String,
+    pub digest: String,
+    pub record_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_schema: Option<Value>,
+    pub implementations: Vec<ResolvedRecordContractImplementation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedRecordContractImplementation {
+    pub type_name: String,
+    pub type_version: u64,
+    pub digest: String,
+    pub fields: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
 struct RegisteredContract {
     definition: DataContractDefinition,
     record_schema: Option<Value>,
@@ -151,6 +176,118 @@ impl DataContractRegistry {
         }
         for descriptors in registry.implementations.values_mut() {
             descriptors.sort_by(|left, right| left.type_name.cmp(&right.type_name));
+        }
+        Ok(registry)
+    }
+
+    pub(crate) fn load_resolved(
+        contracts: Vec<ResolvedRecordContract>,
+        types: &HashMap<String, TypeDef>,
+    ) -> Result<Self, DataContractLoadError> {
+        let mut registry = Self::empty();
+        for contract in contracts {
+            if !contract.record_schema.is_object() {
+                return Err(load_error(
+                    "invalid_data_contract",
+                    format!(
+                        "Resolved record contract '{}' {} has no schema object",
+                        contract.id, contract.version
+                    ),
+                ));
+            }
+            let record_validator = compile_schema(
+                &contract.record_schema,
+                &format!("{} {} record_schema", contract.id, contract.version),
+            )?;
+            let binding_validator = contract
+                .binding_schema
+                .as_ref()
+                .map(|schema| {
+                    compile_schema(
+                        schema,
+                        &format!("{} {} binding_schema", contract.id, contract.version),
+                    )
+                })
+                .transpose()?;
+            let identity = (contract.id.clone(), contract.version.clone());
+            if registry.contracts.contains_key(&identity) {
+                return Err(load_error(
+                    "data_contract_conflict",
+                    format!(
+                        "Resolved record contract '{}' {} is duplicated",
+                        contract.id, contract.version
+                    ),
+                ));
+            }
+            let mut implementations = Vec::with_capacity(contract.implementations.len());
+            for implementation in contract.implementations {
+                let canonical_type = implementation.type_name.to_lowercase();
+                let type_definition = types.get(&canonical_type).ok_or_else(|| {
+                    load_error(
+                        "data_contract_implementation_not_found",
+                        format!(
+                            "Resolved contract '{}' {} names missing type '{}'",
+                            contract.id, contract.version, implementation.type_name
+                        ),
+                    )
+                })?;
+                let declared = type_definition.implementations.iter().find(|declared| {
+                    declared.contract == contract.id
+                        && declared.version == contract.version
+                        && declared.fields == implementation.fields
+                });
+                if declared.is_none() {
+                    return Err(load_error(
+                        "data_contract_implementation_mismatch",
+                        format!(
+                            "Resolved contract '{}' {} does not match type '{}'",
+                            contract.id, contract.version, implementation.type_name
+                        ),
+                    ));
+                }
+                implementations.push(DataContractImplementationDescriptor {
+                    contract: contract.id.clone(),
+                    version: contract.version.clone(),
+                    contract_digest: contract.digest.clone(),
+                    type_name: canonical_type,
+                    type_version: implementation.type_version,
+                    implementation_digest: implementation.digest,
+                    fields: implementation.fields,
+                    binding: implementation.binding,
+                    source_path: implementation.source_path,
+                });
+            }
+            implementations.sort_by(|left, right| left.type_name.cmp(&right.type_name));
+            registry
+                .implementations
+                .insert(identity.clone(), implementations);
+            registry.contracts.insert(
+                identity,
+                RegisteredContract {
+                    definition: DataContractDefinition {
+                        kind: "mdbase.contract".to_string(),
+                        contract_type: "record".to_string(),
+                        id: contract.id,
+                        version: contract.version,
+                        name: None,
+                        description: None,
+                        record_schema: Some(contract.record_schema.clone()),
+                        binding_schema: contract.binding_schema.clone(),
+                        data_schema: None,
+                        source_schema: None,
+                        input_schema: None,
+                        output_schema: None,
+                        error_schema: None,
+                        provider_schema: None,
+                        behavior: None,
+                        source_paths: Vec::new(),
+                        digest: contract.digest,
+                    },
+                    record_schema: Some(contract.record_schema),
+                    record_validator: Some(record_validator),
+                    binding_validator,
+                },
+            );
         }
         Ok(registry)
     }
@@ -227,58 +364,20 @@ impl DataContractRegistry {
             };
         };
 
-        let mut view = Value::Object(Map::new());
-        let mut diagnostics = Vec::new();
-        for (contract_field, record_field) in &implementation.fields {
-            if let Some(value) = field_references::get_value(effective_frontmatter, record_field) {
-                if let Err(message) = field_references::set_value_with_schema(
-                    &mut view,
-                    contract_field,
-                    value.clone(),
-                    registered.record_schema.as_ref(),
-                    true,
-                ) {
-                    diagnostics.push(ContractViewDiagnostic {
-                        code: "data_contract_record_invalid".to_string(),
-                        message,
-                        severity: "error".to_string(),
-                        field: Some(contract_field.clone()),
-                        path: None,
-                    });
-                }
-            }
-        }
-        if diagnostics.is_empty() {
-            diagnostics.extend(
-                registered
-                    .record_validator
-                    .as_ref()
-                    .expect("only record contracts have type implementations")
-                    .validate(&view)
-                    .err()
-                    .into_iter()
-                    .flatten()
-                    .map(|error| ContractViewDiagnostic {
-                        code: "data_contract_record_invalid".to_string(),
-                        message: format!(
-                            "record projected through '{type_name}' does not satisfy '{contract}' {version}: {error}"
-                        ),
-                        severity: "error".to_string(),
-                        field: json_pointer_to_field_path(&error.instance_path.to_string()),
-                        path: None,
-                    }),
-            );
-        }
-        ContractViewResult {
-            valid: diagnostics.is_empty(),
-            contract: contract.to_string(),
-            version: version.to_string(),
-            contract_digest: registered.definition.digest.clone(),
-            type_name: type_name.to_string(),
-            implementation_digest: implementation.implementation_digest.clone(),
-            view,
-            diagnostics,
-        }
+        project_resolved_record_contract_with_validator(
+            type_name,
+            contract,
+            version,
+            &registered.definition.digest,
+            &implementation.implementation_digest,
+            &implementation.fields,
+            registered.record_schema.as_ref(),
+            registered
+                .record_validator
+                .as_ref()
+                .expect("only record contracts have type implementations"),
+            effective_frontmatter,
+        )
     }
 
     fn load_contract_file(
@@ -536,6 +635,107 @@ impl DataContractRegistry {
             .or_default()
             .push(descriptor);
         Ok(())
+    }
+}
+
+/// Project one record through an already-resolved record contract.
+///
+/// This is the provider-neutral projection seam for catalogs whose schemas and
+/// implementation mappings were resolved at an earlier authority boundary.
+pub struct ResolvedRecordProjection<'a> {
+    pub type_name: &'a str,
+    pub contract: &'a str,
+    pub version: &'a str,
+    pub contract_digest: &'a str,
+    pub implementation_digest: &'a str,
+    pub fields: &'a BTreeMap<String, String>,
+    pub record_schema: &'a Value,
+    pub effective_frontmatter: &'a Value,
+}
+
+pub fn project_resolved_record_contract(
+    projection: ResolvedRecordProjection<'_>,
+) -> Result<ContractViewResult, DataContractLoadError> {
+    let validator = compile_schema(
+        projection.record_schema,
+        &format!(
+            "{} {} record_schema",
+            projection.contract, projection.version
+        ),
+    )?;
+    Ok(project_resolved_record_contract_with_validator(
+        projection.type_name,
+        projection.contract,
+        projection.version,
+        projection.contract_digest,
+        projection.implementation_digest,
+        projection.fields,
+        Some(projection.record_schema),
+        &validator,
+        projection.effective_frontmatter,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_resolved_record_contract_with_validator(
+    type_name: &str,
+    contract: &str,
+    version: &str,
+    contract_digest: &str,
+    implementation_digest: &str,
+    fields: &BTreeMap<String, String>,
+    record_schema: Option<&Value>,
+    validator: &JSONSchema,
+    effective_frontmatter: &Value,
+) -> ContractViewResult {
+    let mut view = Value::Object(Map::new());
+    let mut diagnostics = Vec::new();
+    for (contract_field, record_field) in fields {
+        if let Some(value) = field_references::get_value(effective_frontmatter, record_field) {
+            if let Err(message) = field_references::set_value_with_schema(
+                &mut view,
+                contract_field,
+                value.clone(),
+                record_schema,
+                true,
+            ) {
+                diagnostics.push(ContractViewDiagnostic {
+                    code: "data_contract_record_invalid".to_string(),
+                    message,
+                    severity: "error".to_string(),
+                    field: Some(contract_field.clone()),
+                    path: None,
+                });
+            }
+        }
+    }
+    if diagnostics.is_empty() {
+        diagnostics.extend(
+            validator
+                .validate(&view)
+                .err()
+                .into_iter()
+                .flatten()
+                .map(|error| ContractViewDiagnostic {
+                    code: "data_contract_record_invalid".to_string(),
+                    message: format!(
+                        "record projected through '{type_name}' does not satisfy '{contract}' {version}: {error}"
+                    ),
+                    severity: "error".to_string(),
+                    field: json_pointer_to_field_path(&error.instance_path.to_string()),
+                    path: None,
+                }),
+        );
+    }
+    ContractViewResult {
+        valid: diagnostics.is_empty(),
+        contract: contract.to_string(),
+        version: version.to_string(),
+        contract_digest: contract_digest.to_string(),
+        type_name: type_name.to_string(),
+        implementation_digest: implementation_digest.to_string(),
+        view,
+        diagnostics,
     }
 }
 

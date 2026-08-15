@@ -10,6 +10,13 @@ use crate::operations::{
 use crate::Collection;
 use std::path::Path;
 
+/// Provider-supplied file facts for one canonical record read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordFileFacts {
+    pub size: u64,
+    pub mtime: Option<String>,
+}
+
 impl Collection {
     /// Read a file (§12.2).
     pub fn read(&self, input: &serde_json::Value) -> serde_json::Value {
@@ -40,7 +47,35 @@ impl Collection {
             Err(_e) => return op_error(INVALID_FRONTMATTER, "File contains invalid UTF-8"),
         };
 
-        let doc = parse_document(&content);
+        let file_metadata = std::fs::metadata(&full_path).ok();
+        let file_facts = RecordFileFacts {
+            size: file_metadata
+                .as_ref()
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            mtime: file_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(|time| {
+                    let datetime: chrono::DateTime<chrono::Utc> = time.into();
+                    datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                }),
+        };
+        self.read_document(path.as_str(), &content, &file_facts, input.include_document)
+    }
+
+    /// Evaluate one exact Markdown record without discovering any other record.
+    ///
+    /// Storage providers validate and fetch the requested identity, then supply
+    /// the exact document and non-semantic file facts from the same snapshot.
+    pub(crate) fn read_document(
+        &self,
+        path: &str,
+        content: &str,
+        file_facts: &RecordFileFacts,
+        include_document: bool,
+    ) -> serde_json::Value {
+        let doc = parse_document(content);
 
         // Get frontmatter as JSON
         let mut warnings: Vec<serde_json::Value> = Vec::new();
@@ -78,7 +113,7 @@ impl Collection {
         };
 
         // Determine types (using path for match rule evaluation)
-        let type_names = self.determine_types_for_path(&persisted_frontmatter, Some(path.as_str()));
+        let type_names = self.determine_types_for_path(&persisted_frontmatter, Some(path));
 
         // Apply defaults for effective frontmatter
         let effective = self.apply_defaults(&persisted_frontmatter, &type_names);
@@ -87,32 +122,18 @@ impl Collection {
         let effective = self.coerce_types(&effective, &type_names);
 
         // Evaluate computed fields (§5.12)
-        let effective = self.evaluate_computed_fields(
-            effective,
-            &type_names,
-            path.as_str(),
-            Some(doc.body.as_str()),
-        );
+        let effective =
+            self.evaluate_computed_fields(effective, &type_names, path, Some(doc.body.as_str()));
 
         // File metadata
-        let file_name = Path::new(path.as_str())
+        let file_name = Path::new(path)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        let folder = Path::new(path.as_str())
+        let folder = Path::new(path)
             .parent()
             .and_then(|p| p.to_str())
             .unwrap_or("");
-        let file_metadata = std::fs::metadata(&full_path).ok();
-        let file_size = file_metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-        let file_mtime = file_metadata
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .map(|t| {
-                let dt: chrono::DateTime<chrono::Utc> = t.into();
-                dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-            });
-
         // Validation
         let validation_level = &self.settings.default_validation;
         let validation = if validation_level == "off" {
@@ -128,7 +149,7 @@ impl Collection {
                     &effective
                 },
                 &type_names,
-                path.as_str(),
+                path,
             )
         };
         let issues_json: Vec<serde_json::Value> =
@@ -142,7 +163,7 @@ impl Collection {
         };
 
         let mut result = serde_json::json!({
-            "path": path.as_str(),
+            "path": path,
             "revision": crate::v03::revision(content.as_bytes()),
             "types": type_names,
             "frontmatter": persisted_frontmatter,
@@ -151,8 +172,8 @@ impl Collection {
             "file": {
                 "name": file_name,
                 "folder": folder,
-                "size": file_size,
-                "mtime": file_mtime.as_deref().unwrap_or(""),
+                "size": file_facts.size,
+                "mtime": file_facts.mtime.as_deref().unwrap_or(""),
             },
             "valid": effective_valid,
             "validation": {
@@ -161,8 +182,8 @@ impl Collection {
             },
         });
 
-        if input.include_document {
-            result["document"] = serde_json::Value::String(content);
+        if include_document {
+            result["document"] = serde_json::Value::String(content.to_string());
         }
 
         if !warnings.is_empty() {
