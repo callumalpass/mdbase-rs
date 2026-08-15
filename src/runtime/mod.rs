@@ -19,7 +19,9 @@ mod gate;
 mod observer;
 mod operation;
 mod outcome;
+mod projection;
 mod provider;
+mod record_resolution;
 mod record_structure;
 mod snapshot;
 
@@ -51,7 +53,17 @@ pub use outcome::{
     ReadCursor, ReadPage, RebuildReason, RecordChange, RecordChangeKind, ResourceChange,
     ResourceChangeKind, RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeMeasurements,
 };
+pub use projection::{
+    PreparedSemanticProjection, RecordResolutionKey, RecordResolutionKeyKind, SemanticFileFacts,
+    SemanticProjection, SemanticProjectionFacts, SEMANTIC_PROJECTION_FORMAT_VERSION,
+    SEMANTIC_PROJECTION_SCHEMA_VERSION,
+};
 pub use provider::{CollectionProvider, FilesystemProvider};
+pub use record_resolution::{
+    OccurrenceResolutionLookup, RecordResolutionPlan, ResolutionCandidate, ResolutionLookupKey,
+    ResolvedRecordStructure, ResolvedStructuralOccurrence, MAX_RESOLUTION_CANDIDATES,
+    MAX_RESOLUTION_LOOKUPS, MAX_STRUCTURAL_OCCURRENCES,
+};
 pub use record_structure::{
     parse_record_structure, RecordStructure, RecordStructureLink, RecordStructureModel,
     RecordStructureParser, StructuralLinkKind, StructuralOccurrence, StructuralResolution,

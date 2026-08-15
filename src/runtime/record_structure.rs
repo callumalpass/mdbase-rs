@@ -51,9 +51,10 @@ pub enum StructuralLinkKind {
 /// Resolution is deliberately explicit even though this parser has no
 /// catalogue context.  `Unresolved` means extraction succeeded and a later
 /// resolver may classify the target as resolved, missing, or ambiguous.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuralResolution {
+    #[default]
     Unresolved,
     Resolved,
     Missing,
@@ -61,12 +62,6 @@ pub enum StructuralResolution {
     UnsafeTraversal,
     External,
     Malformed,
-}
-
-impl Default for StructuralResolution {
-    fn default() -> Self {
-        Self::Unresolved
-    }
 }
 
 /// One preserved outgoing link or embed occurrence.
@@ -359,10 +354,9 @@ fn parse_target_occurrence_with_alias(
         ),
         None => (inner.trim().to_string(), explicit_alias),
     };
-    let anchor = match target_part.find('#') {
-        Some(index) => Some(target_part[index + 1..].to_string()),
-        None => None,
-    };
+    let anchor = target_part
+        .find('#')
+        .map(|index| target_part[index + 1..].to_string());
     make_occurrence(source_kind, kind, raw, target_part, alias, anchor, path)
 }
 
@@ -450,8 +444,8 @@ fn find_closing(chars: &[char], start: usize, first: char, second: char) -> Opti
 
 fn find_balanced(chars: &[char], start: usize, open: char, close: char) -> Option<usize> {
     let mut depth = 1;
-    for index in start..chars.len() {
-        match chars[index] {
+    for (index, character) in chars.iter().copied().enumerate().skip(start) {
+        match character {
             value if value == open => depth += 1,
             value if value == close => {
                 depth -= 1;

@@ -231,6 +231,14 @@ impl CompiledCatalog {
         self.collection.type_warnings()
     }
 
+    pub(crate) fn id_field(&self) -> &str {
+        &self.collection.settings().id_field
+    }
+
+    pub(crate) fn record_extensions(&self) -> &[String] {
+        &self.collection.settings().extensions
+    }
+
     /// Extract provider-neutral structural facts from one exact record.
     ///
     /// This operation validates the canonical relative path but does not
