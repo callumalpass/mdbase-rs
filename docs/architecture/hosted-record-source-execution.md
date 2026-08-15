@@ -8,6 +8,9 @@ Canonical decision: `mdbase-connect/docs/decisions/0010-bounded-hosted-record-so
 Storage-model proposal:
 `mdbase-connect/docs/decisions/0011-server-trusted-queryable-hosted-execution.md`
 
+Benchmark-only semantic seam:
+`docs/architecture/hosted-storage-benchmark-seam.md`
+
 Connect baseline: `6ea62cf2593e91a0e0b17e9e931ebf0ec23dc805`  
 mdbase-rs baseline: `818866705dcc4b6dcfd3bbc1ba63f83fdaec406f`
 
