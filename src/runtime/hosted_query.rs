@@ -24,7 +24,7 @@ use crate::v03::{cel, validate_query, Diagnostic};
 
 use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 1;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 2;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -125,6 +125,16 @@ pub struct HostedOrder {
     /// Every provider order ends with stable record identity as an implicit
     /// deterministic tie-break. This flag makes the contract explicit.
     pub canonical_path_tiebreak: bool,
+    pub semantics: HostedSortSemantics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedSortSemantics {
+    /// Canonical v0.3: null last ascending; scalar natural order; arrays and
+    /// objects by length; unlike JSON kinds equal; direction reverses the
+    /// result; canonical path is the final ascending tie-break.
+    CanonicalV03,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +169,7 @@ pub struct HostedQueryRequirements {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedQueryBudgets {
     pub max_page_size: u64,
+    pub max_offset: u64,
     pub max_candidate_rows: u64,
     pub max_candidate_bytes: u64,
     pub max_exact_documents: u64,
@@ -174,6 +185,7 @@ impl Default for HostedQueryBudgets {
     fn default() -> Self {
         Self {
             max_page_size: MAX_PAGE_SIZE,
+            max_offset: 10_000,
             max_candidate_rows: 10_000,
             max_candidate_bytes: 16 * 1024 * 1024,
             max_exact_documents: 2_000,
@@ -258,7 +270,8 @@ impl CompiledCatalog {
     /// Lowering failure never means false: the candidate becomes broader and
     /// the original canonical query remains an mdbase-rs residual.
     pub fn compile_hosted_query(&self, input: &Value) -> Result<HostedQueryPlan, CatalogError> {
-        let schema_errors = validate_query(input)
+        let semantic_input = semantic_query_input(input)?;
+        let schema_errors = validate_query(&semantic_input)
             .into_iter()
             .filter(|diagnostic| diagnostic.severity == "error")
             .map(|diagnostic| diagnostic.message)
@@ -272,7 +285,7 @@ impl CompiledCatalog {
                 format!("Query could not be decoded: {error}"),
             )
         })?;
-        let canonical_query: Query = serde_json::from_value(input.clone()).map_err(|error| {
+        let canonical_query: Query = serde_json::from_value(semantic_input).map_err(|error| {
             query_error(
                 "invalid_query",
                 format!("Query could not be decoded: {error}"),
@@ -300,6 +313,12 @@ impl CompiledCatalog {
             return Err(query_error(
                 "query_operator_limit_exceeded",
                 "Query ordering, grouping, or summary count exceeds hosted plan limits.",
+            ));
+        }
+        if !query.group_by.is_empty() || !query.summaries.is_empty() {
+            return Err(query_error(
+                "unsupported_hosted_reducer",
+                "Hosted grouping and summaries require the bounded canonical accumulator.",
             ));
         }
 
@@ -357,6 +376,7 @@ impl CompiledCatalog {
                 field,
                 direction: direction(&item.direction),
                 canonical_path_tiebreak: true,
+                semantics: HostedSortSemantics::CanonicalV03,
             });
         }
 
@@ -414,12 +434,22 @@ impl CompiledCatalog {
             || query.select.is_some()
             || !fully_projected;
         requirements.exact_document |= requirements.canonical_residual;
-        requirements.diagnostics = requirements.canonical_residual;
+        requirements.diagnostics = true;
 
         if query.limit.is_some_and(|limit| limit > MAX_PAGE_SIZE) {
             return Err(query_error(
                 "hosted_result_budget_exceeded",
                 format!("Requested limit exceeds the hosted page maximum of {MAX_PAGE_SIZE}."),
+            ));
+        }
+        let default_budgets = HostedQueryBudgets::default();
+        if query.offset > default_budgets.max_offset {
+            return Err(query_error(
+                "hosted_offset_budget_exceeded",
+                format!(
+                    "Requested offset exceeds the hosted maximum of {}.",
+                    default_budgets.max_offset
+                ),
             ));
         }
         if query
@@ -457,7 +487,7 @@ impl CompiledCatalog {
             requested_limit: query.limit,
             offset: query.offset,
             requirements,
-            budgets: HostedQueryBudgets::default(),
+            budgets: default_budgets,
         };
         plan.plan_digest = plan.integrity_digest()?;
         Ok(plan)
@@ -877,7 +907,6 @@ fn lower_query_field(path: &str) -> Option<CandidateField> {
     let segments = path.split('.').map(str::to_string).collect::<Vec<_>>();
     match segments.as_slice() {
         [single] if single == "types" => Some(CandidateField::Types),
-        [single] if single == "path" => Some(CandidateField::Path),
         [root, rest @ ..] if root == "record" || root == "note" => {
             Some(CandidateField::EffectiveFrontmatter(rest.to_vec()))
         }
@@ -885,10 +914,9 @@ fn lower_query_field(path: &str) -> Option<CandidateField> {
             Some(CandidateField::PersistedFrontmatter(rest.to_vec()))
         }
         [root, field] if root == "file" && field == "tags" => Some(CandidateField::BodyTags),
+        [root, field] if root == "file" && field == "path" => Some(CandidateField::Path),
         [root, field]
-            if root == "file"
-                && ["path", "name", "basename", "extension", "size", "mtime"]
-                    .contains(&field.as_str()) =>
+            if root == "file" && ["name", "ext", "size", "mtime"].contains(&field.as_str()) =>
         {
             Some(CandidateField::File(field.clone()))
         }
@@ -897,6 +925,17 @@ fn lower_query_field(path: &str) -> Option<CandidateField> {
         }
         _ => None,
     }
+}
+
+fn semantic_query_input(input: &Value) -> Result<Value, CatalogError> {
+    let mut object = input
+        .as_object()
+        .cloned()
+        .ok_or_else(|| query_error("invalid_query", "Hosted query input must be an object."))?;
+    for control in ["pagination", "cursor", "release_cursor", "snapshot"] {
+        object.remove(control);
+    }
+    Ok(Value::Object(object))
 }
 
 fn expression_path(expression: &Expr) -> Option<String> {
@@ -1418,6 +1457,11 @@ mod tests {
             .compile_hosted_query(&json!({"limit": MAX_PAGE_SIZE + 1}))
             .unwrap_err();
         assert_eq!(error.code, "hosted_result_budget_exceeded");
+
+        let error = catalog()
+            .compile_hosted_query(&json!({"offset": 10_001, "limit": 1}))
+            .unwrap_err();
+        assert_eq!(error.code, "hosted_offset_budget_exceeded");
     }
 
     #[test]
@@ -1435,8 +1479,31 @@ mod tests {
         let second = catalog().compile_hosted_query(&query).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
+        assert_eq!(first.version, 2);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
         assert!(first.plan_digest.starts_with("sha256:"));
-        assert_eq!(serde_json::to_value(first).unwrap()["version"], 1);
+        assert_eq!(serde_json::to_value(first).unwrap()["version"], 2);
+    }
+
+    #[test]
+    fn cursor_control_is_host_transport_and_ordering_is_explicit() {
+        let plan = catalog()
+            .compile_hosted_query(&json!({
+                "pagination": "cursor",
+                "order_by": [{"field": "file.ext", "direction": "desc"}],
+                "limit": 20
+            }))
+            .unwrap();
+        assert_eq!(plan.order[0].field, CandidateField::File("ext".to_string()));
+        assert_eq!(plan.order[0].semantics, HostedSortSemantics::CanonicalV03);
+        assert!(plan.order[0].canonical_path_tiebreak);
+
+        let error = catalog()
+            .compile_hosted_query(&json!({
+                "group_by": [{"field": "record.status"}],
+                "limit": 20
+            }))
+            .unwrap_err();
+        assert_eq!(error.code, "unsupported_hosted_reducer");
     }
 }
