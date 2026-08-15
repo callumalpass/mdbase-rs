@@ -16,6 +16,7 @@ mod external;
 mod feed;
 mod filesystem;
 mod gate;
+mod hosted_query;
 mod observer;
 mod operation;
 mod outcome;
@@ -37,6 +38,12 @@ pub use catalog::{
 };
 pub use context::{OperationContext, OperationDeadline};
 pub use filesystem::FilesystemRuntime;
+pub use hosted_query::{
+    CandidateComparison, CandidateComparisonOperator, CandidateField, CandidatePredicate,
+    CandidateVerdict, CanonicalResidual, HostedAggregate, HostedGroup, HostedOrder,
+    HostedOrderDirection, HostedQueryBudgets, HostedQueryPlan, HostedQueryRequirements,
+    HostedResidualEvaluation, ProjectionAvailability, HOSTED_QUERY_PLAN_VERSION,
+};
 #[cfg(feature = "tracing")]
 pub use observer::TracingObserver;
 pub use observer::{

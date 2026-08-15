@@ -84,7 +84,7 @@ pub(super) fn load_context(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn candidate_context(
+pub(crate) fn candidate_context(
     collection: &Collection,
     record: &FileRecord,
     types: &[String],
@@ -126,7 +126,7 @@ pub(super) fn candidate_context(
     }
 }
 
-pub(super) fn file_value(
+pub(crate) fn file_value(
     record: &FileRecord,
     effective: &Value,
     include_body_metadata: bool,

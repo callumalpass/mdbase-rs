@@ -239,6 +239,10 @@ impl CompiledCatalog {
         &self.collection.settings().extensions
     }
 
+    pub(crate) fn collection(&self) -> &Collection {
+        &self.collection
+    }
+
     /// Extract provider-neutral structural facts from one exact record.
     ///
     /// This operation validates the canonical relative path but does not
