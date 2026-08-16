@@ -357,12 +357,19 @@ fn parse_target_occurrence_with_alias(
     path: &str,
     explicit_alias: Option<String>,
 ) -> StructuralOccurrence {
-    let (target_part, alias) = match inner.find('|') {
-        Some(index) => (
-            inner[..index].trim().to_string(),
-            Some(inner[index + 1..].to_string()),
-        ),
-        None => (inner.trim().to_string(), explicit_alias),
+    let (target_part, alias) = if matches!(
+        kind,
+        StructuralLinkKind::Wikilink | StructuralLinkKind::WikilinkEmbed
+    ) {
+        match inner.find('|') {
+            Some(index) => (
+                inner[..index].trim().to_string(),
+                Some(inner[index + 1..].to_string()),
+            ),
+            None => (inner.trim().to_string(), explicit_alias),
+        }
+    } else {
+        (inner.trim().to_string(), explicit_alias)
     };
     let anchor = target_part
         .find('#')
@@ -496,6 +503,11 @@ impl RecordStructure {
         &self.structural_digest
     }
 
+    /// Verify that deserialized structural facts still bind their digest.
+    pub fn structural_digest_is_valid(&self) -> bool {
+        digest_structure(self) == self.structural_digest
+    }
+
     /// Stable canonical JSON used for persistence and digest comparisons.
     pub fn canonical_json(&self) -> serde_json::Result<Vec<u8>> {
         serde_jcs::to_vec(self)
@@ -536,6 +548,16 @@ mod tests {
             .occurrences
             .iter()
             .any(|item| item.normalized_target.as_deref() == Some("target")));
+    }
+
+    #[test]
+    fn markdown_destination_pipe_is_not_a_wikilink_alias_separator() {
+        let structure = body("[shown](foo|bar.md) ![photo](assets/a|b.png)");
+        assert_eq!(structure.occurrences.len(), 2);
+        assert_eq!(structure.occurrences[0].raw_target, "foo|bar.md");
+        assert_eq!(structure.occurrences[0].alias.as_deref(), Some("shown"));
+        assert_eq!(structure.occurrences[1].raw_target, "assets/a|b.png");
+        assert_eq!(structure.occurrences[1].alias.as_deref(), Some("photo"));
     }
 
     #[test]

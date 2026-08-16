@@ -679,9 +679,7 @@ fn validate_projection(
                 .to_string(),
         });
     }
-    if projection.facts.catalog_revision != plan.catalog_revision
-        || !projection.structure.structural_digest_is_valid()
-    {
+    if !projection.is_current_for(&plan.catalog_revision, env!("CARGO_PKG_VERSION")) {
         return Err(CatalogError {
             code: "hosted_base_projection_stale".to_string(),
             message: "Obsidian Base evaluation requires a current, integrity-bound projection."
@@ -1127,6 +1125,48 @@ views:
             })
             .unwrap_err();
         assert_eq!(incomplete.code, "hosted_base_projection_incomplete");
+        let mut stale_format = projection.clone();
+        stale_format.facts.format_version += 1;
+        let stale_format = plan
+            .evaluate_record(&HostedBaseRecordContext {
+                projection: stale_format,
+                related: Vec::new(),
+                relationship_neighborhood_complete: false,
+                query_context: None,
+                operation_clock: "2026-08-16T00:00:00Z".to_string(),
+                max_expression_steps: 10_000,
+            })
+            .unwrap_err();
+        assert_eq!(stale_format.code, "hosted_base_projection_stale");
+        let mut mismatched_path = projection.clone();
+        mismatched_path.facts.file.path = "tasks/substituted.md".to_string();
+        let mismatched_path = plan
+            .evaluate_record(&HostedBaseRecordContext {
+                projection: mismatched_path,
+                related: Vec::new(),
+                relationship_neighborhood_complete: false,
+                query_context: None,
+                operation_clock: "2026-08-16T00:00:00Z".to_string(),
+                max_expression_steps: 10_000,
+            })
+            .unwrap_err();
+        assert_eq!(mismatched_path.code, "hosted_base_projection_stale");
+        let mut mismatched_structure_path = projection.clone();
+        mismatched_structure_path.structure.path = "tasks/substituted.md".to_string();
+        let mismatched_structure_path = plan
+            .evaluate_record(&HostedBaseRecordContext {
+                projection: mismatched_structure_path,
+                related: Vec::new(),
+                relationship_neighborhood_complete: false,
+                query_context: None,
+                operation_clock: "2026-08-16T00:00:00Z".to_string(),
+                max_expression_steps: 10_000,
+            })
+            .unwrap_err();
+        assert_eq!(
+            mismatched_structure_path.code,
+            "hosted_base_projection_stale"
+        );
         let budget_error = plan
             .evaluate_record(&HostedBaseRecordContext {
                 projection: projection.clone(),

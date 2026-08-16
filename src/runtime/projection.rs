@@ -16,6 +16,7 @@ use crate::v03::Diagnostic;
 use super::{
     CanonicalRecordInput, CatalogError, CompiledCatalog, RecordStructure, ResolutionCandidate,
     ResolvedRecordStructure, StructuralResolution, MAX_RESOLUTION_CANDIDATES,
+    RECORD_STRUCTURE_SCHEMA_VERSION,
 };
 
 /// Format v4 requires providers to bind the canonical file modification time
@@ -55,6 +56,23 @@ pub struct SemanticProjection {
     #[serde(flatten)]
     pub facts: SemanticProjectionFacts,
     pub structure: ResolvedRecordStructure,
+}
+
+impl SemanticProjection {
+    /// Fail-closed currentness and internal-integrity check shared by every
+    /// hosted evaluator. Storage bindings additionally bind record, revision,
+    /// generation, and snapshot identity.
+    pub fn is_current_for(&self, catalog_revision: &str, semantic_engine_version: &str) -> bool {
+        self.facts.semantic_complete
+            && self.facts.schema_version == SEMANTIC_PROJECTION_SCHEMA_VERSION
+            && self.facts.format_version == SEMANTIC_PROJECTION_FORMAT_VERSION
+            && self.facts.semantic_engine_version == semantic_engine_version
+            && self.facts.catalog_revision == catalog_revision
+            && self.facts.path == self.facts.file.path
+            && self.structure.schema_version == RECORD_STRUCTURE_SCHEMA_VERSION
+            && self.structure.path == self.facts.path
+            && self.structure.structural_digest_is_valid()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +205,8 @@ impl CompiledCatalog {
         if resolved.schema_version != prepared.structure.schema_version
             || resolved.path != prepared.structure.path
             || resolved.structural_digest != prepared.structure.structural_digest
+            || !prepared.structure.structural_digest_is_valid()
+            || !resolved.structural_digest_is_valid()
             || resolved
                 .occurrences
                 .iter()
@@ -519,6 +539,19 @@ mod tests {
             first.canonical_digest().unwrap(),
             second.canonical_digest().unwrap()
         );
+    }
+
+    #[test]
+    fn finalization_recomputes_the_resolved_structural_digest() {
+        let catalog = catalog();
+        let prepared = catalog.project_record(&input("[[target]]\n")).unwrap();
+        let plan = catalog.plan_record_resolution(&prepared.structure).unwrap();
+        let mut resolved = catalog
+            .resolve_record_structure(&prepared.structure, &plan, &[])
+            .unwrap();
+        resolved.occurrences[0].occurrence.raw_target = "substituted".to_string();
+        let error = catalog.finalize_projection(prepared, resolved).unwrap_err();
+        assert_eq!(error.code, "projection_resolution_mismatch");
     }
 
     #[test]

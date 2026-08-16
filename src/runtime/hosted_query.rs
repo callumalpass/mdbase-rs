@@ -22,11 +22,7 @@ use crate::v03::query::preflight::{self, CompiledSelection};
 use crate::v03::query::result::serialize_candidate;
 use crate::v03::{cel, validate_query, Diagnostic};
 
-use super::{
-    CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection,
-    RECORD_STRUCTURE_SCHEMA_VERSION, SEMANTIC_PROJECTION_FORMAT_VERSION,
-    SEMANTIC_PROJECTION_SCHEMA_VERSION,
-};
+use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
 
 pub const HOSTED_QUERY_PLAN_VERSION: u32 = 10;
 const MAX_PREDICATE_NODES: usize = 256;
@@ -1936,14 +1932,7 @@ fn projection_value<'a>(
 }
 
 fn projection_is_current_for_plan(plan: &HostedQueryPlan, projection: &SemanticProjection) -> bool {
-    projection.facts.semantic_complete
-        && projection.facts.schema_version == SEMANTIC_PROJECTION_SCHEMA_VERSION
-        && projection.facts.format_version == SEMANTIC_PROJECTION_FORMAT_VERSION
-        && projection.facts.semantic_engine_version == plan.semantic_engine_version
-        && projection.facts.catalog_revision == plan.catalog_revision
-        && projection.structure.schema_version == RECORD_STRUCTURE_SCHEMA_VERSION
-        && projection.structure.path == projection.facts.path
-        && projection.structure.structural_digest_is_valid()
+    projection.is_current_for(&plan.catalog_revision, &plan.semantic_engine_version)
 }
 
 fn complete_file_value_from_projection(
