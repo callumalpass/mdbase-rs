@@ -1045,14 +1045,14 @@ pub(crate) fn base_uses_backlinks(
         .map(String::as_str)
         .chain(filter_expressions(document.filters.as_ref()))
         .chain(filter_expressions(view.filters.as_ref()))
-        .any(|expression| expression.contains("backlinks"))
+        .any(expression::uses_backlinks)
         || view
             .order
             .iter()
             .map(String::as_str)
             .chain(view.sort.iter().map(|sort| sort.property.as_str()))
             .chain(view.group_by.iter().map(BaseGroupBy::property))
-            .any(|property| property.contains("backlinks"))
+            .any(expression::uses_backlinks)
 }
 
 fn filter_expressions(filter: Option<&BaseFilter>) -> Vec<&str> {

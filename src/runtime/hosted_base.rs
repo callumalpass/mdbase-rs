@@ -1453,6 +1453,42 @@ views:
     }
 
     #[test]
+    fn computed_relationship_members_require_graph_for_simple_and_filtered_plans() {
+        let catalog = catalog();
+        for (source, view) in [
+            (
+                "formulas:\n  related: 'file[\"back\" + \"links\"]'\nviews:\n  - type: table\n    name: Simple\n    order: [file.path]\n",
+                "simple",
+            ),
+            (
+                "views:\n  - type: table\n    name: Filtered\n    filters: 'file[\"back\" + \"links\"].length > 0'\n",
+                "filtered",
+            ),
+        ] {
+            let HostedBasePlanning::Planned { plan } = catalog
+                .plan_hosted_obsidian_base(
+                    &json!({"path": "views/computed-links.base", "view": view}),
+                    &CanonicalRecordInput {
+                        stable_id: None,
+                        path: "views/computed-links.base".to_string(),
+                        document: source.to_string(),
+                        file_size: source.len() as u64,
+                        file_mtime: None,
+                    },
+                    &[],
+                )
+                .unwrap()
+            else {
+                panic!("expected computed relationship plan")
+            };
+            assert!(plan.requirements.backlinks);
+            assert!(plan.requirements.outgoing_relationships);
+            assert!(plan.requirements.link_resolution);
+            assert!(!plan.supports_path_keyset_paging());
+        }
+    }
+
+    #[test]
     fn hosted_base_rejects_unbounded_offsets_before_path_keyset_or_fallback_planning() {
         let catalog = catalog();
         for (source, view) in [
@@ -1492,27 +1528,37 @@ views:
     #[test]
     fn hosted_base_fails_closed_for_file_ctime_but_not_string_literals() {
         let catalog = catalog();
-        let ctime_source = "views:\n  - type: table\n    name: Created\n    sort:\n      - property: file.ctime\n        direction: ASC\n";
-        let HostedBasePlanning::Invalid { result } = catalog
-            .plan_hosted_obsidian_base(
-                &json!({"path": "views/ctime.base", "view": "created"}),
-                &CanonicalRecordInput {
-                    stable_id: None,
-                    path: "views/ctime.base".to_string(),
-                    document: ctime_source.to_string(),
-                    file_size: ctime_source.len() as u64,
-                    file_mtime: None,
-                },
-                &[],
-            )
-            .unwrap()
-        else {
-            panic!("hosted ctime dependency must fail closed")
-        };
-        assert_eq!(
-            result.diagnostics[0].code,
-            "hosted_base_file_ctime_unavailable"
-        );
+        for (ctime_source, view) in [
+            (
+                "views:\n  - type: table\n    name: Created\n    sort:\n      - property: file.ctime\n        direction: ASC\n",
+                "created",
+            ),
+            (
+                "views:\n  - type: table\n    name: Computed created\n    filters: 'file[\"ct\" + \"ime\"] != null'\n",
+                "computed-created",
+            ),
+        ] {
+            let HostedBasePlanning::Invalid { result } = catalog
+                .plan_hosted_obsidian_base(
+                    &json!({"path": "views/ctime.base", "view": view}),
+                    &CanonicalRecordInput {
+                        stable_id: None,
+                        path: "views/ctime.base".to_string(),
+                        document: ctime_source.to_string(),
+                        file_size: ctime_source.len() as u64,
+                        file_mtime: None,
+                    },
+                    &[],
+                )
+                .unwrap()
+            else {
+                panic!("hosted ctime dependency must fail closed")
+            };
+            assert_eq!(
+                result.diagnostics[0].code,
+                "hosted_base_file_ctime_unavailable"
+            );
+        }
 
         let literal_source =
             "views:\n  - type: table\n    name: Literal\n    filters: 'title == \"file.ctime\"'\n";

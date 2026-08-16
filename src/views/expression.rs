@@ -687,6 +687,36 @@ pub(crate) fn uses_file_ctime(expression: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Return whether an expression can read backlinks. Unknown computed members
+/// are classified conservatively because their runtime name can depend on the
+/// current row and therefore cannot prove graph independence during planning.
+pub(crate) fn uses_backlinks(expression: &str) -> bool {
+    parse_cached(expression)
+        .map(|expression| expression_uses_backlinks(expression.as_ref()))
+        .unwrap_or(true)
+}
+
+fn constant_member_name(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Literal(Value::String(value)) => Some(value.clone()),
+        Expr::Binary(operator, left, right) if operator == "+" => {
+            let mut value = constant_member_name(left)?;
+            value.push_str(&constant_member_name(right)?);
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+fn member_maybe_matches(member: &Member, expected: &[&str]) -> bool {
+    match member {
+        Member::Named(name) => expected.contains(&name.as_str()),
+        Member::Computed(value) => {
+            constant_member_name(value).is_none_or(|name| expected.contains(&name.as_str()))
+        }
+    }
+}
+
 fn expression_uses_file_ctime(expression: &Expr) -> bool {
     match expression {
         Expr::Literal(_) | Expr::Regex(_, _) | Expr::Identifier(_) => false,
@@ -696,18 +726,8 @@ fn expression_uses_file_ctime(expression: &Expr) -> bool {
             expression_uses_file_ctime(left) || expression_uses_file_ctime(right)
         }
         Expr::Member(object, member) => {
-            let ctime_member = matches!(
-                (object.as_ref(), member),
-                (Expr::Identifier(namespace), Member::Named(property))
-                    if namespace == "file" && property == "ctime"
-            ) || matches!(
-                (object.as_ref(), member),
-                (
-                    Expr::Identifier(namespace),
-                    Member::Computed(value)
-                ) if namespace == "file"
-                    && matches!(value.as_ref(), Expr::Literal(Value::String(property)) if property == "ctime")
-            );
+            let ctime_member = matches!(object.as_ref(), Expr::Identifier(namespace) if namespace == "file")
+                && member_maybe_matches(member, &["ctime"]);
             ctime_member
                 || expression_uses_file_ctime(object)
                 || matches!(member, Member::Computed(value) if expression_uses_file_ctime(value))
@@ -727,10 +747,16 @@ fn expression_uses_relationships(expression: &Expr) -> bool {
             expression_uses_relationships(left) || expression_uses_relationships(right)
         }
         Expr::Member(object, member) => {
-            let relationship_member = matches!(
+            let relationship_member = member_maybe_matches(
                 member,
-                Member::Named(name)
-                    if matches!(name.as_str(), "links" | "embeds" | "backlinks")
+                &[
+                    "links",
+                    "embeds",
+                    "backlinks",
+                    "hasLink",
+                    "asFile",
+                    "asLink",
+                ],
             );
             relationship_member
                 || expression_uses_relationships(object)
@@ -747,6 +773,25 @@ fn expression_uses_relationships(expression: &Expr) -> bool {
             relationship_call
                 || expression_uses_relationships(callee)
                 || arguments.iter().any(expression_uses_relationships)
+        }
+    }
+}
+
+fn expression_uses_backlinks(expression: &Expr) -> bool {
+    match expression {
+        Expr::Literal(_) | Expr::Regex(_, _) | Expr::Identifier(_) => false,
+        Expr::Array(values) => values.iter().any(expression_uses_backlinks),
+        Expr::Unary(_, value) => expression_uses_backlinks(value),
+        Expr::Binary(_, left, right) => {
+            expression_uses_backlinks(left) || expression_uses_backlinks(right)
+        }
+        Expr::Member(object, member) => {
+            member_maybe_matches(member, &["backlinks"])
+                || expression_uses_backlinks(object)
+                || matches!(member, Member::Computed(value) if expression_uses_backlinks(value))
+        }
+        Expr::Call(callee, arguments) => {
+            expression_uses_backlinks(callee) || arguments.iter().any(expression_uses_backlinks)
         }
     }
 }
@@ -2741,6 +2786,22 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string()
+    }
+
+    #[test]
+    fn computed_file_members_are_classified_before_hosted_planning() {
+        assert!(uses_relationships(r#"file["back" + "links"]"#));
+        assert!(uses_relationships(r#"value["as" + "File"]()"#));
+        assert!(uses_relationships("file[property]"));
+        assert!(!uses_relationships(r#"file["na" + "me"]"#));
+
+        assert!(uses_backlinks(r#"file["back" + "links"]"#));
+        assert!(uses_backlinks("file[property]"));
+        assert!(!uses_backlinks(r#"file["em" + "beds"]"#));
+
+        assert!(uses_file_ctime(r#"file["ct" + "ime"]"#));
+        assert!(uses_file_ctime("file[property]"));
+        assert!(!uses_file_ctime(r#"file["na" + "me"]"#));
     }
 
     #[test]
