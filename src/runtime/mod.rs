@@ -18,6 +18,7 @@ mod filesystem;
 mod gate;
 mod hosted_mutation;
 mod hosted_query;
+mod hosted_validation;
 mod observer;
 mod operation;
 mod outcome;
@@ -46,6 +47,9 @@ pub use hosted_query::{
     HostedOrder, HostedOrderDirection, HostedQueryBudgets, HostedQueryPlan,
     HostedQueryRequirements, HostedReduction, HostedReductionInput, HostedResidualEvaluation,
     HostedSortSemantics, ProjectionAvailability, HOSTED_QUERY_PLAN_VERSION,
+};
+pub use hosted_validation::{
+    HostedValidationPlan, HostedValidationRequirement, HostedValidationRequirementKind,
 };
 #[cfg(feature = "tracing")]
 pub use observer::TracingObserver;

@@ -819,7 +819,7 @@ impl Collection {
     }
 }
 
-fn unique_field_references(type_def: &TypeDef) -> Vec<String> {
+pub(crate) fn unique_field_references(type_def: &TypeDef) -> Vec<String> {
     let mut references = type_def
         .fields
         .iter()

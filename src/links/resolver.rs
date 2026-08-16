@@ -505,6 +505,53 @@ impl Collection {
     ) -> Vec<Issue> {
         let mut issues = Vec::new();
 
+        for (field_name, field, type_name, link) in
+            self.validation_link_checks(frontmatter, type_names)
+        {
+            issues.extend(self.validate_single_link(&link, &field_name, &field, &type_name, path));
+        }
+
+        issues
+    }
+
+    pub(crate) fn validation_resolution_targets(
+        &self,
+        frontmatter: &serde_json::Value,
+        type_names: &[String],
+        path: &str,
+    ) -> Vec<String> {
+        let source_dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new(""))
+            .to_string_lossy()
+            .to_string();
+        let mut targets = self
+            .validation_link_checks(frontmatter, type_names)
+            .into_iter()
+            .filter(|(_, field, _, _)| {
+                field.validate_exists == Some(true) || !allowed_target_types(field).is_empty()
+            })
+            .filter_map(|(_, _, _, link)| {
+                self.parse_link(&serde_json::json!({"value": link}))
+                    .pointer("/link/target")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|target| !target.is_empty())
+                    .map(|target| normalize_link_path(target, &source_dir))
+            })
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+
+    fn validation_link_checks(
+        &self,
+        frontmatter: &serde_json::Value,
+        type_names: &[String],
+    ) -> Vec<(String, FieldDef, String, String)> {
+        let mut checks = Vec::new();
+
         for type_name in type_names {
             let type_def = match self.types.get(type_name) {
                 Some(td) => td,
@@ -552,9 +599,12 @@ impl Collection {
                 };
 
                 for link_str in link_values {
-                    let link_issues = self
-                        .validate_single_link(link_str, field_name, link_field, type_name, path);
-                    issues.extend(link_issues);
+                    checks.push((
+                        field_name.clone(),
+                        link_field.clone(),
+                        type_name.clone(),
+                        link_str.to_string(),
+                    ));
                 }
             }
 
@@ -608,19 +658,18 @@ impl Collection {
                         let Some(link_str) = value.as_str() else {
                             continue;
                         };
-                        issues.extend(self.validate_single_link(
-                            link_str,
-                            field_reference,
-                            &link_field,
-                            type_name,
-                            path,
+                        checks.push((
+                            field_reference.clone(),
+                            link_field.clone(),
+                            type_name.clone(),
+                            link_str.to_string(),
                         ));
                     }
                 }
             }
         }
 
-        issues
+        checks
     }
 
     /// Validate a single link value.

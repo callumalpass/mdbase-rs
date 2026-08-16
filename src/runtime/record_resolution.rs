@@ -106,45 +106,9 @@ impl CompiledCatalog {
             let Some(target) = occurrence.normalized_target.as_deref() else {
                 continue;
             };
-            let mut alternatives = vec![ResolutionLookupKey {
-                priority: 0,
-                kind: RecordResolutionKeyKind::Path,
-                value: target.to_string(),
-            }];
-            if std::path::Path::new(target).extension().is_none() {
-                for extension in self.record_extensions() {
-                    alternatives.push(ResolutionLookupKey {
-                        priority: 1,
-                        kind: RecordResolutionKeyKind::Path,
-                        value: format!("{target}.{extension}"),
-                    });
-                }
-            }
-            if !target.contains('/') {
-                let simple = target.to_ascii_lowercase();
-                alternatives.extend([
-                    ResolutionLookupKey {
-                        priority: 2,
-                        kind: RecordResolutionKeyKind::Basename,
-                        value: simple.clone(),
-                    },
-                    ResolutionLookupKey {
-                        priority: 3,
-                        kind: RecordResolutionKeyKind::Id,
-                        value: simple.clone(),
-                    },
-                    ResolutionLookupKey {
-                        priority: 4,
-                        kind: RecordResolutionKeyKind::Title,
-                        value: simple,
-                    },
-                ]);
-            }
-            alternatives.sort();
-            alternatives.dedup();
             lookups.push(OccurrenceResolutionLookup {
                 occurrence_ordinal: occurrence.ordinal,
-                alternatives,
+                alternatives: self.resolution_lookup_alternatives(target),
             });
         }
         let lookup_count = lookups
@@ -160,6 +124,46 @@ impl CompiledCatalog {
             structural_digest: structure.structural_digest.clone(),
             lookups,
         })
+    }
+
+    pub(crate) fn resolution_lookup_alternatives(&self, target: &str) -> Vec<ResolutionLookupKey> {
+        let mut alternatives = vec![ResolutionLookupKey {
+            priority: 0,
+            kind: RecordResolutionKeyKind::Path,
+            value: target.to_string(),
+        }];
+        if std::path::Path::new(target).extension().is_none() {
+            for extension in self.record_extensions() {
+                alternatives.push(ResolutionLookupKey {
+                    priority: 1,
+                    kind: RecordResolutionKeyKind::Path,
+                    value: format!("{target}.{extension}"),
+                });
+            }
+        }
+        if !target.contains('/') {
+            let simple = target.to_ascii_lowercase();
+            alternatives.extend([
+                ResolutionLookupKey {
+                    priority: 2,
+                    kind: RecordResolutionKeyKind::Basename,
+                    value: simple.clone(),
+                },
+                ResolutionLookupKey {
+                    priority: 3,
+                    kind: RecordResolutionKeyKind::Id,
+                    value: simple.clone(),
+                },
+                ResolutionLookupKey {
+                    priority: 4,
+                    kind: RecordResolutionKeyKind::Title,
+                    value: simple,
+                },
+            ]);
+        }
+        alternatives.sort();
+        alternatives.dedup();
+        alternatives
     }
 
     /// Resolve authority-returned exact lookup rows under the compiled plan.
