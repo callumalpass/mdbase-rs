@@ -476,6 +476,7 @@ impl CompiledCatalog {
         requirements.exact_document |= query.include_body;
         requirements.collection_context =
             query.context.is_some() || canonical_preflight.requires_link_graph();
+        requirements.relationships = canonical_preflight.requires_link_graph();
         requirements.structural_body_facts |= canonical_preflight.requires_file_body_metadata();
         requirements.canonical_residual |= query.context.is_some()
             || !query.projections.is_empty()

@@ -37,6 +37,7 @@ impl CompiledCatalog {
         input: &Value,
         view_record: &CanonicalRecordInput,
         context_record: Option<&CanonicalRecordInput>,
+        allowed_types: &[String],
     ) -> Result<HostedCanonicalViewPlanning, CatalogError> {
         let requested_path = input
             .get("path")
@@ -58,7 +59,7 @@ impl CompiledCatalog {
         }
         let classified_view = self.classify_record(view_record)?;
         let document = Value::Object(classified_view.frontmatter.clone());
-        let prepared = match crate::views::prepare_hosted_canonical_view(&document, input) {
+        let mut prepared = match crate::views::prepare_hosted_canonical_view(&document, input) {
             Ok(prepared) => prepared,
             Err(result) => return Ok(HostedCanonicalViewPlanning::Invalid { result }),
         };
@@ -82,10 +83,38 @@ impl CompiledCatalog {
         ) {
             return Ok(HostedCanonicalViewPlanning::Invalid { result });
         }
+        if !allowed_types.is_empty() {
+            if prepared.context_path.as_deref() != Some(view_record.path.as_str())
+                && context.as_ref().is_some_and(|context| {
+                    !context.types.iter().any(|actual| {
+                        allowed_types
+                            .iter()
+                            .any(|allowed| allowed.eq_ignore_ascii_case(actual))
+                    })
+                })
+            {
+                return Ok(invalid(
+                    "scope_denied",
+                    "The saved-view context is outside this capability's record scope.",
+                    prepared
+                        .context_path
+                        .as_deref()
+                        .unwrap_or(&prepared.view_path),
+                ));
+            }
+            scope_view_query(&mut prepared.query, allowed_types);
+        }
         let query = match self.compile_hosted_query(&prepared.query) {
             Ok(query) => query,
             Err(error) => return Ok(invalid(&error.code, error.message, &prepared.view_path)),
         };
+        if !allowed_types.is_empty() && query.requirements.relationships {
+            return Ok(invalid(
+                "scope_denied",
+                "Cross-record saved-view traversal is unavailable to a scoped capability.",
+                &prepared.view_path,
+            ));
+        }
         let context_revision = context.as_ref().map(|context| context.revision.clone());
         let digest_input = json!({
             "schema": "mdbase.hosted-canonical-view-invocation.v1",
@@ -113,6 +142,34 @@ impl CompiledCatalog {
             plan: Box::new(plan),
         })
     }
+}
+
+fn scope_view_query(query: &mut Value, allowed_types: &[String]) {
+    let Some(query) = query.as_object_mut() else {
+        return;
+    };
+    let requested_types = query
+        .get("types")
+        .and_then(Value::as_array)
+        .filter(|types| !types.is_empty());
+    let scoped = requested_types
+        .map(|types| {
+            types
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|requested| {
+                    allowed_types
+                        .iter()
+                        .any(|allowed| allowed.eq_ignore_ascii_case(requested))
+                })
+                .map(|name| Value::String(name.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| allowed_types.iter().cloned().map(Value::String).collect());
+    if requested_types.is_some() && scoped.is_empty() {
+        query.insert("where".to_string(), Value::String("false".to_string()));
+    }
+    query.insert("types".to_string(), Value::Array(scoped));
 }
 
 fn invalid(
@@ -172,6 +229,7 @@ mod tests {
                 &json!({"path": "views/tasks.md", "view": "open", "limit": 25}),
                 &view,
                 None,
+                &[],
             )
             .unwrap();
         let HostedCanonicalViewPlanning::Planned { plan } = outcome else {
