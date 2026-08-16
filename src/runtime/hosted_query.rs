@@ -550,13 +550,24 @@ impl CompiledCatalog {
     ///
     /// This is the point-residual seam used after provider candidate selection.
     /// It performs no enumeration or storage access. Plans needing a `this`
-    /// record, backlinks, or cross-record traversal are rejected so a host must
-    /// use the separate bounded collection-context seam rather than silently
-    /// changing semantics.
+    /// record use [`Self::evaluate_hosted_residual_with_context`]; backlinks or
+    /// cross-record traversal use a separate bounded relationship seam.
     pub fn evaluate_hosted_residual(
         &self,
         plan: &HostedQueryPlan,
         record: &CanonicalRecordInput,
+    ) -> Result<HostedResidualEvaluation, CatalogError> {
+        self.evaluate_hosted_residual_with_context(plan, record, None)
+    }
+
+    /// Evaluate one retained exact record with an optional exact `this`
+    /// context. The context is a point input and is never retained in the plan.
+    /// Link-graph traversal remains a separate bounded seam.
+    pub fn evaluate_hosted_residual_with_context(
+        &self,
+        plan: &HostedQueryPlan,
+        record: &CanonicalRecordInput,
+        context_record: Option<&CanonicalRecordInput>,
     ) -> Result<HostedResidualEvaluation, CatalogError> {
         if plan.version != HOSTED_QUERY_PLAN_VERSION
             || plan.catalog_revision != self.resource_revision()
@@ -566,12 +577,6 @@ impl CompiledCatalog {
             return Err(query_error(
                 "hosted_query_plan_mismatch",
                 "Hosted query plan is not bound to the current semantic catalog.",
-            ));
-        }
-        if plan.requirements.collection_context {
-            return Err(query_error(
-                "hosted_collection_context_required",
-                "This query requires a bounded collection-context residual.",
             ));
         }
         let canonical = serde_jcs::to_vec(&plan.residual.query).map_err(|error| {
@@ -604,12 +609,28 @@ impl CompiledCatalog {
                     .join("; "),
             )
         })?;
-        if compiled.query.context.is_some() || compiled.requires_link_graph() {
+        if compiled.requires_link_graph() {
             return Err(query_error(
                 "hosted_collection_context_required",
-                "This query requires a bounded collection-context residual.",
+                "This query requires a bounded relationship-graph residual.",
             ));
         }
+
+        let this_context = match compiled.query.context.as_ref() {
+            None => None,
+            Some(context) => {
+                let expected_path = &context.this.path;
+                let Some(context_record) =
+                    context_record.filter(|context_record| &context_record.path == expected_path)
+                else {
+                    return Err(query_error(
+                        "context_not_found",
+                        format!("Query context record '{expected_path}' was not supplied."),
+                    ));
+                };
+                Some(self.hosted_query_context(context_record)?)
+            }
+        };
 
         let classified = self.classify_record(record)?;
         let raw = Value::Object(classified.frontmatter);
@@ -684,7 +705,7 @@ impl CompiledCatalog {
                 &types,
                 &effective,
                 &projections,
-                None,
+                this_context.clone(),
                 None,
                 None,
                 type_definitions.clone(),
@@ -711,7 +732,7 @@ impl CompiledCatalog {
             &types,
             &effective,
             &projections,
-            None,
+            this_context,
             None,
             None,
             type_definitions,
@@ -794,6 +815,79 @@ impl CompiledCatalog {
             group_values,
             aggregate_values,
         })
+    }
+
+    fn hosted_query_context(
+        &self,
+        record: &CanonicalRecordInput,
+    ) -> Result<Box<crate::expressions::evaluator::EvalContext>, CatalogError> {
+        use crate::expressions::evaluator::{EvalContext, NoteNamespaceSource};
+
+        let read = self.read_record(&serde_json::json!({"path": record.path}), record);
+        if !read.valid {
+            return Err(query_error(
+                "context_invalid",
+                format!(
+                    "Query context record '{}' is not canonically readable.",
+                    record.path
+                ),
+            ));
+        }
+        let effective = read
+            .result
+            .get("effective_frontmatter")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let persisted = read
+            .result
+            .get("frontmatter")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let types = read
+            .result
+            .get("types")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let mut bindings = cel::enrich_record_bindings(
+            &effective,
+            &persisted,
+            cel::known_fields(self.collection(), &types).iter(),
+        );
+        if let Some(object) = bindings.as_object_mut() {
+            object.insert(
+                "types".to_string(),
+                Value::Array(types.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        Ok(Box::new(EvalContext {
+            frontmatter: bindings,
+            raw_frontmatter: Some(persisted),
+            file_path: Some(record.path.clone()),
+            body: read
+                .result
+                .get("body")
+                .and_then(Value::as_str)
+                .map(String::from),
+            file_size: Some(if record.file_size == 0 {
+                record.document.len() as u64
+            } else {
+                record.file_size
+            }),
+            file_mtime: record.file_mtime.clone(),
+            file_ctime: None,
+            this_context: None,
+            all_files: None,
+            traversal_depth: std::cell::Cell::new(0),
+            backlinks_index: None,
+            type_names: Some(types),
+            types: Some(Arc::new(self.collection().types.clone())),
+            note_namespace_source: NoteNamespaceSource::Effective,
+            string_concat: false,
+        }))
     }
 
     /// Evaluate a projection-complete residual without decrypting exact body

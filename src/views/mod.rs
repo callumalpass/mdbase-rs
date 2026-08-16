@@ -44,6 +44,8 @@ pub(crate) fn compatibility_source_paths(collection: &Collection) -> Vec<PathBuf
     execute::obsidian_source_paths(collection)
 }
 
+pub(crate) use execute::{prepare_hosted_canonical_view, verify_canonical_view_context};
+
 fn normalized_source_path(path: &str) -> Option<CollectionPath> {
     let path = CollectionPath::new(path).ok()?;
     path.as_str()
