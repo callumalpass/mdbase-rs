@@ -375,7 +375,10 @@ fn parse_target_occurrence_with_alias(
         kind,
         StructuralLinkKind::MarkdownLink | StructuralLinkKind::MarkdownImage
     ) {
-        target_part = markdown_destination(&target_part);
+        let Some(destination) = markdown_destination(&target_part) else {
+            return malformed_occurrence(source_kind, kind, raw);
+        };
+        target_part = destination;
     }
     let anchor = target_part
         .find('#')
@@ -383,19 +386,20 @@ fn parse_target_occurrence_with_alias(
     make_occurrence(source_kind, kind, raw, target_part, alias, anchor, path)
 }
 
-fn markdown_destination(value: &str) -> String {
+fn markdown_destination(value: &str) -> Option<String> {
     let value = value.trim();
     if let Some(rest) = value.strip_prefix('<') {
         return rest
             .split_once('>')
-            .map_or(rest, |(destination, _)| destination)
-            .to_string();
+            .map(|(destination, _)| destination.to_string());
     }
-    value
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string()
+    Some(
+        value
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string(),
+    )
 }
 
 fn make_occurrence(
@@ -603,7 +607,7 @@ mod tests {
     #[test]
     fn body_labels_destination_titles_and_malformed_source_are_never_serialized() {
         let structure = body(
-            "[[target|wikilink-secret]] [markdown-secret](local.md \"title-secret\") [[malformed-secret",
+            "[[target|wikilink-secret]] [markdown-secret](local.md \"title-secret\") [[malformed-secret [angle](<local.md \"angle-title-secret\")",
         );
         let serialized = serde_json::to_string(&structure).unwrap();
         for secret in [
@@ -611,6 +615,7 @@ mod tests {
             "markdown-secret",
             "title-secret",
             "malformed-secret",
+            "angle-title-secret",
         ] {
             assert!(
                 !serialized.contains(secret),
@@ -619,6 +624,10 @@ mod tests {
         }
         assert!(serialized.contains("target"));
         assert!(serialized.contains("local.md"));
+        assert!(structure
+            .occurrences
+            .iter()
+            .any(|occurrence| occurrence.resolution == StructuralResolution::Malformed));
     }
 
     #[test]
