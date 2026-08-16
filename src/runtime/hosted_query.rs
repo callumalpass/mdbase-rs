@@ -101,9 +101,10 @@ pub struct CandidateComparison {
     /// result as canonical CEL for this literal/operator pair. Conservative
     /// comparisons may be observed but must never narrow provider candidates.
     pub pruning: CandidateComparisonPruning,
-    /// Catalog proof for strict provider evaluation. A provider must still
-    /// verify the actual current projection value has this kind before using
-    /// the comparison as exact rather than conservative candidate pruning.
+    /// Catalog proof for strict provider evaluation. It becomes an exact
+    /// provider proof only when paired with a transactionally current,
+    /// untampered mdbase-generated projection generation; otherwise the
+    /// provider must verify actual values and fall back conservatively.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_kind: Option<HostedScalarKind>,
 }
@@ -163,8 +164,10 @@ pub struct HostedOrder {
     pub semantics: HostedSortSemantics,
     /// A catalog-backed proof that current projections contain only this
     /// scalar kind (or null) for the ordered field. Providers may use this to
-    /// implement canonical keyset ordering, but must fail the proof at runtime
-    /// if a malformed projection contains another JSON kind.
+    /// implement canonical keyset ordering when the current generation carries
+    /// a transactionally maintained proof that every row is an untampered
+    /// mdbase-generated projection. Without that generation proof, providers
+    /// must verify actual projection kinds at runtime and fail closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_kind: Option<HostedScalarKind>,
 }
