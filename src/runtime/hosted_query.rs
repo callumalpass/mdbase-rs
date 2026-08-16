@@ -1193,6 +1193,8 @@ fn projection_is_current_for_plan(plan: &HostedQueryPlan, projection: &SemanticP
         && projection.facts.semantic_engine_version == plan.semantic_engine_version
         && projection.facts.catalog_revision == plan.catalog_revision
         && projection.structure.schema_version == RECORD_STRUCTURE_SCHEMA_VERSION
+        && projection.structure.path == projection.facts.path
+        && projection.structure.structural_digest_is_valid()
 }
 
 fn complete_file_value_from_projection(
@@ -1567,9 +1569,23 @@ mod tests {
         let plan = catalog
             .compile_hosted_query(&json!({"types": ["task"], "limit": 10}))
             .unwrap();
-        let mut projection = projection("open", true);
-        projection.facts.catalog_revision = "stale-catalog".to_string();
+        let mut stale_projection = projection("open", true);
+        stale_projection.facts.catalog_revision = "stale-catalog".to_string();
 
+        assert_eq!(
+            plan.candidate_verdict(Some(&stale_projection), ProjectionAvailability::Current),
+            CandidateVerdict::CanonicalRequired
+        );
+        let error = catalog
+            .evaluate_hosted_projection_residual(&plan, &stale_projection)
+            .unwrap_err();
+        assert_eq!(error.code, "hosted_exact_residual_required");
+
+        let mut projection = projection("open", true);
+        projection
+            .structure
+            .body_links
+            .push("forged.md".to_string());
         assert_eq!(
             plan.candidate_verdict(Some(&projection), ProjectionAvailability::Current),
             CandidateVerdict::CanonicalRequired

@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CatalogError, CompiledCatalog, RecordResolutionKeyKind, RecordStructure, StructuralOccurrence,
-    StructuralResolution,
+    record_structure::digest_structure, CatalogError, CompiledCatalog, RecordResolutionKeyKind,
+    RecordStructure, StructuralOccurrence, StructuralResolution,
 };
 
 pub const MAX_STRUCTURAL_OCCURRENCES: usize = 4_096;
@@ -64,6 +64,29 @@ pub struct ResolvedStructuralOccurrence {
     pub target_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ambiguous_paths: Vec<String>,
+}
+
+impl ResolvedRecordStructure {
+    /// Verify that deserialized structural facts still bind the digest produced
+    /// before relationship resolution. Resolution outcomes are deliberately
+    /// excluded; the exact occurrence spellings and query-visible body facts
+    /// are not.
+    pub fn structural_digest_is_valid(&self) -> bool {
+        let structure = RecordStructure {
+            schema_version: self.schema_version.clone(),
+            path: self.path.clone(),
+            occurrences: self
+                .occurrences
+                .iter()
+                .map(|resolved| resolved.occurrence.clone())
+                .collect(),
+            body_tags: self.body_tags.clone(),
+            body_links: self.body_links.clone(),
+            body_embeds: self.body_embeds.clone(),
+            structural_digest: String::new(),
+        };
+        digest_structure(&structure) == self.structural_digest
+    }
 }
 
 impl CompiledCatalog {

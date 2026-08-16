@@ -483,7 +483,7 @@ fn compare_occurrences(left: &StructuralOccurrence, right: &StructuralOccurrence
         .then_with(|| left.resolution.cmp(&right.resolution))
 }
 
-fn digest_structure(structure: &RecordStructure) -> String {
+pub(super) fn digest_structure(structure: &RecordStructure) -> String {
     let mut canonical = structure.clone();
     canonical.structural_digest.clear();
     let bytes = serde_jcs::to_vec(&canonical).expect("record structure is serializable");
