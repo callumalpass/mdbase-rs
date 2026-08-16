@@ -104,6 +104,13 @@ pub struct HostedBaseRow {
     pub group_value: Option<Value>,
 }
 
+pub struct HostedBaseGroupAccumulator {
+    property: Option<String>,
+    descending: bool,
+    max_groups: u64,
+    groups: BTreeMap<String, (Value, u64)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum HostedBaseEvaluation {
@@ -590,17 +597,60 @@ impl HostedBasePlan {
     }
 
     pub fn groups(&self, rows: &[HostedBaseRow]) -> Option<Vec<Value>> {
-        let group = self.view.group_by.as_ref()?;
-        let mut grouped = BTreeMap::<String, (Value, u64)>::new();
+        let mut accumulator = self.start_grouping(u64::MAX);
         for row in rows {
-            let value = row.group_value.clone().unwrap_or(Value::Null);
-            let key = serde_jcs::to_string(&value).unwrap_or_default();
-            let entry = grouped.entry(key).or_insert((value, 0));
-            entry.1 = entry.1.saturating_add(1);
+            accumulator.push(row).ok()?;
         }
-        let mut grouped = grouped.into_values().collect::<Vec<_>>();
+        accumulator.finish()
+    }
+
+    pub fn start_grouping(&self, max_groups: u64) -> HostedBaseGroupAccumulator {
+        HostedBaseGroupAccumulator {
+            property: self
+                .view
+                .group_by
+                .as_ref()
+                .map(|group| group.property().to_string()),
+            descending: self
+                .view
+                .group_by
+                .as_ref()
+                .is_some_and(|group| group.direction().eq_ignore_ascii_case("DESC")),
+            max_groups,
+            groups: BTreeMap::new(),
+        }
+    }
+}
+
+impl HostedBaseGroupAccumulator {
+    pub fn push(&mut self, row: &HostedBaseRow) -> Result<(), CatalogError> {
+        if self.property.is_none() {
+            return Ok(());
+        }
+        let value = row.group_value.clone().unwrap_or(Value::Null);
+        let key = serde_jcs::to_string(&value).map_err(|error| CatalogError {
+            code: "invalid_hosted_base_group".to_string(),
+            message: format!("Obsidian Base group value could not canonicalize: {error}"),
+        })?;
+        if !self.groups.contains_key(&key) && self.groups.len() as u64 >= self.max_groups {
+            return Err(CatalogError {
+                code: "hosted_base_group_budget_exceeded".to_string(),
+                message: format!(
+                    "Obsidian Base grouping exceeded the maximum of {} groups.",
+                    self.max_groups
+                ),
+            });
+        }
+        let entry = self.groups.entry(key).or_insert((value, 0));
+        entry.1 = entry.1.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn finish(self) -> Option<Vec<Value>> {
+        let property = self.property?;
+        let mut grouped = self.groups.into_values().collect::<Vec<_>>();
         grouped.sort_by(|left, right| compare_json(&left.0, &right.0));
-        if group.direction().eq_ignore_ascii_case("DESC") {
+        if self.descending {
             grouped.reverse();
         }
         Some(
@@ -608,7 +658,7 @@ impl HostedBasePlan {
                 .into_iter()
                 .map(|(value, count)| {
                     json!({
-                        "values": {group.property(): value},
+                        "values": {property.clone(): value},
                         "count": count,
                         "summaries": {},
                     })
@@ -1159,6 +1209,71 @@ views:
             plan.validate_integrity().unwrap_err().code,
             "hosted_base_plan_mismatch"
         );
+    }
+
+    #[test]
+    fn base_grouping_streams_bounded_state() {
+        let catalog = catalog();
+        let source = "views:\n  - type: table\n    name: Tasks\n    groupBy:\n      property: status\n      direction: ASC\n";
+        let planned = catalog
+            .plan_hosted_obsidian_base(
+                &json!({"path": "views/tasks.base", "view": "tasks"}),
+                &CanonicalRecordInput {
+                    stable_id: None,
+                    path: "views/tasks.base".to_string(),
+                    document: source.to_string(),
+                    file_size: source.len() as u64,
+                    file_mtime: None,
+                },
+                &[],
+            )
+            .unwrap();
+        let HostedBasePlanning::Planned { plan } = planned else {
+            panic!("expected hosted Base plan")
+        };
+        let mut grouping = plan.start_grouping(2);
+        for index in 0..100_000 {
+            grouping
+                .push(&HostedBaseRow {
+                    path: format!("tasks/{index}.md"),
+                    file: Value::Null,
+                    effective_frontmatter: Map::new(),
+                    types: Vec::new(),
+                    values: Map::new(),
+                    sort_values: Map::new(),
+                    group_value: Some(Value::String(if index % 2 == 0 {
+                        "open".to_string()
+                    } else {
+                        "done".to_string()
+                    })),
+                })
+                .unwrap();
+        }
+        assert_eq!(grouping.groups.len(), 2);
+        let groups = grouping.finish().unwrap();
+        assert_eq!(groups[0]["count"], 50_000);
+        assert_eq!(groups[1]["count"], 50_000);
+
+        let mut over_budget = plan.start_grouping(1);
+        for value in ["open", "done"] {
+            let result = over_budget.push(&HostedBaseRow {
+                path: format!("tasks/{value}.md"),
+                file: Value::Null,
+                effective_frontmatter: Map::new(),
+                types: Vec::new(),
+                values: Map::new(),
+                sort_values: Map::new(),
+                group_value: Some(Value::String(value.to_string())),
+            });
+            if value == "done" {
+                assert_eq!(
+                    result.unwrap_err().code,
+                    "hosted_base_group_budget_exceeded"
+                );
+            } else {
+                result.unwrap();
+            }
+        }
     }
 
     #[test]
