@@ -44,7 +44,15 @@ pub(crate) fn compatibility_source_paths(collection: &Collection) -> Vec<PathBuf
     execute::obsidian_source_paths(collection)
 }
 
+pub(crate) use execute::{
+    base_uses_backlinks, combined_filter_matches, evaluate_property, is_configured_obsidian_source,
+    validate_base_expressions,
+};
 pub(crate) use execute::{prepare_hosted_canonical_view, verify_canonical_view_context};
+pub(crate) use expression::{BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone};
+pub(crate) use model::{
+    stable_named_view_ids, ObsidianBaseDocument, ObsidianBaseView, ViewReferenceInput,
+};
 
 fn normalized_source_path(path: &str) -> Option<CollectionPath> {
     let path = CollectionPath::new(path).ok()?;

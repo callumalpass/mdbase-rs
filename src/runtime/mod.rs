@@ -16,6 +16,7 @@ mod external;
 mod feed;
 mod filesystem;
 mod gate;
+mod hosted_base;
 mod hosted_mutation;
 mod hosted_query;
 mod hosted_resource;
@@ -42,6 +43,10 @@ pub use catalog::{
 };
 pub use context::{OperationContext, OperationDeadline};
 pub use filesystem::FilesystemRuntime;
+pub use hosted_base::{
+    HostedBaseEvaluation, HostedBasePlan, HostedBasePlanning, HostedBaseRecordContext,
+    HostedBaseRequirements, HostedBaseRow, HOSTED_BASE_PLAN_VERSION,
+};
 pub use hosted_mutation::{HostedMutationChange, HostedMutationPlan, HostedMutationRequest};
 pub use hosted_query::{
     CandidateComparison, CandidateComparisonOperator, CandidateComparisonPruning, CandidateField,

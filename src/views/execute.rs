@@ -944,7 +944,10 @@ fn base_groups(rows: &[BaseRow<'_>], group_by: &BaseGroupBy) -> Value {
     Value::Array(groups.into_iter().map(|(value, count)| json!({"values": {group_by.property(): value}, "count": count, "summaries": {}})).collect())
 }
 
-fn evaluate_property(property: &str, context: &BasesEvaluationContext) -> Result<Value, String> {
+pub(crate) fn evaluate_property(
+    property: &str,
+    context: &BasesEvaluationContext,
+) -> Result<Value, String> {
     if let Some(name) = property.strip_prefix("formula.") {
         expression::evaluate(&format!("formula.{name}"), context)
     } else if property.starts_with("file.") || property.starts_with("note[") {
@@ -954,7 +957,7 @@ fn evaluate_property(property: &str, context: &BasesEvaluationContext) -> Result
     }
 }
 
-fn combined_filter_matches(
+pub(crate) fn combined_filter_matches(
     shared: Option<&BaseFilter>,
     local: Option<&BaseFilter>,
     context: &BasesEvaluationContext,
@@ -1003,7 +1006,7 @@ fn filter_matches(
     }
 }
 
-fn validate_base_expressions(
+pub(crate) fn validate_base_expressions(
     document: &ObsidianBaseDocument,
     view: &ObsidianBaseView,
     path: &str,
@@ -1038,7 +1041,10 @@ fn validate_base_expressions(
     diagnostics
 }
 
-fn base_uses_backlinks(document: &ObsidianBaseDocument, view: &ObsidianBaseView) -> bool {
+pub(crate) fn base_uses_backlinks(
+    document: &ObsidianBaseDocument,
+    view: &ObsidianBaseView,
+) -> bool {
     document
         .formulas
         .values()
