@@ -12,6 +12,7 @@ use crate::{Collection, SpecProfile};
 use super::{CanonicalRecordInput, CatalogError, CompiledCatalog};
 
 const MAX_HOSTED_MUTATION_RECORDS: usize = 2_001;
+const MAX_HOSTED_MUTATION_EXACT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostedMutationRequest {
@@ -50,6 +51,15 @@ impl CompiledCatalog {
             return Err(mutation_error(
                 "hosted_mutation_context_budget_exceeded",
                 "Hosted mutation context exceeds its exact-record budget.",
+            ));
+        }
+        let exact_bytes = request.records.iter().try_fold(0_usize, |total, record| {
+            total.checked_add(record.document.len())
+        });
+        if exact_bytes.is_none_or(|bytes| bytes > MAX_HOSTED_MUTATION_EXACT_BYTES) {
+            return Err(mutation_error(
+                "hosted_mutation_context_byte_budget_exceeded",
+                "Hosted mutation context exceeds its exact-byte budget.",
             ));
         }
         if !matches!(
