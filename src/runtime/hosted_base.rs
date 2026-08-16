@@ -14,6 +14,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::expressions::evaluator::resolve_execution_timezone;
+use crate::links::parser::normalize_link_path;
 use crate::v03::{Diagnostic, OperationResult};
 use crate::views::{
     base_uses_backlinks, combined_filter_matches, evaluate_property, is_configured_obsidian_source,
@@ -726,6 +727,10 @@ fn validate_projection(
 
 fn projection_file(projection: &SemanticProjection) -> BasesFile {
     let facts = &projection.facts.file;
+    let source_dir = Path::new(&facts.path)
+        .parent()
+        .and_then(|path| path.to_str())
+        .unwrap_or_default();
     let mut tags = frontmatter_tags(&projection.facts.effective_frontmatter);
     for tag in &projection.structure.body_tags {
         if !tags.contains(tag) {
@@ -757,7 +762,13 @@ fn projection_file(projection: &SemanticProjection) -> BasesFile {
         .iter()
         .map(|path| BasesLink {
             path: path.clone(),
-            resolved_path: resolved.get(path).cloned(),
+            resolved_path: resolved
+                .get(path)
+                .or_else(|| {
+                    let target = path.split('#').next().unwrap_or(path);
+                    resolved.get(&normalize_link_path(target, source_dir))
+                })
+                .cloned(),
             ..Default::default()
         })
         .collect();
@@ -767,7 +778,13 @@ fn projection_file(projection: &SemanticProjection) -> BasesFile {
         .iter()
         .map(|path| BasesLink {
             path: path.clone(),
-            resolved_path: resolved.get(path).cloned(),
+            resolved_path: resolved
+                .get(path)
+                .or_else(|| {
+                    let target = path.split('#').next().unwrap_or(path);
+                    resolved.get(&normalize_link_path(target, source_dir))
+                })
+                .cloned(),
             ..Default::default()
         })
         .collect();
@@ -1113,6 +1130,54 @@ mod tests {
             body_embeds: prepared.structure.body_embeds.clone(),
         };
         catalog.finalize_projection(prepared, resolved).unwrap()
+    }
+
+    #[test]
+    fn projection_file_resolves_relative_body_links_from_the_source_directory() {
+        let catalog = catalog();
+        let document = "---\ntitle: Source\n---\n[Target](../target.md#section)\n";
+        let prepared = catalog
+            .project_record(&CanonicalRecordInput {
+                stable_id: Some("source:relative-link".to_string()),
+                path: "tasks/nested/source.md".to_string(),
+                document: document.to_string(),
+                file_size: document.len() as u64,
+                file_mtime: None,
+            })
+            .unwrap();
+        let projection = finalize_to_target(&catalog, prepared, "tasks/target.md");
+
+        let file = projection_file(&projection);
+        assert_eq!(file.links.len(), 1);
+        assert_eq!(file.links[0].path, "../target.md");
+        assert_eq!(
+            file.links[0].resolved_path,
+            Some(Some("tasks/target.md".to_string()))
+        );
+    }
+
+    #[test]
+    fn projection_file_resolves_relative_body_embeds_from_the_source_directory() {
+        let catalog = catalog();
+        let document = "---\ntitle: Source\n---\n![[../assets/picture.png#preview]]\n";
+        let prepared = catalog
+            .project_record(&CanonicalRecordInput {
+                stable_id: Some("source:relative-embed".to_string()),
+                path: "tasks/nested/source.md".to_string(),
+                document: document.to_string(),
+                file_size: document.len() as u64,
+                file_mtime: None,
+            })
+            .unwrap();
+        let projection = finalize_to_target(&catalog, prepared, "tasks/assets/picture.png");
+
+        let file = projection_file(&projection);
+        assert_eq!(file.embeds.len(), 1);
+        assert_eq!(file.embeds[0].path, "../assets/picture.png#preview");
+        assert_eq!(
+            file.embeds[0].resolved_path,
+            Some(Some("tasks/assets/picture.png".to_string()))
+        );
     }
 
     #[test]
