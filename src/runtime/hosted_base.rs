@@ -17,8 +17,8 @@ use crate::expressions::evaluator::resolve_execution_timezone;
 use crate::v03::{Diagnostic, OperationResult};
 use crate::views::{
     base_uses_backlinks, combined_filter_matches, evaluate_property, is_configured_obsidian_source,
-    lower_hosted_candidate, stable_named_view_ids, validate_base_expressions, BaseFilter,
-    BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone, ObsidianBaseDocument,
+    lower_hosted_candidate, stable_named_view_ids, uses_relationships, validate_base_expressions,
+    BaseFilter, BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone, ObsidianBaseDocument,
     ObsidianBaseView, ViewReferenceInput,
 };
 use crate::OperationCancellation;
@@ -27,7 +27,7 @@ use super::{
     CandidatePredicate, CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection,
 };
 
-pub const HOSTED_BASE_PLAN_VERSION: u32 = 3;
+pub const HOSTED_BASE_PLAN_VERSION: u32 = 4;
 pub const MAX_HOSTED_BASE_RELATED_RECORDS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -826,19 +826,33 @@ fn compare_json(left: &Value, right: &Value) -> std::cmp::Ordering {
 }
 
 fn base_uses_relationships(document: &ObsidianBaseDocument, view: &ObsidianBaseView) -> bool {
-    let mut relevant = document.clone();
-    relevant.views.clear();
-    let serialized = serde_json::to_string(&(relevant, view)).unwrap_or_default();
-    [
-        "backlinks",
-        "file.links",
-        "file.embeds",
-        "asFile",
-        "asLink",
-        "file(",
-    ]
-    .iter()
-    .any(|needle| serialized.contains(needle))
+    document
+        .formulas
+        .values()
+        .map(String::as_str)
+        .chain(base_filter_expressions(document.filters.as_ref()))
+        .chain(base_filter_expressions(view.filters.as_ref()))
+        .chain(view.order.iter().map(String::as_str))
+        .chain(view.sort.iter().map(|sort| sort.property.as_str()))
+        .chain(view.group_by.iter().map(|group| group.property()))
+        .any(uses_relationships)
+}
+
+fn base_filter_expressions(filter: Option<&BaseFilter>) -> Vec<&str> {
+    let Some(filter) = filter else {
+        return Vec::new();
+    };
+    match filter {
+        BaseFilter::Expression(expression) => vec![expression],
+        BaseFilter::Logical(logical) => logical
+            .and
+            .iter()
+            .chain(&logical.or)
+            .chain(&logical.not)
+            .flat_map(|filters| filters.values())
+            .flat_map(|filter| base_filter_expressions(Some(filter)))
+            .collect(),
+    }
 }
 
 fn base_candidate(shared: Option<&BaseFilter>, local: Option<&BaseFilter>) -> CandidatePredicate {
@@ -1150,6 +1164,57 @@ views:
             plan.validate_integrity().unwrap_err().code,
             "hosted_base_plan_mismatch"
         );
+    }
+
+    #[test]
+    fn has_link_is_graph_dependent_but_string_literals_are_not() {
+        let catalog = catalog();
+        let input = json!({"path": "views/links.base", "view": "links"});
+        let source = "views:\n  - type: table\n    name: Links\n    filters: 'file.hasLink(\"target.md\")'\n";
+        let view = CanonicalRecordInput {
+            stable_id: None,
+            path: "views/links.base".to_string(),
+            document: source.to_string(),
+            file_size: source.len() as u64,
+            file_mtime: None,
+        };
+        let HostedBasePlanning::Planned { plan } = catalog
+            .plan_hosted_obsidian_base(&input, &view, &[])
+            .unwrap()
+        else {
+            panic!("expected unscoped relationship plan")
+        };
+        assert!(plan.requirements.outgoing_relationships);
+        assert!(plan.requirements.link_resolution);
+        assert_eq!(plan.requirements.max_relationship_depth, 1);
+
+        let HostedBasePlanning::Invalid { result } = catalog
+            .plan_hosted_obsidian_base(&input, &view, &["task".to_string()])
+            .unwrap()
+        else {
+            panic!("scoped hasLink plan must fail closed")
+        };
+        assert_eq!(result.diagnostics[0].code, "scope_denied");
+
+        let literal_source = "views:\n  - type: table\n    name: Links\n    filters: 'label == \"file.hasLink(target.md)\"'\n";
+        let HostedBasePlanning::Planned { plan } = catalog
+            .plan_hosted_obsidian_base(
+                &input,
+                &CanonicalRecordInput {
+                    stable_id: None,
+                    path: "views/links.base".to_string(),
+                    document: literal_source.to_string(),
+                    file_size: literal_source.len() as u64,
+                    file_mtime: None,
+                },
+                &[],
+            )
+            .unwrap()
+        else {
+            panic!("expected literal-only plan")
+        };
+        assert!(!plan.requirements.outgoing_relationships);
+        assert!(!plan.requirements.link_resolution);
     }
 
     #[test]

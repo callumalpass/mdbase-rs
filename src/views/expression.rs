@@ -637,6 +637,53 @@ pub(crate) fn lower_hosted_candidate(expression: &str) -> CandidatePredicate {
         .unwrap_or(CandidatePredicate::All)
 }
 
+/// Return whether an Obsidian Bases expression requires the collection
+/// relationship graph or link-resolution namespace. This intentionally walks
+/// the parsed syntax tree rather than searching source text, so string
+/// literals and similarly named frontmatter fields do not create false
+/// dependencies.
+pub(crate) fn uses_relationships(expression: &str) -> bool {
+    parse_cached(expression)
+        .map(|expression| expression_uses_relationships(expression.as_ref()))
+        // Validation normally rejects parse failures before planning. Treat
+        // any exceptional accepted syntax conservatively so hosted execution
+        // cannot select a projection-only path without proving independence.
+        .unwrap_or(true)
+}
+
+fn expression_uses_relationships(expression: &Expr) -> bool {
+    match expression {
+        Expr::Literal(_) | Expr::Regex(_, _) | Expr::Identifier(_) => false,
+        Expr::Array(values) => values.iter().any(expression_uses_relationships),
+        Expr::Unary(_, value) => expression_uses_relationships(value),
+        Expr::Binary(_, left, right) => {
+            expression_uses_relationships(left) || expression_uses_relationships(right)
+        }
+        Expr::Member(object, member) => {
+            let relationship_member = matches!(
+                member,
+                Member::Named(name)
+                    if matches!(name.as_str(), "links" | "embeds" | "backlinks")
+            );
+            relationship_member
+                || expression_uses_relationships(object)
+                || matches!(member, Member::Computed(value) if expression_uses_relationships(value))
+        }
+        Expr::Call(callee, arguments) => {
+            let relationship_call = match callee.as_ref() {
+                Expr::Identifier(name) => name == "file",
+                Expr::Member(_, Member::Named(name)) => {
+                    matches!(name.as_str(), "hasLink" | "asFile" | "asLink")
+                }
+                _ => false,
+            };
+            relationship_call
+                || expression_uses_relationships(callee)
+                || arguments.iter().any(expression_uses_relationships)
+        }
+    }
+}
+
 fn lower_candidate_expression(expression: &Expr) -> CandidatePredicate {
     match expression {
         Expr::Binary(operator, left, right) if operator == "&&" => candidate_and(vec![
