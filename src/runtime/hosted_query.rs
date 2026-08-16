@@ -187,6 +187,41 @@ pub struct HostedReduction {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Streaming grouping/summary state for one bounded hosted operation. It
+/// retains one fixed-size aggregate state per group rather than every matched
+/// row, so provider memory is independent of collection cardinality.
+pub struct HostedReductionAccumulator {
+    plan: HostedQueryPlan,
+    groups: BTreeMap<String, HostedReductionGroupState>,
+}
+
+struct HostedReductionGroupState {
+    values: serde_json::Map<String, Value>,
+    count: u64,
+    summaries: Vec<HostedSummaryState>,
+}
+
+enum HostedSummaryState {
+    Count(u64),
+    Empty {
+        total: u64,
+        empty: u64,
+    },
+    Number {
+        count: u64,
+        sum: f64,
+        minimum: f64,
+        maximum: f64,
+        invalid: bool,
+    },
+    String {
+        selected: Option<String>,
+        latest: bool,
+        invalid: bool,
+    },
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedAggregate {
     pub field: CandidateField,
@@ -1109,87 +1144,18 @@ impl HostedQueryPlan {
         &self,
         rows: &[HostedReductionInput],
     ) -> Result<HostedReduction, CatalogError> {
-        if self.groups.is_empty() && self.aggregates.is_empty() {
-            return Ok(HostedReduction {
-                groups: None,
-                diagnostics: Vec::new(),
-            });
-        }
+        let mut accumulator = self.start_reduction();
         for row in rows {
-            if row.group_values.len() != self.groups.len()
-                || row.aggregate_values.len() != self.aggregates.len()
-            {
-                return Err(query_error(
-                    "hosted_query_plan_mismatch",
-                    "Hosted reduction values do not align with the compiled plan.",
-                ));
-            }
+            accumulator.push(row)?;
         }
+        accumulator.finish()
+    }
 
-        let mut diagnostics = Vec::new();
-        let groups = if self.groups.is_empty() {
-            vec![hosted_group_value(
-                self,
-                &serde_json::Map::new(),
-                rows,
-                &mut diagnostics,
-            )]
-        } else {
-            let mut grouped = BTreeMap::<
-                String,
-                (serde_json::Map<String, Value>, Vec<HostedReductionInput>),
-            >::new();
-            for row in rows {
-                let values = self
-                    .groups
-                    .iter()
-                    .zip(&row.group_values)
-                    .map(|(group, value)| (group.output_name.clone(), value.clone()))
-                    .collect::<serde_json::Map<_, _>>();
-                let key = serde_json::to_string(&values).map_err(|error| {
-                    query_error(
-                        "invalid_hosted_reduction",
-                        format!("Hosted group values could not be canonicalized: {error}"),
-                    )
-                })?;
-                grouped
-                    .entry(key)
-                    .or_insert_with(|| (values, Vec::new()))
-                    .1
-                    .push(row.clone());
-            }
-            if grouped.len() as u64 > self.budgets.max_groups {
-                return Err(query_error(
-                    "hosted_group_budget_exceeded",
-                    format!(
-                        "Hosted grouping exceeded the maximum of {} groups.",
-                        self.budgets.max_groups
-                    ),
-                ));
-            }
-            let mut grouped = grouped.into_values().collect::<Vec<_>>();
-            grouped.sort_by(|(left, _), (right, _)| {
-                for group in &self.groups {
-                    let comparison = compare_hosted_values(
-                        left.get(&group.output_name).unwrap_or(&Value::Null),
-                        right.get(&group.output_name).unwrap_or(&Value::Null),
-                        group.direction,
-                    );
-                    if comparison != std::cmp::Ordering::Equal {
-                        return comparison;
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
-            grouped
-                .into_iter()
-                .map(|(values, rows)| hosted_group_value(self, &values, &rows, &mut diagnostics))
-                .collect()
-        };
-        Ok(HostedReduction {
-            groups: Some(groups),
-            diagnostics,
-        })
+    pub fn start_reduction(&self) -> HostedReductionAccumulator {
+        HostedReductionAccumulator {
+            plan: self.clone(),
+            groups: BTreeMap::new(),
+        }
     }
 
     /// Evaluate only whether SQL may discard a projected row. Stale, absent,
@@ -1218,6 +1184,254 @@ impl HostedQueryPlan {
                 CandidateVerdict::CanonicalRequired
             }
             Truth::False => CandidateVerdict::Reject,
+        }
+    }
+}
+
+impl HostedReductionAccumulator {
+    pub fn push(&mut self, row: &HostedReductionInput) -> Result<(), CatalogError> {
+        if row.group_values.len() != self.plan.groups.len()
+            || row.aggregate_values.len() != self.plan.aggregates.len()
+        {
+            return Err(query_error(
+                "hosted_query_plan_mismatch",
+                "Hosted reduction values do not align with the compiled plan.",
+            ));
+        }
+        if self.plan.groups.is_empty() && self.plan.aggregates.is_empty() {
+            return Ok(());
+        }
+        let values = self
+            .plan
+            .groups
+            .iter()
+            .zip(&row.group_values)
+            .map(|(group, value)| (group.output_name.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        let key = serde_json::to_string(&values).map_err(|error| {
+            query_error(
+                "invalid_hosted_reduction",
+                format!("Hosted group values could not be canonicalized: {error}"),
+            )
+        })?;
+        if !self.groups.contains_key(&key) {
+            if !self.plan.groups.is_empty()
+                && self.groups.len() as u64 >= self.plan.budgets.max_groups
+            {
+                return Err(query_error(
+                    "hosted_group_budget_exceeded",
+                    format!(
+                        "Hosted grouping exceeded the maximum of {} groups.",
+                        self.plan.budgets.max_groups
+                    ),
+                ));
+            }
+            self.groups.insert(
+                key.clone(),
+                HostedReductionGroupState {
+                    values,
+                    count: 0,
+                    summaries: self
+                        .plan
+                        .aggregates
+                        .iter()
+                        .map(|aggregate| HostedSummaryState::new(&aggregate.function))
+                        .collect(),
+                },
+            );
+        }
+        let group = self
+            .groups
+            .get_mut(&key)
+            .expect("hosted reduction group was inserted above");
+        group.count = group.count.saturating_add(1);
+        for (summary, value) in group.summaries.iter_mut().zip(&row.aggregate_values) {
+            summary.push(value);
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<HostedReduction, CatalogError> {
+        if self.plan.groups.is_empty() && self.plan.aggregates.is_empty() {
+            return Ok(HostedReduction {
+                groups: None,
+                diagnostics: Vec::new(),
+            });
+        }
+        let mut groups = self.groups.into_values().collect::<Vec<_>>();
+        groups.sort_by(|left, right| {
+            for group in &self.plan.groups {
+                let comparison = compare_hosted_values(
+                    left.values.get(&group.output_name).unwrap_or(&Value::Null),
+                    right.values.get(&group.output_name).unwrap_or(&Value::Null),
+                    group.direction,
+                );
+                if comparison != std::cmp::Ordering::Equal {
+                    return comparison;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        let mut diagnostics = Vec::new();
+        let groups = groups
+            .into_iter()
+            .map(|group| {
+                let mut summaries = serde_json::Map::new();
+                for (aggregate, state) in self.plan.aggregates.iter().zip(group.summaries) {
+                    match state.finish(&aggregate.function) {
+                        Ok(value) => {
+                            summaries.insert(aggregate.output_name.clone(), value);
+                        }
+                        Err(message) => {
+                            diagnostics.push(Diagnostic {
+                                severity: "warning".to_string(),
+                                code: "expression_evaluation_error".to_string(),
+                                message,
+                                path: None,
+                                field: Some(format!("summaries.{}", aggregate.output_name)),
+                                type_name: None,
+                                schema_location: None,
+                                details: Some(serde_json::json!({"context": "query_summary"})),
+                            });
+                            summaries.insert(aggregate.output_name.clone(), Value::Null);
+                        }
+                    }
+                }
+                serde_json::json!({
+                    "values": group.values,
+                    "count": group.count,
+                    "summaries": summaries,
+                })
+            })
+            .collect();
+        Ok(HostedReduction {
+            groups: Some(groups),
+            diagnostics,
+        })
+    }
+}
+
+impl HostedSummaryState {
+    fn new(function: &str) -> Self {
+        match function {
+            "count" => Self::Count(0),
+            "empty" | "filled" => Self::Empty { total: 0, empty: 0 },
+            "sum" | "average" | "minimum" | "maximum" => Self::Number {
+                count: 0,
+                sum: 0.0,
+                minimum: f64::INFINITY,
+                maximum: f64::NEG_INFINITY,
+                invalid: false,
+            },
+            "earliest" => Self::String {
+                selected: None,
+                latest: false,
+                invalid: false,
+            },
+            "latest" => Self::String {
+                selected: None,
+                latest: true,
+                invalid: false,
+            },
+            _ => Self::Unknown,
+        }
+    }
+
+    fn push(&mut self, value: &Value) {
+        match self {
+            Self::Count(count) => *count = count.saturating_add(1),
+            Self::Empty { total, empty } => {
+                *total = total.saturating_add(1);
+                if hosted_value_is_empty(value) {
+                    *empty = empty.saturating_add(1);
+                }
+            }
+            Self::Number {
+                count,
+                sum,
+                minimum,
+                maximum,
+                invalid,
+            } => {
+                if value.is_null() {
+                    return;
+                }
+                let Some(number) = value.as_f64() else {
+                    *invalid = true;
+                    return;
+                };
+                *count = count.saturating_add(1);
+                *sum += number;
+                *minimum = minimum.min(number);
+                *maximum = maximum.max(number);
+            }
+            Self::String {
+                selected,
+                latest,
+                invalid,
+            } => {
+                if value.is_null() {
+                    return;
+                }
+                let Some(value) = value.as_str() else {
+                    *invalid = true;
+                    return;
+                };
+                if selected.as_deref().is_none_or(|current| {
+                    if *latest {
+                        value > current
+                    } else {
+                        value < current
+                    }
+                }) {
+                    *selected = Some(value.to_string());
+                }
+            }
+            Self::Unknown => {}
+        }
+    }
+
+    fn finish(self, function: &str) -> Result<Value, String> {
+        match self {
+            Self::Count(count) => Ok(serde_json::json!(count)),
+            Self::Empty { total, empty } => Ok(serde_json::json!(if function == "empty" {
+                empty
+            } else {
+                total.saturating_sub(empty)
+            })),
+            Self::Number {
+                count,
+                sum,
+                minimum,
+                maximum,
+                invalid,
+            } => {
+                if invalid {
+                    return Err(format!(
+                        "Summary '{function}' received a non-numeric value."
+                    ));
+                }
+                if count == 0 {
+                    return Ok(Value::Null);
+                }
+                let number = match function {
+                    "sum" => sum,
+                    "average" => sum / count as f64,
+                    "minimum" => minimum,
+                    "maximum" => maximum,
+                    _ => return Err(format!("Unknown hosted summary function '{function}'.")),
+                };
+                Ok(hosted_number_value(number))
+            }
+            Self::String {
+                selected, invalid, ..
+            } => {
+                if invalid {
+                    return Err(format!("Summary '{function}' received a non-string value."));
+                }
+                Ok(selected.map_or(Value::Null, Value::String))
+            }
+            Self::Unknown => Err(format!("Unknown hosted summary function '{function}'.")),
         }
     }
 }
@@ -1286,99 +1500,6 @@ fn compare_hosted_values(
     match direction {
         HostedOrderDirection::Ascending => ascending,
         HostedOrderDirection::Descending => ascending.reverse(),
-    }
-}
-
-fn hosted_group_value(
-    plan: &HostedQueryPlan,
-    values: &serde_json::Map<String, Value>,
-    rows: &[HostedReductionInput],
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Value {
-    let mut summaries = serde_json::Map::new();
-    for (index, aggregate) in plan.aggregates.iter().enumerate() {
-        let inputs = rows
-            .iter()
-            .map(|row| row.aggregate_values[index].clone())
-            .collect::<Vec<_>>();
-        match hosted_builtin_summary(&aggregate.function, &inputs) {
-            Ok(value) => {
-                summaries.insert(aggregate.output_name.clone(), value);
-            }
-            Err(message) => {
-                diagnostics.push(Diagnostic {
-                    severity: "warning".to_string(),
-                    code: "expression_evaluation_error".to_string(),
-                    message,
-                    path: None,
-                    field: Some(format!("summaries.{}", aggregate.output_name)),
-                    type_name: None,
-                    schema_location: None,
-                    details: Some(serde_json::json!({"context": "query_summary"})),
-                });
-                summaries.insert(aggregate.output_name.clone(), Value::Null);
-            }
-        }
-    }
-    serde_json::json!({
-        "values": values,
-        "count": rows.len(),
-        "summaries": summaries,
-    })
-}
-
-fn hosted_builtin_summary(function: &str, values: &[Value]) -> Result<Value, String> {
-    if function == "count" {
-        return Ok(serde_json::json!(values.len()));
-    }
-    if matches!(function, "empty" | "filled") {
-        let empty = values
-            .iter()
-            .filter(|value| hosted_value_is_empty(value))
-            .count();
-        return Ok(serde_json::json!(if function == "empty" {
-            empty
-        } else {
-            values.len() - empty
-        }));
-    }
-    let non_null = values
-        .iter()
-        .filter(|value| !value.is_null())
-        .collect::<Vec<_>>();
-    if non_null.is_empty() {
-        return Ok(Value::Null);
-    }
-    match function {
-        "sum" | "average" | "minimum" | "maximum" => {
-            let numbers = non_null
-                .iter()
-                .map(|value| value.as_f64())
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| format!("Summary '{function}' received a non-numeric value."))?;
-            let number = match function {
-                "sum" => numbers.iter().sum(),
-                "average" => numbers.iter().sum::<f64>() / numbers.len() as f64,
-                "minimum" => numbers.iter().copied().fold(f64::INFINITY, f64::min),
-                "maximum" => numbers.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                _ => unreachable!(),
-            };
-            Ok(hosted_number_value(number))
-        }
-        "earliest" | "latest" => {
-            let strings = non_null
-                .iter()
-                .map(|value| value.as_str())
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| format!("Summary '{function}' received a non-string value."))?;
-            let selected = if function == "earliest" {
-                strings.into_iter().min()
-            } else {
-                strings.into_iter().max()
-            };
-            Ok(selected.map_or(Value::Null, |value| serde_json::json!(value)))
-        }
-        _ => Err(format!("Unknown hosted summary function '{function}'.")),
     }
 }
 
@@ -2523,6 +2644,46 @@ mod tests {
                 "summaries": {"effort": 7, "records": 2}
             })])
         );
+        assert!(reduction.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn streaming_reduction_retains_only_bounded_group_state() {
+        let plan = catalog()
+            .compile_hosted_query(&json!({
+                "group_by": [{"field": "record.status"}],
+                "summaries": [
+                    {"field": "record.effort", "function": "sum", "name": "sum"},
+                    {"field": "record.effort", "function": "average", "name": "average"},
+                    {"field": "record.effort", "function": "minimum", "name": "minimum"},
+                    {"field": "record.effort", "function": "maximum", "name": "maximum"},
+                    {"field": "record.effort", "function": "count", "name": "count"}
+                ]
+            }))
+            .unwrap();
+        let mut accumulator = plan.start_reduction();
+        for index in 0..100_000_u64 {
+            accumulator
+                .push(&HostedReductionInput {
+                    group_values: vec![Value::String(if index % 2 == 0 {
+                        "even".to_string()
+                    } else {
+                        "odd".to_string()
+                    })],
+                    aggregate_values: vec![serde_json::json!(index); 5],
+                })
+                .unwrap();
+        }
+        assert_eq!(accumulator.groups.len(), 2);
+        let reduction = accumulator.finish().unwrap();
+        let groups = reduction.groups.unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0]["count"], 50_000);
+        assert_eq!(groups[0]["summaries"]["count"], 50_000);
+        assert_eq!(groups[0]["summaries"]["minimum"], 0);
+        assert_eq!(groups[0]["summaries"]["maximum"], 99_998);
+        assert_eq!(groups[1]["summaries"]["minimum"], 1);
+        assert_eq!(groups[1]["summaries"]["maximum"], 99_999);
         assert!(reduction.diagnostics.is_empty());
     }
 
