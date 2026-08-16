@@ -1314,6 +1314,93 @@ impl HostedReductionAccumulator {
         Ok(())
     }
 
+    /// Apply an already-counted SQL group without replaying one reducer input
+    /// per matching record. This seam is intentionally limited to count-only
+    /// plans: other summaries need their own canonical aggregate inputs before
+    /// a provider may collapse rows safely.
+    pub fn push_repeated(
+        &mut self,
+        row: &HostedReductionInput,
+        occurrences: u64,
+    ) -> Result<(), CatalogError> {
+        if self
+            .plan
+            .aggregates
+            .iter()
+            .any(|aggregate| aggregate.function != "count")
+        {
+            return Err(query_error(
+                "hosted_query_plan_mismatch",
+                "Repeated hosted reduction is only valid for count-only summaries.",
+            ));
+        }
+        if row.group_values.len() != self.plan.groups.len()
+            || row.aggregate_values.len() != self.plan.aggregates.len()
+        {
+            return Err(query_error(
+                "hosted_query_plan_mismatch",
+                "Hosted reduction values do not align with the compiled plan.",
+            ));
+        }
+        if occurrences == 0 || (self.plan.groups.is_empty() && self.plan.aggregates.is_empty()) {
+            return Ok(());
+        }
+        let values = self
+            .plan
+            .groups
+            .iter()
+            .zip(&row.group_values)
+            .map(|(group, value)| (group.output_name.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        let key = serde_json::to_string(&values).map_err(|error| {
+            query_error(
+                "invalid_hosted_reduction",
+                format!("Hosted group values could not be canonicalized: {error}"),
+            )
+        })?;
+        if !self.groups.contains_key(&key) {
+            if !self.plan.groups.is_empty()
+                && self.groups.len() as u64 >= self.plan.budgets.max_groups
+            {
+                return Err(query_error(
+                    "hosted_group_budget_exceeded",
+                    format!(
+                        "Hosted grouping exceeded the maximum of {} groups.",
+                        self.plan.budgets.max_groups
+                    ),
+                ));
+            }
+            self.groups.insert(
+                key.clone(),
+                HostedReductionGroupState {
+                    values,
+                    count: 0,
+                    summaries: self
+                        .plan
+                        .aggregates
+                        .iter()
+                        .map(|aggregate| HostedSummaryState::new(&aggregate.function))
+                        .collect(),
+                },
+            );
+        }
+        let group = self
+            .groups
+            .get_mut(&key)
+            .expect("hosted reduction group was inserted above");
+        group.count = group.count.saturating_add(occurrences);
+        for summary in &mut group.summaries {
+            let HostedSummaryState::Count(count) = summary else {
+                return Err(query_error(
+                    "hosted_query_plan_mismatch",
+                    "Repeated hosted reduction encountered a non-count summary state.",
+                ));
+            };
+            *count = count.saturating_add(occurrences);
+        }
+        Ok(())
+    }
+
     pub fn finish(self) -> Result<HostedReduction, CatalogError> {
         if self.plan.groups.is_empty() && self.plan.aggregates.is_empty() {
             return Ok(HostedReduction {
@@ -2879,6 +2966,36 @@ mod tests {
         assert_eq!(groups[1]["summaries"]["minimum"], 1);
         assert_eq!(groups[1]["summaries"]["maximum"], 99_999);
         assert!(reduction.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn counted_sql_groups_reduce_without_row_replay() {
+        let plan = catalog()
+            .compile_hosted_query(&json!({
+                "group_by": [{"field": "record.status"}],
+                "summaries": [
+                    {"field": "record.status", "function": "count", "name": "records"}
+                ]
+            }))
+            .unwrap();
+        let mut accumulator = plan.start_reduction();
+        accumulator
+            .push_repeated(
+                &HostedReductionInput {
+                    group_values: vec![json!("open")],
+                    aggregate_values: vec![Value::Null],
+                },
+                100_000,
+            )
+            .unwrap();
+        assert_eq!(
+            accumulator.finish().unwrap().groups,
+            Some(vec![json!({
+                "values": {"record.status": "open"},
+                "count": 100_000,
+                "summaries": {"records": 100_000}
+            })])
+        );
     }
 
     #[test]
