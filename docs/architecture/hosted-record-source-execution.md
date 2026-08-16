@@ -1,7 +1,8 @@
 # Hosted record-source execution contract
 
 Status: accepted production semantic contract. Candidate B query, projection,
-structural relationship, residual, and mutation seams are under implementation.
+structural relationship, residual, mutation, and bounded definition seams are
+implemented on the Candidate B review branch.
 
 Canonical decision: `mdbase-connect/docs/decisions/0010-bounded-hosted-record-source-execution.md`
 
@@ -68,6 +69,22 @@ Point read, projection, contract, validation, and authorization-relevant type
 classification accept one record plus a compiled catalog. They do not enumerate or
 load unrelated records unless the requested semantic feature explicitly requires a
 bounded link/reference neighborhood.
+
+### Resource and definition execution
+
+Resource reads and ordinary type/view mutations consume only the bounded exact
+resource documents required to compile a catalog. Type-pack and collection-setup
+assessment/apply operations use the same rule: `HostedDefinitionOperation` stages
+at most 2,000 resource documents and 32 MiB, never stages record Markdown, and
+returns a canonical operation result. Successful apply plans additionally return
+the complete bounded post-operation resource stage plus the resulting canonical
+type and contract catalog for atomic authority persistence.
+
+Changing a type or contract is therefore not an instruction to classify or rewrite
+every record inline. The authority invalidates the old projection binding, opens a
+new generation, and uses its stale/absent exact fallback until bounded rebuild
+completion. This keeps definition writes independent of collection cardinality
+without treating previously persisted record types as current authorization facts.
 
 ### Structural projection
 
