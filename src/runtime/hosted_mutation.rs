@@ -40,6 +40,24 @@ pub struct HostedMutationPlan {
 }
 
 impl CompiledCatalog {
+    pub fn hosted_mutation_requires_incoming_context(
+        &self,
+        operation: &str,
+        input: &Value,
+    ) -> bool {
+        match operation {
+            "rename" => input
+                .get("update_refs")
+                .and_then(Value::as_bool)
+                .unwrap_or(self.collection.settings.rename_update_refs),
+            "delete" => input
+                .get("check_backlinks")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
     /// Execute one mutation against a bounded caller-supplied exact context.
     /// The disposable stage is not an authority: the returned write set must
     /// still be committed with provider-owned revision CAS and fencing.
@@ -176,22 +194,75 @@ impl CompiledCatalog {
             .v03_operations()
             .expect("compiled catalogs always use the canonical profile")
             .execute_staged_mutation(&request.operation, &Value::Object(input));
-        if !result.valid
-            || request
-                .input
-                .get("dry_run")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        {
+        if !result.valid {
             return Ok(HostedMutationPlan {
                 result,
                 primary_stable_id: request.primary_stable_id.clone(),
                 changes: Vec::new(),
             });
         }
+        let is_dry_run = request
+            .input
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mutation_result = if is_dry_run {
+            reset_mutation_stage(directory.path(), &request.records, self)?;
+            let mut committed_input = request
+                .input
+                .as_object()
+                .cloned()
+                .expect("hosted mutation input was validated above");
+            committed_input.insert("dry_run".to_string(), Value::Bool(false));
+            match request.operation.as_str() {
+                "update" => {
+                    let path = primary_before
+                        .as_ref()
+                        .expect("hosted update target was validated above");
+                    if let Some(patch) = committed_input.remove("patch") {
+                        committed_input.insert("fields".to_string(), patch);
+                    }
+                    committed_input.insert("path".to_string(), Value::String(path.clone()));
+                }
+                "rename" => {
+                    let from = primary_before
+                        .as_ref()
+                        .expect("hosted rename target was validated above");
+                    let to = committed_input
+                        .get("path")
+                        .or_else(|| committed_input.get("to"))
+                        .cloned()
+                        .expect("hosted rename destination was validated above");
+                    committed_input.insert("from".to_string(), Value::String(from.clone()));
+                    committed_input.insert("to".to_string(), to);
+                }
+                "delete" => {
+                    let path = primary_before
+                        .as_ref()
+                        .expect("hosted delete target was validated above");
+                    committed_input.insert("path".to_string(), Value::String(path.clone()));
+                }
+                "create" => {
+                    committed_input.remove("types");
+                }
+                _ => unreachable!(),
+            }
+            collection
+                .v03_operations()
+                .expect("compiled catalogs always use the canonical profile")
+                .execute_staged_mutation(&request.operation, &Value::Object(committed_input))
+        } else {
+            result.clone()
+        };
+        if !mutation_result.valid {
+            return Err(mutation_error(
+                "hosted_mutation_dry_run_mismatch",
+                "Canonical dry-run and disposable mutation execution disagreed.",
+            ));
+        }
 
         let mut affected = BTreeSet::from([request.primary_stable_id.clone()]);
-        if let Some(references) = result
+        if let Some(references) = mutation_result
             .result
             .get("references_updated")
             .and_then(Value::as_array)
@@ -268,6 +339,38 @@ impl CompiledCatalog {
     }
 }
 
+fn reset_mutation_stage(
+    root: &std::path::Path,
+    records: &[CanonicalRecordInput],
+    catalog: &CompiledCatalog,
+) -> Result<(), CatalogError> {
+    for entry in fs::read_dir(root).map_err(stage_io_error)? {
+        let path = entry.map_err(stage_io_error)?.path();
+        if path.is_dir() {
+            fs::remove_dir_all(path).map_err(stage_io_error)?;
+        } else {
+            fs::remove_file(path).map_err(stage_io_error)?;
+        }
+    }
+    for record in records {
+        let path = catalog
+            .collection
+            .validate_record_path(&record.path)
+            .map_err(|error| {
+                mutation_error(
+                    "invalid_path",
+                    format!("Hosted mutation record path is invalid: {error}"),
+                )
+            })?;
+        let destination = path.under(root);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(stage_io_error)?;
+        }
+        fs::write(destination, &record.document).map_err(stage_io_error)?;
+    }
+    Ok(())
+}
+
 fn mutation_error(code: impl Into<String>, message: impl Into<String>) -> CatalogError {
     CatalogError {
         code: code.into(),
@@ -327,6 +430,9 @@ mod tests {
     #[test]
     fn plans_create_update_and_delete_from_bounded_exact_context() {
         let catalog = catalog();
+        assert!(!catalog
+            .hosted_mutation_requires_incoming_context("rename", &json!({"update_refs": false})));
+        assert!(catalog.hosted_mutation_requires_incoming_context("rename", &json!({})));
         let created = catalog
             .plan_hosted_mutation(&HostedMutationRequest {
                 operation: "create".to_string(),
@@ -381,7 +487,7 @@ mod tests {
         let reference = record(
             "record-2",
             "notes/ref.md",
-            "---\ntitle: Ref\n---\nSee [[../tasks/one]].\n",
+            "---\ntitle: Ref\nlinks:\n  nested:\n    - '[[../tasks/one]]'\nsummary: 'See [[../tasks/one]] and [[../tasks/one#part]].'\n---\nSee [[../tasks/one]].\n",
         );
         let renamed = catalog
             .plan_hosted_mutation(&HostedMutationRequest {
@@ -407,5 +513,11 @@ mod tests {
             .unwrap()
             .document
             .contains("moved"));
+        assert!(!renamed.changes[1]
+            .record
+            .as_ref()
+            .unwrap()
+            .document
+            .contains("tasks/one"));
     }
 }
