@@ -99,6 +99,10 @@ pub struct CandidateComparison {
 #[serde(rename_all = "snake_case")]
 pub enum CandidateComparisonPruning {
     ExactJson,
+    /// The literal is YYYY-MM-DD. Providers may narrow only records whose
+    /// projected value is also exactly YYYY-MM-DD; every other JSON/string
+    /// shape remains a candidate for canonical datetime-aware evaluation.
+    IsoDateOnlyString,
     Conservative,
 }
 
@@ -1096,7 +1100,8 @@ fn lower_query_field(path: &str) -> Option<CandidateField> {
         [root, field] if root == "file" && field == "tags" => Some(CandidateField::BodyTags),
         [root, field] if root == "file" && field == "path" => Some(CandidateField::Path),
         [root, field]
-            if root == "file" && ["name", "ext", "size", "mtime"].contains(&field.as_str()) =>
+            if root == "file"
+                && ["name", "basename", "ext", "size", "mtime"].contains(&field.as_str()) =>
         {
             Some(CandidateField::File(field.clone()))
         }
@@ -1316,6 +1321,19 @@ fn comparison_pruning(
         Value::String(value) => !ambiguous_canonical_string(value),
         Value::Number(_) | Value::Array(_) | Value::Object(_) => false,
     };
+    if value.as_str().is_some_and(is_iso_date_only)
+        && matches!(
+            operator,
+            Op::Equal
+                | Op::NotEqual
+                | Op::LessThan
+                | Op::LessThanOrEqual
+                | Op::GreaterThan
+                | Op::GreaterThanOrEqual
+        )
+    {
+        return CandidateComparisonPruning::IsoDateOnlyString;
+    }
     let exact = match operator {
         Op::Equal | Op::NotEqual => exact_scalar(value),
         Op::LessThan | Op::LessThanOrEqual | Op::GreaterThan | Op::GreaterThanOrEqual => {
@@ -1334,6 +1352,13 @@ fn comparison_pruning(
     } else {
         CandidateComparisonPruning::Conservative
     }
+}
+
+fn is_iso_date_only(value: &str) -> bool {
+    value.len() == 10
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[7] == b'-'
+        && chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
 }
 
 fn ambiguous_canonical_string(value: &str) -> bool {
@@ -1571,16 +1596,27 @@ mod tests {
     }
 
     #[test]
-    fn datetime_and_numeric_coercions_are_never_provider_pruning_proofs() {
-        for source in ["record.due < '2026-06-01'", "record.count == 42"] {
-            let plan = catalog()
-                .compile_hosted_query(&json!({"where": source, "limit": 10}))
-                .unwrap();
-            assert!(matches!(
-                plan.candidate,
-                CandidatePredicate::Compare { ref comparison }
-                    if comparison.pruning == CandidateComparisonPruning::Conservative
-            ));
+    fn datetime_and_numeric_coercions_are_never_exact_json_pruning_proofs() {
+        let date = catalog()
+            .compile_hosted_query(&json!({
+                "where": "record.due < '2026-06-01'",
+                "limit": 10
+            }))
+            .unwrap();
+        assert!(matches!(
+            date.candidate,
+            CandidatePredicate::Compare { ref comparison }
+                if comparison.pruning == CandidateComparisonPruning::IsoDateOnlyString
+        ));
+        let numeric = catalog()
+            .compile_hosted_query(&json!({"where": "record.count == 42", "limit": 10}))
+            .unwrap();
+        assert!(matches!(
+            numeric.candidate,
+            CandidatePredicate::Compare { ref comparison }
+                if comparison.pruning == CandidateComparisonPruning::Conservative
+        ));
+        for plan in [date, numeric] {
             assert_eq!(
                 plan.candidate_verdict(
                     Some(&projection("open", true)),
