@@ -28,7 +28,7 @@ use super::{
     SEMANTIC_PROJECTION_SCHEMA_VERSION,
 };
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 8;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 9;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -62,6 +62,10 @@ pub struct CanonicalResidual {
     /// Whether candidate facts alone prove the filter. False means retained
     /// candidates must be evaluated by mdbase-rs before emission.
     pub filter_fully_projected: bool,
+    /// The canonical `where` and type match can be evaluated from one current
+    /// projection even when the response itself still requires exact body or
+    /// selected-field hydration. This never authorizes projection-only output.
+    pub projection_filter_safe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -431,6 +435,7 @@ impl CompiledCatalog {
             });
         }
         let mut fully_projected = true;
+        let mut projection_filter_safe = true;
         if let Some(source) = query.where_expression.as_deref() {
             let expression = cel::compile(source).map_err(|error| {
                 query_error(
@@ -447,10 +452,14 @@ impl CompiledCatalog {
                 Some(lowered) => {
                     if !lowered.complete {
                         requirements.exact_document = true;
+                        projection_filter_safe = false;
                     }
                     predicates.push(lowered.predicate);
                 }
-                None => requirements.exact_document = true,
+                None => {
+                    requirements.exact_document = true;
+                    projection_filter_safe = false;
+                }
             }
         }
         let candidate = conjunction(predicates);
@@ -543,6 +552,9 @@ impl CompiledCatalog {
             || query.select.is_some()
             || !fully_projected;
         requirements.diagnostic_type_matchers = self.has_diagnostic_type_matchers();
+        projection_filter_safe &= !requirements.query_context
+            && !requirements.relationships
+            && !requirements.diagnostic_type_matchers;
         requirements.exact_document |= requirements.query_context
             || !query.projections.is_empty()
             || query.select.is_some()
@@ -593,6 +605,7 @@ impl CompiledCatalog {
             residual: CanonicalResidual {
                 query: semantic_input,
                 filter_fully_projected: fully_projected,
+                projection_filter_safe,
             },
             order,
             groups,
@@ -963,6 +976,27 @@ impl CompiledCatalog {
         plan: &HostedQueryPlan,
         projection: &SemanticProjection,
     ) -> Result<HostedResidualEvaluation, CatalogError> {
+        self.evaluate_hosted_projection(plan, projection, false)
+    }
+
+    /// Evaluate only the canonical type/filter decision and operator keys from
+    /// one current projection. This supports page-at-a-time candidate
+    /// selection before exact response hydration; it never emits a record and
+    /// is available only when the compiled residual carries an explicit proof.
+    pub fn evaluate_hosted_projection_match(
+        &self,
+        plan: &HostedQueryPlan,
+        projection: &SemanticProjection,
+    ) -> Result<HostedResidualEvaluation, CatalogError> {
+        self.evaluate_hosted_projection(plan, projection, true)
+    }
+
+    fn evaluate_hosted_projection(
+        &self,
+        plan: &HostedQueryPlan,
+        projection: &SemanticProjection,
+        match_only: bool,
+    ) -> Result<HostedResidualEvaluation, CatalogError> {
         if plan.version != HOSTED_QUERY_PLAN_VERSION
             || plan.catalog_revision != self.resource_revision()
             || plan.semantic_engine_version != env!("CARGO_PKG_VERSION")
@@ -973,10 +1007,12 @@ impl CompiledCatalog {
                 "Hosted query plan is not bound to the current semantic catalog.",
             ));
         }
-        if plan.requirements.exact_document
+        let output_requires_exact = plan.requirements.exact_document
             || plan.requirements.body_prose
             || plan.requirements.structural_body_facts
-            || plan.requirements.collection_context
+            || plan.requirements.collection_context;
+        if (!match_only && output_requires_exact)
+            || (match_only && !plan.residual.projection_filter_safe)
             || !projection_is_current_for_plan(plan, projection)
         {
             return Err(query_error(
@@ -1001,9 +1037,10 @@ impl CompiledCatalog {
                     .join("; "),
             )
         })?;
-        if !compiled.projections.is_empty()
-            || !compiled.selections.is_empty()
-            || compiled.query.include_body
+        if (!match_only
+            && (!compiled.projections.is_empty()
+                || !compiled.selections.is_empty()
+                || compiled.query.include_body))
             || compiled.requires_this_context()
             || compiled.requires_link_graph()
         {
@@ -1095,9 +1132,13 @@ impl CompiledCatalog {
             .as_ref()
             .map(|candidate| hosted_operator_values(plan, candidate))
             .unwrap_or_default();
-        let record = candidate
-            .as_ref()
-            .map(|candidate| serialize_candidate(candidate, &compiled.query));
+        let record = (!match_only)
+            .then(|| {
+                candidate
+                    .as_ref()
+                    .map(|candidate| serialize_candidate(candidate, &compiled.query))
+            })
+            .flatten();
         Ok(HostedResidualEvaluation {
             matched,
             record,
@@ -2302,6 +2343,43 @@ mod tests {
     }
 
     #[test]
+    fn projection_match_separates_filtering_from_exact_body_hydration() {
+        let catalog = catalog();
+        let plan = catalog
+            .compile_hosted_query(&json!({
+                "types": ["task"],
+                "where": "record.status == 'open'",
+                "include_body": true,
+                "order_by": [{"field": "file.path"}],
+                "limit": 10
+            }))
+            .unwrap();
+        assert!(plan.requirements.exact_document);
+        assert!(plan.residual.projection_filter_safe);
+        assert!(catalog
+            .evaluate_hosted_projection_residual(&plan, &projection("open", true))
+            .is_err());
+        let matching = catalog
+            .evaluate_hosted_projection_match(&plan, &projection("open", true))
+            .unwrap();
+        assert!(matching.matched);
+        assert!(matching.record.is_none());
+        assert_eq!(matching.order_values, vec![json!("tasks/one.md")]);
+
+        let body_plan = catalog
+            .compile_hosted_query(&json!({
+                "where": "file.body.contains('Text')",
+                "include_body": true,
+                "limit": 10
+            }))
+            .unwrap();
+        assert!(!body_plan.residual.projection_filter_safe);
+        assert!(catalog
+            .evaluate_hosted_projection_match(&body_plan, &projection("open", true))
+            .is_err());
+    }
+
+    #[test]
     fn projection_result_preserves_canonical_body_metadata_without_body_prose() {
         let catalog = catalog();
         let record = CanonicalRecordInput {
@@ -2638,10 +2716,10 @@ mod tests {
         let second = catalog().compile_hosted_query(&query).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
-        assert_eq!(first.version, 8);
+        assert_eq!(first.version, 9);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
         assert!(first.plan_digest.starts_with("sha256:"));
-        assert_eq!(serde_json::to_value(first).unwrap()["version"], 8);
+        assert_eq!(serde_json::to_value(first).unwrap()["version"], 9);
     }
 
     #[test]
