@@ -16,6 +16,7 @@ mod external;
 mod feed;
 mod filesystem;
 mod gate;
+mod hosted_mutation;
 mod hosted_query;
 mod observer;
 mod operation;
@@ -38,6 +39,7 @@ pub use catalog::{
 };
 pub use context::{OperationContext, OperationDeadline};
 pub use filesystem::FilesystemRuntime;
+pub use hosted_mutation::{HostedMutationChange, HostedMutationPlan, HostedMutationRequest};
 pub use hosted_query::{
     CandidateComparison, CandidateComparisonOperator, CandidateComparisonPruning, CandidateField,
     CandidatePredicate, CandidateVerdict, CanonicalResidual, HostedAggregate, HostedGroup,

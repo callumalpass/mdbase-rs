@@ -60,7 +60,7 @@ pub struct CatalogError {
 /// identity. Evicting it changes performance only.
 pub struct CompiledCatalog {
     resource_revision: String,
-    collection: Collection,
+    pub(super) collection: Collection,
 }
 
 impl CompiledCatalog {
