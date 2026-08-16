@@ -24,7 +24,7 @@ use crate::v03::{cel, validate_query, Diagnostic};
 
 use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 10;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 11;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -219,6 +219,7 @@ pub struct HostedReduction {
 pub struct HostedReductionAccumulator {
     plan: HostedQueryPlan,
     groups: BTreeMap<String, HostedReductionGroupState>,
+    retained_bytes: u64,
 }
 
 struct HostedReductionGroupState {
@@ -284,6 +285,9 @@ pub struct HostedQueryBudgets {
     pub max_exact_bytes: u64,
     pub max_operator_steps: u64,
     pub max_groups: u64,
+    /// Heap-accounting ceiling for retained group keys, values, and summary
+    /// state. This is distinct from the complete operator resident-memory cap.
+    pub max_aggregation_bytes: u64,
     pub max_connection_wait_ms: u64,
     pub max_wall_time_ms: u64,
     pub max_snapshot_time_ms: u64,
@@ -300,11 +304,12 @@ impl Default for HostedQueryBudgets {
             max_exact_documents: 2_000,
             max_exact_bytes: 64 * 1024 * 1024,
             max_operator_steps: 2_000_000,
-            max_groups: 10_000,
+            max_groups: 2_000,
+            max_aggregation_bytes: 8 * 1024 * 1024,
             max_connection_wait_ms: 2_000,
             max_wall_time_ms: 15_000,
             max_snapshot_time_ms: 30_000,
-            max_memory_bytes: 128 * 1024 * 1024,
+            max_memory_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -1221,6 +1226,7 @@ impl HostedQueryPlan {
         HostedReductionAccumulator {
             plan: self.clone(),
             groups: BTreeMap::new(),
+            retained_bytes: 0,
         }
     }
 
@@ -1292,19 +1298,38 @@ impl HostedReductionAccumulator {
                     ),
                 ));
             }
+            let summaries = self
+                .plan
+                .aggregates
+                .iter()
+                .map(|aggregate| HostedSummaryState::new(&aggregate.function))
+                .collect::<Vec<_>>();
+            let summary_growth = summaries
+                .iter()
+                .zip(&row.aggregate_values)
+                .map(|(summary, value)| summary.additional_retained_bytes(value))
+                .sum::<u64>();
+            let retained_growth = reduction_group_retained_bytes(&key, &values, summaries.len())?
+                .saturating_add(summary_growth);
+            self.ensure_retained_growth(retained_growth)?;
             self.groups.insert(
                 key.clone(),
                 HostedReductionGroupState {
                     values,
                     count: 0,
-                    summaries: self
-                        .plan
-                        .aggregates
-                        .iter()
-                        .map(|aggregate| HostedSummaryState::new(&aggregate.function))
-                        .collect(),
+                    summaries,
                 },
             );
+            self.retained_bytes = self.retained_bytes.saturating_add(retained_growth);
+        } else {
+            let summary_growth = self.groups[&key]
+                .summaries
+                .iter()
+                .zip(&row.aggregate_values)
+                .map(|(summary, value)| summary.additional_retained_bytes(value))
+                .sum::<u64>();
+            self.ensure_retained_growth(summary_growth)?;
+            self.retained_bytes = self.retained_bytes.saturating_add(summary_growth);
         }
         let group = self
             .groups
@@ -1373,19 +1398,23 @@ impl HostedReductionAccumulator {
                     ),
                 ));
             }
+            let summaries = self
+                .plan
+                .aggregates
+                .iter()
+                .map(|aggregate| HostedSummaryState::new(&aggregate.function))
+                .collect::<Vec<_>>();
+            let retained_growth = reduction_group_retained_bytes(&key, &values, summaries.len())?;
+            self.ensure_retained_growth(retained_growth)?;
             self.groups.insert(
                 key.clone(),
                 HostedReductionGroupState {
                     values,
                     count: 0,
-                    summaries: self
-                        .plan
-                        .aggregates
-                        .iter()
-                        .map(|aggregate| HostedSummaryState::new(&aggregate.function))
-                        .collect(),
+                    summaries,
                 },
             );
+            self.retained_bytes = self.retained_bytes.saturating_add(retained_growth);
         }
         let group = self
             .groups
@@ -1402,6 +1431,19 @@ impl HostedReductionAccumulator {
             *count = count.saturating_add(occurrences);
         }
         Ok(())
+    }
+
+    fn ensure_retained_growth(&self, growth: u64) -> Result<(), CatalogError> {
+        if self.retained_bytes.saturating_add(growth) <= self.plan.budgets.max_aggregation_bytes {
+            return Ok(());
+        }
+        Err(query_error(
+            "hosted_aggregation_state_budget_exceeded",
+            format!(
+                "Hosted aggregation state exceeded the maximum of {} bytes.",
+                self.plan.budgets.max_aggregation_bytes
+            ),
+        ))
     }
 
     pub fn finish(self) -> Result<HostedReduction, CatalogError> {
@@ -1462,6 +1504,25 @@ impl HostedReductionAccumulator {
             diagnostics,
         })
     }
+}
+
+fn reduction_group_retained_bytes(
+    key: &str,
+    values: &serde_json::Map<String, Value>,
+    summary_count: usize,
+) -> Result<u64, CatalogError> {
+    // Account dynamic key/value copies plus conservative map/node and summary
+    // state overhead. This deliberately overcounts rather than pretending to
+    // expose allocator-exact heap usage through the provider-neutral seam.
+    let values_bytes = serde_json::to_vec(values).map_err(|error| {
+        query_error(
+            "invalid_hosted_reduction",
+            format!("Hosted group values could not be measured: {error}"),
+        )
+    })?;
+    let dynamic = key.len().saturating_add(values_bytes.len());
+    let overhead = 128_usize.saturating_add(summary_count.saturating_mul(64));
+    Ok(u64::try_from(dynamic.saturating_add(overhead)).unwrap_or(u64::MAX))
 }
 
 impl HostedSummaryState {
@@ -1542,6 +1603,39 @@ impl HostedSummaryState {
             }
             Self::Unknown => {}
         }
+    }
+
+    fn additional_retained_bytes(&self, value: &Value) -> u64 {
+        let Self::String {
+            selected,
+            latest,
+            invalid,
+        } = self
+        else {
+            return 0;
+        };
+        if *invalid {
+            return 0;
+        }
+        let Some(value) = value.as_str() else {
+            return 0;
+        };
+        let replaces = selected.as_deref().is_none_or(|current| {
+            if *latest {
+                value > current
+            } else {
+                value < current
+            }
+        });
+        if !replaces {
+            return 0;
+        }
+        u64::try_from(
+            value
+                .len()
+                .saturating_sub(selected.as_ref().map_or(0, String::len)),
+        )
+        .unwrap_or(u64::MAX)
     }
 
     fn finish(self, function: &str) -> Result<Value, String> {
@@ -2827,10 +2921,10 @@ mod tests {
         let second = catalog().compile_hosted_query(&query).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
-        assert_eq!(first.version, 10);
+        assert_eq!(first.version, 11);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
         assert!(first.plan_digest.starts_with("sha256:"));
-        assert_eq!(serde_json::to_value(first).unwrap()["version"], 10);
+        assert_eq!(serde_json::to_value(first).unwrap()["version"], 11);
     }
 
     #[test]
@@ -2969,6 +3063,31 @@ mod tests {
         assert_eq!(groups[1]["summaries"]["minimum"], 1);
         assert_eq!(groups[1]["summaries"]["maximum"], 99_999);
         assert!(reduction.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn aggregation_state_has_a_distinct_eight_mibibyte_budget() {
+        let mut plan = catalog()
+            .compile_hosted_query(&json!({
+                "group_by": [{"field": "record.status"}],
+                "summaries": [
+                    {"field": "record.status", "function": "latest", "name": "latest"}
+                ]
+            }))
+            .unwrap();
+        assert_eq!(plan.budgets.max_groups, 2_000);
+        assert_eq!(plan.budgets.max_aggregation_bytes, 8 * 1024 * 1024);
+        assert_eq!(plan.budgets.max_memory_bytes, 32 * 1024 * 1024);
+
+        plan.budgets.max_aggregation_bytes = 1;
+        let error = plan
+            .start_reduction()
+            .push(&HostedReductionInput {
+                group_values: vec![json!("open")],
+                aggregate_values: vec![json!("open")],
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "hosted_aggregation_state_budget_exceeded");
     }
 
     #[test]
