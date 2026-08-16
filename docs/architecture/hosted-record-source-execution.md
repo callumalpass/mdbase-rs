@@ -127,6 +127,13 @@ backlinks from those projections and never accepts exact record Markdown for thi
 path. Candidate and edge enumeration, snapshots, SQL, and cursors remain provider
 responsibilities.
 
+Base plan version 2 also carries a conservative closed candidate predicate derived
+from the parsed Base AST. Proven equality/inequality conjuncts and
+`file.hasTag(...)` may narrow provider-readable projections. An unsupported AND
+term becomes `all` while preserving other proven conjuncts; an OR containing any
+unsupported branch becomes entirely `all`; negation remains residual-only. The
+canonical Base evaluator always decides final inclusion and values.
+
 Base expression evaluation charges every AST node, including formula and list
 callback recursion, to a caller-supplied work ceiling. Exhaustion is
 `hosted_base_operator_budget_exceeded`, not a false filter result. Recursive parser

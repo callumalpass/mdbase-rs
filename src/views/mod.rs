@@ -50,11 +50,11 @@ pub(crate) use execute::{
 };
 pub(crate) use execute::{prepare_hosted_canonical_view, verify_canonical_view_context};
 pub(crate) use expression::{
-    BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone, BASES_OPERATION_CANCELLED,
-    BASES_WORK_BUDGET_EXCEEDED,
+    lower_hosted_candidate, BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone,
+    BASES_OPERATION_CANCELLED, BASES_WORK_BUDGET_EXCEEDED,
 };
 pub(crate) use model::{
-    stable_named_view_ids, ObsidianBaseDocument, ObsidianBaseView, ViewReferenceInput,
+    stable_named_view_ids, BaseFilter, ObsidianBaseDocument, ObsidianBaseView, ViewReferenceInput,
 };
 
 fn normalized_source_path(path: &str) -> Option<CollectionPath> {

@@ -9,6 +9,10 @@ use chrono_tz::Tz;
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value};
 
+use crate::runtime::{
+    CandidateComparison, CandidateComparisonOperator, CandidateComparisonPruning, CandidateField,
+    CandidatePredicate,
+};
 use crate::OperationCancellation;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -625,6 +629,132 @@ fn parse_cached(expression: &str) -> Result<Arc<Expr>, String> {
         cache.insert(expression.to_string(), ast.clone());
     }
     Ok(ast)
+}
+
+pub(crate) fn lower_hosted_candidate(expression: &str) -> CandidatePredicate {
+    parse_cached(expression)
+        .map(|expression| lower_candidate_expression(expression.as_ref()))
+        .unwrap_or(CandidatePredicate::All)
+}
+
+fn lower_candidate_expression(expression: &Expr) -> CandidatePredicate {
+    match expression {
+        Expr::Binary(operator, left, right) if operator == "&&" => candidate_and(vec![
+            lower_candidate_expression(left),
+            lower_candidate_expression(right),
+        ]),
+        Expr::Binary(operator, left, right) if operator == "||" => {
+            let terms = vec![
+                lower_candidate_expression(left),
+                lower_candidate_expression(right),
+            ];
+            if terms
+                .iter()
+                .any(|term| matches!(term, CandidatePredicate::All))
+            {
+                CandidatePredicate::All
+            } else {
+                CandidatePredicate::Or { terms }
+            }
+        }
+        Expr::Binary(operator, left, right) if matches!(operator.as_str(), "==" | "!=") => {
+            let pair = candidate_field(left)
+                .and_then(|field| candidate_literal(right).map(|value| (field, value)))
+                .or_else(|| {
+                    candidate_field(right)
+                        .and_then(|field| candidate_literal(left).map(|value| (field, value)))
+                });
+            pair.map_or(CandidatePredicate::All, |(field, value)| {
+                CandidatePredicate::Compare {
+                    comparison: CandidateComparison {
+                        field,
+                        operator: if operator == "==" {
+                            CandidateComparisonOperator::Equal
+                        } else {
+                            CandidateComparisonOperator::NotEqual
+                        },
+                        value,
+                        pruning: CandidateComparisonPruning::ExactJson,
+                    },
+                }
+            })
+        }
+        Expr::Call(callee, arguments) if arguments.len() == 1 => {
+            let Expr::Member(object, Member::Named(method)) = callee.as_ref() else {
+                return CandidatePredicate::All;
+            };
+            if method == "hasTag" && candidate_path(object).as_deref() == Some("file") {
+                if let Some(value) = candidate_literal(&arguments[0]) {
+                    return CandidatePredicate::Compare {
+                        comparison: CandidateComparison {
+                            field: CandidateField::BodyTags,
+                            operator: CandidateComparisonOperator::Contains,
+                            value,
+                            pruning: CandidateComparisonPruning::ExactJson,
+                        },
+                    };
+                }
+            }
+            CandidatePredicate::All
+        }
+        _ => CandidatePredicate::All,
+    }
+}
+
+fn candidate_and(terms: Vec<CandidatePredicate>) -> CandidatePredicate {
+    let terms = terms
+        .into_iter()
+        .filter(|term| !matches!(term, CandidatePredicate::All))
+        .collect::<Vec<_>>();
+    match terms.len() {
+        0 => CandidatePredicate::All,
+        1 => terms.into_iter().next().unwrap_or(CandidatePredicate::All),
+        _ => CandidatePredicate::And { terms },
+    }
+}
+
+fn candidate_field(expression: &Expr) -> Option<CandidateField> {
+    let path = candidate_path(expression)?;
+    let segments = path.split('.').collect::<Vec<_>>();
+    match segments.as_slice() {
+        [name] if !matches!(*name, "file" | "this" | "formula" | "note") => {
+            Some(CandidateField::EffectiveFrontmatter(vec![name.to_string()]))
+        }
+        ["note", name] => Some(CandidateField::EffectiveFrontmatter(vec![name.to_string()])),
+        ["file", "path"] => Some(CandidateField::Path),
+        ["file", name] if matches!(*name, "name" | "basename" | "ext" | "size" | "mtime") => {
+            Some(CandidateField::File(name.to_string()))
+        }
+        _ => None,
+    }
+}
+
+fn candidate_path(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Identifier(value) => Some(value.clone()),
+        Expr::Member(object, Member::Named(value)) => {
+            Some(format!("{}.{}", candidate_path(object)?, value))
+        }
+        Expr::Member(object, Member::Computed(value)) => {
+            let Value::String(value) = candidate_literal(value)? else {
+                return None;
+            };
+            Some(format!("{}.{}", candidate_path(object)?, value))
+        }
+        _ => None,
+    }
+}
+
+fn candidate_literal(expression: &Expr) -> Option<Value> {
+    match expression {
+        Expr::Literal(value) => Some(value.clone()),
+        Expr::Array(values) => values
+            .iter()
+            .map(candidate_literal)
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
+        _ => None,
+    }
 }
 
 struct Evaluator<'a> {

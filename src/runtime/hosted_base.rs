@@ -17,14 +17,17 @@ use crate::expressions::evaluator::resolve_execution_timezone;
 use crate::v03::{Diagnostic, OperationResult};
 use crate::views::{
     base_uses_backlinks, combined_filter_matches, evaluate_property, is_configured_obsidian_source,
-    stable_named_view_ids, validate_base_expressions, BasesEvaluationContext, BasesFile, BasesLink,
-    BasesTimezone, ObsidianBaseDocument, ObsidianBaseView, ViewReferenceInput,
+    lower_hosted_candidate, stable_named_view_ids, validate_base_expressions, BaseFilter,
+    BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone, ObsidianBaseDocument,
+    ObsidianBaseView, ViewReferenceInput,
 };
 use crate::OperationCancellation;
 
-use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
+use super::{
+    CandidatePredicate, CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection,
+};
 
-pub const HOSTED_BASE_PLAN_VERSION: u32 = 1;
+pub const HOSTED_BASE_PLAN_VERSION: u32 = 2;
 pub const MAX_HOSTED_BASE_RELATED_RECORDS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +59,7 @@ pub struct HostedBasePlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggested_page_size: Option<u64>,
     pub requirements: HostedBaseRequirements,
+    pub candidate: CandidatePredicate,
     pub invocation_digest: String,
 }
 
@@ -223,6 +227,7 @@ impl CompiledCatalog {
             Sha256::digest(view_record.document.as_bytes())
         );
         let suggested_page_size = request.limit.or(view.limit);
+        let candidate = base_candidate(document.filters.as_ref(), view.filters.as_ref());
         let mut plan = HostedBasePlan {
             plan_version: HOSTED_BASE_PLAN_VERSION,
             catalog_revision: self.resource_revision().to_string(),
@@ -246,6 +251,7 @@ impl CompiledCatalog {
                     .is_some_and(|context| context.is_some()),
                 max_relationship_depth: u8::from(relationships),
             },
+            candidate,
             invocation_digest: String::new(),
         };
         plan.invocation_digest = digest_plan(&plan)?;
@@ -835,6 +841,55 @@ fn base_uses_relationships(document: &ObsidianBaseDocument, view: &ObsidianBaseV
     .any(|needle| serialized.contains(needle))
 }
 
+fn base_candidate(shared: Option<&BaseFilter>, local: Option<&BaseFilter>) -> CandidatePredicate {
+    hosted_candidate_and(vec![lower_base_filter(shared), lower_base_filter(local)])
+}
+
+fn lower_base_filter(filter: Option<&BaseFilter>) -> CandidatePredicate {
+    let Some(filter) = filter else {
+        return CandidatePredicate::All;
+    };
+    match filter {
+        BaseFilter::Expression(expression) => lower_hosted_candidate(expression),
+        BaseFilter::Logical(logical) => {
+            let mut conjuncts = logical
+                .and
+                .iter()
+                .flat_map(|filters| filters.values())
+                .map(|filter| lower_base_filter(Some(filter)))
+                .collect::<Vec<_>>();
+            if let Some(filters) = &logical.or {
+                let terms = filters
+                    .values()
+                    .into_iter()
+                    .map(|filter| lower_base_filter(Some(filter)))
+                    .collect::<Vec<_>>();
+                if !terms
+                    .iter()
+                    .any(|term| matches!(term, CandidatePredicate::All))
+                {
+                    conjuncts.push(CandidatePredicate::Or { terms });
+                }
+            }
+            // Negation is deliberately residual-only until every Base truthy,
+            // null, and coercion case has a total candidate proof.
+            hosted_candidate_and(conjuncts)
+        }
+    }
+}
+
+fn hosted_candidate_and(terms: Vec<CandidatePredicate>) -> CandidatePredicate {
+    let terms = terms
+        .into_iter()
+        .filter(|term| !matches!(term, CandidatePredicate::All))
+        .collect::<Vec<_>>();
+    match terms.len() {
+        0 => CandidatePredicate::All,
+        1 => terms.into_iter().next().unwrap_or(CandidatePredicate::All),
+        _ => CandidatePredicate::And { terms },
+    }
+}
+
 fn digest_plan(plan: &HostedBasePlan) -> Result<String, CatalogError> {
     let mut unsigned = plan.clone();
     unsigned.invocation_digest.clear();
@@ -995,6 +1050,9 @@ views:
         };
         plan.validate_integrity().unwrap();
         assert!(!plan.requirements.backlinks);
+        assert!(
+            matches!(plan.candidate, CandidatePredicate::And { ref terms } if terms.len() == 2)
+        );
         let projection = project(
             &catalog,
             "tasks/high.md",
@@ -1120,6 +1178,7 @@ views:
             panic!("expected relationship plan")
         };
         assert!(plan.requirements.backlinks);
+        assert_eq!(plan.candidate, CandidatePredicate::All);
         let project = project(
             &catalog,
             "Projects/mobile.md",
