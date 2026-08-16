@@ -626,6 +626,13 @@ fn validate_projection(
     plan: &HostedBasePlan,
     projection: &SemanticProjection,
 ) -> Result<(), CatalogError> {
+    if !projection.facts.semantic_complete {
+        return Err(CatalogError {
+            code: "hosted_base_projection_incomplete".to_string(),
+            message: "Obsidian Base evaluation cannot trust a semantically incomplete projection."
+                .to_string(),
+        });
+    }
     if projection.facts.catalog_revision != plan.catalog_revision
         || !projection.structure.structural_digest_is_valid()
     {
@@ -993,6 +1000,19 @@ views:
             "tasks/high.md",
             "---\nstatus: todo\npriority: high\ntags: [task]\n---\n# urgent\n",
         );
+        let mut incomplete_projection = projection.clone();
+        incomplete_projection.facts.semantic_complete = false;
+        let incomplete = plan
+            .evaluate_record(&HostedBaseRecordContext {
+                projection: incomplete_projection,
+                related: Vec::new(),
+                relationship_neighborhood_complete: false,
+                query_context: None,
+                operation_clock: "2026-08-16T00:00:00Z".to_string(),
+                max_expression_steps: 10_000,
+            })
+            .unwrap_err();
+        assert_eq!(incomplete.code, "hosted_base_projection_incomplete");
         let budget_error = plan
             .evaluate_record(&HostedBaseRecordContext {
                 projection: projection.clone(),
