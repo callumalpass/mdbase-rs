@@ -219,7 +219,7 @@ mod tests {
         let view = CanonicalRecordInput {
             stable_id: Some("view-id".to_string()),
             path: "views/tasks.md".to_string(),
-            document: "---\ntype: view\nid: tasks\nversion: 1\nname: Tasks\nquery:\n  types: [task]\nviews:\n  - id: open\n    name: Open\n    where: record.status == 'open'\n    order_by:\n      - field: file.path\n---\n"
+            document: "---\ntype: view\nid: tasks\nversion: 1\nname: Tasks\nquery:\n  types: [task]\n  where: this.id == 'tasks'\nviews:\n  - id: open\n    name: Open\n    where: record.status == 'open'\n    order_by:\n      - field: file.path\n---\n"
                 .to_string(),
             file_size: 0,
             file_mtime: None,
@@ -237,6 +237,7 @@ mod tests {
         };
         assert_eq!(plan.view_id, "open");
         assert_eq!(plan.query.page_size, 25);
+        assert!(plan.query.requirements.query_context);
         assert!(plan.invocation_digest.starts_with("sha256:"));
         let task = CanonicalRecordInput {
             stable_id: Some("task-id".to_string()),

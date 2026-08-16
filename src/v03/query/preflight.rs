@@ -38,6 +38,13 @@ impl CompiledQuery {
             .any(expression_requires_link_graph)
     }
 
+    /// Invocation context is metadata-only unless an expression actually
+    /// reads the `this` binding.
+    pub fn requires_this_context(&self) -> bool {
+        self.record_expressions()
+            .any(|expression| expression_uses_identifier(expression, "this"))
+    }
+
     /// Body-derived file metadata can be deferred until after pagination when
     /// no filter, projection, ordering, grouping, or summary reads it.
     pub fn requires_file_body_metadata(&self) -> bool {
@@ -441,6 +448,36 @@ fn expression_requires_link_graph(expression: &Expr) -> bool {
         }
         Expr::Array(values) => values.iter().any(expression_requires_link_graph),
         Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) | Expr::Ident(_) => false,
+    }
+}
+
+fn expression_uses_identifier(expression: &Expr, identifier: &str) -> bool {
+    match expression {
+        Expr::Ident(name) => name == identifier,
+        Expr::Dot(object, _) | Expr::UnaryOp(_, object) => {
+            expression_uses_identifier(object, identifier)
+        }
+        Expr::Index(left, right)
+        | Expr::BinOp(left, _, right)
+        | Expr::NullCoalesce(left, right) => {
+            expression_uses_identifier(left, identifier)
+                || expression_uses_identifier(right, identifier)
+        }
+        Expr::Call(function, arguments) => {
+            expression_uses_identifier(function, identifier)
+                || arguments
+                    .iter()
+                    .any(|argument| expression_uses_identifier(argument, identifier))
+        }
+        Expr::Conditional(condition, then_expression, else_expression) => {
+            expression_uses_identifier(condition, identifier)
+                || expression_uses_identifier(then_expression, identifier)
+                || expression_uses_identifier(else_expression, identifier)
+        }
+        Expr::Array(values) => values
+            .iter()
+            .any(|value| expression_uses_identifier(value, identifier)),
+        Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) => false,
     }
 }
 

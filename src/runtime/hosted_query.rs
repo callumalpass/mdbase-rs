@@ -28,7 +28,7 @@ use super::{
     SEMANTIC_PROJECTION_SCHEMA_VERSION,
 };
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 6;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 7;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -206,6 +206,8 @@ pub struct HostedQueryRequirements {
     pub bounded_top_k: bool,
     pub bounded_grouping: bool,
     pub collection_context: bool,
+    #[serde(default)]
+    pub query_context: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,7 +281,6 @@ struct QueryEnvelope {
     offset: u64,
     #[serde(default)]
     include_body: bool,
-    context: Option<Value>,
     #[serde(default)]
     projections: BTreeMap<String, Value>,
     select: Option<Vec<Value>>,
@@ -474,16 +475,17 @@ impl CompiledCatalog {
 
         requirements.body_prose = query.include_body;
         requirements.exact_document |= query.include_body;
+        requirements.query_context = canonical_preflight.requires_this_context();
         requirements.collection_context =
-            query.context.is_some() || canonical_preflight.requires_link_graph();
+            requirements.query_context || canonical_preflight.requires_link_graph();
         requirements.relationships = canonical_preflight.requires_link_graph();
         requirements.structural_body_facts |= canonical_preflight.requires_file_body_metadata();
-        requirements.canonical_residual |= query.context.is_some()
+        requirements.canonical_residual |= requirements.query_context
             || !query.projections.is_empty()
             || query.select.is_some()
             || !fully_projected;
         requirements.diagnostic_type_matchers = self.has_diagnostic_type_matchers();
-        requirements.exact_document |= query.context.is_some()
+        requirements.exact_document |= requirements.query_context
             || !query.projections.is_empty()
             || query.select.is_some()
             || requirements.structural_body_facts
@@ -617,7 +619,11 @@ impl CompiledCatalog {
             ));
         }
 
-        let this_context = match compiled.query.context.as_ref() {
+        let this_context = match compiled
+            .requires_this_context()
+            .then_some(compiled.query.context.as_ref())
+            .flatten()
+        {
             None => None,
             Some(context) => {
                 let expected_path = &context.this.path;
@@ -940,7 +946,7 @@ impl CompiledCatalog {
         if !compiled.projections.is_empty()
             || !compiled.selections.is_empty()
             || compiled.query.include_body
-            || compiled.query.context.is_some()
+            || compiled.requires_this_context()
             || compiled.requires_link_graph()
         {
             return Err(query_error(
@@ -2427,10 +2433,10 @@ mod tests {
         let second = catalog().compile_hosted_query(&query).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
-        assert_eq!(first.version, 6);
+        assert_eq!(first.version, 7);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
         assert!(first.plan_digest.starts_with("sha256:"));
-        assert_eq!(serde_json::to_value(first).unwrap()["version"], 6);
+        assert_eq!(serde_json::to_value(first).unwrap()["version"], 7);
     }
 
     #[test]
