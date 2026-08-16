@@ -104,6 +104,11 @@ impl CompiledCatalog {
             fs::write(destination, &record.document).map_err(stage_io_error)?;
         }
 
+        let data_contracts = crate::data_contracts::DataContractRegistry::load_resolved(
+            self.contracts.clone(),
+            &self.collection.types,
+        )
+        .map_err(|error| mutation_error(error.code, error.message))?;
         let collection = Collection {
             root: directory.path().to_path_buf(),
             spec_profile: SpecProfile::V03,
@@ -112,8 +117,7 @@ impl CompiledCatalog {
             types: self.collection.types.clone(),
             type_plans: self.collection.type_plans.clone(),
             type_warnings: self.collection.type_warnings.clone(),
-            // Record mutations do not consult contract projection schemas.
-            data_contracts: crate::data_contracts::DataContractRegistry::empty(),
+            data_contracts,
         };
         let primary_before = before_by_stable.get(&request.primary_stable_id).cloned();
         let mut input = request.input.as_object().cloned().ok_or_else(|| {

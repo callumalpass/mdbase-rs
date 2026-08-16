@@ -61,6 +61,7 @@ pub struct CatalogError {
 pub struct CompiledCatalog {
     resource_revision: String,
     pub(super) collection: Collection,
+    pub(super) contracts: Vec<crate::data_contracts::ResolvedRecordContract>,
 }
 
 impl CompiledCatalog {
@@ -150,15 +151,17 @@ impl CompiledCatalog {
                 message: error.message,
             })?;
 
+        let contracts = input.contracts;
         let data_contracts =
-            crate::data_contracts::DataContractRegistry::load_resolved(input.contracts, &types)
+            crate::data_contracts::DataContractRegistry::load_resolved(contracts.clone(), &types)
                 .map_err(|error| CatalogError {
-                    code: error.code,
-                    message: error.message,
-                })?;
+                code: error.code,
+                message: error.message,
+            })?;
 
         Ok(Self {
             resource_revision: input.resource_revision,
+            contracts,
             collection: Collection {
                 root: PathBuf::new(),
                 spec_profile: SpecProfile::V03,
