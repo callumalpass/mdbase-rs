@@ -1093,7 +1093,17 @@ fn semantic_query_input(input: &Value) -> Result<Value, CatalogError> {
         .as_object()
         .cloned()
         .ok_or_else(|| query_error("invalid_query", "Hosted query input must be an object."))?;
-    for control in ["pagination", "cursor", "release_cursor", "snapshot"] {
+    // Hosted pagination controls page transport, not record semantics. Keeping
+    // them out of the canonical digest lets a cursor consumer change its next
+    // page size without changing the pinned query meaning.
+    for control in [
+        "pagination",
+        "cursor",
+        "release_cursor",
+        "snapshot",
+        "limit",
+        "offset",
+    ] {
         object.remove(control);
     }
     Ok(Value::Object(object))
@@ -1896,7 +1906,8 @@ mod tests {
         let controlled = json!({
             "types": ["task"],
             "order_by": [{"field": "file.path"}],
-            "limit": 20,
+            "limit": 250,
+            "offset": 50,
             "pagination": "cursor",
             "cursor": "opaque-secret-token",
             "snapshot": "provider-snapshot-id",
@@ -1905,9 +1916,21 @@ mod tests {
 
         let base = catalog.compile_hosted_query(&query).unwrap();
         let with_transport = catalog.compile_hosted_query(&controlled).unwrap();
-        assert_eq!(with_transport, base);
         let residual = with_transport.residual.query.as_object().unwrap();
-        for control in ["pagination", "cursor", "snapshot", "release_cursor"] {
+        assert_eq!(
+            with_transport.canonical_query_digest,
+            base.canonical_query_digest
+        );
+        assert_eq!(with_transport.residual.query, base.residual.query);
+        assert_ne!(with_transport.plan_digest, base.plan_digest);
+        for control in [
+            "pagination",
+            "cursor",
+            "snapshot",
+            "release_cursor",
+            "limit",
+            "offset",
+        ] {
             assert!(!residual.contains_key(control));
         }
     }
