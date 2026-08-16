@@ -168,8 +168,10 @@ fn scope_view_query(query: &mut Value, allowed_types: &[String]) {
         .unwrap_or_else(|| allowed_types.iter().cloned().map(Value::String).collect());
     if requested_types.is_some() && scoped.is_empty() {
         query.insert("where".to_string(), Value::String("false".to_string()));
+        query.remove("types");
+    } else {
+        query.insert("types".to_string(), Value::Array(scoped));
     }
-    query.insert("types".to_string(), Value::Array(scoped));
 }
 
 fn invalid(
@@ -250,5 +252,30 @@ mod tests {
             .evaluate_hosted_residual_with_context(&plan.query, &task, Some(&view))
             .unwrap();
         assert!(evaluated.matched);
+    }
+
+    #[test]
+    fn disjoint_scoped_view_types_compile_to_an_empty_plan() {
+        let view = CanonicalRecordInput {
+            stable_id: Some("view-id".to_string()),
+            path: "views/private.md".to_string(),
+            document: "---\ntype: view\nid: private\nversion: 1\nname: Private\nquery:\n  types: [private]\nviews:\n  - id: all\n    name: All\n---\n"
+                .to_string(),
+            file_size: 0,
+            file_mtime: None,
+        };
+        let outcome = catalog()
+            .plan_hosted_canonical_view(
+                &json!({"path": "views/private.md", "view": "all", "limit": 25}),
+                &view,
+                None,
+                &["task".to_string()],
+            )
+            .unwrap();
+        let HostedCanonicalViewPlanning::Planned { plan } = outcome else {
+            panic!("a disjoint scoped view should compile to an empty plan")
+        };
+        assert_eq!(plan.query.candidate, super::super::CandidatePredicate::None);
+        assert!(plan.query.residual.query.get("types").is_none());
     }
 }
