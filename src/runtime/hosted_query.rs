@@ -107,6 +107,9 @@ pub struct CandidateComparison {
 #[serde(rename_all = "snake_case")]
 pub enum CandidateComparisonPruning {
     ExactJson,
+    /// The value is a canonical tag without a leading `#`. Providers may
+    /// narrow only with Obsidian's exact-or-descendant tag rule.
+    NormalizedTagHierarchy,
     /// The literal is YYYY-MM-DD. Providers may narrow only records whose
     /// projected value is also exactly YYYY-MM-DD; every other JSON/string
     /// shape remains a candidate for canonical datetime-aware evaluation.

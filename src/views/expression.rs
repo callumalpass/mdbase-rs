@@ -684,13 +684,15 @@ fn lower_candidate_expression(expression: &Expr) -> CandidatePredicate {
                 return CandidatePredicate::All;
             };
             if method == "hasTag" && candidate_path(object).as_deref() == Some("file") {
-                if let Some(value) = candidate_literal(&arguments[0]) {
+                if let Some(value) = candidate_literal(&arguments[0])
+                    .and_then(|value| value.as_str().map(normalize_tag).map(Value::String))
+                {
                     return CandidatePredicate::Compare {
                         comparison: CandidateComparison {
                             field: CandidateField::BodyTags,
                             operator: CandidateComparisonOperator::Contains,
                             value,
-                            pruning: CandidateComparisonPruning::ExactJson,
+                            pruning: CandidateComparisonPruning::NormalizedTagHierarchy,
                         },
                     };
                 }
@@ -2651,6 +2653,26 @@ mod tests {
             &context
         )
         .unwrap());
+    }
+
+    #[test]
+    fn lowers_only_canonical_hierarchical_tag_candidates() {
+        let candidate = lower_hosted_candidate("file.hasTag(\"#task\")");
+        assert!(matches!(
+            candidate,
+            CandidatePredicate::Compare {
+                comparison: CandidateComparison {
+                    field: CandidateField::BodyTags,
+                    operator: CandidateComparisonOperator::Contains,
+                    value: Value::String(ref value),
+                    pruning: CandidateComparisonPruning::NormalizedTagHierarchy,
+                }
+            } if value == "task"
+        ));
+        assert_eq!(
+            lower_hosted_candidate("file.hasTag(42)"),
+            CandidatePredicate::All
+        );
     }
 
     #[test]

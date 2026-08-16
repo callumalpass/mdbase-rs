@@ -27,7 +27,7 @@ use super::{
     CandidatePredicate, CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection,
 };
 
-pub const HOSTED_BASE_PLAN_VERSION: u32 = 2;
+pub const HOSTED_BASE_PLAN_VERSION: u32 = 3;
 pub const MAX_HOSTED_BASE_RELATED_RECORDS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -864,7 +864,9 @@ fn lower_base_filter(filter: Option<&BaseFilter>) -> CandidatePredicate {
                     .into_iter()
                     .map(|filter| lower_base_filter(Some(filter)))
                     .collect::<Vec<_>>();
-                if !terms
+                if terms.is_empty() {
+                    conjuncts.push(CandidatePredicate::None);
+                } else if !terms
                     .iter()
                     .any(|term| matches!(term, CandidatePredicate::All))
                 {
@@ -1148,6 +1150,29 @@ views:
             plan.validate_integrity().unwrap_err().code,
             "hosted_base_plan_mismatch"
         );
+    }
+
+    #[test]
+    fn empty_base_or_is_a_closed_false_candidate() {
+        let catalog = catalog();
+        let source = "filters:\n  or: []\nviews:\n  - type: table\n    name: Empty\n";
+        let HostedBasePlanning::Planned { plan } = catalog
+            .plan_hosted_obsidian_base(
+                &json!({"path": "views/empty.base", "view": "empty"}),
+                &CanonicalRecordInput {
+                    stable_id: None,
+                    path: "views/empty.base".to_string(),
+                    document: source.to_string(),
+                    file_size: source.len() as u64,
+                    file_mtime: None,
+                },
+                &[],
+            )
+            .unwrap()
+        else {
+            panic!("expected empty Base plan")
+        };
+        assert_eq!(plan.candidate, CandidatePredicate::None);
     }
 
     #[test]
