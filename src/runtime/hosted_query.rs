@@ -28,7 +28,7 @@ use super::{
     SEMANTIC_PROJECTION_SCHEMA_VERSION,
 };
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 7;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 8;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -156,6 +156,20 @@ pub struct HostedOrder {
     /// deterministic tie-break. This flag makes the contract explicit.
     pub canonical_path_tiebreak: bool,
     pub semantics: HostedSortSemantics,
+    /// A catalog-backed proof that current projections contain only this
+    /// scalar kind (or null) for the ordered field. Providers may use this to
+    /// implement canonical keyset ordering, but must fail the proof at runtime
+    /// if a malformed projection contains another JSON kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_kind: Option<HostedScalarKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedScalarKind {
+    String,
+    Number,
+    Boolean,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +186,10 @@ pub struct HostedGroup {
     pub field: CandidateField,
     pub output_name: String,
     pub direction: HostedOrderDirection,
+    /// The same catalog-backed scalar proof used by hosted ordering. This is
+    /// intentionally absent when schemas do not prove one common kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_kind: Option<HostedScalarKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -456,6 +474,7 @@ impl CompiledCatalog {
             };
             accumulate_field_requirement(&field, &mut requirements);
             order.push(HostedOrder {
+                value_kind: hosted_scalar_kind(&field, &query.types, self.collection()),
                 field,
                 direction: direction(&item.direction),
                 canonical_path_tiebreak: true,
@@ -476,6 +495,7 @@ impl CompiledCatalog {
             };
             accumulate_field_requirement(&field, &mut requirements);
             groups.push(HostedGroup {
+                value_kind: hosted_scalar_kind(&field, &query.types, self.collection()),
                 field,
                 output_name: item.field.clone(),
                 direction: direction(&item.direction),
@@ -1677,6 +1697,61 @@ fn lower_query_field(path: &str) -> Option<CandidateField> {
     }
 }
 
+fn hosted_scalar_kind(
+    field: &CandidateField,
+    selected_types: &[String],
+    collection: &crate::Collection,
+) -> Option<HostedScalarKind> {
+    match field {
+        CandidateField::Path => Some(HostedScalarKind::String),
+        CandidateField::File(name) => match name.as_str() {
+            "path" | "name" | "basename" | "ext" | "extension" | "mtime" => {
+                Some(HostedScalarKind::String)
+            }
+            "size" => Some(HostedScalarKind::Number),
+            _ => None,
+        },
+        CandidateField::PersistedFrontmatter(path) | CandidateField::EffectiveFrontmatter(path) => {
+            if selected_types.is_empty() || path.is_empty() {
+                return None;
+            }
+            let mut proven = None;
+            for type_name in selected_types {
+                let type_file = collection
+                    .types
+                    .values()
+                    .find(|candidate| candidate.name.eq_ignore_ascii_case(type_name))?;
+                let kind = field_scalar_kind(&type_file.fields, path)?;
+                if proven.is_some_and(|current| current != kind) {
+                    return None;
+                }
+                proven = Some(kind);
+            }
+            proven
+        }
+        CandidateField::Types | CandidateField::BodyTags => None,
+    }
+}
+
+fn field_scalar_kind(
+    fields: &std::collections::HashMap<String, crate::types::schema::FieldDef>,
+    path: &[String],
+) -> Option<HostedScalarKind> {
+    let (first, rest) = path.split_first()?;
+    let mut field = fields.get(first)?;
+    for segment in rest {
+        field = field.fields.as_ref()?.get(segment)?;
+    }
+    match field.field_type.as_str() {
+        "string" | "date" | "datetime" | "time" | "duration" | "link" | "path" | "enum" => {
+            Some(HostedScalarKind::String)
+        }
+        "number" | "integer" => Some(HostedScalarKind::Number),
+        "boolean" => Some(HostedScalarKind::Boolean),
+        _ => None,
+    }
+}
+
 fn semantic_query_input(input: &Value) -> Result<Value, CatalogError> {
     let mut object = input
         .as_object()
@@ -2078,7 +2153,13 @@ mod tests {
                         "properties": {"status": {"type": "string"}}
                     }}
                 }),
-                schema: json!({"type": "object"}),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "effort": {"type": "number"}
+                    }
+                }),
             }],
             contracts: Vec::new(),
         })
@@ -2557,10 +2638,10 @@ mod tests {
         let second = catalog().compile_hosted_query(&query).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
-        assert_eq!(first.version, 7);
+        assert_eq!(first.version, 8);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
         assert!(first.plan_digest.starts_with("sha256:"));
-        assert_eq!(serde_json::to_value(first).unwrap()["version"], 7);
+        assert_eq!(serde_json::to_value(first).unwrap()["version"], 8);
     }
 
     #[test]
@@ -2579,12 +2660,26 @@ mod tests {
 
         let grouped = catalog()
             .compile_hosted_query(&json!({
+                "types": ["task"],
                 "group_by": [{"field": "record.status"}],
                 "limit": 20
             }))
             .unwrap();
         assert_eq!(grouped.groups[0].output_name, "record.status");
         assert!(grouped.requirements.bounded_grouping);
+        assert_eq!(grouped.groups[0].value_kind, Some(HostedScalarKind::String));
+
+        let ordered = catalog()
+            .compile_hosted_query(&json!({
+                "types": ["task"],
+                "order_by": [
+                    {"field": "record.status"},
+                    {"field": "file.mtime", "direction": "desc"}
+                ]
+            }))
+            .unwrap();
+        assert_eq!(ordered.order[0].value_kind, Some(HostedScalarKind::String));
+        assert_eq!(ordered.order[1].value_kind, Some(HostedScalarKind::String));
     }
 
     #[test]

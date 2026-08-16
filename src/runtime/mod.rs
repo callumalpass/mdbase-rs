@@ -54,7 +54,7 @@ pub use hosted_query::{
     CandidatePredicate, CandidateVerdict, CanonicalResidual, HostedAggregate, HostedGroup,
     HostedOrder, HostedOrderDirection, HostedQueryBudgets, HostedQueryPlan,
     HostedQueryRequirements, HostedReduction, HostedReductionAccumulator, HostedReductionInput,
-    HostedResidualEvaluation, HostedSortSemantics, ProjectionAvailability,
+    HostedResidualEvaluation, HostedScalarKind, HostedSortSemantics, ProjectionAvailability,
     HOSTED_QUERY_PLAN_VERSION,
 };
 pub use hosted_resource::{
