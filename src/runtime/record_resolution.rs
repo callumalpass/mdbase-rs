@@ -146,12 +146,12 @@ impl CompiledCatalog {
             alternatives.extend([
                 ResolutionLookupKey {
                     priority: 2,
-                    kind: RecordResolutionKeyKind::Basename,
+                    kind: RecordResolutionKeyKind::Id,
                     value: simple.clone(),
                 },
                 ResolutionLookupKey {
                     priority: 3,
-                    kind: RecordResolutionKeyKind::Id,
+                    kind: RecordResolutionKeyKind::Basename,
                     value: simple.clone(),
                 },
                 ResolutionLookupKey {

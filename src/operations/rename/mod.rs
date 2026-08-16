@@ -359,6 +359,7 @@ impl Collection {
                 from_no_ext,
                 to_no_ext,
                 &source_dir,
+                source_id.as_deref(),
             ) {
                 body_changed = true;
                 pending_updates.push(serde_json::json!({
@@ -412,16 +413,8 @@ impl Collection {
                     continue;
                 }
 
-                let fm_to_write: Option<&serde_yaml::Value> = if fm_changed {
-                    fm_yaml.as_ref()
-                } else {
-                    match &doc.frontmatter {
-                        Some(v @ serde_yaml::Value::Mapping(_)) => Some(v),
-                        _ => None,
-                    }
-                };
-
-                let output = if let Some(new_fm) = fm_to_write {
+                let output = if fm_changed {
+                    let new_fm = fm_yaml.as_ref().expect("changed frontmatter is a mapping");
                     let mut output = String::new();
                     output.push_str("---\n");
                     let yaml_str = serde_yaml::to_string(new_fm).unwrap_or_default();
@@ -437,12 +430,17 @@ impl Collection {
                         }
                     }
                     output
-                } else {
-                    let mut output = new_body;
-                    if !output.is_empty() && !output.ends_with('\n') {
-                        output.push('\n');
-                    }
+                } else if doc.has_frontmatter {
+                    let prefix_length = content
+                        .len()
+                        .checked_sub(doc.body.len())
+                        .expect("parsed body is an exact document suffix");
+                    let mut output = String::with_capacity(prefix_length + new_body.len());
+                    output.push_str(&content[..prefix_length]);
+                    output.push_str(&new_body);
                     output
+                } else {
+                    new_body
                 };
                 if let Err(e) = crate::operations::atomic_write(file_path, output.as_bytes()) {
                     ref_update_failures.push(serde_json::json!({

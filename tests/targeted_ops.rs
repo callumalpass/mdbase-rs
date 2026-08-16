@@ -257,6 +257,86 @@ fn rename_updates_body_wikilink_outside_code_blocks() {
 }
 
 #[test]
+fn rename_updates_filename_markdown_links_images_and_case_folded_wikilinks() {
+    let tmp = TempDir::new().expect("tempdir");
+    write_file(
+        &tmp.path().join("mdbase.yaml"),
+        "spec_version: 0.2.1\nsettings:\n  rename_update_refs: true\n",
+    );
+    write_file(&tmp.path().join("Target.md"), "---\nid: t\n---\n");
+    write_file(
+        &tmp.path().join("ref.md"),
+        "[link](Target.md#section) ![image](Target.md) [[target#anchor|Alias]]\n",
+    );
+
+    let collection = open_collection(tmp.path());
+    let result = collection.rename(&serde_json::json!({
+        "from": "Target.md",
+        "to": "Renamed.md",
+        "update_refs": true
+    }));
+    assert!(result.get("error").is_none(), "rename failed: {result}");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("ref.md")).unwrap(),
+        "[link](./Renamed.md#section) ![image](./Renamed.md) [[Renamed#anchor|Alias]]\n"
+    );
+}
+
+#[test]
+fn rename_preserves_opaque_frontmatter_when_only_the_body_changes() {
+    for frontmatter in ["title: [broken", "- one\n- two", "null", "scalar"] {
+        let tmp = TempDir::new().expect("tempdir");
+        write_file(
+            &tmp.path().join("mdbase.yaml"),
+            "spec_version: 0.2.1\nsettings:\n  rename_update_refs: true\n",
+        );
+        write_file(&tmp.path().join("target.md"), "Target.\n");
+        let original = format!("---\n{frontmatter}\n---\nSee [target](target.md).\n");
+        write_file(&tmp.path().join("ref.md"), &original);
+
+        let collection = open_collection(tmp.path());
+        let result = collection.rename(&serde_json::json!({
+            "from": "target.md",
+            "to": "renamed.md",
+            "update_refs": true
+        }));
+        assert!(result.get("error").is_none(), "rename failed: {result}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("ref.md")).unwrap(),
+            format!("---\n{frontmatter}\n---\nSee [target](./renamed.md).\n")
+        );
+    }
+}
+
+#[test]
+fn duplicate_simple_link_keys_are_ambiguous_instead_of_arbitrarily_resolved() {
+    let tmp = TempDir::new().expect("tempdir");
+    setup_minimal(tmp.path());
+    write_file(&tmp.path().join("one/duplicate.md"), "One.\n");
+    write_file(&tmp.path().join("two/duplicate.md"), "Two.\n");
+    write_file(
+        &tmp.path().join("source.md"),
+        "---\nrelated: '[[duplicate]]'\n---\nSee [[duplicate]].\n",
+    );
+
+    let collection = open_collection(tmp.path());
+    let resolved = collection.resolve_link(&serde_json::json!({
+        "path": "source.md",
+        "field": "related"
+    }));
+    assert!(resolved["resolved_path"].is_null(), "{resolved}");
+    let deleted = collection.delete(&serde_json::json!({
+        "path": "one/duplicate.md",
+        "check_backlinks": true,
+        "dry_run": true
+    }));
+    assert_eq!(deleted["would_delete"], true, "{deleted}");
+    assert!(deleted
+        .get("broken_links")
+        .is_none_or(|links| { links.as_array().is_some_and(Vec::is_empty) }));
+}
+
+#[test]
 fn rename_does_not_update_links_inside_code_blocks() {
     let tmp = TempDir::new().expect("tempdir");
     write_file(

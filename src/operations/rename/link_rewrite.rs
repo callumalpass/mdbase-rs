@@ -11,11 +11,16 @@ impl Collection {
         from_stem: &str,
         from_no_ext: &str,
         source_dir: &str,
+        source_id: Option<&str>,
     ) -> bool {
         let is_wikilink = link_val.starts_with("[[") && link_val.ends_with("]]");
         let is_md_link = link_val.contains("](");
-        let is_bare_path =
-            link_val.starts_with("./") || link_val.starts_with("../") || link_val.contains('/');
+        let bare_target = link_val.split('#').next().unwrap_or(link_val).trim();
+        let is_bare_path = link_val.starts_with("./")
+            || link_val.starts_with("../")
+            || link_val.contains('/')
+            || bare_target.ends_with(".md")
+            || bare_target.ends_with(".mdx");
 
         // Only process actual link-formatted values
         if !is_wikilink && !is_md_link && !is_bare_path {
@@ -51,6 +56,18 @@ impl Collection {
             return false;
         }
 
+        // A simple wikilink matching the configured record ID continues to
+        // resolve after a path-only rename.  Treat it as stable even when its
+        // spelling differs only by case from the former filename stem.
+        if is_wikilink
+            && !target.contains('/')
+            && !target.contains('.')
+            && target != from_stem
+            && source_id.is_some_and(|id| target.eq_ignore_ascii_case(id))
+        {
+            return false;
+        }
+
         // Normalize the target relative to source file
         let normalized = normalize_link_path(target, source_dir);
 
@@ -66,7 +83,11 @@ impl Collection {
         }
 
         // Check stem match for simple wikilinks (only wikilinks can match by stem)
-        if is_wikilink && !target.contains('/') && !target.contains('.') && target == from_stem {
+        if is_wikilink
+            && !target.contains('/')
+            && !target.contains('.')
+            && target.eq_ignore_ascii_case(from_stem)
+        {
             return true;
         }
 
@@ -100,7 +121,9 @@ impl Collection {
             };
 
             // Determine new name
-            let new_name = if name_part == from_stem || name_part.trim() == from_stem {
+            let new_name = if name_part.eq_ignore_ascii_case(from_stem)
+                || name_part.trim().eq_ignore_ascii_case(from_stem)
+            {
                 // Simple name -> use new stem
                 to_stem.to_string()
             } else if name_part.contains('/') {

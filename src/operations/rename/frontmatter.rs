@@ -72,7 +72,8 @@ impl Collection {
                     .trim();
                 // Simple name (no path separators or extensions) that matches the
                 // renamed file's id_field value -> potentially id-stable
-                if !target.contains('/') && !target.contains('.') && target == id.as_str() {
+                if !target.contains('/') && !target.contains('.') && target.eq_ignore_ascii_case(id)
+                {
                     // Only skip if the link field has a typed target constraint,
                     // meaning it resolves via id lookup rather than filename.
                     // Generic link fields (no target type) resolve by filename
@@ -107,7 +108,7 @@ impl Collection {
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
             if !stem.is_empty() {
-                *stem_counts.entry(stem.to_string()).or_insert(0) += 1;
+                *stem_counts.entry(stem.to_ascii_lowercase()).or_insert(0) += 1;
             }
         }
 
@@ -119,7 +120,9 @@ impl Collection {
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
             if !from_stem.is_empty() {
-                *stem_counts.entry(from_stem.to_string()).or_insert(0) += 1;
+                *stem_counts
+                    .entry(from_stem.to_ascii_lowercase())
+                    .or_insert(0) += 1;
             }
         }
 
@@ -150,7 +153,11 @@ impl Collection {
             return false; // Path-based links are not ambiguous
         }
 
-        stem_counts.get(&target).copied().unwrap_or(0) > 1
+        stem_counts
+            .get(&target.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(0)
+            > 1
     }
 }
 
@@ -206,6 +213,7 @@ impl FrontmatterRewriteContext<'_> {
             self.from_stem,
             self.from_no_ext,
             self.source_dir,
+            self.source_id.as_deref(),
         ) {
             if self.collection.should_skip_id_stable_link(
                 link,
@@ -251,6 +259,7 @@ impl FrontmatterRewriteContext<'_> {
             self.from_no_ext,
             self.to_no_ext,
             self.source_dir,
+            self.source_id.as_deref(),
         );
         if rewritten != *link {
             *link = rewritten;
