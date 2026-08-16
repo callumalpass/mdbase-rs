@@ -5,10 +5,10 @@
 //! a catalogue snapshot later, while a filesystem consumer can use the same
 //! extraction result.  Exact Markdown and body prose never enter the value.
 //!
-//! Markdown destination titles and escaped delimiters are retained in the raw
-//! target and are intentionally not interpreted by this extraction seam. A
-//! later syntax-aware resolver may refine those values without changing the
-//! provider-neutral occurrence model.
+//! Body link targets and resolution syntax are retained, while body labels and
+//! complete source spellings are redacted before serialization and digesting.
+//! Exact mutation planning reparses the encrypted authority when source text is
+//! required. Frontmatter source values remain readable by architecture.
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -25,7 +25,7 @@ use crate::frontmatter::parser::{parse_document, yaml_to_json, FrontmatterState}
 use crate::links::parser::normalize_link_path;
 
 /// Version of the provider-neutral structural envelope.
-pub const RECORD_STRUCTURE_SCHEMA_VERSION: &str = "mdbase-record-structure-v2";
+pub const RECORD_STRUCTURE_SCHEMA_VERSION: &str = "mdbase-record-structure-v3";
 
 /// Where an occurrence was found in the exact record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -74,9 +74,11 @@ pub struct StructuralOccurrence {
     pub ordinal: usize,
     pub source_kind: StructuralSourceKind,
     pub kind: StructuralLinkKind,
-    /// Complete source spelling, including delimiters and alias text.
+    /// Complete source spelling for frontmatter occurrences; empty for body.
     pub raw: String,
-    /// Target spelling before anchor removal and path normalization.
+    /// Target spelling before anchor removal and path normalization. For body
+    /// occurrences this is reduced to the target itself and never includes a
+    /// Markdown destination title or visible label.
     pub raw_target: String,
     /// Lexically normalized collection-relative target, when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,11 +148,9 @@ impl RecordStructureParser {
         // Use the established code/fence semantics before structural scanning.
         // The scanner itself still records malformed constructs outside code.
         let body = strip_code_blocks_and_inline_code(&parsed.body);
-        occurrences.extend(scan_occurrences(
-            &body,
-            StructuralSourceKind::Body,
-            &self.path,
-        ));
+        let mut body_occurrences = scan_occurrences(&body, StructuralSourceKind::Body, &self.path);
+        body_occurrences.iter_mut().for_each(redact_body_occurrence);
+        occurrences.extend(body_occurrences);
 
         occurrences.sort_by(compare_occurrences);
         for (ordinal, occurrence) in occurrences.iter_mut().enumerate() {
@@ -357,7 +357,7 @@ fn parse_target_occurrence_with_alias(
     path: &str,
     explicit_alias: Option<String>,
 ) -> StructuralOccurrence {
-    let (target_part, alias) = if matches!(
+    let (mut target_part, alias) = if matches!(
         kind,
         StructuralLinkKind::Wikilink | StructuralLinkKind::WikilinkEmbed
     ) {
@@ -371,10 +371,31 @@ fn parse_target_occurrence_with_alias(
     } else {
         (inner.trim().to_string(), explicit_alias)
     };
+    if matches!(
+        kind,
+        StructuralLinkKind::MarkdownLink | StructuralLinkKind::MarkdownImage
+    ) {
+        target_part = markdown_destination(&target_part);
+    }
     let anchor = target_part
         .find('#')
         .map(|index| target_part[index + 1..].to_string());
     make_occurrence(source_kind, kind, raw, target_part, alias, anchor, path)
+}
+
+fn markdown_destination(value: &str) -> String {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('<') {
+        return rest
+            .split_once('>')
+            .map_or(rest, |(destination, _)| destination)
+            .to_string();
+    }
+    value
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn make_occurrence(
@@ -442,6 +463,27 @@ fn malformed_occurrence(
         relative: false,
         resolution: StructuralResolution::Malformed,
     }
+}
+
+fn redact_body_occurrence(occurrence: &mut StructuralOccurrence) {
+    debug_assert_eq!(occurrence.source_kind, StructuralSourceKind::Body);
+    occurrence.raw.clear();
+    occurrence.alias = None;
+    occurrence.raw_target = match occurrence.resolution {
+        StructuralResolution::Malformed => String::new(),
+        StructuralResolution::External => safe_external_target(&occurrence.raw_target),
+        _ => occurrence.normalized_target.clone().unwrap_or_default(),
+    };
+}
+
+fn safe_external_target(target: &str) -> String {
+    // Markdown destination titles follow whitespace after the destination. The
+    // URL itself is a structural relationship target; its optional title is prose.
+    target
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn is_external_target(target: &str) -> bool {
@@ -523,14 +565,17 @@ mod tests {
     }
 
     #[test]
-    fn preserves_alias_anchor_embed_image_and_relative_target() {
+    fn preserves_target_syntax_while_redacting_body_labels() {
         let structure = body("[[../target#Heading|Shown]] ![[./asset.png|Asset]] [read](../read.md#intro) ![photo](./photo.jpg)");
         assert_eq!(structure.occurrences.len(), 4);
         assert!(structure
             .occurrences
             .iter()
-            .any(|item| item.alias.as_deref() == Some("Shown")
-                && item.anchor.as_deref() == Some("Heading")));
+            .any(|item| item.anchor.as_deref() == Some("Heading")));
+        assert!(structure
+            .occurrences
+            .iter()
+            .all(|item| item.alias.is_none() && item.raw.is_empty()));
         assert!(structure
             .occurrences
             .iter()
@@ -542,11 +587,6 @@ mod tests {
         assert!(structure
             .occurrences
             .iter()
-            .any(|item| item.kind == StructuralLinkKind::MarkdownLink
-                && item.alias.as_deref() == Some("read")));
-        assert!(structure
-            .occurrences
-            .iter()
             .any(|item| item.normalized_target.as_deref() == Some("target")));
     }
 
@@ -555,9 +595,30 @@ mod tests {
         let structure = body("[shown](foo|bar.md) ![photo](assets/a|b.png)");
         assert_eq!(structure.occurrences.len(), 2);
         assert_eq!(structure.occurrences[0].raw_target, "foo|bar.md");
-        assert_eq!(structure.occurrences[0].alias.as_deref(), Some("shown"));
+        assert_eq!(structure.occurrences[0].alias, None);
         assert_eq!(structure.occurrences[1].raw_target, "assets/a|b.png");
-        assert_eq!(structure.occurrences[1].alias.as_deref(), Some("photo"));
+        assert_eq!(structure.occurrences[1].alias, None);
+    }
+
+    #[test]
+    fn body_labels_destination_titles_and_malformed_source_are_never_serialized() {
+        let structure = body(
+            "[[target|wikilink-secret]] [markdown-secret](local.md \"title-secret\") [[malformed-secret",
+        );
+        let serialized = serde_json::to_string(&structure).unwrap();
+        for secret in [
+            "wikilink-secret",
+            "markdown-secret",
+            "title-secret",
+            "malformed-secret",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "leaked {secret}: {serialized}"
+            );
+        }
+        assert!(serialized.contains("target"));
+        assert!(serialized.contains("local.md"));
     }
 
     #[test]

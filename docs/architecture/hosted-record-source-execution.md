@@ -94,22 +94,27 @@ file facts, matched types, persisted/effective frontmatter, diagnostics, and
 structurally significant body facts without body prose or exact Markdown.
 
 One shared structural parser supplies projection, validation, backlink, rename,
-delete, and reference semantics. It preserves wikilink, Markdown-link and embed
-kind, normalized target, raw target form where required, alias, anchor, relative
-form, source, body tags, and resolution outcome. Resolution distinguishes resolved,
-missing, ambiguous, and unsafe traversal outcomes; it never collapses multiple
-basename, ID, or title matches into one arbitrary target.
+delete, and reference semantics. Provider-readable body occurrences preserve link
+or embed kind, normalized target, anchor, relative form, source, body tags, and
+resolution outcome. They deliberately redact visible labels, destination titles,
+malformed source tails, and complete Markdown source spelling. Mutation planning
+reparses the encrypted exact authority when source text is required. Frontmatter
+occurrences may preserve their source form because projected frontmatter is already
+provider-readable. Resolution distinguishes resolved, missing, ambiguous, and
+unsafe traversal outcomes; it never collapses multiple basename, ID, or title
+matches into one arbitrary target.
 
 The projection exposes canonical outgoing occurrences. The authority persists
 those rows and derives backlinks from their inverse. Authority record/catalog/
 generation currentness remains outside mdbase-rs, but the semantic engine and
 projection format versions and content digest are explicit outputs.
 
-Projection format 4 requires a hosted authority to supply the authoritative
-record-version modification time when projecting or canonically evaluating a
-record. The value is emitted through the existing file-facts shape. A provider
-must rebuild older null-time projections rather than relabel them, while the JSON
-schema identifier remains v3 because no projection member was added.
+Projection format 5 retains the format-4 authoritative record modification-time
+binding and adds a confidentiality boundary: computed fields that transitively
+read `file.body` are omitted from readable effective frontmatter and mark the
+projection incomplete, requiring bounded canonical exact evaluation. Body link
+labels and source spellings are likewise absent. Authorities must treat older
+formats as stale and rebuild them; they must not relabel old rows as format 5.
 
 ### Query compilation and accumulation
 

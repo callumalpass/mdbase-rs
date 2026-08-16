@@ -2960,7 +2960,7 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
                     i += 1;
                 }
                 let path: String = chars[paren_start..i - 1].iter().collect();
-                let path = path.trim().to_string();
+                let path = markdown_destination_target(&path);
                 // Skip external URLs
                 if !path.is_empty() && !path.starts_with("http://") && !path.starts_with("https://")
                 {
@@ -3040,7 +3040,7 @@ pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
                     i += 1;
                 }
                 let path: String = chars[paren_start..i - 1].iter().collect();
-                let path = path.trim().to_string();
+                let path = markdown_destination_target(&path);
                 if !path.is_empty() && !path.starts_with("http://") && !path.starts_with("https://")
                 {
                     let path = path.split('#').next().unwrap_or(&path).to_string();
@@ -3055,6 +3055,21 @@ pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
     }
 
     embeds
+}
+
+fn markdown_destination_target(value: &str) -> String {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('<') {
+        return rest
+            .split_once('>')
+            .map_or(rest, |(destination, _)| destination)
+            .to_string();
+    }
+    value
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Extract link targets from a frontmatter value (recursively handles strings, arrays, objects).
@@ -3122,5 +3137,12 @@ mod limit_tests {
             evaluate_with_limits(&expression, &EvalContext::empty(), 128, 3, &clock).unwrap_err();
         assert_eq!(error.code, "expression_work_exceeded");
         assert!(error.message.contains("3-step"));
+    }
+
+    #[test]
+    fn markdown_body_fact_extractors_exclude_labels_and_destination_titles() {
+        let body = "[private label](notes/one.md \"private title\") ![private alt](assets/one.png \"private image title\")";
+        assert_eq!(extract_links_from_body(body), ["notes/one.md"]);
+        assert_eq!(extract_embeds_from_body(body), ["assets/one.png"]);
     }
 }

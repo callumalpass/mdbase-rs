@@ -4,7 +4,7 @@
 //! serialized projection. Authority-owned record/catalog/generation bindings are
 //! applied outside this module.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -19,12 +19,11 @@ use super::{
     RECORD_STRUCTURE_SCHEMA_VERSION,
 };
 
-/// Format v4 requires providers to bind the canonical file modification time
-/// supplied for a hosted record into both the projection envelope and its
-/// revision-scoped persistence metadata. Older projections may contain a null
-/// mtime and must not be treated as current by a v4 executor.
-pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 4;
-pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v3";
+/// Format v5 excludes body-dependent computed values and body link labels/source
+/// spellings from provider-readable state. Older projections may contain body
+/// prose through either seam and must not be treated as current by a v5 executor.
+pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 5;
+pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v4";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticProjectionFacts {
@@ -125,14 +124,14 @@ impl CompiledCatalog {
         let classified = self.classify_record(record)?;
         let read = self.read_record(&serde_json::json!({"path": record.path}), record);
         let structure = self.parse_record_structure(record)?;
-        let semantic_complete = read.valid
+        let mut semantic_complete = read.valid
             && classified.frontmatter_error.is_none()
             && structure
                 .occurrences
                 .iter()
                 .all(|occurrence| occurrence.resolution != StructuralResolution::Malformed);
 
-        let effective_frontmatter = if read.valid {
+        let mut effective_frontmatter = if read.valid {
             read.result
                 .get("effective_frontmatter")
                 .and_then(Value::as_object)
@@ -143,6 +142,18 @@ impl CompiledCatalog {
         };
         let mut diagnostics = read.diagnostics;
         collect_result_diagnostics(&read.result, &mut diagnostics);
+        let body_dependent_fields = self.body_dependent_computed_fields(&classified.types);
+        for field in body_dependent_fields {
+            effective_frontmatter.remove(&field);
+            semantic_complete = false;
+            let mut diagnostic = Diagnostic::error(
+                "projection_body_dependent_computed_field",
+                "A body-dependent computed field requires canonical exact evaluation and is omitted from provider-readable projection state.",
+                Some(record.path.clone()),
+            );
+            diagnostic.field = Some(field);
+            diagnostics.push(diagnostic);
+        }
         if let Some(message) = classified.frontmatter_error.as_ref() {
             diagnostics.push(Diagnostic::error(
                 "frontmatter_parse_failed",
@@ -194,6 +205,15 @@ impl CompiledCatalog {
             },
             structure,
         })
+    }
+
+    fn body_dependent_computed_fields(&self, type_names: &[String]) -> BTreeSet<String> {
+        type_names
+            .iter()
+            .filter_map(|type_name| self.collection.type_plans.get(type_name))
+            .flat_map(|plan| plan.computed.iter())
+            .filter_map(|(field_name, field)| field.body_dependent.then_some(field_name.clone()))
+            .collect()
     }
 
     /// Bind an authority-fetched relationship result to a prepared projection.
@@ -461,6 +481,40 @@ mod tests {
         .unwrap()
     }
 
+    fn body_computed_catalog() -> CompiledCatalog {
+        CompiledCatalog::compile(CatalogInput {
+            resource_revision: "resources-body-computed".to_string(),
+            configuration_document:
+                "spec_version: 0.3.0\nsettings:\n  default_validation: warn\n".to_string(),
+            types: vec![ResolvedTypeResource {
+                path: "_types/note.md".to_string(),
+                revision: "type-body-computed".to_string(),
+                definition: json!({
+                    "kind": "mdbase.type",
+                    "name": "note",
+                    "version": 1,
+                    "match": {"path_glob": "notes/*.md"},
+                    "schema": {"dialect": "json-schema-2020-12", "value": {
+                        "type": "object",
+                        "properties": {
+                            "excerpt": {"type": "string", "x-mdbase-v02-field": {"computed": "file.body"}},
+                            "copied_excerpt": {"type": "string", "x-mdbase-v02-field": {"computed": "excerpt"}}
+                        }
+                    }}
+                }),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "excerpt": {"type": "string", "x-mdbase-v02-field": {"computed": "file.body"}},
+                        "copied_excerpt": {"type": "string", "x-mdbase-v02-field": {"computed": "excerpt"}}
+                    }
+                }),
+            }],
+            contracts: Vec::new(),
+        })
+        .unwrap()
+    }
+
     fn input(document: &str) -> CanonicalRecordInput {
         CanonicalRecordInput {
             stable_id: Some("record-1".to_string()),
@@ -499,8 +553,45 @@ mod tests {
             }));
         let serialized = String::from_utf8(projection.canonical_json().unwrap()).unwrap();
         assert!(!serialized.contains("secret-body-prose"));
+        assert!(!serialized.contains("Two"));
         assert!(!serialized.contains("---"));
         assert_eq!(projection.canonical_digest().unwrap().len(), 71);
+    }
+
+    #[test]
+    fn body_dependent_computed_values_are_omitted_and_force_exact_fallback() {
+        let catalog = body_computed_catalog();
+        let record = input("body-computed-secret\n");
+        let exact = catalog.read_record(&serde_json::json!({"path": record.path}), &record);
+        assert_eq!(
+            exact.result["effective_frontmatter"]["excerpt"], "body-computed-secret\n",
+            "exact result: {:?}",
+            exact.result
+        );
+        assert_eq!(
+            exact.result["effective_frontmatter"]["copied_excerpt"],
+            "body-computed-secret\n"
+        );
+
+        let prepared = catalog.project_record(&record).unwrap();
+        assert!(!prepared.facts.semantic_complete);
+        assert!(!prepared.facts.effective_frontmatter.contains_key("excerpt"));
+        assert!(!prepared
+            .facts
+            .effective_frontmatter
+            .contains_key("copied_excerpt"));
+        assert_eq!(
+            prepared
+                .facts
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "projection_body_dependent_computed_field")
+                .count(),
+            2
+        );
+        assert!(!serde_json::to_string(&prepared)
+            .unwrap()
+            .contains("body-computed-secret"));
     }
 
     #[test]
