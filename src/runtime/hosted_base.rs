@@ -269,6 +269,22 @@ impl CompiledCatalog {
 }
 
 impl HostedBasePlan {
+    /// True when membership and ordering need no collection-wide semantic
+    /// evaluation. Providers may keyset-page current projections by canonical
+    /// path, then run canonical evaluation only for that page's output fields.
+    pub fn supports_path_keyset_paging(&self) -> bool {
+        self.document.filters.is_none()
+            && self.document.formulas.is_empty()
+            && self.view.filters.is_none()
+            && self.view.sort.is_empty()
+            && self.view.group_by.is_none()
+            && self.context_path.is_none()
+            && !self.requirements.backlinks
+            && !self.requirements.outgoing_relationships
+            && !self.requirements.link_resolution
+            && !self.requirements.query_context
+    }
+
     pub fn order_arity(&self) -> usize {
         self.view.sort.len()
     }
@@ -1216,6 +1232,43 @@ views:
         assert_eq!(row.file["embeds"][0]["path"], "image");
         assert_eq!(row.file["backlinks"], json!([]));
         assert!(!serde_json::to_string(&row).unwrap().contains("# urgent"));
+    }
+
+    #[test]
+    fn path_keyset_capability_is_semantically_closed() {
+        let catalog = catalog();
+        let input = json!({"path": "views/projects.base", "view": "all"});
+        let simple_source =
+            "views:\n  - type: table\n    name: All\n    order: [file.name, status]\n";
+        let simple = CanonicalRecordInput {
+            stable_id: None,
+            path: "views/projects.base".to_string(),
+            document: simple_source.to_string(),
+            file_size: simple_source.len() as u64,
+            file_mtime: None,
+        };
+        let HostedBasePlanning::Planned { plan } = catalog
+            .plan_hosted_obsidian_base(&input, &simple, &[])
+            .unwrap()
+        else {
+            panic!("expected simple hosted Base plan")
+        };
+        assert!(plan.supports_path_keyset_paging());
+
+        let filtered_source =
+            "views:\n  - type: table\n    name: All\n    filters: 'status == \"open\"'\n";
+        let filtered = CanonicalRecordInput {
+            document: filtered_source.to_string(),
+            file_size: filtered_source.len() as u64,
+            ..simple
+        };
+        let HostedBasePlanning::Planned { plan } = catalog
+            .plan_hosted_obsidian_base(&input, &filtered, &[])
+            .unwrap()
+        else {
+            panic!("expected filtered hosted Base plan")
+        };
+        assert!(!plan.supports_path_keyset_paging());
     }
 
     #[test]
