@@ -117,6 +117,22 @@ remove a possible match. Missing, stale, malformed, unavailable, or unsupported
 projection facts evaluate as unknown and remain candidates. Canonical residual
 evaluation reuses filesystem semantics.
 
+Configured Obsidian Base resources compile through a separate versioned hosted Base
+plan. It reuses the canonical Bases parser/evaluator for shared and named-view
+filters, formulas, TaskNotes renderer fields, ordering, grouping, timezones,
+`this.file`, links, embeds, and backlinks. The authority supplies one projection
+plus a declared-complete bounded incoming/outgoing neighborhood; absence of the
+completion proof fails closed. mdbase-rs reconstructs resolved links and inverse
+backlinks from those projections and never accepts exact record Markdown for this
+path. Candidate and edge enumeration, snapshots, SQL, and cursors remain provider
+responsibilities.
+
+Base expression evaluation charges every AST node, including formula and list
+callback recursion, to a caller-supplied work ceiling. Exhaustion is
+`hosted_base_operator_budget_exceeded`, not a false filter result. Recursive parser
+and evaluator entry points use a bounded growable stack so valid TaskNotes method
+chains cannot exhaust a small async worker stack.
+
 ### Mutation planning
 
 A `MutationPlan` contains portable expected generation/resource revision, record

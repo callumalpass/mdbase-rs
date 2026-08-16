@@ -17,8 +17,8 @@ use super::{
     StructuralResolution,
 };
 
-pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 2;
-pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v2";
+pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 3;
+pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v3";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticProjectionFacts {

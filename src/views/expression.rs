@@ -406,6 +406,10 @@ pub(crate) struct BasesEvaluationContext {
     pub link_resolutions: Arc<BTreeMap<String, Option<String>>>,
     pub now: Option<String>,
     pub timezone: BasesTimezone,
+    /// Optional semantic work ceiling used by bounded hosted execution. One
+    /// unit is charged for every AST node evaluation, including nested list
+    /// callbacks and formulas.
+    pub work_limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -536,6 +540,15 @@ pub(crate) fn evaluate(
     expression: &str,
     context: &BasesEvaluationContext,
 ) -> Result<Value, String> {
+    stacker::maybe_grow(2 * 1024 * 1024, 4 * 1024 * 1024, || {
+        evaluate_on_base_stack(expression, context)
+    })
+}
+
+fn evaluate_on_base_stack(
+    expression: &str,
+    context: &BasesEvaluationContext,
+) -> Result<Value, String> {
     let ast = match parse_cached(expression) {
         Ok(ast) => ast,
         Err(error) if error == "Object literals are not supported by Obsidian Bases" => {
@@ -557,6 +570,12 @@ pub(crate) fn evaluate(
 /// used as a proxy for syntax validation: an otherwise valid formula can refer
 /// to fields that are absent from an arbitrary validation context.
 pub(crate) fn validate(expression: &str) -> Result<(), String> {
+    stacker::maybe_grow(2 * 1024 * 1024, 4 * 1024 * 1024, || {
+        validate_on_base_stack(expression)
+    })
+}
+
+fn validate_on_base_stack(expression: &str) -> Result<(), String> {
     match parse_cached(expression) {
         Ok(_) => Ok(()),
         // Obsidian currently accepts this source through its public expression
@@ -567,6 +586,15 @@ pub(crate) fn validate(expression: &str) -> Result<(), String> {
 }
 
 pub(crate) fn matches(expression: &str, context: &BasesEvaluationContext) -> Result<bool, String> {
+    stacker::maybe_grow(2 * 1024 * 1024, 4 * 1024 * 1024, || {
+        matches_on_base_stack(expression, context)
+    })
+}
+
+fn matches_on_base_stack(
+    expression: &str,
+    context: &BasesEvaluationContext,
+) -> Result<bool, String> {
     let ast = parse_cached(expression)?;
     let mut evaluator = Evaluator::new(context);
     match evaluator.evaluate(ast.as_ref(), &BTreeMap::new()) {
@@ -600,7 +628,10 @@ struct Evaluator<'a> {
     timezone: BasesTimezone,
     formula_cache: HashMap<String, RuntimeValue>,
     formula_stack: HashSet<String>,
+    remaining_work: usize,
 }
+
+pub(crate) const BASES_WORK_BUDGET_EXCEEDED: &str = "Obsidian Base expression work budget exceeded";
 
 type Scope = BTreeMap<String, RuntimeValue>;
 
@@ -616,10 +647,15 @@ impl<'a> Evaluator<'a> {
             timezone,
             formula_cache: HashMap::new(),
             formula_stack: HashSet::new(),
+            remaining_work: context.work_limit.unwrap_or(2_000_000),
         }
     }
 
     fn evaluate(&mut self, expression: &Expr, scope: &Scope) -> RuntimeValue {
+        let Some(remaining) = self.remaining_work.checked_sub(1) else {
+            return RuntimeValue::Error(BASES_WORK_BUDGET_EXCEEDED.to_string());
+        };
+        self.remaining_work = remaining;
         match expression {
             Expr::Literal(value) => from_json(value, None),
             Expr::Regex(pattern, flags) => RuntimeValue::Regex(pattern.clone(), flags.clone()),
@@ -2371,6 +2407,7 @@ mod tests {
             now: object.get("now").and_then(Value::as_str).map(String::from),
             timezone: BasesTimezone::from_setting(object.get("timezone").and_then(Value::as_str))
                 .expect("oracle timezone"),
+            work_limit: None,
         }
     }
 

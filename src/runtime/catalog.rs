@@ -247,8 +247,10 @@ impl CompiledCatalog {
         &self.collection.settings().id_field
     }
 
-    pub(crate) fn record_extensions(&self) -> &[String] {
-        &self.collection.settings().extensions
+    pub(crate) fn record_extensions(&self) -> Vec<String> {
+        std::iter::once("md".to_string())
+            .chain(self.collection.settings().extensions.iter().cloned())
+            .collect()
     }
 
     pub(crate) fn collection(&self) -> &Collection {

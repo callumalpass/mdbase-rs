@@ -332,13 +332,23 @@ mod tests {
         let structure = structure("[[target]]");
         let plan = catalog.plan_record_resolution(&structure).unwrap();
         let lookup = &plan.lookups[0];
+        let markdown_path = lookup
+            .alternatives
+            .iter()
+            .position(|item| item.priority == 1 && item.value == "target.md")
+            .unwrap();
+        let basename = lookup
+            .alternatives
+            .iter()
+            .position(|item| item.kind == RecordResolutionKeyKind::Basename)
+            .unwrap();
         let resolved = catalog
             .resolve_record_structure(
                 &structure,
                 &plan,
                 &[
-                    candidate(lookup, 1, "exact", "target.md"),
-                    candidate(lookup, 2, "basename", "elsewhere/target.md"),
+                    candidate(lookup, markdown_path, "exact", "target.md"),
+                    candidate(lookup, basename, "basename", "elsewhere/target.md"),
                 ],
             )
             .unwrap();
@@ -350,6 +360,16 @@ mod tests {
             resolved.occurrences[0].resolution,
             StructuralResolution::Resolved
         );
+    }
+
+    #[test]
+    fn extensionless_targets_always_plan_the_mandatory_markdown_path() {
+        let catalog = catalog();
+        let structure = structure("[[projects/mobile]]");
+        let plan = catalog.plan_record_resolution(&structure).unwrap();
+        assert!(plan.lookups[0].alternatives.iter().any(|lookup| {
+            lookup.kind == RecordResolutionKeyKind::Path && lookup.value == "projects/mobile.md"
+        }));
     }
 
     #[test]
@@ -431,6 +451,6 @@ mod tests {
         let plan = catalog.plan_record_resolution(&structure).unwrap();
         let value = serde_json::to_value(&plan).unwrap();
         assert_eq!(value["source_path"], json!("notes/source.md"));
-        assert_eq!(plan.lookups[0].alternatives.len(), 5);
+        assert_eq!(plan.lookups[0].alternatives.len(), 6);
     }
 }

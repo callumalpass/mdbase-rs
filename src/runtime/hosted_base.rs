@@ -82,6 +82,7 @@ pub struct HostedBaseRecordContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_context: Option<SemanticProjection>,
     pub operation_clock: String,
+    pub max_expression_steps: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -254,6 +255,10 @@ impl CompiledCatalog {
 }
 
 impl HostedBasePlan {
+    pub fn order_arity(&self) -> usize {
+        self.view.sort.len()
+    }
+
     pub fn validate_integrity(&self) -> Result<(), CatalogError> {
         if self.plan_version != HOSTED_BASE_PLAN_VERSION
             || self.invocation_digest != digest_plan(self)?
@@ -387,6 +392,7 @@ impl HostedBasePlan {
             link_resolutions,
             now: Some(input.operation_clock.clone()),
             timezone,
+            work_limit: Some(usize::try_from(input.max_expression_steps).unwrap_or(usize::MAX)),
         };
         let matched = match combined_filter_matches(
             self.document.filters.as_ref(),
@@ -394,6 +400,12 @@ impl HostedBasePlan {
             &context,
         ) {
             Ok(matched) => matched,
+            Err(error) if error == crate::views::BASES_WORK_BUDGET_EXCEEDED => {
+                return Err(CatalogError {
+                    code: "hosted_base_operator_budget_exceeded".to_string(),
+                    message: error,
+                })
+            }
             Err(error) => {
                 return Ok(HostedBaseEvaluation::Excluded {
                     diagnostics: vec![Diagnostic {
@@ -424,10 +436,17 @@ impl HostedBasePlan {
         );
         let mut computed = Map::new();
         for property in properties {
-            computed.insert(
-                property.clone(),
-                evaluate_property(&property, &context).unwrap_or(Value::Null),
-            );
+            let value = match evaluate_property(&property, &context) {
+                Ok(value) => value,
+                Err(error) if error == crate::views::BASES_WORK_BUDGET_EXCEEDED => {
+                    return Err(CatalogError {
+                        code: "hosted_base_operator_budget_exceeded".to_string(),
+                        message: error,
+                    })
+                }
+                Err(_) => Value::Null,
+            };
+            computed.insert(property.clone(), value);
         }
         let mut value_properties = self.view.order.clone();
         if let Some(group) = &self.view.group_by {
@@ -576,11 +595,10 @@ fn validate_projection(
 ) -> Result<(), CatalogError> {
     if projection.facts.catalog_revision != plan.catalog_revision
         || !projection.structure.structural_digest_is_valid()
-        || !projection.facts.semantic_complete
     {
         return Err(CatalogError {
             code: "hosted_base_projection_stale".to_string(),
-            message: "Obsidian Base evaluation requires a current, complete projection."
+            message: "Obsidian Base evaluation requires a current, integrity-bound projection."
                 .to_string(),
         });
     }
@@ -942,6 +960,17 @@ views:
             "tasks/high.md",
             "---\nstatus: todo\npriority: high\ntags: [task]\n---\n# urgent\n",
         );
+        let budget_error = plan
+            .evaluate_record(&HostedBaseRecordContext {
+                projection: projection.clone(),
+                related: Vec::new(),
+                relationship_neighborhood_complete: false,
+                query_context: None,
+                operation_clock: "2026-08-16T00:00:00Z".to_string(),
+                max_expression_steps: 1,
+            })
+            .unwrap_err();
+        assert_eq!(budget_error.code, "hosted_base_operator_budget_exceeded");
         let evaluated = plan
             .evaluate_record(&HostedBaseRecordContext {
                 projection,
@@ -949,6 +978,7 @@ views:
                 relationship_neighborhood_complete: false,
                 query_context: None,
                 operation_clock: "2026-08-16T00:00:00Z".to_string(),
+                max_expression_steps: 10_000,
             })
             .unwrap();
         let HostedBaseEvaluation::Included { row } = evaluated else {
@@ -1046,6 +1076,7 @@ views:
                 relationship_neighborhood_complete: false,
                 query_context: None,
                 operation_clock: "2026-08-16T00:00:00Z".to_string(),
+                max_expression_steps: 10_000,
             })
             .unwrap_err();
         assert_eq!(incomplete.code, "hosted_base_relationship_state_incomplete");
@@ -1057,6 +1088,7 @@ views:
                 relationship_neighborhood_complete: true,
                 query_context: None,
                 operation_clock: "2026-08-16T00:00:00Z".to_string(),
+                max_expression_steps: 10_000,
             })
             .unwrap();
         let HostedBaseEvaluation::Included { row } = evaluated else {
