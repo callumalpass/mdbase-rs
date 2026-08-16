@@ -110,6 +110,16 @@ fn discovers_and_executes_configured_obsidian_bases() {
     assert_eq!(executed.result["meta"]["total_count"], 2);
     assert_eq!(executed.result["results"][0]["path"], "tasks/high.md");
     assert_eq!(
+        executed.result["results"][0]["file"]["properties"]["status"],
+        "todo"
+    );
+    assert_eq!(executed.result["results"][0]["file"]["links"], json!([]));
+    assert_eq!(executed.result["results"][0]["file"]["embeds"], json!([]));
+    assert_eq!(
+        executed.result["results"][0]["file"]["backlinks"],
+        json!([])
+    );
+    assert_eq!(
         executed.result["results"][0]["values"]["formula.urgency"],
         2
     );

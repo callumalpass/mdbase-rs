@@ -17,9 +17,9 @@ use crate::expressions::evaluator::resolve_execution_timezone;
 use crate::v03::{Diagnostic, OperationResult};
 use crate::views::{
     base_uses_backlinks, combined_filter_matches, evaluate_property, is_configured_obsidian_source,
-    lower_hosted_candidate, stable_named_view_ids, uses_relationships, validate_base_expressions,
-    BaseFilter, BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone, ObsidianBaseDocument,
-    ObsidianBaseView, ViewReferenceInput,
+    lower_hosted_candidate, serialize_bases_file, stable_named_view_ids, uses_relationships,
+    validate_base_expressions, BaseFilter, BasesEvaluationContext, BasesFile, BasesLink,
+    BasesTimezone, ObsidianBaseDocument, ObsidianBaseView, ViewReferenceInput,
 };
 use crate::OperationCancellation;
 
@@ -509,17 +509,7 @@ impl HostedBasePlan {
                 .cloned()
                 .unwrap_or(Value::Null)
         });
-        let file_value = json!({
-            "path": file.path,
-            "name": file.name,
-            "basename": file.basename,
-            "folder": file.folder,
-            "ext": file.extension,
-            "size": file.size,
-            "mtime": file.mtime,
-            "ctime": file.ctime,
-            "tags": file.tags,
-        });
+        let file_value = serialize_bases_file(&file);
         Ok(HostedBaseEvaluation::Included {
             row: Box::new(HostedBaseRow {
                 path: input.projection.facts.path.clone(),
@@ -1072,7 +1062,7 @@ views:
         let projection = project(
             &catalog,
             "tasks/high.md",
-            "---\nstatus: todo\npriority: high\ntags: [task]\n---\n# urgent\n",
+            "---\nstatus: todo\npriority: high\ntags: [task]\n---\n# urgent\nSee [[missing]]. ![[image]]\n",
         );
         let mut incomplete_projection = projection.clone();
         incomplete_projection.facts.semantic_complete = false;
@@ -1130,6 +1120,11 @@ views:
         assert_eq!(row.path, "tasks/high.md");
         assert_eq!(row.values["formula.urgency"], 2);
         assert_eq!(row.values["file.name"], "high");
+        assert_eq!(row.file["properties"]["status"], "todo");
+        assert_eq!(row.file["links"][0]["path"], "missing");
+        assert_eq!(row.file["links"][0]["resolved_path"], Value::Null);
+        assert_eq!(row.file["embeds"][0]["path"], "image");
+        assert_eq!(row.file["backlinks"], json!([]));
         assert!(!serde_json::to_string(&row).unwrap().contains("# urgent"));
     }
 

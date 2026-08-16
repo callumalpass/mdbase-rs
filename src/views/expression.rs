@@ -446,6 +446,33 @@ pub(crate) struct BasesLink {
     pub external: bool,
 }
 
+pub(crate) fn serialize_bases_file(file: &BasesFile) -> Value {
+    fn link_value(link: &BasesLink) -> Value {
+        serde_json::json!({
+            "path": link.path,
+            "display": link.display,
+            "resolved_path": link.resolved_path.clone().flatten(),
+            "external": link.external,
+        })
+    }
+
+    serde_json::json!({
+        "path": file.path,
+        "name": file.name,
+        "basename": file.basename,
+        "folder": file.folder,
+        "ext": file.extension,
+        "size": file.size,
+        "mtime": file.mtime,
+        "ctime": file.ctime,
+        "properties": file.properties,
+        "tags": file.tags,
+        "links": file.links.iter().map(link_value).collect::<Vec<_>>(),
+        "embeds": file.embeds.iter().map(link_value).collect::<Vec<_>>(),
+        "backlinks": file.backlinks.iter().map(link_value).collect::<Vec<_>>(),
+    })
+}
+
 #[derive(Clone, Debug)]
 struct DateValue {
     millis: i64,

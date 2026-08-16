@@ -8,7 +8,9 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use super::expression::{self, BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone};
+use super::expression::{
+    self, serialize_bases_file, BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone,
+};
 use super::model::{
     identifier, presentation_for, stable_named_view_ids, BaseFilter, BaseGroupBy,
     NamedViewDescriptor, ObsidianBaseDocument, ObsidianBaseView, ViewDocumentDescriptor,
@@ -885,17 +887,7 @@ struct BaseRow<'a> {
 fn serialize_base_row(row: &BaseRow<'_>) -> Value {
     json!({
         "path": row.record.rel_path,
-        "file": {
-            "path": row.file.path,
-            "name": row.file.name,
-            "basename": row.file.basename,
-            "folder": row.file.folder,
-            "ext": row.file.extension,
-            "size": row.file.size,
-            "mtime": row.file.mtime,
-            "ctime": row.file.ctime,
-            "tags": row.file.tags,
-        },
+        "file": serialize_bases_file(&row.file),
         "effective_frontmatter": row.record.effective_frontmatter,
         "types": row.record.type_names,
         "values": row.values,
