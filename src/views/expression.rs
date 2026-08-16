@@ -9,6 +9,8 @@ use chrono_tz::Tz;
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value};
 
+use crate::OperationCancellation;
+
 #[derive(Clone, Debug, PartialEq)]
 enum Expr {
     Literal(Value),
@@ -410,6 +412,9 @@ pub(crate) struct BasesEvaluationContext {
     /// unit is charged for every AST node evaluation, including nested list
     /// callbacks and formulas.
     pub work_limit: Option<usize>,
+    /// Cooperative host cancellation checked at every AST node. Filesystem
+    /// execution leaves this unset and uses its outer operation boundaries.
+    pub cancellation: Option<OperationCancellation>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -632,6 +637,7 @@ struct Evaluator<'a> {
 }
 
 pub(crate) const BASES_WORK_BUDGET_EXCEEDED: &str = "Obsidian Base expression work budget exceeded";
+pub(crate) const BASES_OPERATION_CANCELLED: &str = "Obsidian Base expression evaluation cancelled";
 
 type Scope = BTreeMap<String, RuntimeValue>;
 
@@ -652,6 +658,14 @@ impl<'a> Evaluator<'a> {
     }
 
     fn evaluate(&mut self, expression: &Expr, scope: &Scope) -> RuntimeValue {
+        if self
+            .context
+            .cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.stop_reason().is_some())
+        {
+            return RuntimeValue::Error(BASES_OPERATION_CANCELLED.to_string());
+        }
         let Some(remaining) = self.remaining_work.checked_sub(1) else {
             return RuntimeValue::Error(BASES_WORK_BUDGET_EXCEEDED.to_string());
         };
@@ -2408,6 +2422,7 @@ mod tests {
             timezone: BasesTimezone::from_setting(object.get("timezone").and_then(Value::as_str))
                 .expect("oracle timezone"),
             work_limit: None,
+            cancellation: None,
         }
     }
 

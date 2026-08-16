@@ -131,7 +131,8 @@ Base expression evaluation charges every AST node, including formula and list
 callback recursion, to a caller-supplied work ceiling. Exhaustion is
 `hosted_base_operator_budget_exceeded`, not a false filter result. Recursive parser
 and evaluator entry points use a bounded growable stack so valid TaskNotes method
-chains cannot exhaust a small async worker stack.
+chains cannot exhaust a small async worker stack. Hosted evaluators also accept a
+provider-neutral cooperative cancellation/deadline token checked at every AST node.
 
 For stale or absent provider projections, `finalize_projection_batch` reconstructs
 a caller-bounded exact snapshot without consulting stale provider indexes. It

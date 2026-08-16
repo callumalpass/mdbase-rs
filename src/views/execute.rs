@@ -768,6 +768,7 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
             now: Some(clock.clone()),
             timezone: timezone.clone(),
             work_limit: None,
+            cancellation: None,
         };
         match combined_filter_matches(document.filters.as_ref(), view.filters.as_ref(), &context) {
             Ok(true) => {}

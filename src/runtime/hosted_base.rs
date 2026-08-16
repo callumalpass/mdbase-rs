@@ -20,6 +20,7 @@ use crate::views::{
     stable_named_view_ids, validate_base_expressions, BasesEvaluationContext, BasesFile, BasesLink,
     BasesTimezone, ObsidianBaseDocument, ObsidianBaseView, ViewReferenceInput,
 };
+use crate::OperationCancellation;
 
 use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
 
@@ -278,6 +279,25 @@ impl HostedBasePlan {
         &self,
         input: &HostedBaseRecordContext,
     ) -> Result<HostedBaseEvaluation, CatalogError> {
+        self.evaluate_record_inner(input, None)
+    }
+
+    /// Evaluate with a cooperative token checked at every expression AST node.
+    /// Providers can run this method on a blocking worker and cancel the token
+    /// when the owning request future is dropped.
+    pub fn evaluate_record_with_cancellation(
+        &self,
+        input: &HostedBaseRecordContext,
+        cancellation: &OperationCancellation,
+    ) -> Result<HostedBaseEvaluation, CatalogError> {
+        self.evaluate_record_inner(input, Some(cancellation.clone()))
+    }
+
+    fn evaluate_record_inner(
+        &self,
+        input: &HostedBaseRecordContext,
+        cancellation: Option<OperationCancellation>,
+    ) -> Result<HostedBaseEvaluation, CatalogError> {
         self.validate_integrity()?;
         if input.related.len() > MAX_HOSTED_BASE_RELATED_RECORDS {
             return Err(CatalogError {
@@ -393,6 +413,7 @@ impl HostedBasePlan {
             now: Some(input.operation_clock.clone()),
             timezone,
             work_limit: Some(usize::try_from(input.max_expression_steps).unwrap_or(usize::MAX)),
+            cancellation,
         };
         let matched = match combined_filter_matches(
             self.document.filters.as_ref(),
@@ -403,6 +424,12 @@ impl HostedBasePlan {
             Err(error) if error == crate::views::BASES_WORK_BUDGET_EXCEEDED => {
                 return Err(CatalogError {
                     code: "hosted_base_operator_budget_exceeded".to_string(),
+                    message: error,
+                })
+            }
+            Err(error) if error == crate::views::BASES_OPERATION_CANCELLED => {
+                return Err(CatalogError {
+                    code: "operation_cancelled".to_string(),
                     message: error,
                 })
             }
@@ -441,6 +468,12 @@ impl HostedBasePlan {
                 Err(error) if error == crate::views::BASES_WORK_BUDGET_EXCEEDED => {
                     return Err(CatalogError {
                         code: "hosted_base_operator_budget_exceeded".to_string(),
+                        message: error,
+                    })
+                }
+                Err(error) if error == crate::views::BASES_OPERATION_CANCELLED => {
+                    return Err(CatalogError {
+                        code: "operation_cancelled".to_string(),
                         message: error,
                     })
                 }
@@ -971,6 +1004,22 @@ views:
             })
             .unwrap_err();
         assert_eq!(budget_error.code, "hosted_base_operator_budget_exceeded");
+        let cancellation = OperationCancellation::new();
+        cancellation.cancel();
+        let cancelled = plan
+            .evaluate_record_with_cancellation(
+                &HostedBaseRecordContext {
+                    projection: projection.clone(),
+                    related: Vec::new(),
+                    relationship_neighborhood_complete: false,
+                    query_context: None,
+                    operation_clock: "2026-08-16T00:00:00Z".to_string(),
+                    max_expression_steps: 10_000,
+                },
+                &cancellation,
+            )
+            .unwrap_err();
+        assert_eq!(cancelled.code, "operation_cancelled");
         let evaluated = plan
             .evaluate_record(&HostedBaseRecordContext {
                 projection,
