@@ -28,7 +28,7 @@ use super::{
     SEMANTIC_PROJECTION_SCHEMA_VERSION,
 };
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 9;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 10;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -105,6 +105,11 @@ pub struct CandidateComparison {
     /// result as canonical CEL for this literal/operator pair. Conservative
     /// comparisons may be observed but must never narrow provider candidates.
     pub pruning: CandidateComparisonPruning,
+    /// Catalog proof for strict provider evaluation. A provider must still
+    /// verify the actual current projection value has this kind before using
+    /// the comparison as exact rather than conservative candidate pruning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_kind: Option<HostedScalarKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,7 +467,8 @@ impl CompiledCatalog {
                 }
             }
         }
-        let candidate = conjunction(predicates);
+        let mut candidate = conjunction(predicates);
+        annotate_candidate_scalar_kinds(&mut candidate, &query.types, self.collection());
         if predicate_nodes(&candidate) > MAX_PREDICATE_NODES {
             return Err(query_error(
                 "query_operator_limit_exceeded",
@@ -1664,6 +1670,7 @@ fn lower_expression(
                     operator,
                     pruning: comparison_pruning(operator, &value),
                     value,
+                    value_kind: None,
                 },
             }))
         }
@@ -1683,6 +1690,7 @@ fn lower_expression(
                     operator: CandidateComparisonOperator::Contains,
                     pruning: comparison_pruning(CandidateComparisonOperator::Contains, &value),
                     value,
+                    value_kind: None,
                 },
             }))
         }
@@ -1771,6 +1779,29 @@ fn hosted_scalar_kind(
             proven
         }
         CandidateField::Types | CandidateField::BodyTags => None,
+    }
+}
+
+fn annotate_candidate_scalar_kinds(
+    predicate: &mut CandidatePredicate,
+    selected_types: &[String],
+    collection: &crate::Collection,
+) {
+    match predicate {
+        CandidatePredicate::And { terms } | CandidatePredicate::Or { terms } => {
+            for term in terms {
+                annotate_candidate_scalar_kinds(term, selected_types, collection);
+            }
+        }
+        CandidatePredicate::Not { term } => {
+            annotate_candidate_scalar_kinds(term, selected_types, collection);
+        }
+        CandidatePredicate::Compare { comparison } => {
+            comparison.value_kind =
+                hosted_scalar_kind(&comparison.field, selected_types, collection);
+        }
+        CandidatePredicate::All | CandidatePredicate::None | CandidatePredicate::HasType { .. } => {
+        }
     }
 }
 
@@ -2263,6 +2294,7 @@ mod tests {
                     term,
                     CandidatePredicate::Compare { comparison }
                         if comparison.pruning == CandidateComparisonPruning::ExactJson
+                            && comparison.value_kind == Some(HostedScalarKind::String)
                 ))
         ));
         assert_eq!(plan.page_size, 50);
@@ -2716,10 +2748,10 @@ mod tests {
         let second = catalog().compile_hosted_query(&query).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
-        assert_eq!(first.version, 9);
+        assert_eq!(first.version, 10);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
         assert!(first.plan_digest.starts_with("sha256:"));
-        assert_eq!(serde_json::to_value(first).unwrap()["version"], 9);
+        assert_eq!(serde_json::to_value(first).unwrap()["version"], 10);
     }
 
     #[test]

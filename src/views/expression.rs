@@ -749,6 +749,7 @@ fn lower_candidate_expression(expression: &Expr) -> CandidatePredicate {
                         },
                         value,
                         pruning: CandidateComparisonPruning::ExactJson,
+                        value_kind: None,
                     },
                 }
             })
@@ -767,6 +768,7 @@ fn lower_candidate_expression(expression: &Expr) -> CandidatePredicate {
                             operator: CandidateComparisonOperator::Contains,
                             value,
                             pruning: CandidateComparisonPruning::NormalizedTagHierarchy,
+                            value_kind: None,
                         },
                     };
                 }
@@ -2740,6 +2742,7 @@ mod tests {
                     operator: CandidateComparisonOperator::Contains,
                     value: Value::String(ref value),
                     pruning: CandidateComparisonPruning::NormalizedTagHierarchy,
+                    value_kind: None,
                 }
             } if value == "task"
         ));
