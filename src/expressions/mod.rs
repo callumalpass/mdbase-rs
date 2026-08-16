@@ -28,6 +28,42 @@ pub(crate) fn expr_contains_ident(expr: &crate::expressions::ast::Expr, name: &s
     }
 }
 
+/// Whether an expression reads exact body prose rather than projected structural
+/// facts such as `file.tags`, `file.links`, or `file.embeds`.
+pub(crate) fn expr_reads_body_prose(expr: &crate::expressions::ast::Expr) -> bool {
+    use crate::expressions::ast::Expr;
+    match expr {
+        Expr::Dot(object, field) => {
+            (field == "body"
+                && matches!(
+                    object.as_ref(),
+                    Expr::Ident(name) if name == "file"
+                ))
+                || expr_reads_body_prose(object)
+        }
+        Expr::Index(object, index) => {
+            (matches!(object.as_ref(), Expr::Ident(name) if name == "file")
+                && matches!(index.as_ref(), Expr::Str(field) if field == "body"))
+                || expr_reads_body_prose(object)
+                || expr_reads_body_prose(index)
+        }
+        Expr::BinOp(left, _, right) | Expr::NullCoalesce(left, right) => {
+            expr_reads_body_prose(left) || expr_reads_body_prose(right)
+        }
+        Expr::UnaryOp(_, expression) => expr_reads_body_prose(expression),
+        Expr::Array(elements) => elements.iter().any(expr_reads_body_prose),
+        Expr::Call(function, arguments) => {
+            expr_reads_body_prose(function) || arguments.iter().any(expr_reads_body_prose)
+        }
+        Expr::Conditional(condition, then_expression, else_expression) => {
+            expr_reads_body_prose(condition)
+                || expr_reads_body_prose(then_expression)
+                || expr_reads_body_prose(else_expression)
+        }
+        _ => false,
+    }
+}
+
 /// Check if a JSON value is truthy (for where clause evaluation).
 pub(crate) fn is_truthy_value(val: &serde_json::Value) -> bool {
     match val {

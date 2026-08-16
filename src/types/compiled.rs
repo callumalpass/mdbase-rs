@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::errors::{CIRCULAR_COMPUTED, INVALID_TYPE_DEFINITION};
 use crate::expressions::ast::Expr;
 use crate::expressions::expr_contains_ident;
+use crate::expressions::expr_reads_body_prose;
 use crate::expressions::parser::Parser;
 
 use super::schema::{FieldDef, TypeDef};
@@ -14,6 +15,9 @@ use super::schema::{FieldDef, TypeDef};
 pub(crate) struct CompiledComputed {
     pub expression: Arc<Expr>,
     pub dependencies: Vec<String>,
+    /// Whether evaluating this field can copy exact body prose into its value.
+    /// Hosted projections must omit such values and use canonical exact fallback.
+    pub body_dependent: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -68,12 +72,29 @@ fn compile_type(type_def: &TypeDef) -> Result<CompiledTypePlan, CompileTypeError
         plan.computed.insert(
             field_name.clone(),
             CompiledComputed {
+                body_dependent: expr_reads_body_prose(&expression),
                 expression: Arc::new(expression),
                 dependencies,
             },
         );
     }
     plan.computed_order = computed_order(type_def, &plan.computed)?;
+    for field_name in &plan.computed_order {
+        let body_dependent = plan.computed.get(field_name).is_some_and(|field| {
+            field.body_dependent
+                || field.dependencies.iter().any(|dependency| {
+                    plan.computed
+                        .get(dependency)
+                        .is_some_and(|dependency| dependency.body_dependent)
+                })
+        });
+        if body_dependent {
+            plan.computed
+                .get_mut(field_name)
+                .expect("computed order only names compiled fields")
+                .body_dependent = true;
+        }
+    }
     validate_match_fields(type_def, &computed_names)?;
 
     if let Some(source) = type_def

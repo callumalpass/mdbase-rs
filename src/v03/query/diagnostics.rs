@@ -16,7 +16,7 @@ pub(super) fn invalid_schema(mut diagnostic: Diagnostic) -> Diagnostic {
     diagnostic
 }
 
-pub(super) fn evaluation(
+pub(crate) fn evaluation(
     path: &str,
     field: &str,
     context: &str,

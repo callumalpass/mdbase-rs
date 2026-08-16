@@ -9,6 +9,12 @@ use chrono_tz::Tz;
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value};
 
+use crate::runtime::{
+    CandidateComparison, CandidateComparisonOperator, CandidateComparisonPruning, CandidateField,
+    CandidatePredicate,
+};
+use crate::OperationCancellation;
+
 #[derive(Clone, Debug, PartialEq)]
 enum Expr {
     Literal(Value),
@@ -406,6 +412,13 @@ pub(crate) struct BasesEvaluationContext {
     pub link_resolutions: Arc<BTreeMap<String, Option<String>>>,
     pub now: Option<String>,
     pub timezone: BasesTimezone,
+    /// Optional semantic work ceiling used by bounded hosted execution. One
+    /// unit is charged for every AST node evaluation, including nested list
+    /// callbacks and formulas.
+    pub work_limit: Option<usize>,
+    /// Cooperative host cancellation checked at every AST node. Filesystem
+    /// execution leaves this unset and uses its outer operation boundaries.
+    pub cancellation: Option<OperationCancellation>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -431,6 +444,33 @@ pub(crate) struct BasesLink {
     pub display: Option<String>,
     pub resolved_path: Option<Option<String>>,
     pub external: bool,
+}
+
+pub(crate) fn serialize_bases_file(file: &BasesFile) -> Value {
+    fn link_value(link: &BasesLink) -> Value {
+        serde_json::json!({
+            "path": link.path,
+            "display": link.display,
+            "resolved_path": link.resolved_path.clone().flatten(),
+            "external": link.external,
+        })
+    }
+
+    serde_json::json!({
+        "path": file.path,
+        "name": file.name,
+        "basename": file.basename,
+        "folder": file.folder,
+        "ext": file.extension,
+        "size": file.size,
+        "mtime": file.mtime,
+        "ctime": file.ctime,
+        "properties": file.properties,
+        "tags": file.tags,
+        "links": file.links.iter().map(link_value).collect::<Vec<_>>(),
+        "embeds": file.embeds.iter().map(link_value).collect::<Vec<_>>(),
+        "backlinks": file.backlinks.iter().map(link_value).collect::<Vec<_>>(),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -536,6 +576,15 @@ pub(crate) fn evaluate(
     expression: &str,
     context: &BasesEvaluationContext,
 ) -> Result<Value, String> {
+    stacker::maybe_grow(2 * 1024 * 1024, 4 * 1024 * 1024, || {
+        evaluate_on_base_stack(expression, context)
+    })
+}
+
+fn evaluate_on_base_stack(
+    expression: &str,
+    context: &BasesEvaluationContext,
+) -> Result<Value, String> {
     let ast = match parse_cached(expression) {
         Ok(ast) => ast,
         Err(error) if error == "Object literals are not supported by Obsidian Bases" => {
@@ -557,6 +606,12 @@ pub(crate) fn evaluate(
 /// used as a proxy for syntax validation: an otherwise valid formula can refer
 /// to fields that are absent from an arbitrary validation context.
 pub(crate) fn validate(expression: &str) -> Result<(), String> {
+    stacker::maybe_grow(2 * 1024 * 1024, 4 * 1024 * 1024, || {
+        validate_on_base_stack(expression)
+    })
+}
+
+fn validate_on_base_stack(expression: &str) -> Result<(), String> {
     match parse_cached(expression) {
         Ok(_) => Ok(()),
         // Obsidian currently accepts this source through its public expression
@@ -567,6 +622,15 @@ pub(crate) fn validate(expression: &str) -> Result<(), String> {
 }
 
 pub(crate) fn matches(expression: &str, context: &BasesEvaluationContext) -> Result<bool, String> {
+    stacker::maybe_grow(2 * 1024 * 1024, 4 * 1024 * 1024, || {
+        matches_on_base_stack(expression, context)
+    })
+}
+
+fn matches_on_base_stack(
+    expression: &str,
+    context: &BasesEvaluationContext,
+) -> Result<bool, String> {
     let ast = parse_cached(expression)?;
     let mut evaluator = Evaluator::new(context);
     match evaluator.evaluate(ast.as_ref(), &BTreeMap::new()) {
@@ -594,13 +658,279 @@ fn parse_cached(expression: &str) -> Result<Arc<Expr>, String> {
     Ok(ast)
 }
 
+pub(crate) fn lower_hosted_candidate(expression: &str) -> CandidatePredicate {
+    parse_cached(expression)
+        .map(|expression| lower_candidate_expression(expression.as_ref()))
+        .unwrap_or(CandidatePredicate::All)
+}
+
+/// Return whether an Obsidian Bases expression requires the collection
+/// relationship graph or link-resolution namespace. This intentionally walks
+/// the parsed syntax tree rather than searching source text, so string
+/// literals and similarly named frontmatter fields do not create false
+/// dependencies.
+pub(crate) fn uses_relationships(expression: &str) -> bool {
+    parse_cached(expression)
+        .map(|expression| expression_uses_relationships(expression.as_ref()))
+        // Validation normally rejects parse failures before planning. Treat
+        // any exceptional accepted syntax conservatively so hosted execution
+        // cannot select a projection-only path without proving independence.
+        .unwrap_or(true)
+}
+
+/// Return whether an expression reads the filesystem creation/change time.
+/// Hosted authorities do not possess a portable canonical ctime, so planning
+/// must reject this dependency rather than silently evaluating it as null.
+pub(crate) fn uses_file_ctime(expression: &str) -> bool {
+    parse_cached(expression)
+        .map(|expression| expression_uses_file_ctime(expression.as_ref()))
+        .unwrap_or(true)
+}
+
+/// Return whether an expression can read backlinks. Unknown computed members
+/// are classified conservatively because their runtime name can depend on the
+/// current row and therefore cannot prove graph independence during planning.
+pub(crate) fn uses_backlinks(expression: &str) -> bool {
+    parse_cached(expression)
+        .map(|expression| expression_uses_backlinks(expression.as_ref()))
+        .unwrap_or(true)
+}
+
+fn constant_member_name(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Literal(Value::String(value)) => Some(value.clone()),
+        Expr::Binary(operator, left, right) if operator == "+" => {
+            let mut value = constant_member_name(left)?;
+            value.push_str(&constant_member_name(right)?);
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+fn member_maybe_matches(member: &Member, expected: &[&str]) -> bool {
+    match member {
+        Member::Named(name) => expected.contains(&name.as_str()),
+        Member::Computed(value) => {
+            constant_member_name(value).is_none_or(|name| expected.contains(&name.as_str()))
+        }
+    }
+}
+
+fn expression_uses_file_ctime(expression: &Expr) -> bool {
+    match expression {
+        Expr::Literal(_) | Expr::Regex(_, _) | Expr::Identifier(_) => false,
+        Expr::Array(values) => values.iter().any(expression_uses_file_ctime),
+        Expr::Unary(_, value) => expression_uses_file_ctime(value),
+        Expr::Binary(_, left, right) => {
+            expression_uses_file_ctime(left) || expression_uses_file_ctime(right)
+        }
+        Expr::Member(object, member) => {
+            let ctime_member = matches!(object.as_ref(), Expr::Identifier(namespace) if namespace == "file")
+                && member_maybe_matches(member, &["ctime"]);
+            ctime_member
+                || expression_uses_file_ctime(object)
+                || matches!(member, Member::Computed(value) if expression_uses_file_ctime(value))
+        }
+        Expr::Call(callee, arguments) => {
+            expression_uses_file_ctime(callee) || arguments.iter().any(expression_uses_file_ctime)
+        }
+    }
+}
+
+fn expression_uses_relationships(expression: &Expr) -> bool {
+    match expression {
+        Expr::Literal(_) | Expr::Regex(_, _) | Expr::Identifier(_) => false,
+        Expr::Array(values) => values.iter().any(expression_uses_relationships),
+        Expr::Unary(_, value) => expression_uses_relationships(value),
+        Expr::Binary(_, left, right) => {
+            expression_uses_relationships(left) || expression_uses_relationships(right)
+        }
+        Expr::Member(object, member) => {
+            let relationship_member = member_maybe_matches(
+                member,
+                &[
+                    "links",
+                    "embeds",
+                    "backlinks",
+                    "hasLink",
+                    "asFile",
+                    "asLink",
+                ],
+            );
+            relationship_member
+                || expression_uses_relationships(object)
+                || matches!(member, Member::Computed(value) if expression_uses_relationships(value))
+        }
+        Expr::Call(callee, arguments) => {
+            let relationship_call = match callee.as_ref() {
+                Expr::Identifier(name) => name == "file",
+                Expr::Member(_, Member::Named(name)) => {
+                    matches!(name.as_str(), "hasLink" | "asFile" | "asLink")
+                }
+                _ => false,
+            };
+            relationship_call
+                || expression_uses_relationships(callee)
+                || arguments.iter().any(expression_uses_relationships)
+        }
+    }
+}
+
+fn expression_uses_backlinks(expression: &Expr) -> bool {
+    match expression {
+        Expr::Literal(_) | Expr::Regex(_, _) | Expr::Identifier(_) => false,
+        Expr::Array(values) => values.iter().any(expression_uses_backlinks),
+        Expr::Unary(_, value) => expression_uses_backlinks(value),
+        Expr::Binary(_, left, right) => {
+            expression_uses_backlinks(left) || expression_uses_backlinks(right)
+        }
+        Expr::Member(object, member) => {
+            member_maybe_matches(member, &["backlinks"])
+                || expression_uses_backlinks(object)
+                || matches!(member, Member::Computed(value) if expression_uses_backlinks(value))
+        }
+        Expr::Call(callee, arguments) => {
+            expression_uses_backlinks(callee) || arguments.iter().any(expression_uses_backlinks)
+        }
+    }
+}
+
+fn lower_candidate_expression(expression: &Expr) -> CandidatePredicate {
+    match expression {
+        Expr::Binary(operator, left, right) if operator == "&&" => candidate_and(vec![
+            lower_candidate_expression(left),
+            lower_candidate_expression(right),
+        ]),
+        Expr::Binary(operator, left, right) if operator == "||" => {
+            let terms = vec![
+                lower_candidate_expression(left),
+                lower_candidate_expression(right),
+            ];
+            if terms
+                .iter()
+                .any(|term| matches!(term, CandidatePredicate::All))
+            {
+                CandidatePredicate::All
+            } else {
+                CandidatePredicate::Or { terms }
+            }
+        }
+        Expr::Binary(operator, left, right) if matches!(operator.as_str(), "==" | "!=") => {
+            let pair = candidate_field(left)
+                .and_then(|field| candidate_literal(right).map(|value| (field, value)))
+                .or_else(|| {
+                    candidate_field(right)
+                        .and_then(|field| candidate_literal(left).map(|value| (field, value)))
+                });
+            pair.map_or(CandidatePredicate::All, |(field, value)| {
+                CandidatePredicate::Compare {
+                    comparison: CandidateComparison {
+                        field,
+                        operator: if operator == "==" {
+                            CandidateComparisonOperator::Equal
+                        } else {
+                            CandidateComparisonOperator::NotEqual
+                        },
+                        value,
+                        pruning: CandidateComparisonPruning::ExactJson,
+                        value_kind: None,
+                    },
+                }
+            })
+        }
+        Expr::Call(callee, arguments) if arguments.len() == 1 => {
+            let Expr::Member(object, Member::Named(method)) = callee.as_ref() else {
+                return CandidatePredicate::All;
+            };
+            if method == "hasTag" && candidate_path(object).as_deref() == Some("file") {
+                if let Some(value) = candidate_literal(&arguments[0])
+                    .and_then(|value| value.as_str().map(normalize_tag).map(Value::String))
+                {
+                    return CandidatePredicate::Compare {
+                        comparison: CandidateComparison {
+                            field: CandidateField::BodyTags,
+                            operator: CandidateComparisonOperator::Contains,
+                            value,
+                            pruning: CandidateComparisonPruning::NormalizedTagHierarchy,
+                            value_kind: None,
+                        },
+                    };
+                }
+            }
+            CandidatePredicate::All
+        }
+        _ => CandidatePredicate::All,
+    }
+}
+
+fn candidate_and(terms: Vec<CandidatePredicate>) -> CandidatePredicate {
+    let terms = terms
+        .into_iter()
+        .filter(|term| !matches!(term, CandidatePredicate::All))
+        .collect::<Vec<_>>();
+    match terms.len() {
+        0 => CandidatePredicate::All,
+        1 => terms.into_iter().next().unwrap_or(CandidatePredicate::All),
+        _ => CandidatePredicate::And { terms },
+    }
+}
+
+fn candidate_field(expression: &Expr) -> Option<CandidateField> {
+    let path = candidate_path(expression)?;
+    let segments = path.split('.').collect::<Vec<_>>();
+    match segments.as_slice() {
+        [name] if !matches!(*name, "file" | "this" | "formula" | "note") => {
+            Some(CandidateField::EffectiveFrontmatter(vec![name.to_string()]))
+        }
+        ["note", name] => Some(CandidateField::EffectiveFrontmatter(vec![name.to_string()])),
+        ["file", "path"] => Some(CandidateField::Path),
+        ["file", name] if matches!(*name, "name" | "basename" | "ext" | "size" | "mtime") => {
+            Some(CandidateField::File(name.to_string()))
+        }
+        _ => None,
+    }
+}
+
+fn candidate_path(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Identifier(value) => Some(value.clone()),
+        Expr::Member(object, Member::Named(value)) => {
+            Some(format!("{}.{}", candidate_path(object)?, value))
+        }
+        Expr::Member(object, Member::Computed(value)) => {
+            let Value::String(value) = candidate_literal(value)? else {
+                return None;
+            };
+            Some(format!("{}.{}", candidate_path(object)?, value))
+        }
+        _ => None,
+    }
+}
+
+fn candidate_literal(expression: &Expr) -> Option<Value> {
+    match expression {
+        Expr::Literal(value) => Some(value.clone()),
+        Expr::Array(values) => values
+            .iter()
+            .map(candidate_literal)
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
+        _ => None,
+    }
+}
+
 struct Evaluator<'a> {
     context: &'a BasesEvaluationContext,
     now: DateValue,
     timezone: BasesTimezone,
     formula_cache: HashMap<String, RuntimeValue>,
     formula_stack: HashSet<String>,
+    remaining_work: usize,
 }
+
+pub(crate) const BASES_WORK_BUDGET_EXCEEDED: &str = "Obsidian Base expression work budget exceeded";
+pub(crate) const BASES_OPERATION_CANCELLED: &str = "Obsidian Base expression evaluation cancelled";
 
 type Scope = BTreeMap<String, RuntimeValue>;
 
@@ -616,10 +946,23 @@ impl<'a> Evaluator<'a> {
             timezone,
             formula_cache: HashMap::new(),
             formula_stack: HashSet::new(),
+            remaining_work: context.work_limit.unwrap_or(2_000_000),
         }
     }
 
     fn evaluate(&mut self, expression: &Expr, scope: &Scope) -> RuntimeValue {
+        if self
+            .context
+            .cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.stop_reason().is_some())
+        {
+            return RuntimeValue::Error(BASES_OPERATION_CANCELLED.to_string());
+        }
+        let Some(remaining) = self.remaining_work.checked_sub(1) else {
+            return RuntimeValue::Error(BASES_WORK_BUDGET_EXCEEDED.to_string());
+        };
+        self.remaining_work = remaining;
         match expression {
             Expr::Literal(value) => from_json(value, None),
             Expr::Regex(pattern, flags) => RuntimeValue::Regex(pattern.clone(), flags.clone()),
@@ -2371,6 +2714,8 @@ mod tests {
             now: object.get("now").and_then(Value::as_str).map(String::from),
             timezone: BasesTimezone::from_setting(object.get("timezone").and_then(Value::as_str))
                 .expect("oracle timezone"),
+            work_limit: None,
+            cancellation: None,
         }
     }
 
@@ -2444,6 +2789,22 @@ mod tests {
     }
 
     #[test]
+    fn computed_file_members_are_classified_before_hosted_planning() {
+        assert!(uses_relationships(r#"file["back" + "links"]"#));
+        assert!(uses_relationships(r#"value["as" + "File"]()"#));
+        assert!(uses_relationships("file[property]"));
+        assert!(!uses_relationships(r#"file["na" + "me"]"#));
+
+        assert!(uses_backlinks(r#"file["back" + "links"]"#));
+        assert!(uses_backlinks("file[property]"));
+        assert!(!uses_backlinks(r#"file["em" + "beds"]"#));
+
+        assert!(uses_file_ctime(r#"file["ct" + "ime"]"#));
+        assert!(uses_file_ctime("file[property]"));
+        assert!(!uses_file_ctime(r#"file["na" + "me"]"#));
+    }
+
+    #[test]
     fn evaluates_formula_dependencies_and_file_predicates() {
         let mut context = BasesEvaluationContext {
             note: Map::from_iter([
@@ -2469,6 +2830,27 @@ mod tests {
             &context
         )
         .unwrap());
+    }
+
+    #[test]
+    fn lowers_only_canonical_hierarchical_tag_candidates() {
+        let candidate = lower_hosted_candidate("file.hasTag(\"#task\")");
+        assert!(matches!(
+            candidate,
+            CandidatePredicate::Compare {
+                comparison: CandidateComparison {
+                    field: CandidateField::BodyTags,
+                    operator: CandidateComparisonOperator::Contains,
+                    value: Value::String(ref value),
+                    pruning: CandidateComparisonPruning::NormalizedTagHierarchy,
+                    value_kind: None,
+                }
+            } if value == "task"
+        ));
+        assert_eq!(
+            lower_hosted_candidate("file.hasTag(42)"),
+            CandidatePredicate::All
+        );
     }
 
     #[test]

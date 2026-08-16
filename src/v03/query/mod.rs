@@ -1,11 +1,11 @@
 //! Canonical v0.3 query validation, semantic preflight, and execution.
 
-mod context;
-mod diagnostics;
+pub(crate) mod context;
+pub(crate) mod diagnostics;
 mod execute;
-mod model;
-mod preflight;
-mod result;
+pub(crate) mod model;
+pub(crate) mod preflight;
+pub(crate) mod result;
 
 pub use execute::QueryPerformance;
 pub(crate) use execute::{

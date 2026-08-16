@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ObsidianBaseDocument {
     #[serde(default)]
     pub filters: Option<BaseFilter>,
@@ -17,14 +17,14 @@ pub struct ObsidianBaseDocument {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum BaseFilter {
     Expression(String),
     Logical(BaseLogicalFilter),
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct BaseLogicalFilter {
     #[serde(default)]
     pub and: Option<BaseFilterList>,
@@ -34,7 +34,7 @@ pub struct BaseLogicalFilter {
     pub not: Option<BaseFilterList>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum BaseFilterList {
     Many(Vec<BaseFilter>),
@@ -50,7 +50,7 @@ impl BaseFilterList {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ObsidianBaseView {
     pub name: String,
     #[serde(rename = "type")]
@@ -70,28 +70,28 @@ pub struct ObsidianBaseView {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct BaseSort {
     pub property: String,
     #[serde(default)]
     pub direction: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum BaseGroupBy {
     Property(String),
     Definition(BaseGroupByDefinition),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct BaseGroupByDefinition {
     pub property: String,
     #[serde(default)]
     pub direction: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ViewReferenceInput {
     pub path: String,
     #[serde(rename = "view", alias = "view_id")]
@@ -106,7 +106,7 @@ pub struct ViewReferenceInput {
     pub render: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ViewContextInput {
     pub path: String,
 }

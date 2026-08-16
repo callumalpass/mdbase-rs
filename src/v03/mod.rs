@@ -19,7 +19,7 @@ pub(crate) mod cel;
 mod collection_setup;
 mod lifecycle;
 mod operations;
-mod query;
+pub(crate) mod query;
 mod type_pack;
 
 pub use cel::{

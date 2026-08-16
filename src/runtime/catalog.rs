@@ -9,6 +9,9 @@ use crate::types::{inheritance, loader};
 use crate::v03::{Diagnostic, OperationResult, TypeFile};
 use crate::{Collection, Settings, SpecProfile};
 
+use super::record_structure::RecordStructure;
+use super::CollectionSnapshotRecord;
+
 /// Provider-neutral inputs for compiling the record semantics needed by
 /// point and incremental execution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -57,7 +60,8 @@ pub struct CatalogError {
 /// identity. Evicting it changes performance only.
 pub struct CompiledCatalog {
     resource_revision: String,
-    collection: Collection,
+    pub(super) collection: Collection,
+    pub(super) contracts: Vec<crate::data_contracts::ResolvedRecordContract>,
 }
 
 impl CompiledCatalog {
@@ -147,15 +151,17 @@ impl CompiledCatalog {
                 message: error.message,
             })?;
 
+        let contracts = input.contracts;
         let data_contracts =
-            crate::data_contracts::DataContractRegistry::load_resolved(input.contracts, &types)
+            crate::data_contracts::DataContractRegistry::load_resolved(contracts.clone(), &types)
                 .map_err(|error| CatalogError {
-                    code: error.code,
-                    message: error.message,
-                })?;
+                code: error.code,
+                message: error.message,
+            })?;
 
         Ok(Self {
             resource_revision: input.resource_revision,
+            contracts,
             collection: Collection {
                 root: PathBuf::new(),
                 spec_profile: SpecProfile::V03,
@@ -171,6 +177,15 @@ impl CompiledCatalog {
 
     pub fn resource_revision(&self) -> &str {
         &self.resource_revision
+    }
+
+    pub(crate) fn has_diagnostic_type_matchers(&self) -> bool {
+        self.collection.types.values().any(|type_definition| {
+            type_definition
+                .match_rules
+                .as_ref()
+                .is_some_and(|rules| rules.match_expr.is_some())
+        })
     }
 
     pub fn read_record(&self, input: &Value, record: &CanonicalRecordInput) -> OperationResult {
@@ -195,6 +210,30 @@ impl CompiledCatalog {
             .read_record_not_found(input)
     }
 
+    /// Parse and classify one exact Markdown document for a provider-owned
+    /// record without reading or mutating any collection filesystem.
+    ///
+    /// This deliberately preserves malformed or non-object frontmatter as an
+    /// opaque document in the same way as filesystem snapshots used by exact
+    /// synchronization. Typed reads remain strict through [`Self::read_record`].
+    pub fn classify_record(
+        &self,
+        record: &CanonicalRecordInput,
+    ) -> Result<CollectionSnapshotRecord, CatalogError> {
+        let path = self
+            .collection
+            .validate_record_path(&record.path)
+            .map_err(|error| CatalogError {
+                code: "invalid_path".to_string(),
+                message: format!("The record path is invalid: {error}"),
+            })?;
+        Ok(super::snapshot::materialize_snapshot_record(
+            &self.collection,
+            path.as_str(),
+            record.document.clone(),
+        ))
+    }
+
     pub fn determine_types_for_record(&self, path: &str, frontmatter: &Value) -> Vec<String> {
         self.collection
             .determine_types_for_path(frontmatter, Some(path))
@@ -202,6 +241,50 @@ impl CompiledCatalog {
 
     pub fn type_warnings(&self) -> &[String] {
         self.collection.type_warnings()
+    }
+
+    pub(crate) fn id_field(&self) -> &str {
+        &self.collection.settings().id_field
+    }
+
+    pub(crate) fn record_extensions(&self) -> Vec<String> {
+        std::iter::once("md".to_string())
+            .chain(self.collection.settings().extensions.iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn collection(&self) -> &Collection {
+        &self.collection
+    }
+
+    /// Extract provider-neutral structural facts from one exact record.
+    ///
+    /// This operation validates the canonical relative path but does not
+    /// enumerate records or resolve occurrences against a catalogue. A host
+    /// may perform that second step against its own consistent snapshot.
+    pub fn parse_record_structure(
+        &self,
+        record: &CanonicalRecordInput,
+    ) -> Result<RecordStructure, CatalogError> {
+        let path = self
+            .collection
+            .validate_record_path(&record.path)
+            .map_err(|error| CatalogError {
+                code: "invalid_path".to_string(),
+                message: format!("The record path is invalid: {error}"),
+            })?;
+        Ok(super::record_structure::parse_record_structure(
+            path.as_str(),
+            &record.document,
+        ))
+    }
+
+    /// Alias emphasizing that this is a projection rather than a resolver.
+    pub fn project_record_structure(
+        &self,
+        record: &CanonicalRecordInput,
+    ) -> Result<RecordStructure, CatalogError> {
+        self.parse_record_structure(record)
     }
 }
 
@@ -401,6 +484,82 @@ mod tests {
         );
         assert!(!result.valid);
         assert_eq!(result.diagnostics[0].code, "record_identity_mismatch");
+    }
+
+    #[test]
+    fn classifies_exact_records_without_a_collection_root() {
+        let classified = catalog()
+            .classify_record(&CanonicalRecordInput {
+                stable_id: Some("record-1".to_string()),
+                path: "tasks/one.md".to_string(),
+                document: "---\nscore: 3\n---\nBody\n".to_string(),
+                file_size: 24,
+                file_mtime: None,
+            })
+            .unwrap();
+        assert_eq!(classified.path, "tasks/one.md");
+        assert_eq!(
+            classified.revision,
+            crate::v03::revision(classified.document.as_bytes())
+        );
+        assert_eq!(classified.frontmatter["score"], 3);
+        assert_eq!(classified.body, "Body\n");
+        assert_eq!(classified.types, ["task"]);
+        assert_eq!(classified.frontmatter_error, None);
+    }
+
+    #[test]
+    fn exact_classification_matches_filesystem_snapshot_including_opaque_markdown() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("_types")).unwrap();
+        std::fs::create_dir_all(root.path().join("tasks")).unwrap();
+        std::fs::write(
+            root.path().join("mdbase.yaml"),
+            &catalog_input().configuration_document,
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("_types/task.md"),
+            "---\nkind: mdbase.type\nname: task\nversion: 1\nmatch:\n  path_glob: tasks/*.md\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\n---\n",
+        )
+        .unwrap();
+        let document = "---\ntitle: [unterminated\n---\nOpaque body";
+        std::fs::write(root.path().join("tasks/opaque.md"), document).unwrap();
+        let filesystem = Collection::open(root.path())
+            .unwrap()
+            .snapshot_record("tasks/opaque.md")
+            .unwrap();
+        let provider = catalog()
+            .classify_record(&CanonicalRecordInput {
+                stable_id: None,
+                path: "tasks/opaque.md".to_string(),
+                document: document.to_string(),
+                file_size: document.len() as u64,
+                file_mtime: None,
+            })
+            .unwrap();
+        assert_eq!(provider, filesystem);
+        assert_eq!(
+            provider.frontmatter_error.as_deref(),
+            Some("Failed to parse YAML frontmatter")
+        );
+        assert_eq!(provider.body, document);
+    }
+
+    #[test]
+    fn exact_classification_rejects_non_record_paths() {
+        for path in ["../escape.md", "_types/task.md", "payload.bin"] {
+            let error = catalog()
+                .classify_record(&CanonicalRecordInput {
+                    stable_id: None,
+                    path: path.to_string(),
+                    document: "Body\n".to_string(),
+                    file_size: 5,
+                    file_mtime: None,
+                })
+                .unwrap_err();
+            assert_eq!(error.code, "invalid_path");
+        }
     }
 
     #[test]

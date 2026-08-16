@@ -6,6 +6,8 @@
 //! corresponding change is available.
 
 mod api;
+#[cfg(feature = "hosted-storage-benchmark")]
+mod benchmark;
 mod catalog;
 mod context;
 mod cursor;
@@ -14,19 +16,55 @@ mod external;
 mod feed;
 mod filesystem;
 mod gate;
+mod hosted_base;
+mod hosted_mutation;
+mod hosted_query;
+mod hosted_resource;
+mod hosted_validation;
+mod hosted_view;
 mod observer;
 mod operation;
 mod outcome;
+mod projection;
 mod provider;
+mod record_resolution;
+mod record_structure;
 mod snapshot;
 
 pub use crate::data_contracts::{ResolvedRecordContract, ResolvedRecordContractImplementation};
 pub use api::CollectionRuntime;
+#[cfg(feature = "hosted-storage-benchmark")]
+pub use benchmark::{
+    BenchmarkDiagnostic, BenchmarkFileFacts, BenchmarkProjection, CandidateExpression,
+    CandidateTruth, CompiledCandidate, ProjectionRelationship, QueryRequirements,
+};
 pub use catalog::{
     CanonicalRecordInput, CatalogError, CatalogInput, CompiledCatalog, ResolvedTypeResource,
 };
 pub use context::{OperationContext, OperationDeadline};
 pub use filesystem::FilesystemRuntime;
+pub use hosted_base::{
+    HostedBaseEvaluation, HostedBaseGroupAccumulator, HostedBasePlan, HostedBasePlanning,
+    HostedBaseRecordContext, HostedBaseRequirements, HostedBaseRow, HOSTED_BASE_PLAN_VERSION,
+    MAX_HOSTED_BASE_RELATED_RECORDS,
+};
+pub use hosted_mutation::{HostedMutationChange, HostedMutationPlan, HostedMutationRequest};
+pub use hosted_query::{
+    CandidateComparison, CandidateComparisonOperator, CandidateComparisonPruning, CandidateField,
+    CandidatePredicate, CandidateVerdict, CanonicalResidual, HostedAggregate, HostedGroup,
+    HostedOrder, HostedOrderDirection, HostedQueryBudgets, HostedQueryPlan,
+    HostedQueryRequirements, HostedReduction, HostedReductionAccumulator, HostedReductionInput,
+    HostedResidualEvaluation, HostedScalarKind, HostedSortSemantics, ProjectionAvailability,
+    HOSTED_QUERY_PLAN_VERSION,
+};
+pub use hosted_resource::{
+    HostedDefinitionOperation, HostedDefinitionPlan, HostedResourceDocument, HostedResourceKind,
+    HostedResourceMutationPlan,
+};
+pub use hosted_validation::{
+    HostedValidationPlan, HostedValidationRequirement, HostedValidationRequirementKind,
+};
+pub use hosted_view::{HostedCanonicalViewPlan, HostedCanonicalViewPlanning};
 #[cfg(feature = "tracing")]
 pub use observer::TracingObserver;
 pub use observer::{
@@ -43,7 +81,22 @@ pub use outcome::{
     ReadCursor, ReadPage, RebuildReason, RecordChange, RecordChangeKind, ResourceChange,
     ResourceChangeKind, RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeMeasurements,
 };
+pub use projection::{
+    PreparedSemanticProjection, RecordResolutionKey, RecordResolutionKeyKind, SemanticFileFacts,
+    SemanticProjection, SemanticProjectionFacts, SEMANTIC_PROJECTION_FORMAT_VERSION,
+    SEMANTIC_PROJECTION_SCHEMA_VERSION,
+};
 pub use provider::{CollectionProvider, FilesystemProvider};
+pub use record_resolution::{
+    OccurrenceResolutionLookup, RecordResolutionPlan, ResolutionCandidate, ResolutionLookupKey,
+    ResolvedRecordStructure, ResolvedStructuralOccurrence, MAX_RESOLUTION_CANDIDATES,
+    MAX_RESOLUTION_LOOKUPS, MAX_STRUCTURAL_OCCURRENCES,
+};
+pub use record_structure::{
+    parse_record_structure, RecordStructure, RecordStructureLink, RecordStructureModel,
+    RecordStructureParser, StructuralLinkKind, StructuralOccurrence, StructuralResolution,
+    StructuralSourceKind, RECORD_STRUCTURE_SCHEMA_VERSION,
+};
 pub(crate) use snapshot::is_schema_resource_path;
 pub use snapshot::{
     CollectionSnapshot, CollectionSnapshotRecord, CollectionSnapshotResource,

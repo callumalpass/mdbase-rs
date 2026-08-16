@@ -1,8 +1,16 @@
 # Hosted record-source execution contract
 
-Status: accepted companion contract for the cross-repository hosted execution ADR.
+Status: accepted production semantic contract. Candidate B query, projection,
+structural relationship, residual, mutation, and bounded definition seams are
+implemented on the Candidate B review branch.
 
 Canonical decision: `mdbase-connect/docs/decisions/0010-bounded-hosted-record-source-execution.md`
+
+Governing storage-model decision:
+`mdbase-connect/docs/decisions/0011-server-trusted-queryable-hosted-execution.md`
+
+Historical benchmark prototype seam:
+`docs/architecture/hosted-storage-benchmark-seam.md`
 
 Connect baseline: `6ea62cf2593e91a0e0b17e9e931ebf0ec23dc805`  
 mdbase-rs baseline: `818866705dcc4b6dcfd3bbc1ba63f83fdaec406f`
@@ -13,6 +21,10 @@ mdbase-rs owns canonical resource compilation, exact Markdown parsing, type
 matching, defaults, coercion, computed fields, CEL, projections, contracts, views,
 validation, diagnostics, bounded query accumulation, portable execution outcomes,
 and semantic mutation plans.
+
+The selected hosted authority stores encrypted exact Markdown as the sole canonical
+record and a provider-readable, rebuildable semantic projection. Body prose and
+exact Markdown are absent from that projection.
 
 The integrating authority owns record storage, asynchronous IO, snapshots,
 encryption, authorization, admission, durable cursor storage, quotas, retries, and
@@ -32,9 +44,10 @@ it produces an immutable `CompiledCatalog` that owns type, contract, schema, sav
 view, and configuration semantics. Resource paths remain canonical collection
 paths; no authority credential or database identity enters the value.
 
-The filesystem provider builds the input from files. The hosted provider builds it
-from one consistent encrypted PostgreSQL snapshot. Both produce the same catalog
-digest and diagnostics for the same resources.
+The filesystem provider builds the input from files. A hosted provider builds it
+from one consistent authority snapshot, regardless of whether the benchmarked
+physical representation is encrypted, hybrid, or provider-readable. Both produce
+the same catalog digest and diagnostics for the same resources.
 
 ### Canonical record input
 
@@ -57,9 +70,56 @@ classification accept one record plus a compiled catalog. They do not enumerate 
 load unrelated records unless the requested semantic feature explicitly requires a
 bounded link/reference neighborhood.
 
+### Resource and definition execution
+
+Resource reads and ordinary type/view mutations consume only the bounded exact
+resource documents required to compile a catalog. Type-pack and collection-setup
+assessment/apply operations use the same rule: `HostedDefinitionOperation` stages
+at most 2,000 resource documents and 32 MiB, never stages record Markdown, and
+returns a canonical operation result. Successful apply plans additionally return
+the complete bounded post-operation resource stage plus the resulting canonical
+type and contract catalog for atomic authority persistence.
+
+Changing a type or contract is therefore not an instruction to classify or rewrite
+every record inline. The authority invalidates the old projection binding, opens a
+new generation, and uses its stale/absent exact fallback until bounded rebuild
+completion. This keeps definition writes independent of collection cardinality
+without treating previously persisted record types as current authorization facts.
+
+### Structural projection
+
+Parsing one canonical record produces a versioned semantic projection and a
+deterministic structural/link digest. The projection contains canonical path and
+file facts, matched types, persisted/effective frontmatter, diagnostics, and
+structurally significant body facts without body prose or exact Markdown.
+
+One shared structural parser supplies projection, validation, backlink, rename,
+delete, and reference semantics. Provider-readable body occurrences preserve link
+or embed kind, normalized target, anchor, relative form, source, body tags, and
+resolution outcome. They deliberately redact visible labels, destination titles,
+malformed source tails, and complete Markdown source spelling. Mutation planning
+reparses the encrypted exact authority when source text is required. Frontmatter
+occurrences may preserve their source form because projected frontmatter is already
+provider-readable. Resolution distinguishes resolved, missing, ambiguous, and
+unsafe traversal outcomes; it never collapses multiple basename, ID, or title
+matches into one arbitrary target.
+
+The projection exposes canonical outgoing occurrences. The authority persists
+those rows and derives backlinks from their inverse. Authority record/catalog/
+generation currentness remains outside mdbase-rs, but the semantic engine and
+projection format versions and content digest are explicit outputs.
+
+Projection format 5 retains the format-4 authoritative record modification-time
+binding and adds a confidentiality boundary: computed fields that transitively
+read `file.body` are omitted from readable effective frontmatter and mark the
+projection incomplete, requiring bounded canonical exact evaluation. Body link
+labels and source spellings are likewise absent. Authorities must treat older
+formats as stale and rebuild them; they must not relabel old rows as format 5.
+
 ### Query compilation and accumulation
 
-`compile_query` returns a private plan plus public `QueryRequirements` describing:
+`compile_query` returns a versioned closed plan plus public `QueryRequirements`
+describing:
 
 - body and body-derived file facts;
 - link/backlink graph needs;
@@ -71,7 +131,7 @@ bounded link/reference neighborhood.
 - diagnostics.
 
 A `BoundedQueryExecution` consumes one canonical record at a time and accounts all
-retained state against caller-supplied budgets. The initial supported algorithms are
+retained state against caller-supplied budgets. The supported bounded algorithms are
 streaming filters/projections, fixed-state counts and built-in summaries, bounded
 top-K, bounded groups, bounded diagnostics, and bounded final serialization.
 
@@ -79,9 +139,42 @@ Exhaustion returns one stable `ExecutionFailure::BudgetExceeded { budget_kind }`
 It never truncates or requests collection materialization. Cancellation and
 deadlines are checked at bounded intervals.
 
-Custom summaries and link graphs are unsupported until they have an explicit
-bounded implementation. Candidate hints may add false positives but never remove a
-possible match.
+Custom summaries and recursive graph traversal are unsupported until they have an
+explicit bounded implementation. Candidate plans may add false positives but never
+remove a possible match. Missing, stale, malformed, unavailable, or unsupported
+projection facts evaluate as unknown and remain candidates. Canonical residual
+evaluation reuses filesystem semantics.
+
+Configured Obsidian Base resources compile through a separate versioned hosted Base
+plan. It reuses the canonical Bases parser/evaluator for shared and named-view
+filters, formulas, TaskNotes renderer fields, ordering, grouping, timezones,
+`this.file`, links, embeds, and backlinks. The authority supplies one projection
+plus a declared-complete bounded incoming/outgoing neighborhood; absence of the
+completion proof fails closed. mdbase-rs reconstructs resolved links and inverse
+backlinks from those projections and never accepts exact record Markdown for this
+path. Candidate and edge enumeration, snapshots, SQL, and cursors remain provider
+responsibilities.
+
+Base plan version 2 also carries a conservative closed candidate predicate derived
+from the parsed Base AST. Proven equality/inequality conjuncts and
+`file.hasTag(...)` may narrow provider-readable projections. An unsupported AND
+term becomes `all` while preserving other proven conjuncts; an OR containing any
+unsupported branch becomes entirely `all`; negation remains residual-only. The
+canonical Base evaluator always decides final inclusion and values.
+
+Base expression evaluation charges every AST node, including formula and list
+callback recursion, to a caller-supplied work ceiling. Exhaustion is
+`hosted_base_operator_budget_exceeded`, not a false filter result. Recursive parser
+and evaluator entry points use a bounded growable stack so valid TaskNotes method
+chains cannot exhaust a small async worker stack. Hosted evaluators also accept a
+provider-neutral cooperative cancellation/deadline token checked at every AST node.
+
+For stale or absent provider projections, `finalize_projection_batch` reconstructs
+a caller-bounded exact snapshot without consulting stale provider indexes. It
+builds canonical identity keys, applies the same closed relationship-resolution
+plans, enforces the global relationship-candidate ceiling, and returns complete
+semantic projections suitable for the ordinary Base evaluator. The host remains
+responsible for exact-document, plaintext-byte, time, and memory limits.
 
 ### Mutation planning
 
@@ -89,7 +182,10 @@ A `MutationPlan` contains portable expected generation/resource revision, record
 preconditions, destination uniqueness requirements, bounded reference-neighborhood
 evidence, canonical exact writes/deletes, and the final portable semantic result.
 It contains no host request identity, grant, ciphertext, SQL, receipt, or journal
-state.
+state. Rename/delete/reference plans use the same structural occurrences and
+resolution semantics as projection generation. They preserve aliases and anchors,
+report ambiguity, and include expected neighbor revisions rather than discovering
+or mutating authority storage themselves.
 
 Authorities prepare against a read snapshot and atomically revalidate the plan at
 their own commit boundary. A changed precondition causes bounded reprepare or a
@@ -117,5 +213,6 @@ preserves completeness. Hosted PostgreSQL hints follow the same rule.
 - no PostgreSQL or CEL-to-SQL adapter in mdbase-rs;
 - no Connect protocol or durable cursor rows;
 - no application-level authorization types;
-- no plaintext hosted indexes; and
+- no authority-specific SQL, physical-index, encryption, currentness, generation,
+  lease, checkpoint, or persistence policy in mdbase-rs; and
 - no general spill/sort engine in the first bounded operator set.

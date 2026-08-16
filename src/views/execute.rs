@@ -8,7 +8,9 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use super::expression::{self, BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone};
+use super::expression::{
+    self, serialize_bases_file, BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone,
+};
 use super::model::{
     identifier, presentation_for, stable_named_view_ids, BaseFilter, BaseGroupBy,
     NamedViewDescriptor, ObsidianBaseDocument, ObsidianBaseView, ViewDocumentDescriptor,
@@ -344,6 +346,58 @@ fn obsidian_documents(
         .collect()
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CanonicalViewQuery {
+    pub query: Value,
+    pub view_path: String,
+    pub view_id: String,
+    pub context_path: Option<String>,
+    pub required_context_types: Vec<String>,
+}
+
+pub(crate) fn prepare_hosted_canonical_view(
+    document: &Value,
+    input: &Value,
+) -> Result<CanonicalViewQuery, OperationResult> {
+    let mut request =
+        serde_json::from_value::<ViewReferenceInput>(input.clone()).map_err(|error| {
+            failed(
+                "invalid_request",
+                format!("View execution input is invalid: {error}"),
+                None,
+            )
+        })?;
+    if input.get("context") == Some(&Value::Null) {
+        request.context = Some(None);
+    }
+    prepare_canonical_view_query(document, &request)
+}
+
+pub(crate) fn verify_canonical_view_context(
+    prepared: &CanonicalViewQuery,
+    actual_types: Option<&[String]>,
+) -> Result<(), OperationResult> {
+    if prepared.required_context_types.is_empty() {
+        return Ok(());
+    }
+    let matches = actual_types.is_some_and(|actual| {
+        prepared.required_context_types.iter().any(|required| {
+            actual
+                .iter()
+                .any(|actual| actual.eq_ignore_ascii_case(required))
+        })
+    });
+    if matches {
+        Ok(())
+    } else {
+        Err(failed(
+            "context_type_mismatch",
+            "The invocation context does not match an allowed context type.",
+            prepared.context_path.clone(),
+        ))
+    }
+}
+
 fn execute_canonical(collection: &Collection, request: &ViewReferenceInput) -> OperationResult {
     if request.render {
         return failed(
@@ -364,13 +418,62 @@ fn execute_canonical(collection: &Collection, request: &ViewReferenceInput) -> O
         .get("frontmatter")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let schema_diagnostics = validate_view(&document, &request.path);
+    let prepared = match prepare_canonical_view_query(&document, request) {
+        Ok(prepared) => prepared,
+        Err(result) => return result,
+    };
+    let context_types = prepared.context_path.as_deref().map(|context_path| {
+        collection
+            .read(&json!({"path": context_path}))
+            .get("types")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect::<Vec<_>>()
+    });
+    if let Err(result) = verify_canonical_view_context(&prepared, context_types.as_deref()) {
+        return result;
+    }
+    let mut result = match collection.v03_operations() {
+        Ok(operations) => operations.query(&prepared.query),
+        Err(diagnostic) => {
+            return OperationResult {
+                valid: false,
+                result: json!({}),
+                diagnostics: vec![*diagnostic],
+            }
+        }
+    };
+    if result.valid {
+        result.result["meta"]["view"] = json!({"path": prepared.view_path, "id": prepared.view_id});
+        result.result["meta"]["context"] = prepared
+            .context_path
+            .map(|path| json!({"path": path}))
+            .unwrap_or(Value::Null);
+    }
+    result
+}
+
+fn prepare_canonical_view_query(
+    document: &Value,
+    request: &ViewReferenceInput,
+) -> Result<CanonicalViewQuery, OperationResult> {
+    if request.render {
+        return Err(failed(
+            "unsupported_presentation",
+            "This provider supports headless view execution.",
+            Some(request.path.clone()),
+        ));
+    }
+    let schema_diagnostics = validate_view(document, &request.path);
     if !schema_diagnostics.is_empty() {
-        return OperationResult {
+        return Err(OperationResult {
             valid: false,
             result: json!({}),
             diagnostics: schema_diagnostics,
-        };
+        });
     }
     let views = document
         .get("views")
@@ -381,21 +484,21 @@ fn execute_canonical(collection: &Collection, request: &ViewReferenceInput) -> O
         .filter_map(|view| view.get("id").and_then(Value::as_str))
         .collect::<Vec<_>>();
     if ids.iter().copied().collect::<HashSet<_>>().len() != ids.len() {
-        return failed(
+        return Err(failed(
             "invalid_view",
             "View record contains duplicate named-view IDs.",
             Some(request.path.clone()),
-        );
+        ));
     }
     let Some(view) = views
         .iter()
         .find(|view| view.get("id").and_then(Value::as_str) == Some(&request.view_id))
     else {
-        return failed(
+        return Err(failed(
             "view_not_found",
             format!("Named view '{}' was not found.", request.view_id),
             Some(request.path.clone()),
-        );
+        ));
     };
     let shared = document
         .get("query")
@@ -456,11 +559,11 @@ fn execute_canonical(collection: &Collection, request: &ViewReferenceInput) -> O
     for (name, definition) in local_projections {
         if let Some(existing) = projections.get(&name) {
             if canonical_json(existing) != canonical_json(&definition) {
-                return failed(
+                return Err(failed(
                     "invalid_view",
                     format!("Projection '{name}' has conflicting definitions."),
                     Some(request.path.clone()),
-                );
+                ));
             }
         } else {
             projections.insert(name, definition);
@@ -503,61 +606,35 @@ fn execute_canonical(collection: &Collection, request: &ViewReferenceInput) -> O
             .and_then(Value::as_str)
             == Some("error")
     {
-        return failed(
+        return Err(failed(
             "context_required",
             "This named view requires an invocation context.",
             Some(request.path.clone()),
-        );
+        ));
     }
     if let Some(context_path) = context_path.as_deref() {
-        if let Some(required_types) = context_declaration
-            .and_then(|value| value.get("this"))
-            .and_then(Value::as_object)
-            .and_then(|value| value.get("types"))
-            .and_then(Value::as_array)
-        {
-            let context_read = collection.read(&json!({"path": context_path}));
-            let actual = context_read
-                .get("types")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect::<HashSet<_>>();
-            if !required_types
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|required| actual.contains(required))
-            {
-                return failed(
-                    "context_type_mismatch",
-                    "The invocation context does not match an allowed context type.",
-                    Some(context_path.to_string()),
-                );
-            }
-        }
         query.insert(
             "context".to_string(),
             json!({"this": {"path": context_path}}),
         );
     }
-    let mut result = match collection.v03_operations() {
-        Ok(operations) => operations.query(&Value::Object(query)),
-        Err(diagnostic) => {
-            return OperationResult {
-                valid: false,
-                result: json!({}),
-                diagnostics: vec![*diagnostic],
-            }
-        }
-    };
-    if result.valid {
-        result.result["meta"]["view"] = json!({"path": request.path, "id": request.view_id});
-        result.result["meta"]["context"] = context_path
-            .map(|path| json!({"path": path}))
-            .unwrap_or(Value::Null);
-    }
-    result
+    let required_context_types = context_declaration
+        .and_then(|value| value.get("this"))
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("types"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect();
+    Ok(CanonicalViewQuery {
+        query: Value::Object(query),
+        view_path: request.path.clone(),
+        view_id: request.view_id.clone(),
+        context_path,
+        required_context_types,
+    })
 }
 
 fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> OperationResult {
@@ -692,6 +769,8 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
             link_resolutions: link_resolutions.clone(),
             now: Some(clock.clone()),
             timezone: timezone.clone(),
+            work_limit: None,
+            cancellation: None,
         };
         match combined_filter_matches(document.filters.as_ref(), view.filters.as_ref(), &context) {
             Ok(true) => {}
@@ -808,17 +887,7 @@ struct BaseRow<'a> {
 fn serialize_base_row(row: &BaseRow<'_>) -> Value {
     json!({
         "path": row.record.rel_path,
-        "file": {
-            "path": row.file.path,
-            "name": row.file.name,
-            "basename": row.file.basename,
-            "folder": row.file.folder,
-            "ext": row.file.extension,
-            "size": row.file.size,
-            "mtime": row.file.mtime,
-            "ctime": row.file.ctime,
-            "tags": row.file.tags,
-        },
+        "file": serialize_bases_file(&row.file),
         "effective_frontmatter": row.record.effective_frontmatter,
         "types": row.record.type_names,
         "values": row.values,
@@ -869,7 +938,10 @@ fn base_groups(rows: &[BaseRow<'_>], group_by: &BaseGroupBy) -> Value {
     Value::Array(groups.into_iter().map(|(value, count)| json!({"values": {group_by.property(): value}, "count": count, "summaries": {}})).collect())
 }
 
-fn evaluate_property(property: &str, context: &BasesEvaluationContext) -> Result<Value, String> {
+pub(crate) fn evaluate_property(
+    property: &str,
+    context: &BasesEvaluationContext,
+) -> Result<Value, String> {
     if let Some(name) = property.strip_prefix("formula.") {
         expression::evaluate(&format!("formula.{name}"), context)
     } else if property.starts_with("file.") || property.starts_with("note[") {
@@ -879,7 +951,7 @@ fn evaluate_property(property: &str, context: &BasesEvaluationContext) -> Result
     }
 }
 
-fn combined_filter_matches(
+pub(crate) fn combined_filter_matches(
     shared: Option<&BaseFilter>,
     local: Option<&BaseFilter>,
     context: &BasesEvaluationContext,
@@ -928,7 +1000,7 @@ fn filter_matches(
     }
 }
 
-fn validate_base_expressions(
+pub(crate) fn validate_base_expressions(
     document: &ObsidianBaseDocument,
     view: &ObsidianBaseView,
     path: &str,
@@ -963,21 +1035,24 @@ fn validate_base_expressions(
     diagnostics
 }
 
-fn base_uses_backlinks(document: &ObsidianBaseDocument, view: &ObsidianBaseView) -> bool {
+pub(crate) fn base_uses_backlinks(
+    document: &ObsidianBaseDocument,
+    view: &ObsidianBaseView,
+) -> bool {
     document
         .formulas
         .values()
         .map(String::as_str)
         .chain(filter_expressions(document.filters.as_ref()))
         .chain(filter_expressions(view.filters.as_ref()))
-        .any(|expression| expression.contains("backlinks"))
+        .any(expression::uses_backlinks)
         || view
             .order
             .iter()
             .map(String::as_str)
             .chain(view.sort.iter().map(|sort| sort.property.as_str()))
             .chain(view.group_by.iter().map(BaseGroupBy::property))
-            .any(|property| property.contains("backlinks"))
+            .any(expression::uses_backlinks)
 }
 
 fn filter_expressions(filter: Option<&BaseFilter>) -> Vec<&str> {

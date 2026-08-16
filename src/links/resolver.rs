@@ -12,20 +12,15 @@ fn normalize_collection_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
-fn collection_parent(path: &str) -> &str {
-    path.rsplit_once('/').map_or("", |(parent, _)| parent)
-}
-
 #[cfg(test)]
 mod path_tests {
-    use super::{collection_parent, normalize_collection_path};
+    use super::normalize_collection_path;
 
     #[test]
     fn collection_paths_are_platform_independent() {
         let path = normalize_collection_path(r"projects\active\note.md");
 
         assert_eq!(path, "projects/active/note.md");
-        assert_eq!(collection_parent(&path), "projects/active");
     }
 }
 
@@ -94,9 +89,26 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LinkResolutionIndex {
     pub known_paths: HashSet<String>,
-    pub basename_lower_to_path: HashMap<String, String>,
-    pub id_lower_to_path: HashMap<String, String>,
-    pub title_lower_to_path: HashMap<String, String>,
+    pub basename_lower_to_path: HashMap<String, Option<String>>,
+    pub id_lower_to_path: HashMap<String, Option<String>>,
+    pub title_lower_to_path: HashMap<String, Option<String>>,
+}
+
+fn insert_unique_resolution_key(
+    index: &mut HashMap<String, Option<String>>,
+    key: String,
+    path: &str,
+) {
+    match index.entry(key) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Some(path.to_string()));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if entry.get().as_deref() != Some(path) {
+                entry.insert(None);
+            }
+        }
+    }
 }
 
 impl Collection {
@@ -114,10 +126,11 @@ impl Collection {
                 .file_stem()
                 .and_then(|s| s.to_str())
             {
-                index
-                    .basename_lower_to_path
-                    .entry(basename.to_ascii_lowercase())
-                    .or_insert_with(|| path.clone());
+                insert_unique_resolution_key(
+                    &mut index.basename_lower_to_path,
+                    basename.to_ascii_lowercase(),
+                    &path,
+                );
             }
 
             if let Some(id) = file_data
@@ -125,17 +138,19 @@ impl Collection {
                 .get(&self.settings.id_field)
                 .and_then(|v| v.as_str())
             {
-                index
-                    .id_lower_to_path
-                    .entry(id.to_ascii_lowercase())
-                    .or_insert_with(|| path.clone());
+                insert_unique_resolution_key(
+                    &mut index.id_lower_to_path,
+                    id.to_ascii_lowercase(),
+                    &path,
+                );
             }
 
             if let Some(title) = file_data.frontmatter.get("title").and_then(|v| v.as_str()) {
-                index
-                    .title_lower_to_path
-                    .entry(title.to_ascii_lowercase())
-                    .or_insert_with(|| path.clone());
+                insert_unique_resolution_key(
+                    &mut index.title_lower_to_path,
+                    title.to_ascii_lowercase(),
+                    &path,
+                );
             }
         }
 
@@ -293,7 +308,7 @@ impl Collection {
     pub(crate) fn resolve_simple_name(
         &self,
         name: &str,
-        source_dir: &str,
+        _source_dir: &str,
         target_types: &[String],
     ) -> Option<String> {
         let files = self.scan_collection_files();
@@ -305,6 +320,7 @@ impl Collection {
 
         let mut id_matches: Vec<String> = Vec::new();
         let mut filename_matches: Vec<String> = Vec::new();
+        let mut title_matches: Vec<String> = Vec::new();
 
         for file_path in &files {
             let rel_path = file_path
@@ -340,7 +356,7 @@ impl Collection {
 
             // Check id_field match
             if let Some(id_val) = fm.get(id_field_name).and_then(|v| v.as_str()) {
-                if id_val == name {
+                if id_val.eq_ignore_ascii_case(name) {
                     id_matches.push(rel_path.clone());
                 }
             }
@@ -350,45 +366,30 @@ impl Collection {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
-            if basename == name {
+            if basename.eq_ignore_ascii_case(name) {
                 filename_matches.push(rel_path.clone());
             }
+            if fm
+                .get("title")
+                .and_then(|value| value.as_str())
+                .is_some_and(|title| title.eq_ignore_ascii_case(name))
+            {
+                title_matches.push(rel_path.clone());
+            }
         }
 
-        // Prefer id matches over filename matches
+        // Match the hosted resolution priorities exactly: configured ID,
+        // basename, then title. Multiple matches at the first populated priority are
+        // ambiguous and must never be collapsed by directory or lexical order.
         let candidates = if !id_matches.is_empty() {
             id_matches
-        } else {
+        } else if !filename_matches.is_empty() {
             filename_matches
+        } else {
+            title_matches
         };
 
-        if candidates.is_empty() {
-            return None;
-        }
-        if candidates.len() == 1 {
-            return Some(candidates[0].clone());
-        }
-
-        // Tiebreaker: same directory > shortest path > alphabetical
-        let mut sorted = candidates;
-        sorted.sort_by(|a, b| {
-            let a_same = collection_parent(a) == source_dir;
-            let b_same = collection_parent(b) == source_dir;
-            if a_same != b_same {
-                return if a_same {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Greater
-                };
-            }
-            let a_depth = a.matches('/').count();
-            let b_depth = b.matches('/').count();
-            if a_depth != b_depth {
-                return a_depth.cmp(&b_depth);
-            }
-            a.cmp(b)
-        });
-        Some(sorted[0].clone())
+        (candidates.len() == 1).then(|| candidates[0].clone())
     }
 
     /// Get the target type constraints for a field.
@@ -478,17 +479,17 @@ impl Collection {
             }
         }
 
-        // Basename match (for wikilinks without path)
+        // Simple-name lookup follows the same priority as hosted resolution.
         if !resolved_target.contains('/') {
             let target_lower = resolved_target.to_ascii_lowercase();
-            if let Some(path) = resolution_index.basename_lower_to_path.get(&target_lower) {
-                return Some(path.clone());
-            }
             if let Some(path) = resolution_index.id_lower_to_path.get(&target_lower) {
-                return Some(path.clone());
+                return path.clone();
+            }
+            if let Some(path) = resolution_index.basename_lower_to_path.get(&target_lower) {
+                return path.clone();
             }
             if let Some(path) = resolution_index.title_lower_to_path.get(&target_lower) {
-                return Some(path.clone());
+                return path.clone();
             }
         }
 
@@ -504,6 +505,53 @@ impl Collection {
         path: &str,
     ) -> Vec<Issue> {
         let mut issues = Vec::new();
+
+        for (field_name, field, type_name, link) in
+            self.validation_link_checks(frontmatter, type_names)
+        {
+            issues.extend(self.validate_single_link(&link, &field_name, &field, &type_name, path));
+        }
+
+        issues
+    }
+
+    pub(crate) fn validation_resolution_targets(
+        &self,
+        frontmatter: &serde_json::Value,
+        type_names: &[String],
+        path: &str,
+    ) -> Vec<String> {
+        let source_dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new(""))
+            .to_string_lossy()
+            .to_string();
+        let mut targets = self
+            .validation_link_checks(frontmatter, type_names)
+            .into_iter()
+            .filter(|(_, field, _, _)| {
+                field.validate_exists == Some(true) || !allowed_target_types(field).is_empty()
+            })
+            .filter_map(|(_, _, _, link)| {
+                self.parse_link(&serde_json::json!({"value": link}))
+                    .pointer("/link/target")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|target| !target.is_empty())
+                    .map(|target| normalize_link_path(target, &source_dir))
+            })
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+
+    fn validation_link_checks(
+        &self,
+        frontmatter: &serde_json::Value,
+        type_names: &[String],
+    ) -> Vec<(String, FieldDef, String, String)> {
+        let mut checks = Vec::new();
 
         for type_name in type_names {
             let type_def = match self.types.get(type_name) {
@@ -552,9 +600,12 @@ impl Collection {
                 };
 
                 for link_str in link_values {
-                    let link_issues = self
-                        .validate_single_link(link_str, field_name, link_field, type_name, path);
-                    issues.extend(link_issues);
+                    checks.push((
+                        field_name.clone(),
+                        link_field.clone(),
+                        type_name.clone(),
+                        link_str.to_string(),
+                    ));
                 }
             }
 
@@ -608,19 +659,18 @@ impl Collection {
                         let Some(link_str) = value.as_str() else {
                             continue;
                         };
-                        issues.extend(self.validate_single_link(
-                            link_str,
-                            field_reference,
-                            &link_field,
-                            type_name,
-                            path,
+                        checks.push((
+                            field_reference.clone(),
+                            link_field.clone(),
+                            type_name.clone(),
+                            link_str.to_string(),
                         ));
                     }
                 }
             }
         }
 
-        issues
+        checks
     }
 
     /// Validate a single link value.

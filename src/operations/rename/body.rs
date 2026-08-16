@@ -15,6 +15,7 @@ impl Collection {
         from_no_ext: &str,
         to_no_ext: &str,
         source_dir: &str,
+        source_id: Option<&str>,
     ) -> bool {
         let mut changed = false;
 
@@ -49,6 +50,7 @@ impl Collection {
                     from_no_ext,
                     to_no_ext,
                     source_dir,
+                    source_id,
                 );
                 if new_line != line {
                     changed = true;
@@ -97,6 +99,7 @@ impl Collection {
         from_no_ext: &str,
         to_no_ext: &str,
         source_dir: &str,
+        source_id: Option<&str>,
     ) -> String {
         let mut result = String::with_capacity(line.len());
         let chars: Vec<char> = line.chars().collect();
@@ -154,6 +157,7 @@ impl Collection {
                             from_stem,
                             from_no_ext,
                             source_dir,
+                            source_id,
                         ) {
                             let new_inner = self.rewrite_wikilink_inner(
                                 &inner,
@@ -210,6 +214,7 @@ impl Collection {
                                 from_stem,
                                 from_no_ext,
                                 source_dir,
+                                source_id,
                             )
                         {
                             let text_part: String =
@@ -253,6 +258,7 @@ impl Collection {
                         from_stem,
                         from_no_ext,
                         source_dir,
+                        source_id,
                     ) {
                         let new_inner = self.rewrite_wikilink_inner(
                             &inner,
@@ -305,7 +311,14 @@ impl Collection {
                     let href: String = chars[paren_start..i - 1].iter().collect();
                     if !href.starts_with("http://")
                         && !href.starts_with("https://")
-                        && self.link_resolves_to(&href, _from, from_stem, from_no_ext, source_dir)
+                        && self.link_resolves_to(
+                            &href,
+                            _from,
+                            from_stem,
+                            from_no_ext,
+                            source_dir,
+                            source_id,
+                        )
                     {
                         let text_part: String = chars[link_start..paren_start - 1].iter().collect();
                         let (_, anchor) = if let Some(hp) = href.find('#') {
