@@ -28,7 +28,7 @@ use super::{
     SEMANTIC_PROJECTION_SCHEMA_VERSION,
 };
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 5;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 6;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -218,6 +218,7 @@ pub struct HostedQueryBudgets {
     pub max_exact_bytes: u64,
     pub max_operator_steps: u64,
     pub max_groups: u64,
+    pub max_connection_wait_ms: u64,
     pub max_wall_time_ms: u64,
     pub max_snapshot_time_ms: u64,
     pub max_memory_bytes: u64,
@@ -234,6 +235,7 @@ impl Default for HostedQueryBudgets {
             max_exact_bytes: 64 * 1024 * 1024,
             max_operator_steps: 2_000_000,
             max_groups: 10_000,
+            max_connection_wait_ms: 2_000,
             max_wall_time_ms: 15_000,
             max_snapshot_time_ms: 30_000,
             max_memory_bytes: 128 * 1024 * 1024,
@@ -2316,10 +2318,10 @@ mod tests {
         let second = catalog().compile_hosted_query(&query).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
-        assert_eq!(first.version, 5);
+        assert_eq!(first.version, 6);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
         assert!(first.plan_digest.starts_with("sha256:"));
-        assert_eq!(serde_json::to_value(first).unwrap()["version"], 5);
+        assert_eq!(serde_json::to_value(first).unwrap()["version"], 6);
     }
 
     #[test]
