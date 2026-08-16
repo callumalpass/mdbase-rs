@@ -22,9 +22,13 @@ use crate::v03::query::preflight::{self, CompiledSelection};
 use crate::v03::query::result::serialize_candidate;
 use crate::v03::{cel, validate_query, Diagnostic};
 
-use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
+use super::{
+    CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection,
+    RECORD_STRUCTURE_SCHEMA_VERSION, SEMANTIC_PROJECTION_FORMAT_VERSION,
+    SEMANTIC_PROJECTION_SCHEMA_VERSION,
+};
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 2;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 3;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -160,6 +164,7 @@ pub struct HostedQueryRequirements {
     pub persisted_frontmatter: bool,
     pub effective_frontmatter: bool,
     pub diagnostics: bool,
+    pub diagnostic_type_matchers: bool,
     pub canonical_residual: bool,
     pub bounded_top_k: bool,
     pub bounded_grouping: bool,
@@ -285,12 +290,13 @@ impl CompiledCatalog {
                 format!("Query could not be decoded: {error}"),
             )
         })?;
-        let canonical_query: Query = serde_json::from_value(semantic_input).map_err(|error| {
-            query_error(
-                "invalid_query",
-                format!("Query could not be decoded: {error}"),
-            )
-        })?;
+        let canonical_query: Query =
+            serde_json::from_value(semantic_input.clone()).map_err(|error| {
+                query_error(
+                    "invalid_query",
+                    format!("Query could not be decoded: {error}"),
+                )
+            })?;
         let canonical_preflight = preflight::compile(canonical_query).map_err(|diagnostics| {
             query_error(
                 "invalid_query",
@@ -435,11 +441,12 @@ impl CompiledCatalog {
             || !query.projections.is_empty()
             || query.select.is_some()
             || !fully_projected;
+        requirements.diagnostic_type_matchers = self.has_diagnostic_type_matchers();
         requirements.exact_document |= query.context.is_some()
             || !query.projections.is_empty()
             || query.select.is_some()
             || requirements.structural_body_facts
-            || self.has_diagnostic_type_matchers();
+            || requirements.diagnostic_type_matchers;
         requirements.diagnostics = true;
 
         if query.limit.is_some_and(|limit| limit > MAX_PAGE_SIZE) {
@@ -469,7 +476,7 @@ impl CompiledCatalog {
             ));
         }
         let page_size = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
-        let canonical = serde_jcs::to_vec(input).map_err(|error| {
+        let canonical = serde_jcs::to_vec(&semantic_input).map_err(|error| {
             query_error(
                 "invalid_query",
                 format!("Query could not be canonicalized: {error}"),
@@ -483,7 +490,7 @@ impl CompiledCatalog {
             plan_digest: String::new(),
             candidate,
             residual: CanonicalResidual {
-                query: input.clone(),
+                query: semantic_input,
                 filter_fully_projected: fully_projected,
             },
             order,
@@ -761,7 +768,7 @@ impl CompiledCatalog {
             || plan.requirements.body_prose
             || plan.requirements.structural_body_facts
             || plan.requirements.collection_context
-            || !projection.facts.semantic_complete
+            || !projection_is_current_for_plan(plan, projection)
         {
             return Err(query_error(
                 "hosted_exact_residual_required",
@@ -860,7 +867,8 @@ impl CompiledCatalog {
                 }
             },
         };
-        let file = file_value(&file_record, &effective, false);
+        let mut file = file_value(&file_record, &effective, false);
+        complete_file_value_from_projection(&mut file, &effective, projection);
         let record = matched.then(|| {
             serialize_candidate(
                 &Candidate {
@@ -913,12 +921,15 @@ impl HostedQueryPlan {
         let Some(projection) = projection else {
             return CandidateVerdict::CanonicalRequired;
         };
-        if !projection.facts.semantic_complete {
+        if !projection_is_current_for_plan(self, projection) {
             return CandidateVerdict::CanonicalRequired;
         }
         match evaluate_predicate(&self.candidate, projection) {
             Truth::True if self.residual.filter_fully_projected => CandidateVerdict::Retain,
             Truth::True | Truth::Unknown => CandidateVerdict::CanonicalRequired,
+            Truth::False if self.requirements.diagnostic_type_matchers => {
+                CandidateVerdict::CanonicalRequired
+            }
             Truth::False => CandidateVerdict::Reject,
         }
     }
@@ -1175,6 +1186,46 @@ fn projection_value<'a>(
     }
 }
 
+fn projection_is_current_for_plan(plan: &HostedQueryPlan, projection: &SemanticProjection) -> bool {
+    projection.facts.semantic_complete
+        && projection.facts.schema_version == SEMANTIC_PROJECTION_SCHEMA_VERSION
+        && projection.facts.format_version == SEMANTIC_PROJECTION_FORMAT_VERSION
+        && projection.facts.semantic_engine_version == plan.semantic_engine_version
+        && projection.facts.catalog_revision == plan.catalog_revision
+        && projection.structure.schema_version == RECORD_STRUCTURE_SCHEMA_VERSION
+}
+
+fn complete_file_value_from_projection(
+    file: &mut Value,
+    effective: &Value,
+    projection: &SemanticProjection,
+) {
+    let mut tags = effective
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect::<Vec<_>>();
+    for tag in &projection.structure.body_tags {
+        if !tags.contains(tag) {
+            tags.push(tag.clone());
+        }
+    }
+    if let Some(object) = file.as_object_mut() {
+        object.insert("tags".to_string(), serde_json::json!(tags));
+        object.insert(
+            "links".to_string(),
+            serde_json::json!(projection.structure.body_links),
+        );
+        object.insert(
+            "embeds".to_string(),
+            serde_json::json!(projection.structure.body_embeds),
+        );
+    }
+}
+
 fn nested<'a>(root: &'a serde_json::Map<String, Value>, path: &[String]) -> Option<&'a Value> {
     let (first, rest) = path.split_first()?;
     let mut value = root.get(first)?;
@@ -1345,9 +1396,7 @@ fn query_error(code: &str, message: impl Into<String>) -> CatalogError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{
-        CatalogInput, PreparedSemanticProjection, ResolvedRecordStructure, ResolvedTypeResource,
-    };
+    use crate::runtime::{CatalogInput, PreparedSemanticProjection, ResolvedTypeResource};
     use serde_json::json;
 
     fn catalog() -> CompiledCatalog {
@@ -1376,7 +1425,8 @@ mod tests {
     }
 
     fn projection(status: &str, complete: bool) -> SemanticProjection {
-        let prepared: PreparedSemanticProjection = catalog()
+        let catalog = catalog();
+        let prepared: PreparedSemanticProjection = catalog
             .project_record(&super::super::CanonicalRecordInput {
                 stable_id: Some("record-1".to_string()),
                 path: "tasks/one.md".to_string(),
@@ -1387,16 +1437,29 @@ mod tests {
             .unwrap();
         let mut facts = prepared.facts;
         facts.semantic_complete = complete;
-        SemanticProjection {
+        let unresolved = PreparedSemanticProjection {
             facts,
-            structure: ResolvedRecordStructure {
-                schema_version: prepared.structure.schema_version,
-                path: prepared.structure.path,
-                structural_digest: prepared.structure.structural_digest,
-                body_tags: prepared.structure.body_tags,
-                occurrences: Vec::new(),
-            },
-        }
+            structure: prepared.structure,
+        };
+        let plan = catalog
+            .plan_record_resolution(&unresolved.structure)
+            .unwrap();
+        let resolved = catalog
+            .resolve_record_structure(&unresolved.structure, &plan, &[])
+            .unwrap();
+        catalog.finalize_projection(unresolved, resolved).unwrap()
+    }
+
+    fn finalized_projection(
+        catalog: &CompiledCatalog,
+        record: &CanonicalRecordInput,
+    ) -> SemanticProjection {
+        let prepared = catalog.project_record(record).unwrap();
+        let plan = catalog.plan_record_resolution(&prepared.structure).unwrap();
+        let resolved = catalog
+            .resolve_record_structure(&prepared.structure, &plan, &[])
+            .unwrap();
+        catalog.finalize_projection(prepared, resolved).unwrap()
     }
 
     #[test]
@@ -1453,6 +1516,110 @@ mod tests {
             .unwrap();
         assert!(!missing.matched);
         assert!(missing.record.is_none());
+    }
+
+    #[test]
+    fn projection_result_preserves_canonical_body_metadata_without_body_prose() {
+        let catalog = catalog();
+        let record = CanonicalRecordInput {
+            stable_id: Some("record-1".to_string()),
+            path: "tasks/one.md".to_string(),
+            document: "---\nstatus: open\ntags: [frontmatter]\n---\n#body [[target#anchor|Alias]] [other](other.md#section) ![[embed#part]] ![image](asset.png)\n"
+                .to_string(),
+            file_size: 0,
+            file_mtime: None,
+        };
+        let projection = finalized_projection(&catalog, &record);
+        let plan = catalog
+            .compile_hosted_query(&json!({"types": ["task"], "limit": 10}))
+            .unwrap();
+
+        let exact = catalog
+            .evaluate_hosted_residual(&plan, &record)
+            .unwrap()
+            .record
+            .unwrap();
+        let projected = catalog
+            .evaluate_hosted_projection_residual(&plan, &projection)
+            .unwrap()
+            .record
+            .unwrap();
+
+        for field in ["tags", "links", "embeds"] {
+            assert_eq!(
+                projected.pointer(&format!("/file/{field}")),
+                exact.pointer(&format!("/file/{field}")),
+                "projection-backed file.{field} diverged from exact evaluation"
+            );
+        }
+        assert_eq!(projected["file"]["tags"], json!(["frontmatter", "body"]));
+        assert_eq!(projected["file"]["links"], json!(["target", "other.md"]));
+        assert_eq!(
+            projected["file"]["embeds"],
+            json!(["embed#part", "asset.png"])
+        );
+        assert!(!projected.to_string().contains("Alias"));
+    }
+
+    #[test]
+    fn projection_binding_mismatch_requires_exact_fallback() {
+        let catalog = catalog();
+        let plan = catalog
+            .compile_hosted_query(&json!({"types": ["task"], "limit": 10}))
+            .unwrap();
+        let mut projection = projection("open", true);
+        projection.facts.catalog_revision = "stale-catalog".to_string();
+
+        assert_eq!(
+            plan.candidate_verdict(Some(&projection), ProjectionAvailability::Current),
+            CandidateVerdict::CanonicalRequired
+        );
+        let error = catalog
+            .evaluate_hosted_projection_residual(&plan, &projection)
+            .unwrap_err();
+        assert_eq!(error.code, "hosted_exact_residual_required");
+    }
+
+    #[test]
+    fn diagnostic_matchers_prevent_type_candidate_pruning() {
+        let catalog = CompiledCatalog::compile(CatalogInput {
+            resource_revision: "catalog-diagnostic".to_string(),
+            configuration_document: "spec_version: 0.3.0\nsettings:\n  default_validation: warn\n"
+                .to_string(),
+            types: vec![ResolvedTypeResource {
+                path: "_types/task.md".to_string(),
+                revision: "type-1".to_string(),
+                definition: json!({
+                    "kind": "mdbase.type",
+                    "name": "task",
+                    "version": 1,
+                    "match": {"expr": {"$expr": "missing.value == true"}},
+                    "schema": {"dialect": "json-schema-2020-12", "value": {
+                        "type": "object"
+                    }}
+                }),
+                schema: json!({"type": "object"}),
+            }],
+            contracts: Vec::new(),
+        })
+        .unwrap();
+        let record = CanonicalRecordInput {
+            stable_id: Some("record-1".to_string()),
+            path: "notes/one.md".to_string(),
+            document: "---\nstatus: open\n---\nText\n".to_string(),
+            file_size: 0,
+            file_mtime: None,
+        };
+        let projection = finalized_projection(&catalog, &record);
+        let plan = catalog
+            .compile_hosted_query(&json!({"types": ["task"], "limit": 10}))
+            .unwrap();
+
+        assert!(plan.requirements.diagnostic_type_matchers);
+        assert_eq!(
+            plan.candidate_verdict(Some(&projection), ProjectionAvailability::Current),
+            CandidateVerdict::CanonicalRequired
+        );
     }
 
     #[test]
@@ -1674,10 +1841,10 @@ mod tests {
         let second = catalog().compile_hosted_query(&query).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
-        assert_eq!(first.version, 2);
+        assert_eq!(first.version, 3);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
         assert!(first.plan_digest.starts_with("sha256:"));
-        assert_eq!(serde_json::to_value(first).unwrap()["version"], 2);
+        assert_eq!(serde_json::to_value(first).unwrap()["version"], 3);
     }
 
     #[test]
@@ -1700,5 +1867,32 @@ mod tests {
             }))
             .unwrap_err();
         assert_eq!(error.code, "unsupported_hosted_reducer");
+    }
+
+    #[test]
+    fn transport_controls_are_absent_from_semantic_plan_and_digest() {
+        let catalog = catalog();
+        let query = json!({
+            "types": ["task"],
+            "order_by": [{"field": "file.path"}],
+            "limit": 20
+        });
+        let controlled = json!({
+            "types": ["task"],
+            "order_by": [{"field": "file.path"}],
+            "limit": 20,
+            "pagination": "cursor",
+            "cursor": "opaque-secret-token",
+            "snapshot": "provider-snapshot-id",
+            "release_cursor": true
+        });
+
+        let base = catalog.compile_hosted_query(&query).unwrap();
+        let with_transport = catalog.compile_hosted_query(&controlled).unwrap();
+        assert_eq!(with_transport, base);
+        let residual = with_transport.residual.query.as_object().unwrap();
+        for control in ["pagination", "cursor", "snapshot", "release_cursor"] {
+            assert!(!residual.contains_key(control));
+        }
     }
 }

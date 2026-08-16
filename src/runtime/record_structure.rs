@@ -17,12 +17,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::expressions::evaluator::{extract_tags_from_body, strip_code_blocks_and_inline_code};
+use crate::expressions::evaluator::{
+    extract_embeds_from_body, extract_links_from_body, extract_tags_from_body,
+    strip_code_blocks_and_inline_code,
+};
 use crate::frontmatter::parser::{parse_document, yaml_to_json, FrontmatterState};
 use crate::links::parser::normalize_link_path;
 
 /// Version of the provider-neutral structural envelope.
-pub const RECORD_STRUCTURE_SCHEMA_VERSION: &str = "mdbase-record-structure-v1";
+pub const RECORD_STRUCTURE_SCHEMA_VERSION: &str = "mdbase-record-structure-v2";
 
 /// Where an occurrence was found in the exact record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -98,6 +101,11 @@ pub struct RecordStructure {
     pub occurrences: Vec<StructuralOccurrence>,
     /// Body tags use the same rules as query and expression semantics.
     pub body_tags: Vec<String>,
+    /// Ordered query-visible body links with aliases and anchors removed by the
+    /// canonical v0.3 extractor.
+    pub body_links: Vec<String>,
+    /// Ordered query-visible embed targets from wikilinks and Markdown images.
+    pub body_embeds: Vec<String>,
     /// Digest of this envelope with `structural_digest` set to an empty string.
     pub structural_digest: String,
 }
@@ -148,15 +156,17 @@ impl RecordStructureParser {
         for (ordinal, occurrence) in occurrences.iter_mut().enumerate() {
             occurrence.ordinal = ordinal;
         }
-        let mut body_tags = extract_tags_from_body(&parsed.body);
-        body_tags.sort();
-        body_tags.dedup();
+        let body_tags = extract_tags_from_body(&parsed.body);
+        let body_links = extract_links_from_body(&parsed.body);
+        let body_embeds = extract_embeds_from_body(&parsed.body);
 
         let mut structure = RecordStructure {
             schema_version: RECORD_STRUCTURE_SCHEMA_VERSION.to_string(),
             path: self.path.clone(),
             occurrences,
             body_tags,
+            body_links,
+            body_embeds,
             structural_digest: String::new(),
         };
         structure.structural_digest = digest_structure(&structure);

@@ -50,6 +50,8 @@ pub struct ResolvedRecordStructure {
     pub structural_digest: String,
     pub occurrences: Vec<ResolvedStructuralOccurrence>,
     pub body_tags: Vec<String>,
+    pub body_links: Vec<String>,
+    pub body_embeds: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +242,8 @@ impl CompiledCatalog {
             structural_digest: structure.structural_digest.clone(),
             occurrences,
             body_tags: structure.body_tags.clone(),
+            body_links: structure.body_links.clone(),
+            body_embeds: structure.body_embeds.clone(),
         })
     }
 }

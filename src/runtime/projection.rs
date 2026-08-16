@@ -17,14 +17,15 @@ use super::{
     StructuralResolution,
 };
 
-pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 1;
-pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v1";
+pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 2;
+pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v2";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticProjectionFacts {
     pub schema_version: String,
     pub format_version: u32,
     pub semantic_engine_version: String,
+    pub catalog_revision: String,
     pub path: String,
     pub types: Vec<String>,
     pub file: SemanticFileFacts,
@@ -158,6 +159,7 @@ impl CompiledCatalog {
                 schema_version: SEMANTIC_PROJECTION_SCHEMA_VERSION.to_string(),
                 format_version: SEMANTIC_PROJECTION_FORMAT_VERSION,
                 semantic_engine_version: env!("CARGO_PKG_VERSION").to_string(),
+                catalog_revision: self.resource_revision().to_string(),
                 path: record.path.clone(),
                 types,
                 file,
