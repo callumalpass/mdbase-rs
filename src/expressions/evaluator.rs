@@ -2959,6 +2959,9 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
                     }
                     i += 1;
                 }
+                if paren_depth > 0 {
+                    continue;
+                }
                 let path: String = chars[paren_start..i - 1].iter().collect();
                 let Some(path) = markdown_destination_target(&path) else {
                     continue;
@@ -3040,6 +3043,9 @@ pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
                         paren_depth -= 1;
                     }
                     i += 1;
+                }
+                if paren_depth > 0 {
+                    continue;
                 }
                 let path: String = chars[paren_start..i - 1].iter().collect();
                 let Some(path) = markdown_destination_target(&path) else {
@@ -3149,5 +3155,13 @@ mod limit_tests {
         let body = "[private label](notes/one.md \"private title\") ![private alt](assets/one.png \"private image title\") [malformed](<notes/leak.md \"leaked title\")";
         assert_eq!(extract_links_from_body(body), ["notes/one.md"]);
         assert_eq!(extract_embeds_from_body(body), ["assets/one.png"]);
+    }
+
+    #[test]
+    fn malformed_markdown_destinations_are_skipped_without_panicking() {
+        for body in ["[x](", "[x]((", "![x](", "![x](("] {
+            assert!(extract_links_from_body(body).is_empty());
+            assert!(extract_embeds_from_body(body).is_empty());
+        }
     }
 }
