@@ -18,6 +18,7 @@ mod filesystem;
 mod gate;
 mod hosted_mutation;
 mod hosted_query;
+mod hosted_resource;
 mod hosted_validation;
 mod observer;
 mod operation;
