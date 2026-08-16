@@ -57,7 +57,10 @@ pub use hosted_query::{
     HostedResidualEvaluation, HostedSortSemantics, ProjectionAvailability,
     HOSTED_QUERY_PLAN_VERSION,
 };
-pub use hosted_resource::{HostedResourceDocument, HostedResourceKind, HostedResourceMutationPlan};
+pub use hosted_resource::{
+    HostedDefinitionOperation, HostedDefinitionPlan, HostedResourceDocument, HostedResourceKind,
+    HostedResourceMutationPlan,
+};
 pub use hosted_validation::{
     HostedValidationPlan, HostedValidationRequirement, HostedValidationRequirementKind,
 };
