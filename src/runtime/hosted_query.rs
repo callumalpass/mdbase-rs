@@ -28,7 +28,7 @@ use super::{
     SEMANTIC_PROJECTION_SCHEMA_VERSION,
 };
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 3;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 4;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -89,6 +89,17 @@ pub struct CandidateComparison {
     pub field: CandidateField,
     pub operator: CandidateComparisonOperator,
     pub value: Value,
+    /// `ExactJson` proves that provider JSON operations have the same false
+    /// result as canonical CEL for this literal/operator pair. Conservative
+    /// comparisons may be observed but must never narrow provider candidates.
+    pub pruning: CandidateComparisonPruning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateComparisonPruning {
+    ExactJson,
+    Conservative,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,8 +367,14 @@ impl CompiledCatalog {
             let lowered = lower_expression(&expression, &mut requirements);
             fully_projected = false;
             requirements.canonical_residual = true;
-            if lowered.is_none_or(|lowered| !lowered.complete) {
-                requirements.exact_document = true;
+            match lowered {
+                Some(lowered) => {
+                    if !lowered.complete {
+                        requirements.exact_document = true;
+                    }
+                    predicates.push(lowered.predicate);
+                }
+                None => requirements.exact_document = true,
             }
         }
         let candidate = conjunction(predicates);
@@ -1015,6 +1032,7 @@ fn lower_expression(
                 comparison: CandidateComparison {
                     field,
                     operator,
+                    pruning: comparison_pruning(operator, &value),
                     value,
                 },
             }))
@@ -1033,6 +1051,7 @@ fn lower_expression(
                 comparison: CandidateComparison {
                     field,
                     operator: CandidateComparisonOperator::Contains,
+                    pruning: comparison_pruning(CandidateComparisonOperator::Contains, &value),
                     value,
                 },
             }))
@@ -1164,12 +1183,15 @@ fn evaluate_predicate(predicate: &CandidatePredicate, projection: &SemanticProje
                 .iter()
                 .any(|candidate| candidate == type_name),
         ),
-        CandidatePredicate::Compare { comparison } => {
+        CandidatePredicate::Compare { comparison }
+            if comparison.pruning == CandidateComparisonPruning::ExactJson =>
+        {
             let Some(value) = projection_value(projection, &comparison.field) else {
                 return Truth::Unknown;
             };
             compare(value, comparison.operator, &comparison.value)
         }
+        CandidatePredicate::Compare { .. } => Truth::Unknown,
     }
 }
 
@@ -1282,6 +1304,43 @@ fn compare(left: &Value, operator: CandidateComparisonOperator, right: &Value) -
             })
         }
     }
+}
+
+fn comparison_pruning(
+    operator: CandidateComparisonOperator,
+    value: &Value,
+) -> CandidateComparisonPruning {
+    use CandidateComparisonOperator as Op;
+    let exact_scalar = |value: &Value| match value {
+        Value::Null | Value::Bool(_) => true,
+        Value::String(value) => !ambiguous_canonical_string(value),
+        Value::Number(_) | Value::Array(_) | Value::Object(_) => false,
+    };
+    let exact = match operator {
+        Op::Equal | Op::NotEqual => exact_scalar(value),
+        Op::LessThan | Op::LessThanOrEqual | Op::GreaterThan | Op::GreaterThanOrEqual => {
+            value.is_number()
+                || value
+                    .as_str()
+                    .is_some_and(|value| !ambiguous_canonical_string(value))
+        }
+        Op::In => value
+            .as_array()
+            .is_some_and(|values| values.iter().all(exact_scalar)),
+        Op::Contains => exact_scalar(value),
+    };
+    if exact {
+        CandidateComparisonPruning::ExactJson
+    } else {
+        CandidateComparisonPruning::Conservative
+    }
+}
+
+fn ambiguous_canonical_string(value: &str) -> bool {
+    value.parse::<f64>().is_ok()
+        || chrono::DateTime::parse_from_rfc3339(value).is_ok()
+        || chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+        || chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S").is_ok()
 }
 
 fn fold_and(values: impl Iterator<Item = Truth>) -> Truth {
@@ -1475,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn comparison_filters_remain_residual_until_cel_coercion_is_in_the_ir() {
+    fn exact_json_comparisons_prune_but_still_use_canonical_residuals() {
         let plan = catalog()
             .compile_hosted_query(&json!({
                 "types": ["task"],
@@ -1485,13 +1544,22 @@ mod tests {
             }))
             .unwrap();
         assert!(!plan.residual.filter_fully_projected);
+        assert!(matches!(
+            plan.candidate,
+            CandidatePredicate::And { ref terms }
+                if terms.iter().any(|term| matches!(
+                    term,
+                    CandidatePredicate::Compare { comparison }
+                        if comparison.pruning == CandidateComparisonPruning::ExactJson
+                ))
+        ));
         assert_eq!(plan.page_size, 50);
         assert_eq!(
             plan.candidate_verdict(
                 Some(&projection("closed", true)),
                 ProjectionAvailability::Current
             ),
-            CandidateVerdict::CanonicalRequired
+            CandidateVerdict::Reject
         );
         assert_eq!(
             plan.candidate_verdict(
@@ -1500,6 +1568,27 @@ mod tests {
             ),
             CandidateVerdict::CanonicalRequired
         );
+    }
+
+    #[test]
+    fn datetime_and_numeric_coercions_are_never_provider_pruning_proofs() {
+        for source in ["record.due < '2026-06-01'", "record.count == 42"] {
+            let plan = catalog()
+                .compile_hosted_query(&json!({"where": source, "limit": 10}))
+                .unwrap();
+            assert!(matches!(
+                plan.candidate,
+                CandidatePredicate::Compare { ref comparison }
+                    if comparison.pruning == CandidateComparisonPruning::Conservative
+            ));
+            assert_eq!(
+                plan.candidate_verdict(
+                    Some(&projection("open", true)),
+                    ProjectionAvailability::Current
+                ),
+                CandidateVerdict::CanonicalRequired
+            );
+        }
     }
 
     #[test]
@@ -1683,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_conjunction_does_not_prune_before_canonical_comparison() {
+    fn proven_conjunct_may_prune_before_an_exact_body_residual() {
         let plan = catalog()
             .compile_hosted_query(&json!({
                 "where": "record.status == 'open' && file.body.contains('needle')",
@@ -1698,7 +1787,7 @@ mod tests {
                 Some(&projection("closed", true)),
                 ProjectionAvailability::Current
             ),
-            CandidateVerdict::CanonicalRequired
+            CandidateVerdict::Reject
         );
     }
 
@@ -1867,10 +1956,10 @@ mod tests {
         let second = catalog().compile_hosted_query(&query).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
-        assert_eq!(first.version, 3);
+        assert_eq!(first.version, 4);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
         assert!(first.plan_digest.starts_with("sha256:"));
-        assert_eq!(serde_json::to_value(first).unwrap()["version"], 3);
+        assert_eq!(serde_json::to_value(first).unwrap()["version"], 4);
     }
 
     #[test]

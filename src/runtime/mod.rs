@@ -39,10 +39,10 @@ pub use catalog::{
 pub use context::{OperationContext, OperationDeadline};
 pub use filesystem::FilesystemRuntime;
 pub use hosted_query::{
-    CandidateComparison, CandidateComparisonOperator, CandidateField, CandidatePredicate,
-    CandidateVerdict, CanonicalResidual, HostedAggregate, HostedGroup, HostedOrder,
-    HostedOrderDirection, HostedQueryBudgets, HostedQueryPlan, HostedQueryRequirements,
-    HostedResidualEvaluation, HostedSortSemantics, ProjectionAvailability,
+    CandidateComparison, CandidateComparisonOperator, CandidateComparisonPruning, CandidateField,
+    CandidatePredicate, CandidateVerdict, CanonicalResidual, HostedAggregate, HostedGroup,
+    HostedOrder, HostedOrderDirection, HostedQueryBudgets, HostedQueryPlan,
+    HostedQueryRequirements, HostedResidualEvaluation, HostedSortSemantics, ProjectionAvailability,
     HOSTED_QUERY_PLAN_VERSION,
 };
 #[cfg(feature = "tracing")]
