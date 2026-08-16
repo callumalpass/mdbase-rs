@@ -17,14 +17,15 @@ use crate::expressions::evaluator::resolve_execution_timezone;
 use crate::v03::{Diagnostic, OperationResult};
 use crate::views::{
     base_uses_backlinks, combined_filter_matches, evaluate_property, is_configured_obsidian_source,
-    lower_hosted_candidate, serialize_bases_file, stable_named_view_ids, uses_relationships,
-    validate_base_expressions, BaseFilter, BasesEvaluationContext, BasesFile, BasesLink,
-    BasesTimezone, ObsidianBaseDocument, ObsidianBaseView, ViewReferenceInput,
+    lower_hosted_candidate, serialize_bases_file, stable_named_view_ids, uses_file_ctime,
+    uses_relationships, validate_base_expressions, BaseFilter, BasesEvaluationContext, BasesFile,
+    BasesLink, BasesTimezone, ObsidianBaseDocument, ObsidianBaseView, ViewReferenceInput,
 };
 use crate::OperationCancellation;
 
 use super::{
-    CandidatePredicate, CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection,
+    CandidatePredicate, CanonicalRecordInput, CatalogError, CompiledCatalog, HostedQueryBudgets,
+    SemanticProjection,
 };
 
 pub const HOSTED_BASE_PLAN_VERSION: u32 = 4;
@@ -196,6 +197,13 @@ impl CompiledCatalog {
                 },
             });
         }
+        if base_uses_file_ctime(&document, &view) {
+            return Ok(invalid(
+                "hosted_base_file_ctime_unavailable",
+                "Hosted Base execution cannot evaluate file.ctime because exact Markdown authorities do not have a portable canonical filesystem ctime.",
+                Some(request.path),
+            ));
+        }
         let configured_timezone = self.collection().settings.timezone.as_deref();
         let timezone =
             match resolve_execution_timezone(request.timezone.as_deref(), configured_timezone) {
@@ -233,6 +241,15 @@ impl CompiledCatalog {
             "sha256:{:x}",
             Sha256::digest(view_record.document.as_bytes())
         );
+        let offset = request.offset.unwrap_or(0);
+        let max_offset = HostedQueryBudgets::default().max_offset;
+        if offset > max_offset {
+            return Ok(invalid(
+                "hosted_offset_budget_exceeded",
+                format!("Requested offset exceeds the hosted maximum of {max_offset}."),
+                Some(request.path),
+            ));
+        }
         let suggested_page_size = request.limit.or(view.limit);
         let candidate = base_candidate(document.filters.as_ref(), view.filters.as_ref());
         let mut plan = HostedBasePlan {
@@ -246,7 +263,7 @@ impl CompiledCatalog {
             context_path,
             timezone,
             allowed_types,
-            offset: request.offset.unwrap_or(0),
+            offset,
             suggested_page_size,
             requirements: HostedBaseRequirements {
                 backlinks,
@@ -292,6 +309,8 @@ impl HostedBasePlan {
     pub fn validate_integrity(&self) -> Result<(), CatalogError> {
         if self.plan_version != HOSTED_BASE_PLAN_VERSION
             || self.invocation_digest != digest_plan(self)?
+            || self.offset > HostedQueryBudgets::default().max_offset
+            || base_uses_file_ctime(&self.document, &self.view)
         {
             return Err(CatalogError {
                 code: "hosted_base_plan_mismatch".to_string(),
@@ -892,6 +911,19 @@ fn base_uses_relationships(document: &ObsidianBaseDocument, view: &ObsidianBaseV
         .any(uses_relationships)
 }
 
+fn base_uses_file_ctime(document: &ObsidianBaseDocument, view: &ObsidianBaseView) -> bool {
+    document
+        .formulas
+        .values()
+        .map(String::as_str)
+        .chain(base_filter_expressions(document.filters.as_ref()))
+        .chain(base_filter_expressions(view.filters.as_ref()))
+        .chain(view.order.iter().map(String::as_str))
+        .chain(view.sort.iter().map(|sort| sort.property.as_str()))
+        .chain(view.group_by.iter().map(|group| group.property()))
+        .any(uses_file_ctime)
+}
+
 fn base_filter_expressions(filter: Option<&BaseFilter>) -> Vec<&str> {
     let Some(filter) = filter else {
         return Vec::new();
@@ -1418,6 +1450,88 @@ views:
         };
         assert!(!plan.requirements.outgoing_relationships);
         assert!(!plan.requirements.link_resolution);
+    }
+
+    #[test]
+    fn hosted_base_rejects_unbounded_offsets_before_path_keyset_or_fallback_planning() {
+        let catalog = catalog();
+        for (source, view) in [
+            (
+                "views:\n  - type: table\n    name: All records\n",
+                "all-records",
+            ),
+            (
+                "views:\n  - type: table\n    name: Filtered\n    filters: 'status == \"open\"'\n",
+                "filtered",
+            ),
+        ] {
+            let HostedBasePlanning::Invalid { result } = catalog
+                .plan_hosted_obsidian_base(
+                    &json!({
+                        "path": "views/offset.base",
+                        "view": view,
+                        "offset": HostedQueryBudgets::default().max_offset + 1,
+                    }),
+                    &CanonicalRecordInput {
+                        stable_id: None,
+                        path: "views/offset.base".to_string(),
+                        document: source.to_string(),
+                        file_size: source.len() as u64,
+                        file_mtime: None,
+                    },
+                    &[],
+                )
+                .unwrap()
+            else {
+                panic!("oversized Base offset must fail before execution")
+            };
+            assert_eq!(result.diagnostics[0].code, "hosted_offset_budget_exceeded");
+        }
+    }
+
+    #[test]
+    fn hosted_base_fails_closed_for_file_ctime_but_not_string_literals() {
+        let catalog = catalog();
+        let ctime_source = "views:\n  - type: table\n    name: Created\n    sort:\n      - property: file.ctime\n        direction: ASC\n";
+        let HostedBasePlanning::Invalid { result } = catalog
+            .plan_hosted_obsidian_base(
+                &json!({"path": "views/ctime.base", "view": "created"}),
+                &CanonicalRecordInput {
+                    stable_id: None,
+                    path: "views/ctime.base".to_string(),
+                    document: ctime_source.to_string(),
+                    file_size: ctime_source.len() as u64,
+                    file_mtime: None,
+                },
+                &[],
+            )
+            .unwrap()
+        else {
+            panic!("hosted ctime dependency must fail closed")
+        };
+        assert_eq!(
+            result.diagnostics[0].code,
+            "hosted_base_file_ctime_unavailable"
+        );
+
+        let literal_source =
+            "views:\n  - type: table\n    name: Literal\n    filters: 'title == \"file.ctime\"'\n";
+        let HostedBasePlanning::Planned { .. } = catalog
+            .plan_hosted_obsidian_base(
+                &json!({"path": "views/ctime.base", "view": "literal"}),
+                &CanonicalRecordInput {
+                    stable_id: None,
+                    path: "views/ctime.base".to_string(),
+                    document: literal_source.to_string(),
+                    file_size: literal_source.len() as u64,
+                    file_mtime: None,
+                },
+                &[],
+            )
+            .unwrap()
+        else {
+            panic!("a string literal mentioning file.ctime is not a dependency")
+        };
     }
 
     #[test]

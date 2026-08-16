@@ -50,8 +50,9 @@ pub(crate) use execute::{
 };
 pub(crate) use execute::{prepare_hosted_canonical_view, verify_canonical_view_context};
 pub(crate) use expression::{
-    lower_hosted_candidate, serialize_bases_file, uses_relationships, BasesEvaluationContext,
-    BasesFile, BasesLink, BasesTimezone, BASES_OPERATION_CANCELLED, BASES_WORK_BUDGET_EXCEEDED,
+    lower_hosted_candidate, serialize_bases_file, uses_file_ctime, uses_relationships,
+    BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone, BASES_OPERATION_CANCELLED,
+    BASES_WORK_BUDGET_EXCEEDED,
 };
 pub(crate) use model::{
     stable_named_view_ids, BaseFilter, ObsidianBaseDocument, ObsidianBaseView, ViewReferenceInput,

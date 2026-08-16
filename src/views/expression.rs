@@ -678,6 +678,46 @@ pub(crate) fn uses_relationships(expression: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Return whether an expression reads the filesystem creation/change time.
+/// Hosted authorities do not possess a portable canonical ctime, so planning
+/// must reject this dependency rather than silently evaluating it as null.
+pub(crate) fn uses_file_ctime(expression: &str) -> bool {
+    parse_cached(expression)
+        .map(|expression| expression_uses_file_ctime(expression.as_ref()))
+        .unwrap_or(true)
+}
+
+fn expression_uses_file_ctime(expression: &Expr) -> bool {
+    match expression {
+        Expr::Literal(_) | Expr::Regex(_, _) | Expr::Identifier(_) => false,
+        Expr::Array(values) => values.iter().any(expression_uses_file_ctime),
+        Expr::Unary(_, value) => expression_uses_file_ctime(value),
+        Expr::Binary(_, left, right) => {
+            expression_uses_file_ctime(left) || expression_uses_file_ctime(right)
+        }
+        Expr::Member(object, member) => {
+            let ctime_member = matches!(
+                (object.as_ref(), member),
+                (Expr::Identifier(namespace), Member::Named(property))
+                    if namespace == "file" && property == "ctime"
+            ) || matches!(
+                (object.as_ref(), member),
+                (
+                    Expr::Identifier(namespace),
+                    Member::Computed(value)
+                ) if namespace == "file"
+                    && matches!(value.as_ref(), Expr::Literal(Value::String(property)) if property == "ctime")
+            );
+            ctime_member
+                || expression_uses_file_ctime(object)
+                || matches!(member, Member::Computed(value) if expression_uses_file_ctime(value))
+        }
+        Expr::Call(callee, arguments) => {
+            expression_uses_file_ctime(callee) || arguments.iter().any(expression_uses_file_ctime)
+        }
+    }
+}
+
 fn expression_uses_relationships(expression: &Expr) -> bool {
     match expression {
         Expr::Literal(_) | Expr::Regex(_, _) | Expr::Identifier(_) => false,
