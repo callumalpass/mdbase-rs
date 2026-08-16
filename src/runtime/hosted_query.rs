@@ -28,7 +28,7 @@ use super::{
     SEMANTIC_PROJECTION_SCHEMA_VERSION,
 };
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 4;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 5;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -70,6 +70,14 @@ pub struct HostedResidualEvaluation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<Value>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Canonical values aligned with the closed plan. Providers may retain
+    /// these only for the lifetime of one bounded page/reducer operation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order_values: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_values: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aggregate_values: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -159,7 +167,21 @@ pub enum HostedSortSemantics {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedGroup {
     pub field: CandidateField,
+    pub output_name: String,
     pub direction: HostedOrderDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostedReductionInput {
+    pub group_values: Vec<Value>,
+    pub aggregate_values: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostedReduction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<Vec<Value>>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,13 +358,6 @@ impl CompiledCatalog {
                 "Query ordering, grouping, or summary count exceeds hosted plan limits.",
             ));
         }
-        if !query.group_by.is_empty() || !query.summaries.is_empty() {
-            return Err(query_error(
-                "unsupported_hosted_reducer",
-                "Hosted grouping and summaries require the bounded canonical accumulator.",
-            ));
-        }
-
         let mut requirements = HostedQueryRequirements::default();
         let mut predicates = Vec::new();
         if !query.types.is_empty() {
@@ -364,10 +379,8 @@ impl CompiledCatalog {
                     format!("Query filter did not compile: {}", error.message),
                 )
             })?;
-            // Comparison lowering is retained as a requirements/classification
-            // analysis, but is not yet an authoritative SQL pruning predicate.
-            // CEL coercion and datetime comparison must be represented in the
-            // provider IR before a false comparison may discard a record.
+            // Lowering may only prove candidate exclusion. The canonical
+            // residual remains authoritative for every retained record.
             let lowered = lower_expression(&expression, &mut requirements);
             fully_projected = false;
             requirements.canonical_residual = true;
@@ -408,6 +421,9 @@ impl CompiledCatalog {
                 semantics: HostedSortSemantics::CanonicalV03,
             });
         }
+        requirements.bounded_top_k = order
+            .iter()
+            .any(|item| !matches!(&item.field, CandidateField::Path));
 
         let mut groups = Vec::with_capacity(query.group_by.len());
         for item in &query.group_by {
@@ -420,6 +436,7 @@ impl CompiledCatalog {
             accumulate_field_requirement(&field, &mut requirements);
             groups.push(HostedGroup {
                 field,
+                output_name: item.field.clone(),
                 direction: direction(&item.direction),
             });
         }
@@ -622,6 +639,9 @@ impl CompiledCatalog {
                 matched: false,
                 record: None,
                 diagnostics,
+                order_values: Vec::new(),
+                group_values: Vec::new(),
+                aggregate_values: Vec::new(),
             });
         }
         let effective = collection.apply_defaults(&raw, &types);
@@ -716,7 +736,7 @@ impl CompiledCatalog {
             &effective,
             compiled.requires_file_body_metadata(),
         );
-        let record_output = if matched {
+        let candidate = if matched {
             let mut values = serde_json::Map::new();
             for selection in &compiled.selections {
                 match selection {
@@ -744,26 +764,33 @@ impl CompiledCatalog {
                     }
                 }
             }
-            Some(serialize_candidate(
-                &Candidate {
-                    path: record.path.clone(),
-                    types,
-                    raw: file_record.raw_frontmatter,
-                    effective,
-                    body: file_record.body,
-                    file,
-                    projections,
-                    values,
-                },
-                &compiled.query,
-            ))
+            Some(Candidate {
+                path: record.path.clone(),
+                types,
+                raw: file_record.raw_frontmatter,
+                effective,
+                body: file_record.body,
+                file,
+                projections,
+                values,
+            })
         } else {
             None
         };
+        let (order_values, group_values, aggregate_values) = candidate
+            .as_ref()
+            .map(|candidate| hosted_operator_values(plan, candidate))
+            .unwrap_or_default();
+        let record_output = candidate
+            .as_ref()
+            .map(|candidate| serialize_candidate(candidate, &compiled.query));
         Ok(HostedResidualEvaluation {
             matched,
             record: record_output,
             diagnostics,
+            order_values,
+            group_values,
+            aggregate_values,
         })
     }
 
@@ -837,6 +864,9 @@ impl CompiledCatalog {
                 matched: false,
                 record: None,
                 diagnostics: Vec::new(),
+                order_values: Vec::new(),
+                group_values: Vec::new(),
+                aggregate_values: Vec::new(),
             });
         }
         let collection = self.collection();
@@ -890,25 +920,30 @@ impl CompiledCatalog {
         };
         let mut file = file_value(&file_record, &effective, false);
         complete_file_value_from_projection(&mut file, &effective, projection);
-        let record = matched.then(|| {
-            serialize_candidate(
-                &Candidate {
-                    path: projection.facts.path.clone(),
-                    types: projection.facts.types.clone(),
-                    raw: file_record.raw_frontmatter,
-                    effective,
-                    body: String::new(),
-                    file,
-                    projections,
-                    values: serde_json::Map::new(),
-                },
-                &compiled.query,
-            )
+        let candidate = matched.then(|| Candidate {
+            path: projection.facts.path.clone(),
+            types: projection.facts.types.clone(),
+            raw: file_record.raw_frontmatter,
+            effective,
+            body: String::new(),
+            file,
+            projections,
+            values: serde_json::Map::new(),
         });
+        let (order_values, group_values, aggregate_values) = candidate
+            .as_ref()
+            .map(|candidate| hosted_operator_values(plan, candidate))
+            .unwrap_or_default();
+        let record = candidate
+            .as_ref()
+            .map(|candidate| serialize_candidate(candidate, &compiled.query));
         Ok(HostedResidualEvaluation {
             matched,
             record,
             diagnostics,
+            order_values,
+            group_values,
+            aggregate_values,
         })
     }
 }
@@ -924,6 +959,117 @@ impl HostedQueryPlan {
             )
         })?;
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    }
+
+    /// Compare canonical operator values emitted by the point-residual seam.
+    /// The path tie-break is always ascending, matching filesystem execution.
+    pub fn compare_order_values(
+        &self,
+        left_values: &[Value],
+        left_path: &str,
+        right_values: &[Value],
+        right_path: &str,
+    ) -> std::cmp::Ordering {
+        for (index, order) in self.order.iter().enumerate() {
+            let comparison = compare_hosted_values(
+                left_values.get(index).unwrap_or(&Value::Null),
+                right_values.get(index).unwrap_or(&Value::Null),
+                order.direction,
+            );
+            if comparison != std::cmp::Ordering::Equal {
+                return comparison;
+            }
+        }
+        left_path.cmp(right_path)
+    }
+
+    /// Build canonical query groups and built-in summaries from one bounded
+    /// set of already-matched records. No record content is retained here.
+    pub fn reduce_matches(
+        &self,
+        rows: &[HostedReductionInput],
+    ) -> Result<HostedReduction, CatalogError> {
+        if self.groups.is_empty() && self.aggregates.is_empty() {
+            return Ok(HostedReduction {
+                groups: None,
+                diagnostics: Vec::new(),
+            });
+        }
+        for row in rows {
+            if row.group_values.len() != self.groups.len()
+                || row.aggregate_values.len() != self.aggregates.len()
+            {
+                return Err(query_error(
+                    "hosted_query_plan_mismatch",
+                    "Hosted reduction values do not align with the compiled plan.",
+                ));
+            }
+        }
+
+        let mut diagnostics = Vec::new();
+        let groups = if self.groups.is_empty() {
+            vec![hosted_group_value(
+                self,
+                &serde_json::Map::new(),
+                rows,
+                &mut diagnostics,
+            )]
+        } else {
+            let mut grouped = BTreeMap::<
+                String,
+                (serde_json::Map<String, Value>, Vec<HostedReductionInput>),
+            >::new();
+            for row in rows {
+                let values = self
+                    .groups
+                    .iter()
+                    .zip(&row.group_values)
+                    .map(|(group, value)| (group.output_name.clone(), value.clone()))
+                    .collect::<serde_json::Map<_, _>>();
+                let key = serde_json::to_string(&values).map_err(|error| {
+                    query_error(
+                        "invalid_hosted_reduction",
+                        format!("Hosted group values could not be canonicalized: {error}"),
+                    )
+                })?;
+                grouped
+                    .entry(key)
+                    .or_insert_with(|| (values, Vec::new()))
+                    .1
+                    .push(row.clone());
+            }
+            if grouped.len() as u64 > self.budgets.max_groups {
+                return Err(query_error(
+                    "hosted_group_budget_exceeded",
+                    format!(
+                        "Hosted grouping exceeded the maximum of {} groups.",
+                        self.budgets.max_groups
+                    ),
+                ));
+            }
+            let mut grouped = grouped.into_values().collect::<Vec<_>>();
+            grouped.sort_by(|(left, _), (right, _)| {
+                for group in &self.groups {
+                    let comparison = compare_hosted_values(
+                        left.get(&group.output_name).unwrap_or(&Value::Null),
+                        right.get(&group.output_name).unwrap_or(&Value::Null),
+                        group.direction,
+                    );
+                    if comparison != std::cmp::Ordering::Equal {
+                        return comparison;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            grouped
+                .into_iter()
+                .map(|(values, rows)| hosted_group_value(self, &values, &rows, &mut diagnostics))
+                .collect()
+        };
+        Ok(HostedReduction {
+            groups: Some(groups),
+            diagnostics,
+        })
     }
 
     /// Evaluate only whether SQL may discard a projected row. Stale, absent,
@@ -953,6 +1099,184 @@ impl HostedQueryPlan {
             }
             Truth::False => CandidateVerdict::Reject,
         }
+    }
+}
+
+fn hosted_operator_values(
+    plan: &HostedQueryPlan,
+    candidate: &Candidate,
+) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    (
+        plan.order
+            .iter()
+            .map(|order| hosted_candidate_value(candidate, &order.field))
+            .collect(),
+        plan.groups
+            .iter()
+            .map(|group| hosted_candidate_value(candidate, &group.field))
+            .collect(),
+        plan.aggregates
+            .iter()
+            .map(|aggregate| hosted_candidate_value(candidate, &aggregate.field))
+            .collect(),
+    )
+}
+
+fn hosted_candidate_value(candidate: &Candidate, field: &CandidateField) -> Value {
+    match field {
+        CandidateField::Path => Value::String(candidate.path.clone()),
+        CandidateField::Types => {
+            Value::Array(candidate.types.iter().cloned().map(Value::String).collect())
+        }
+        CandidateField::File(name) => candidate.file.get(name).cloned().unwrap_or(Value::Null),
+        CandidateField::PersistedFrontmatter(path) => nested_value(&candidate.raw, path),
+        CandidateField::EffectiveFrontmatter(path) => nested_value(&candidate.effective, path),
+        CandidateField::BodyTags => candidate.file.get("tags").cloned().unwrap_or(Value::Null),
+    }
+}
+
+fn nested_value(root: &Value, path: &[String]) -> Value {
+    path.iter()
+        .try_fold(root, |value, segment| value.get(segment))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn compare_hosted_values(
+    left: &Value,
+    right: &Value,
+    direction: HostedOrderDirection,
+) -> std::cmp::Ordering {
+    let ascending = match (left.is_null(), right.is_null()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => match (left, right) {
+            (Value::Number(left), Value::Number(right)) => left
+                .as_f64()
+                .partial_cmp(&right.as_f64())
+                .unwrap_or(std::cmp::Ordering::Equal),
+            (Value::String(left), Value::String(right)) => left.cmp(right),
+            (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
+            (Value::Array(left), Value::Array(right)) => left.len().cmp(&right.len()),
+            (Value::Object(left), Value::Object(right)) => left.len().cmp(&right.len()),
+            _ => std::cmp::Ordering::Equal,
+        },
+    };
+    match direction {
+        HostedOrderDirection::Ascending => ascending,
+        HostedOrderDirection::Descending => ascending.reverse(),
+    }
+}
+
+fn hosted_group_value(
+    plan: &HostedQueryPlan,
+    values: &serde_json::Map<String, Value>,
+    rows: &[HostedReductionInput],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Value {
+    let mut summaries = serde_json::Map::new();
+    for (index, aggregate) in plan.aggregates.iter().enumerate() {
+        let inputs = rows
+            .iter()
+            .map(|row| row.aggregate_values[index].clone())
+            .collect::<Vec<_>>();
+        match hosted_builtin_summary(&aggregate.function, &inputs) {
+            Ok(value) => {
+                summaries.insert(aggregate.output_name.clone(), value);
+            }
+            Err(message) => {
+                diagnostics.push(Diagnostic {
+                    severity: "warning".to_string(),
+                    code: "expression_evaluation_error".to_string(),
+                    message,
+                    path: None,
+                    field: Some(format!("summaries.{}", aggregate.output_name)),
+                    type_name: None,
+                    schema_location: None,
+                    details: Some(serde_json::json!({"context": "query_summary"})),
+                });
+                summaries.insert(aggregate.output_name.clone(), Value::Null);
+            }
+        }
+    }
+    serde_json::json!({
+        "values": values,
+        "count": rows.len(),
+        "summaries": summaries,
+    })
+}
+
+fn hosted_builtin_summary(function: &str, values: &[Value]) -> Result<Value, String> {
+    if function == "count" {
+        return Ok(serde_json::json!(values.len()));
+    }
+    if matches!(function, "empty" | "filled") {
+        let empty = values
+            .iter()
+            .filter(|value| hosted_value_is_empty(value))
+            .count();
+        return Ok(serde_json::json!(if function == "empty" {
+            empty
+        } else {
+            values.len() - empty
+        }));
+    }
+    let non_null = values
+        .iter()
+        .filter(|value| !value.is_null())
+        .collect::<Vec<_>>();
+    if non_null.is_empty() {
+        return Ok(Value::Null);
+    }
+    match function {
+        "sum" | "average" | "minimum" | "maximum" => {
+            let numbers = non_null
+                .iter()
+                .map(|value| value.as_f64())
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| format!("Summary '{function}' received a non-numeric value."))?;
+            let number = match function {
+                "sum" => numbers.iter().sum(),
+                "average" => numbers.iter().sum::<f64>() / numbers.len() as f64,
+                "minimum" => numbers.iter().copied().fold(f64::INFINITY, f64::min),
+                "maximum" => numbers.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                _ => unreachable!(),
+            };
+            Ok(hosted_number_value(number))
+        }
+        "earliest" | "latest" => {
+            let strings = non_null
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| format!("Summary '{function}' received a non-string value."))?;
+            let selected = if function == "earliest" {
+                strings.into_iter().min()
+            } else {
+                strings.into_iter().max()
+            };
+            Ok(selected.map_or(Value::Null, |value| serde_json::json!(value)))
+        }
+        _ => Err(format!("Unknown hosted summary function '{function}'.")),
+    }
+}
+
+fn hosted_number_value(value: f64) -> Value {
+    if value.fract() == 0.0 && value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+        serde_json::json!(value as i64)
+    } else {
+        serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
+    }
+}
+
+fn hosted_value_is_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(value) => value.is_empty(),
+        Value::Array(value) => value.is_empty(),
+        Value::Object(value) => value.is_empty(),
+        Value::Bool(_) | Value::Number(_) => false,
     }
 }
 
@@ -1992,10 +2316,10 @@ mod tests {
         let second = catalog().compile_hosted_query(&query).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
-        assert_eq!(first.version, 4);
+        assert_eq!(first.version, 5);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
         assert!(first.plan_digest.starts_with("sha256:"));
-        assert_eq!(serde_json::to_value(first).unwrap()["version"], 4);
+        assert_eq!(serde_json::to_value(first).unwrap()["version"], 5);
     }
 
     #[test]
@@ -2010,14 +2334,76 @@ mod tests {
         assert_eq!(plan.order[0].field, CandidateField::File("ext".to_string()));
         assert_eq!(plan.order[0].semantics, HostedSortSemantics::CanonicalV03);
         assert!(plan.order[0].canonical_path_tiebreak);
+        assert!(plan.requirements.bounded_top_k);
 
-        let error = catalog()
+        let grouped = catalog()
             .compile_hosted_query(&json!({
                 "group_by": [{"field": "record.status"}],
                 "limit": 20
             }))
-            .unwrap_err();
-        assert_eq!(error.code, "unsupported_hosted_reducer");
+            .unwrap();
+        assert_eq!(grouped.groups[0].output_name, "record.status");
+        assert!(grouped.requirements.bounded_grouping);
+    }
+
+    #[test]
+    fn canonical_operator_values_drive_bounded_order_and_reduction() {
+        let catalog = catalog();
+        let plan = catalog
+            .compile_hosted_query(&json!({
+                "order_by": [{"field": "record.effort", "direction": "desc"}],
+                "group_by": [{"field": "record.status"}],
+                "summaries": [
+                    {"field": "record.effort", "function": "sum", "name": "effort"},
+                    {"field": "record.status", "function": "count", "name": "records"}
+                ]
+            }))
+            .unwrap();
+        let evaluate = |path: &str, status: &str, effort: u64| {
+            catalog
+                .evaluate_hosted_residual(
+                    &plan,
+                    &CanonicalRecordInput {
+                        stable_id: None,
+                        path: path.to_string(),
+                        document: format!("---\nstatus: {status}\neffort: {effort}\n---\nBody\n"),
+                        file_size: 0,
+                        file_mtime: None,
+                    },
+                )
+                .unwrap()
+        };
+        let low = evaluate("tasks/low.md", "open", 2);
+        let high = evaluate("tasks/high.md", "open", 5);
+        assert!(plan
+            .compare_order_values(
+                &high.order_values,
+                "tasks/high.md",
+                &low.order_values,
+                "tasks/low.md"
+            )
+            .is_lt());
+        let reduction = plan
+            .reduce_matches(&[
+                HostedReductionInput {
+                    group_values: low.group_values,
+                    aggregate_values: low.aggregate_values,
+                },
+                HostedReductionInput {
+                    group_values: high.group_values,
+                    aggregate_values: high.aggregate_values,
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            reduction.groups,
+            Some(vec![json!({
+                "values": {"record.status": "open"},
+                "count": 2,
+                "summaries": {"effort": 7, "records": 2}
+            })])
+        );
+        assert!(reduction.diagnostics.is_empty());
     }
 
     #[test]

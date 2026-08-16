@@ -42,8 +42,8 @@ pub use hosted_query::{
     CandidateComparison, CandidateComparisonOperator, CandidateComparisonPruning, CandidateField,
     CandidatePredicate, CandidateVerdict, CanonicalResidual, HostedAggregate, HostedGroup,
     HostedOrder, HostedOrderDirection, HostedQueryBudgets, HostedQueryPlan,
-    HostedQueryRequirements, HostedResidualEvaluation, HostedSortSemantics, ProjectionAvailability,
-    HOSTED_QUERY_PLAN_VERSION,
+    HostedQueryRequirements, HostedReduction, HostedReductionInput, HostedResidualEvaluation,
+    HostedSortSemantics, ProjectionAvailability, HOSTED_QUERY_PLAN_VERSION,
 };
 #[cfg(feature = "tracing")]
 pub use observer::TracingObserver;
