@@ -46,6 +46,7 @@ pub use filesystem::FilesystemRuntime;
 pub use hosted_base::{
     HostedBaseEvaluation, HostedBasePlan, HostedBasePlanning, HostedBaseRecordContext,
     HostedBaseRequirements, HostedBaseRow, HOSTED_BASE_PLAN_VERSION,
+    MAX_HOSTED_BASE_RELATED_RECORDS,
 };
 pub use hosted_mutation::{HostedMutationChange, HostedMutationPlan, HostedMutationRequest};
 pub use hosted_query::{
