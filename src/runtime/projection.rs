@@ -18,7 +18,11 @@ use super::{
     ResolvedRecordStructure, StructuralResolution, MAX_RESOLUTION_CANDIDATES,
 };
 
-pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 3;
+/// Format v4 requires providers to bind the canonical file modification time
+/// supplied for a hosted record into both the projection envelope and its
+/// revision-scoped persistence metadata. Older projections may contain a null
+/// mtime and must not be treated as current by a v4 executor.
+pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 4;
 pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v3";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

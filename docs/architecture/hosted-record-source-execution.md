@@ -88,6 +88,12 @@ those rows and derives backlinks from their inverse. Authority record/catalog/
 generation currentness remains outside mdbase-rs, but the semantic engine and
 projection format versions and content digest are explicit outputs.
 
+Projection format 4 requires a hosted authority to supply the authoritative
+record-version modification time when projecting or canonically evaluating a
+record. The value is emitted through the existing file-facts shape. A provider
+must rebuild older null-time projections rather than relabel them, while the JSON
+schema identifier remains v3 because no projection member was added.
+
 ### Query compilation and accumulation
 
 `compile_query` returns a versioned closed plan plus public `QueryRequirements`
