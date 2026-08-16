@@ -133,6 +133,13 @@ callback recursion, to a caller-supplied work ceiling. Exhaustion is
 and evaluator entry points use a bounded growable stack so valid TaskNotes method
 chains cannot exhaust a small async worker stack.
 
+For stale or absent provider projections, `finalize_projection_batch` reconstructs
+a caller-bounded exact snapshot without consulting stale provider indexes. It
+builds canonical identity keys, applies the same closed relationship-resolution
+plans, enforces the global relationship-candidate ceiling, and returns complete
+semantic projections suitable for the ordinary Base evaluator. The host remains
+responsible for exact-document, plaintext-byte, time, and memory limits.
+
 ### Mutation planning
 
 A `MutationPlan` contains portable expected generation/resource revision, record

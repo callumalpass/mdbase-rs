@@ -4,6 +4,7 @@
 //! serialized projection. Authority-owned record/catalog/generation bindings are
 //! applied outside this module.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -13,8 +14,8 @@ use sha2::{Digest, Sha256};
 use crate::v03::Diagnostic;
 
 use super::{
-    CanonicalRecordInput, CatalogError, CompiledCatalog, RecordStructure, ResolvedRecordStructure,
-    StructuralResolution,
+    CanonicalRecordInput, CatalogError, CompiledCatalog, RecordStructure, ResolutionCandidate,
+    ResolvedRecordStructure, StructuralResolution, MAX_RESOLUTION_CANDIDATES,
 };
 
 pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 3;
@@ -197,6 +198,67 @@ impl CompiledCatalog {
             facts: prepared.facts,
             structure: resolved,
         })
+    }
+
+    /// Canonically resolve and finalize a caller-bounded exact snapshot without
+    /// consulting provider indexes. This is the fail-safe seam for an authority
+    /// whose persisted projection or relationship graph is stale or absent.
+    /// The caller owns record/byte limits; mdbase-rs additionally enforces its
+    /// closed relationship-candidate ceiling across the whole batch.
+    pub fn finalize_projection_batch(
+        &self,
+        records: Vec<(String, PreparedSemanticProjection)>,
+    ) -> Result<Vec<(String, SemanticProjection)>, CatalogError> {
+        let mut identities =
+            BTreeMap::<(super::RecordResolutionKeyKind, String), Vec<(String, String)>>::new();
+        for (record_id, prepared) in &records {
+            for key in &prepared.facts.resolution_keys {
+                identities
+                    .entry((key.kind, key.value.clone()))
+                    .or_default()
+                    .push((record_id.clone(), prepared.facts.path.clone()));
+            }
+        }
+        for values in identities.values_mut() {
+            values.sort();
+            values.dedup();
+        }
+
+        let mut candidate_count = 0_usize;
+        let mut finalized = Vec::with_capacity(records.len());
+        for (record_id, prepared) in records {
+            let plan = self.plan_record_resolution(&prepared.structure)?;
+            let mut candidates = Vec::new();
+            for lookup in &plan.lookups {
+                for alternative in &lookup.alternatives {
+                    let Some(matches) =
+                        identities.get(&(alternative.kind, alternative.value.clone()))
+                    else {
+                        continue;
+                    };
+                    candidate_count = candidate_count.saturating_add(matches.len());
+                    if candidate_count > MAX_RESOLUTION_CANDIDATES {
+                        return Err(CatalogError {
+                            code: "relationship_resolution_budget_exceeded".to_string(),
+                            message: "The exact fallback snapshot exceeded its bounded relationship-candidate budget."
+                                .to_string(),
+                        });
+                    }
+                    candidates.extend(matches.iter().map(|(target_id, path)| {
+                        ResolutionCandidate {
+                            occurrence_ordinal: lookup.occurrence_ordinal,
+                            lookup: alternative.clone(),
+                            record_id: target_id.clone(),
+                            path: path.clone(),
+                        }
+                    }));
+                }
+            }
+            let resolved =
+                self.resolve_record_structure(&prepared.structure, &plan, &candidates)?;
+            finalized.push((record_id, self.finalize_projection(prepared, resolved)?));
+        }
+        Ok(finalized)
     }
 }
 
@@ -452,6 +514,47 @@ mod tests {
         assert_eq!(
             first.canonical_digest().unwrap(),
             second.canonical_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_fallback_batch_resolves_relationships_without_provider_indexes() {
+        let catalog = catalog();
+        let source_document = "---\nuid: source\n---\n[[projects/mobile]]\n";
+        let target_document = "---\nuid: mobile\ntitle: Mobile\n---\n";
+        let source = catalog
+            .project_record(&CanonicalRecordInput {
+                stable_id: Some("source-id".to_string()),
+                path: "notes/source.md".to_string(),
+                document: source_document.to_string(),
+                file_size: source_document.len() as u64,
+                file_mtime: None,
+            })
+            .unwrap();
+        let target = catalog
+            .project_record(&CanonicalRecordInput {
+                stable_id: Some("target-id".to_string()),
+                path: "projects/mobile.md".to_string(),
+                document: target_document.to_string(),
+                file_size: target_document.len() as u64,
+                file_mtime: None,
+            })
+            .unwrap();
+
+        let finalized = catalog
+            .finalize_projection_batch(vec![
+                ("source-id".to_string(), source),
+                ("target-id".to_string(), target),
+            ])
+            .unwrap();
+        let source = &finalized[0].1;
+        assert_eq!(
+            source.structure.occurrences[0].target_record_id.as_deref(),
+            Some("target-id")
+        );
+        assert_eq!(
+            source.structure.occurrences[0].resolution,
+            StructuralResolution::Resolved
         );
     }
 }
