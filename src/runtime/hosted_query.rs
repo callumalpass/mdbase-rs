@@ -1046,6 +1046,20 @@ impl CompiledCatalog {
 }
 
 impl HostedQueryPlan {
+    /// Verify that every closed-plan field still matches the mdbase-rs digest
+    /// captured at compilation. Hosts must call this before translating a
+    /// durably stored plan into provider predicates.
+    pub fn validate_integrity(&self) -> Result<(), CatalogError> {
+        if self.version != HOSTED_QUERY_PLAN_VERSION || self.integrity_digest()? != self.plan_digest
+        {
+            return Err(query_error(
+                "hosted_query_plan_mismatch",
+                "Hosted query plan integrity validation failed.",
+            ));
+        }
+        Ok(())
+    }
+
     fn integrity_digest(&self) -> Result<String, CatalogError> {
         let mut unsigned = self.clone();
         unsigned.plan_digest.clear();
