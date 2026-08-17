@@ -13,7 +13,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::expressions::ast::{BinOp, Expr, UnaryOp};
-use crate::expressions::evaluator::resolve_execution_timezone;
+use crate::expressions::evaluator::{path_is_in_folder, resolve_execution_timezone};
 use crate::query::cache_source::FileRecord;
 use crate::v03::query::context::{candidate_context, file_value, namespace_value};
 use crate::v03::query::diagnostics;
@@ -24,7 +24,7 @@ use crate::v03::{cel, validate_query, Diagnostic};
 
 use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 11;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 12;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -85,11 +85,28 @@ pub struct HostedResidualEvaluation {
 pub enum CandidatePredicate {
     All,
     None,
-    And { terms: Vec<CandidatePredicate> },
-    Or { terms: Vec<CandidatePredicate> },
-    Not { term: Box<CandidatePredicate> },
-    HasType { type_name: String },
-    Compare { comparison: CandidateComparison },
+    And {
+        terms: Vec<CandidatePredicate>,
+    },
+    Or {
+        terms: Vec<CandidatePredicate>,
+    },
+    Not {
+        term: Box<CandidatePredicate>,
+    },
+    HasType {
+        type_name: String,
+    },
+    /// Canonical `file.inFolder(literal)` membership. The literal is stored
+    /// with trailing `/` removed, matching the canonical evaluator. Providers
+    /// must compare a record's parent folder at path-segment boundaries; this
+    /// is not substring or generic string-prefix matching.
+    PathInFolder {
+        folder: String,
+    },
+    Compare {
+        comparison: CandidateComparison,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1858,6 +1875,16 @@ fn lower_expression(
             let Expr::Dot(receiver, method) = function.as_ref() else {
                 return None;
             };
+            if method == "inFolder" && expression_path(receiver).as_deref() == Some("file") {
+                let Value::String(folder) = literal(&arguments[0])? else {
+                    return None;
+                };
+                return Some(LoweredPredicate::complete(
+                    CandidatePredicate::PathInFolder {
+                        folder: folder.trim_end_matches('/').to_string(),
+                    },
+                ));
+            }
             if method != "contains" {
                 return None;
             }
@@ -1980,8 +2007,10 @@ fn annotate_candidate_scalar_kinds(
             comparison.value_kind =
                 hosted_scalar_kind(&comparison.field, selected_types, collection);
         }
-        CandidatePredicate::All | CandidatePredicate::None | CandidatePredicate::HasType { .. } => {
-        }
+        CandidatePredicate::All
+        | CandidatePredicate::None
+        | CandidatePredicate::HasType { .. }
+        | CandidatePredicate::PathInFolder { .. } => {}
     }
 }
 
@@ -2080,6 +2109,9 @@ fn evaluate_predicate(predicate: &CandidatePredicate, projection: &SemanticProje
                 .iter()
                 .any(|candidate| candidate == type_name),
         ),
+        CandidatePredicate::PathInFolder { folder } => {
+            bool_truth(path_is_in_folder(&projection.facts.path, folder))
+        }
         CandidatePredicate::Compare { comparison }
             if comparison.pruning == CandidateComparisonPruning::ExactJson =>
         {
@@ -2548,6 +2580,108 @@ mod tests {
     }
 
     #[test]
+    fn in_folder_is_a_projection_safe_segment_bounded_candidate() {
+        let catalog = catalog();
+        let plan = catalog
+            .compile_hosted_query(&json!({
+                "types": ["task"],
+                "where": "file.inFolder('tasks/')",
+                "order_by": [{"field": "file.path"}],
+                "pagination": "cursor",
+                "limit": 17
+            }))
+            .unwrap();
+
+        assert_eq!(plan.version, HOSTED_QUERY_PLAN_VERSION);
+        assert!(!plan.requirements.exact_document);
+        assert!(plan.requirements.canonical_residual);
+        assert!(plan.residual.projection_filter_safe);
+        assert!(matches!(
+            plan.candidate,
+            CandidatePredicate::And { ref terms }
+                if terms.iter().any(|term| matches!(
+                    term,
+                    CandidatePredicate::PathInFolder { folder } if folder == "tasks"
+                ))
+        ));
+        assert_eq!(
+            serde_json::to_value(&plan).unwrap()["candidate"]["terms"][1],
+            json!({"op": "path_in_folder", "folder": "tasks"})
+        );
+
+        let matching = finalized_projection(
+            &catalog,
+            &CanonicalRecordInput {
+                stable_id: Some("record-match".to_string()),
+                path: "tasks/one.md".to_string(),
+                document: "---\ntype: task\nstatus: open\n---\nText\n".to_string(),
+                file_size: 0,
+                file_mtime: None,
+            },
+        );
+        let sibling = finalized_projection(
+            &catalog,
+            &CanonicalRecordInput {
+                stable_id: Some("record-sibling".to_string()),
+                path: "tasks-archive/one.md".to_string(),
+                document: "---\ntype: task\nstatus: open\n---\nText\n".to_string(),
+                file_size: 0,
+                file_mtime: None,
+            },
+        );
+
+        assert!(
+            catalog
+                .evaluate_hosted_projection_match(&plan, &matching)
+                .unwrap()
+                .matched
+        );
+        assert!(
+            !catalog
+                .evaluate_hosted_projection_match(&plan, &sibling)
+                .unwrap()
+                .matched
+        );
+        assert_eq!(
+            plan.candidate_verdict(Some(&sibling), ProjectionAvailability::Current),
+            CandidateVerdict::Reject
+        );
+    }
+
+    #[test]
+    fn in_folder_candidate_matches_canonical_root_and_boundary_rules() {
+        for (path, folder, expected) in [
+            ("one.md", "", true),
+            ("nested/one.md", "", false),
+            ("tasks/one.md", "tasks", true),
+            ("tasks/nested/one.md", "tasks", true),
+            ("tasks-archive/one.md", "tasks", false),
+            ("task/one.md", "tasks", false),
+            ("tasks.md", "tasks", false),
+            ("tasks2/nested/one.md", "tasks", false),
+        ] {
+            assert_eq!(
+                path_is_in_folder(path, folder),
+                expected,
+                "path={path:?}, folder={folder:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_in_folder_argument_remains_an_exact_residual() {
+        let plan = catalog()
+            .compile_hosted_query(&json!({
+                "where": "file.inFolder(record.status)",
+                "limit": 17
+            }))
+            .unwrap();
+        assert!(plan.requirements.exact_document);
+        assert!(!plan.residual.projection_filter_safe);
+        assert_eq!(plan.candidate, CandidatePredicate::All);
+    }
+
+    #[test]
     fn projection_match_separates_filtering_from_exact_body_hydration() {
         let catalog = catalog();
         let plan = catalog
@@ -2921,10 +3055,10 @@ mod tests {
         let second = catalog().compile_hosted_query(&query).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
-        assert_eq!(first.version, 11);
+        assert_eq!(first.version, 12);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
         assert!(first.plan_digest.starts_with("sha256:"));
-        assert_eq!(serde_json::to_value(first).unwrap()["version"], 11);
+        assert_eq!(serde_json::to_value(first).unwrap()["version"], 12);
     }
 
     #[test]

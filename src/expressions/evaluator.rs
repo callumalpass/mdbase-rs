@@ -670,11 +670,7 @@ fn eval_file_method(method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Va
             let folder = evaluate(&args[0], ctx)?;
             let folder_str = folder.as_str().unwrap_or("");
             if let Some(ref p) = ctx.file_path {
-                // Check if the file's path starts with the folder
-                let in_folder = p.starts_with(folder_str)
-                    && (p.len() == folder_str.len()
-                        || p.as_bytes().get(folder_str.len()) == Some(&b'/'));
-                Ok(Value::Bool(in_folder))
+                Ok(Value::Bool(path_is_in_folder(p, folder_str)))
             } else {
                 Ok(Value::Bool(false))
             }
@@ -812,6 +808,19 @@ fn eval_file_method(method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Va
             method
         ))),
     }
+}
+
+/// Canonical segment-bounded `file.inFolder()` membership shared by exact and
+/// hosted projection execution. A trailing slash in the argument is ignored,
+/// and the empty folder denotes only records at the collection root.
+pub(crate) fn path_is_in_folder(path: &str, folder: &str) -> bool {
+    let folder = folder.trim_end_matches('/');
+    let record_folder = path.rsplit_once('/').map_or("", |(folder, _)| folder);
+    record_folder == folder
+        || (!folder.is_empty()
+            && record_folder
+                .strip_prefix(folder)
+                .is_some_and(|suffix| suffix.starts_with('/')))
 }
 
 fn eval_index(obj_expr: &Expr, idx_expr: &Expr, ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -3162,6 +3171,24 @@ mod limit_tests {
         for body in ["[x](", "[x]((", "![x](", "![x](("] {
             assert!(extract_links_from_body(body).is_empty());
             assert!(extract_embeds_from_body(body).is_empty());
+        }
+    }
+
+    #[test]
+    fn in_folder_is_segment_bounded_and_normalizes_trailing_slashes() {
+        for (path, folder, expected) in [
+            ("one.md", "", true),
+            ("nested/one.md", "", false),
+            ("tasks/one.md", "tasks", true),
+            ("tasks/nested/one.md", "tasks/", true),
+            ("tasks-archive/one.md", "tasks", false),
+            ("tasks.md", "tasks", false),
+        ] {
+            assert_eq!(
+                path_is_in_folder(path, folder),
+                expected,
+                "path={path:?}, folder={folder:?}"
+            );
         }
     }
 }
