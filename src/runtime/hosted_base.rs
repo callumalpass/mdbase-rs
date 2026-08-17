@@ -1369,6 +1369,30 @@ views:
     }
 
     #[test]
+    fn hosted_base_lowers_segment_bounded_folder_candidates() {
+        let catalog = catalog();
+        let source = "views:\n  - type: table\n    name: Tasks\n    filters: 'file.inFolder(\"tasks/\")'\n    order: [file.path]\n";
+        let input = json!({"path": "views/tasks.base", "view": "tasks"});
+        let record = CanonicalRecordInput {
+            stable_id: None,
+            path: "views/tasks.base".to_string(),
+            document: source.to_string(),
+            file_size: source.len() as u64,
+            file_mtime: None,
+        };
+        let HostedBasePlanning::Planned { plan } = catalog
+            .plan_hosted_obsidian_base(&input, &record, &[])
+            .unwrap()
+        else {
+            panic!("expected hosted Base plan")
+        };
+        assert!(matches!(
+            plan.candidate,
+            CandidatePredicate::PathInFolder { ref folder } if folder == "tasks"
+        ));
+    }
+
+    #[test]
     fn plan_digest_and_scope_fail_closed() {
         let catalog = catalog();
         let source = "views:\n  - type: table\n    name: Projects\n    filters: 'file.backlinks.length > 0'\n";
