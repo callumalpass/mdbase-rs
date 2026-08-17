@@ -843,6 +843,15 @@ fn lower_candidate_expression(expression: &Expr) -> CandidatePredicate {
             let Expr::Member(object, Member::Named(method)) = callee.as_ref() else {
                 return CandidatePredicate::All;
             };
+            if method == "inFolder" && candidate_path(object).as_deref() == Some("file") {
+                if let Some(folder) = candidate_literal(&arguments[0]).and_then(|value| {
+                    value
+                        .as_str()
+                        .map(|folder| folder.trim_end_matches('/').to_string())
+                }) {
+                    return CandidatePredicate::PathInFolder { folder };
+                }
+            }
             if method == "hasTag" && candidate_path(object).as_deref() == Some("file") {
                 if let Some(value) = candidate_literal(&arguments[0])
                     .and_then(|value| value.as_str().map(normalize_tag).map(Value::String))
