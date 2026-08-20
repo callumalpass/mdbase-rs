@@ -640,6 +640,73 @@ fn first_precondition_conflict(
             return Ok(Some(entry.path.clone()));
         }
     }
+    first_unsettled_conflict(collection, journal)
+}
+
+/// A path already owned by a transaction that passed its commit point but has
+/// not settled.
+///
+/// Settlement runs after the commit lock is released, so between the two the
+/// working tree still shows the old revision while the new one is already
+/// committed. Checking only the working tree therefore lets a second writer
+/// commit against a baseline that is about to be overwritten. Both then hold
+/// commit points for the same path, and whichever settles second finds a
+/// revision matching neither its before nor its intended state — reported as
+/// `manual_recovery_required`, which strands the journal and fails every later
+/// `Collection::open`.
+///
+/// Rejecting here keeps that outcome reachable only by genuine external edits,
+/// and makes a lost race an ordinary `concurrent_modification` before any
+/// commit point is taken.
+fn first_unsettled_conflict(
+    collection: &Collection,
+    journal: &RuntimeJournal,
+) -> Result<Option<String>, TransactionError> {
+    let root = collection.root.join(TRANSACTIONS_DIR);
+    let mut directories = match fs::read_dir(&root) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io_error(root, source)),
+    };
+    directories.sort();
+    let claimed = journal
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<BTreeSet<_>>();
+    for directory in directories {
+        if directory.file_name().and_then(|name| name.to_str()) == Some(journal.id.as_str()) {
+            continue;
+        }
+        let bytes = match fs::read(directory.join(JOURNAL_FILE)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error(directory.join(JOURNAL_FILE), source)),
+        };
+        let value = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
+        if value.get("version").and_then(serde_json::Value::as_u64) != Some(2) {
+            continue;
+        }
+        let other: RuntimeJournal = serde_json::from_value(value)
+            .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
+        // Only a committed-but-unsettled transaction owns paths it has not yet
+        // written. A prepared one has taken no commit point and loses the race
+        // itself; a settled one is already visible in the working tree.
+        if other.phase != RuntimePhase::Committing {
+            continue;
+        }
+        if let Some(entry) = other
+            .entries
+            .iter()
+            .find(|entry| claimed.contains(entry.path.as_str()))
+        {
+            return Ok(Some(entry.path.clone()));
+        }
+    }
     Ok(None)
 }
 
@@ -877,4 +944,135 @@ fn context_check(context: &OperationContext) -> Result<(), TransactionError> {
     context
         .check()
         .map_err(|error| TransactionError::OperationBoundary { code: error.code() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{
+        CanonicalFieldChangeSet, CanonicalTypeSet, RecordChange, RecordChangeKind,
+    };
+    use std::collections::BTreeMap;
+
+    fn collection() -> (tempfile::TempDir, Collection) {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("a.md"), "old-a\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        (root, collection)
+    }
+
+    fn change(path: &str, before: &[u8], after: &[u8]) -> ChangeBatch {
+        ChangeBatch::new(vec![CanonicalChange::Record(RecordChange {
+            kind: RecordChangeKind::Updated,
+            path: crate::api::CollectionPath::new(path).unwrap(),
+            from: None,
+            before_revision: Some(
+                crate::api::Revision::parse(crate::v03::revision(before)).unwrap(),
+            ),
+            after_revision: Some(crate::api::Revision::parse(crate::v03::revision(after)).unwrap()),
+            before_types: CanonicalTypeSet::new([]),
+            after_types: CanonicalTypeSet::new([]),
+            changed_fields: CanonicalFieldChangeSet::new([]).unwrap(),
+            body_changed: true,
+        })])
+        .unwrap()
+    }
+
+    fn prepare(collection: &Collection, path: &str, before: &[u8], after: &[u8]) -> CommitId {
+        let baseline: FileBaseline = BTreeMap::from([(path.to_string(), before.to_vec())]);
+        let desired: FileBaseline = BTreeMap::from([(path.to_string(), after.to_vec())]);
+        let claim = HostClaimId::generate();
+        let event_id = ChangeEventId::generate();
+        let changes = change(path, before, after);
+        let result = crate::v03::OperationResult {
+            valid: true,
+            result: serde_json::json!({}),
+            diagnostics: Vec::new(),
+        };
+        let outcome = prepare_runtime_transaction(
+            collection,
+            RuntimePrepareInput {
+                baseline: &baseline,
+                desired: &desired,
+                claim: &claim,
+                mutation_digest: claim.as_str(),
+                result: &result,
+                changes: &changes,
+                event_id: &event_id,
+            },
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+        match outcome {
+            RuntimePrepareOutcome::Prepared(id) => id,
+            other => panic!("expected a prepared transaction, got {other:?}"),
+        }
+    }
+
+    fn commit(collection: &Collection, id: &CommitId) -> RuntimeCommitAttempt {
+        commit_runtime_prepared(
+            collection,
+            id,
+            &CollectionGeneration::initial(),
+            ChangeWatermark::from_stored(1),
+            &OperationContext::legacy(),
+        )
+        .unwrap()
+    }
+
+    /// Settlement runs after the commit lock is released, so for a window the
+    /// working tree still shows the old revision of a path that is already
+    /// committed. A second writer that checked only the working tree committed
+    /// too, and then could not settle: its path matched neither its before nor
+    /// its intended revision, which was reported as `manual_recovery_required`
+    /// and stranded the journal so every later open of the collection failed.
+    #[test]
+    fn a_committed_but_unsettled_path_rejects_the_next_writer_before_its_commit_point() {
+        let (_root, collection) = collection();
+        let first = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
+        let second = prepare(&collection, "a.md", b"old-a\n", b"other-a\n");
+
+        // The first writer commits and does not settle: the working tree still
+        // reads `old-a`, which is exactly the stale view that misled the second.
+        assert!(matches!(
+            commit(&collection, &first),
+            RuntimeCommitAttempt::SettlementRequired(_)
+        ));
+        assert_eq!(fs::read(collection.root.join("a.md")).unwrap(), b"old-a\n");
+
+        match commit(&collection, &second) {
+            RuntimeCommitAttempt::RejectedBeforeCommit(_) => {}
+            other => panic!("the second writer must lose cleanly, got {other:?}"),
+        }
+
+        // The loser took no commit point, so the winner still settles and the
+        // collection stays openable rather than requiring manual recovery.
+        settle_runtime_commit(&collection, &first).unwrap();
+        assert_eq!(fs::read(collection.root.join("a.md")).unwrap(), b"new-a\n");
+        drop(collection);
+        Collection::open(_root.path()).expect("the collection must remain openable");
+    }
+
+    /// The rejection is specific to paths a committed transaction owns, so an
+    /// unrelated path still commits while settlement is outstanding.
+    #[test]
+    fn an_unsettled_transaction_does_not_block_an_unrelated_path() {
+        let (root, collection) = collection();
+        fs::write(root.path().join("b.md"), "old-b\n").unwrap();
+        let first = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
+        let second = prepare(&collection, "b.md", b"old-b\n", b"new-b\n");
+        assert!(matches!(
+            commit(&collection, &first),
+            RuntimeCommitAttempt::SettlementRequired(_)
+        ));
+        assert!(matches!(
+            commit(&collection, &second),
+            RuntimeCommitAttempt::SettlementRequired(_)
+        ));
+    }
 }
