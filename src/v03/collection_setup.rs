@@ -187,7 +187,6 @@ struct CollectionSetupPlan {
     shadow: Option<batch::ShadowCollection>,
     assessment: CollectionSetupAssessment,
     receipt_configuration: Vec<ConfigurationContributionReceipt>,
-    baseline_validation_errors: Vec<Diagnostic>,
 }
 
 impl Collection {
@@ -289,18 +288,8 @@ impl Collection {
                 )
             }
         };
-        let committed_validation_errors = collection_validation_errors(&reopened);
-        if !introduced_validation_errors(
-            &plan.baseline_validation_errors,
-            &committed_validation_errors,
-        )
-        .is_empty()
-        {
-            return setup_error(
-                "collection_setup_apply_failed",
-                "The committed collection setup introduced validation errors.",
-            );
-        }
+        // Reopening verifies structural integrity. Record schema diagnostics are
+        // reported by the assessment but do not block application setup.
         let committed = match batch::collect_collection_files(&reopened) {
             Ok(files) => baseline_revision(&files),
             Err(diagnostic) => return failed(vec![*diagnostic]),
@@ -432,9 +421,6 @@ fn plan_collection_setup(
     let final_validation_errors = collection_validation_errors(&shadow.collection);
     let introduced_diagnostics =
         introduced_validation_errors(&baseline_validation_errors, &final_validation_errors);
-    if !introduced_diagnostics.is_empty() {
-        return Err(introduced_diagnostics);
-    }
     let resolved_diagnostic_count =
         introduced_validation_errors(&final_validation_errors, &baseline_validation_errors).len();
     let desired = batch::collect_collection_files(&shadow.collection)
@@ -462,13 +448,13 @@ fn plan_collection_setup(
         &baseline_validation_errors,
         final_validation_errors.len(),
         resolved_diagnostic_count,
+        introduced_diagnostics.len(),
         changed,
     )?;
     Ok(CollectionSetupPlan {
         shadow: Some(shadow),
         assessment,
         receipt_configuration,
-        baseline_validation_errors,
     })
 }
 
@@ -569,13 +555,13 @@ fn plan_unchanged_collection_setup(
         baseline_validation_errors,
         baseline_validation_errors.len(),
         0,
+        0,
         false,
     )?;
     Ok(Some(CollectionSetupPlan {
         shadow: None,
         assessment,
         receipt_configuration,
-        baseline_validation_errors: baseline_validation_errors.to_vec(),
     }))
 }
 
@@ -591,6 +577,7 @@ fn complete_assessment(
     baseline_validation_errors: &[Diagnostic],
     final_diagnostic_count: usize,
     resolved_diagnostic_count: usize,
+    introduced_diagnostic_count: usize,
     changed: bool,
 ) -> Result<CollectionSetupAssessment, Vec<Diagnostic>> {
     let has_configuration_conflict = configuration.iter().any(|entry| entry.conflict.is_some());
@@ -619,7 +606,7 @@ fn complete_assessment(
         baseline_diagnostic_count: baseline_validation_errors.len(),
         final_diagnostic_count,
         resolved_diagnostic_count,
-        introduced_diagnostic_count: 0,
+        introduced_diagnostic_count,
         baseline_diagnostic_digest: validation_diagnostic_digest(baseline_validation_errors),
         assessment_digest: String::new(),
     };
@@ -1198,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_rejects_validation_errors_introduced_by_a_type_pack() {
+    fn setup_reports_but_permits_validation_errors_introduced_by_a_type_pack() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(
             directory.path().join("mdbase.yaml"),
@@ -1246,15 +1233,19 @@ mod tests {
             });
 
         let assessment = collection.assess_collection_setup(&declaration);
-        assert!(!assessment.valid);
-        assert!(assessment
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "schema_required"));
+        assert!(assessment.valid, "{:?}", assessment.diagnostics);
+        assert_eq!(assessment.result["introduced_diagnostic_count"], 1);
+        assert_eq!(assessment.result["final_diagnostic_count"], 1);
+
+        let applied =
+            collection.apply_collection_setup(&declaration, &apply_options(&assessment.result));
+        assert!(applied.valid, "{:?}", applied.diagnostics);
         assert_eq!(
             fs::read_to_string(directory.path().join("_types/note.md")).unwrap(),
-            current_type
+            desired_type
         );
+        let reopened = Collection::open(directory.path()).unwrap();
+        assert_eq!(collection_validation_errors(&reopened).len(), 1);
     }
 
     #[test]
