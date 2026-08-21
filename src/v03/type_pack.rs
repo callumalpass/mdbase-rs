@@ -346,10 +346,6 @@ pub(crate) fn plan_type_pack(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-    let desired_resources = resolved_resources
-        .iter()
-        .map(|resource| (resource.source.as_str(), resource))
-        .collect::<BTreeMap<_, _>>();
     let other_owners = lock
         .packs
         .iter()
@@ -488,9 +484,12 @@ pub(crate) fn plan_type_pack(
 
     if let Some(current) = &current {
         for resource in &current.resources {
-            if desired_resources
-                .get(resource.source.as_str())
-                .is_some_and(|desired| desired.target == resource.target)
+            // A publisher may rename a source while retaining its installed
+            // target. The desired resource now owns that path, so the old
+            // receipt must not schedule a second, destructive retirement.
+            if resolved_resources
+                .iter()
+                .any(|desired| desired.target == resource.target)
             {
                 continue;
             }
@@ -1782,6 +1781,54 @@ implements:
             .unwrap()
             .iter()
             .all(|resource| resource["action"] == "unchanged"));
+    }
+
+    #[test]
+    fn changing_a_resource_source_does_not_retire_its_desired_target() {
+        let (root, collection) = collection();
+        let definitions = task_resources();
+        let resources = definitions
+            .iter()
+            .map(|(_, source, _, document)| resource(source, document))
+            .collect::<Vec<_>>();
+        let mut initial_manifest = manifest(&definitions);
+        initial_manifest["resources"][2]["mode"] = Value::String("seed".to_string());
+        let initial = provision(initial_manifest, resources);
+        assert!(apply_pack(&collection, &initial).valid);
+
+        let mut renamed = task_resources();
+        renamed[0].1 = "schemas/example.task/1.0.0.schema.json";
+        renamed[1].1 = "contracts/example.task/1.0.0.md";
+        renamed[2].1 = "types/example-task/1.md";
+        let renamed_resources = renamed
+            .iter()
+            .map(|(_, source, _, document)| resource(source, document))
+            .collect::<Vec<_>>();
+        let mut renamed_manifest = manifest(&renamed);
+        renamed_manifest["version"] = Value::String("1.1.0".to_string());
+        renamed_manifest["resources"][2]["mode"] = Value::String("seed".to_string());
+        let renamed = provision(renamed_manifest, renamed_resources);
+
+        let upgraded = apply_pack(&collection, &renamed);
+        assert!(upgraded.valid, "{:?}", upgraded.diagnostics);
+        assert_eq!(
+            upgraded.result["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|resource| resource["action"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["adopt", "adopt", "preserve"]
+        );
+
+        let reopened = Collection::open(root.path()).unwrap();
+        assert_eq!(reopened.list_data_contracts().len(), 1);
+        assert_eq!(
+            reopened
+                .get_data_contract_implementations("example.task", "1.0.0")
+                .len(),
+            1
+        );
     }
 
     #[test]
