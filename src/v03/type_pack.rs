@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{
-    batch, collection_validation_errors, introduced_validation_errors, revision,
-    validate_type_pack, validate_type_pack_lock, Diagnostic, OperationResult,
+    batch, revision, validate_type_pack, validate_type_pack_lock, Diagnostic, OperationResult,
 };
 use crate::api::CollectionPath;
 use crate::frontmatter::parser::{is_parse_error, parse_document};
@@ -660,7 +659,6 @@ pub(crate) fn plan_type_pack(
 }
 
 fn apply_type_pack_plan(collection: &Collection, plan: TypePackPlan) -> OperationResult {
-    let baseline_validation_errors = collection_validation_errors(collection);
     let mut shadow = match batch::shadow_collection(collection) {
         Ok(shadow) => shadow,
         Err(diagnostic) => return failed(vec![*diagnostic]),
@@ -677,7 +675,7 @@ fn apply_type_pack_plan(collection: &Collection, plan: TypePackPlan) -> Operatio
         Ok(commit) => commit,
         Err(error) => return pack_diagnostic(error.code(), error.to_string()),
     };
-    let reopened = match Collection::open(&collection.root) {
+    let _reopened = match Collection::open(&collection.root) {
         Ok(reopened) => reopened,
         Err(error) => {
             return pack_diagnostic(
@@ -686,15 +684,8 @@ fn apply_type_pack_plan(collection: &Collection, plan: TypePackPlan) -> Operatio
             )
         }
     };
-    let committed_validation_errors = collection_validation_errors(&reopened);
-    if !introduced_validation_errors(&baseline_validation_errors, &committed_validation_errors)
-        .is_empty()
-    {
-        return pack_diagnostic(
-            "type_pack_apply_failed",
-            "The committed type pack introduced validation errors.",
-        );
-    }
+    // Reopening verifies structural integrity. Record schema diagnostics are
+    // data quality signals and do not make a type-pack installation invalid.
     let mut result = plan.assessment;
     result["receipt"] = serde_json::to_value(
         plan.next_lock
@@ -716,7 +707,6 @@ pub(crate) fn stage_type_pack_plan(
     shadow: &mut batch::ShadowCollection,
     plan: &TypePackPlan,
 ) -> Result<(), Box<Diagnostic>> {
-    let baseline_validation_errors = collection_validation_errors(&shadow.collection);
     for resource in &plan.resources {
         let path = shadow.directory.path().join(&resource.target);
         match resource.action.as_str() {
@@ -769,14 +759,6 @@ pub(crate) fn stage_type_pack_plan(
             )))
         }
     };
-    let staged_validation_errors = collection_validation_errors(&staged);
-    if let Some(diagnostic) =
-        introduced_validation_errors(&baseline_validation_errors, &staged_validation_errors)
-            .into_iter()
-            .next()
-    {
-        return Err(Box::new(diagnostic));
-    }
     shadow.collection = staged;
     Ok(())
 }

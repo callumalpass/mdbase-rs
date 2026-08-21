@@ -124,22 +124,21 @@ impl CompiledCatalog {
         let classified = self.classify_record(record)?;
         let read = self.read_record(&serde_json::json!({"path": record.path}), record);
         let structure = self.parse_record_structure(record)?;
-        let mut semantic_complete = read.valid
-            && classified.frontmatter_error.is_none()
+        let mut semantic_complete = classified.frontmatter_error.is_none()
             && structure
                 .occurrences
                 .iter()
                 .all(|occurrence| occurrence.resolution != StructuralResolution::Malformed);
 
-        let mut effective_frontmatter = if read.valid {
-            read.result
-                .get("effective_frontmatter")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            Map::new()
-        };
+        // Schema-invalid records still have trustworthy parsed frontmatter and
+        // defaults. Preserve those facts for queries and saved views while
+        // retaining the validation diagnostics below.
+        let mut effective_frontmatter = read
+            .result
+            .get("effective_frontmatter")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
         let mut diagnostics = read.diagnostics;
         collect_result_diagnostics(&read.result, &mut diagnostics);
         let body_dependent_fields = self.body_dependent_computed_fields(&classified.types);
@@ -556,6 +555,49 @@ mod tests {
         assert!(!serialized.contains("Two"));
         assert!(!serialized.contains("---"));
         assert_eq!(projection.canonical_digest().unwrap().len(), 71);
+    }
+
+    #[test]
+    fn schema_invalid_record_remains_semantically_projectable() {
+        let catalog = CompiledCatalog::compile(CatalogInput {
+            resource_revision: "resources-strict".to_string(),
+            configuration_document: "spec_version: 0.3.0\nsettings:\n  default_validation: error\n"
+                .to_string(),
+            types: vec![ResolvedTypeResource {
+                path: "_types/note.md".to_string(),
+                revision: "type-strict".to_string(),
+                definition: json!({
+                    "kind": "mdbase.type",
+                    "name": "note",
+                    "version": 1,
+                    "match": {"path_glob": "notes/*.md"},
+                    "schema": {"dialect": "json-schema-2020-12", "value": {
+                        "type": "object",
+                        "properties": {"projects": {"type": "array"}}
+                    }}
+                }),
+                schema: json!({
+                    "type": "object",
+                    "properties": {"projects": {"type": "array"}}
+                }),
+            }],
+            contracts: Vec::new(),
+        })
+        .unwrap();
+        let prepared = catalog
+            .project_record(&input("---\nprojects:\n---\n"))
+            .unwrap();
+
+        assert!(prepared.facts.semantic_complete);
+        assert_eq!(
+            prepared.facts.effective_frontmatter["projects"],
+            Value::Null
+        );
+        assert!(prepared
+            .facts
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "schema_type"));
     }
 
     #[test]
