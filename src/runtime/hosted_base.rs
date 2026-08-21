@@ -366,9 +366,9 @@ impl HostedBasePlan {
                     .to_string(),
             });
         }
-        validate_projection(self, &input.projection)?;
+        validate_projection_integrity(self, &input.projection)?;
         for projection in &input.related {
-            validate_projection(self, projection)?;
+            validate_projection_integrity(self, projection)?;
         }
         if let Some(context) = &input.query_context {
             validate_projection(self, context)?;
@@ -385,6 +385,16 @@ impl HostedBasePlan {
                         .to_string(),
                 });
             }
+        }
+        if !input.projection.facts.semantic_complete {
+            return Ok(self.exclude_incomplete_projection(&input.projection));
+        }
+        if let Some(projection) = input
+            .related
+            .iter()
+            .find(|projection| !projection.facts.semantic_complete)
+        {
+            return Ok(self.exclude_incomplete_projection(projection));
         }
         if !self.allowed_types.is_empty()
             && !input.projection.facts.types.iter().any(|actual| {
@@ -704,18 +714,11 @@ impl HostedBaseGroupAccumulator {
     }
 }
 
-fn validate_projection(
+fn validate_projection_integrity(
     plan: &HostedBasePlan,
     projection: &SemanticProjection,
 ) -> Result<(), CatalogError> {
-    if !projection.facts.semantic_complete {
-        return Err(CatalogError {
-            code: "hosted_base_projection_incomplete".to_string(),
-            message: "Obsidian Base evaluation cannot trust a semantically incomplete projection."
-                .to_string(),
-        });
-    }
-    if !projection.is_current_for(&plan.catalog_revision, env!("CARGO_PKG_VERSION")) {
+    if !projection.integrity_is_current_for(&plan.catalog_revision, env!("CARGO_PKG_VERSION")) {
         return Err(CatalogError {
             code: "hosted_base_projection_stale".to_string(),
             message: "Obsidian Base evaluation requires a current, integrity-bound projection."
@@ -723,6 +726,52 @@ fn validate_projection(
         });
     }
     Ok(())
+}
+
+fn validate_projection(
+    plan: &HostedBasePlan,
+    projection: &SemanticProjection,
+) -> Result<(), CatalogError> {
+    validate_projection_integrity(plan, projection)?;
+    if !projection.facts.semantic_complete {
+        return Err(CatalogError {
+            code: "hosted_base_projection_incomplete".to_string(),
+            message: "Obsidian Base evaluation cannot trust a semantically incomplete projection."
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+impl HostedBasePlan {
+    fn exclude_incomplete_projection(
+        &self,
+        projection: &SemanticProjection,
+    ) -> HostedBaseEvaluation {
+        let reason_codes = projection
+            .facts
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == "error")
+            .map(|diagnostic| diagnostic.code.clone())
+            .collect::<BTreeSet<_>>();
+        HostedBaseEvaluation::Excluded {
+            diagnostics: vec![Diagnostic {
+                severity: "warning".to_string(),
+                code: "hosted_base_record_skipped".to_string(),
+                message: "A record with incomplete Markdown semantics was omitted from this view."
+                    .to_string(),
+                path: self
+                    .allowed_types
+                    .is_empty()
+                    .then(|| projection.facts.path.clone()),
+                field: None,
+                type_name: None,
+                schema_location: None,
+                details: Some(json!({"reason_codes": reason_codes})),
+            }],
+        }
+    }
 }
 
 fn projection_file(projection: &SemanticProjection) -> BasesFile {
@@ -1225,8 +1274,12 @@ views:
             "tasks/high.md",
             "---\nstatus: todo\npriority: high\ntags: [task]\n---\n# urgent\nSee [[missing]]. ![[image]]\n",
         );
-        let mut incomplete_projection = projection.clone();
-        incomplete_projection.facts.semantic_complete = false;
+        let incomplete_projection = project(
+            &catalog,
+            "tasks/malformed.md",
+            "---\nstatus: [unterminated\n---\nUnreadable task\n",
+        );
+        assert!(!incomplete_projection.facts.semantic_complete);
         let incomplete = plan
             .evaluate_record(&HostedBaseRecordContext {
                 projection: incomplete_projection,
@@ -1236,8 +1289,18 @@ views:
                 operation_clock: "2026-08-16T00:00:00Z".to_string(),
                 max_expression_steps: 10_000,
             })
-            .unwrap_err();
-        assert_eq!(incomplete.code, "hosted_base_projection_incomplete");
+            .unwrap();
+        let HostedBaseEvaluation::Excluded { diagnostics } = incomplete else {
+            panic!("expected incomplete record to be excluded")
+        };
+        assert_eq!(diagnostics[0].code, "hosted_base_record_skipped");
+        assert_eq!(diagnostics[0].path.as_deref(), Some("tasks/malformed.md"));
+        assert_eq!(
+            diagnostics[0].details,
+            Some(json!({
+                "reason_codes": ["frontmatter_parse_failed", "invalid_frontmatter"]
+            }))
+        );
         let mut stale_format = projection.clone();
         stale_format.facts.format_version += 1;
         let stale_format = plan
@@ -1366,6 +1429,99 @@ views:
             panic!("expected filtered hosted Base plan")
         };
         assert!(!plan.supports_path_keyset_paging());
+    }
+
+    #[test]
+    fn incomplete_required_context_remains_fatal() {
+        let catalog = catalog();
+        let source = "views:\n  - type: table\n    name: Contextual\n    filters: 'this.file.name == \"today\"'\n";
+        let HostedBasePlanning::Planned { plan } = catalog
+            .plan_hosted_obsidian_base(
+                &json!({
+                    "path": "views/contextual.base",
+                    "view": "contextual",
+                    "context": {"path": "contexts/today.md"}
+                }),
+                &CanonicalRecordInput {
+                    stable_id: None,
+                    path: "views/contextual.base".to_string(),
+                    document: source.to_string(),
+                    file_size: source.len() as u64,
+                    file_mtime: None,
+                },
+                &[],
+            )
+            .unwrap()
+        else {
+            panic!("expected contextual Base plan")
+        };
+        let candidate = project(
+            &catalog,
+            "tasks/one.md",
+            "---\nstatus: todo\ntags: [task]\n---\nOne\n",
+        );
+        let mut context = project(
+            &catalog,
+            "contexts/today.md",
+            "---\ntitle: Today\n---\nContext\n",
+        );
+        context.facts.semantic_complete = false;
+
+        let error = plan
+            .evaluate_record(&HostedBaseRecordContext {
+                projection: candidate,
+                related: Vec::new(),
+                relationship_neighborhood_complete: true,
+                query_context: Some(context),
+                operation_clock: "2026-08-16T00:00:00Z".to_string(),
+                max_expression_steps: 10_000,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "hosted_base_projection_incomplete");
+    }
+
+    #[test]
+    fn scoped_incomplete_record_diagnostic_does_not_expose_its_path() {
+        let catalog = catalog();
+        let source = "views:\n  - type: table\n    name: Tasks\n";
+        let HostedBasePlanning::Planned { plan } = catalog
+            .plan_hosted_obsidian_base(
+                &json!({"path": "views/tasks.base", "view": "tasks"}),
+                &CanonicalRecordInput {
+                    stable_id: None,
+                    path: "views/tasks.base".to_string(),
+                    document: source.to_string(),
+                    file_size: source.len() as u64,
+                    file_mtime: None,
+                },
+                &["task".to_string()],
+            )
+            .unwrap()
+        else {
+            panic!("expected scoped Base plan")
+        };
+        let mut candidate = project(
+            &catalog,
+            "tasks/private.md",
+            "---\nstatus: todo\ntags: [task]\n---\nPrivate\n",
+        );
+        candidate.facts.semantic_complete = false;
+
+        let HostedBaseEvaluation::Excluded { diagnostics } = plan
+            .evaluate_record(&HostedBaseRecordContext {
+                projection: candidate,
+                related: Vec::new(),
+                relationship_neighborhood_complete: true,
+                query_context: None,
+                operation_clock: "2026-08-16T00:00:00Z".to_string(),
+                max_expression_steps: 10_000,
+            })
+            .unwrap()
+        else {
+            panic!("expected scoped incomplete record to be excluded")
+        };
+        assert_eq!(diagnostics[0].code, "hosted_base_record_skipped");
+        assert_eq!(diagnostics[0].path, None);
     }
 
     #[test]
@@ -1750,6 +1906,23 @@ views:
             })
             .unwrap_err();
         assert_eq!(incomplete.code, "hosted_base_relationship_state_incomplete");
+
+        let mut incomplete_task = task.clone();
+        incomplete_task.facts.semantic_complete = false;
+        let HostedBaseEvaluation::Excluded { diagnostics } = plan
+            .evaluate_record(&HostedBaseRecordContext {
+                projection: project.clone(),
+                related: vec![incomplete_task],
+                relationship_neighborhood_complete: true,
+                query_context: None,
+                operation_clock: "2026-08-16T00:00:00Z".to_string(),
+                max_expression_steps: 10_000,
+            })
+            .unwrap()
+        else {
+            panic!("incomplete relationship should exclude only its candidate")
+        };
+        assert_eq!(diagnostics[0].code, "hosted_base_record_skipped");
 
         let evaluated = plan
             .evaluate_record(&HostedBaseRecordContext {

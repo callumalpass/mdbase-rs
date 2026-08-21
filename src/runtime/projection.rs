@@ -58,12 +58,16 @@ pub struct SemanticProjection {
 }
 
 impl SemanticProjection {
-    /// Fail-closed currentness and internal-integrity check shared by every
-    /// hosted evaluator. Storage bindings additionally bind record, revision,
-    /// generation, and snapshot identity.
-    pub fn is_current_for(&self, catalog_revision: &str, semantic_engine_version: &str) -> bool {
-        self.facts.semantic_complete
-            && self.facts.schema_version == SEMANTIC_PROJECTION_SCHEMA_VERSION
+    /// Check the persisted projection envelope and structural binding without
+    /// deciding whether record-local semantics are complete. Hosted read paths
+    /// use this to distinguish an unreadable record, which may be excluded,
+    /// from a stale or corrupted projection, which must remain fatal.
+    pub fn integrity_is_current_for(
+        &self,
+        catalog_revision: &str,
+        semantic_engine_version: &str,
+    ) -> bool {
+        self.facts.schema_version == SEMANTIC_PROJECTION_SCHEMA_VERSION
             && self.facts.format_version == SEMANTIC_PROJECTION_FORMAT_VERSION
             && self.facts.semantic_engine_version == semantic_engine_version
             && self.facts.catalog_revision == catalog_revision
@@ -71,6 +75,14 @@ impl SemanticProjection {
             && self.structure.schema_version == RECORD_STRUCTURE_SCHEMA_VERSION
             && self.structure.path == self.facts.path
             && self.structure.structural_digest_is_valid()
+    }
+
+    /// Fail-closed currentness and internal-integrity check shared by every
+    /// hosted evaluator. Storage bindings additionally bind record, revision,
+    /// generation, and snapshot identity.
+    pub fn is_current_for(&self, catalog_revision: &str, semantic_engine_version: &str) -> bool {
+        self.facts.semantic_complete
+            && self.integrity_is_current_for(catalog_revision, semantic_engine_version)
     }
 }
 
