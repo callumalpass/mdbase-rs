@@ -270,7 +270,7 @@ fn validate_safe_path(collection: &Collection, path: &str) -> DiagnosticResult<S
         }
         Some("base") => Err(Box::new(Diagnostic::error(
             "invalid_view_path",
-            "Obsidian Base sources must match x-obsidian.bases.include.",
+            "This Obsidian Base path is not enabled. Add a matching glob to x-obsidian.bases.include, or use a canonical mdbase.view document at a .md path.",
             Some(normalized.to_string()),
         ))),
         Some("md") => Ok(normalized.to_string()),

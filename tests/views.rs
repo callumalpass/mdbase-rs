@@ -368,6 +368,9 @@ fn creates_valid_sources_without_clobbering_or_escaping_configuration() {
     }));
     assert!(!outside.valid);
     assert_eq!(outside.diagnostics[0].code, "invalid_view_path");
+    assert!(outside.diagnostics[0]
+        .message
+        .contains("canonical mdbase.view document at a .md path"));
 
     let invalid = operations.create_view_source(&json!({
         "path": "TaskNotes/Views/broken.base",

@@ -243,6 +243,57 @@ fn provider_snapshot_includes_configured_saved_view_sources() {
 }
 
 #[test]
+fn provider_snapshot_classifies_only_valid_canonical_markdown_views_as_resources() {
+    let directory = collection();
+    fs::create_dir(directory.path().join("views")).unwrap();
+    fs::write(
+        directory.path().join("views/tasks.md"),
+        "---\ntype: view\nid: tasks\nversion: 1\nname: Tasks\nviews:\n  - id: all\n    name: All tasks\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("views/invalid.md"),
+        "---\ntype: view\nid: invalid\n---\nInvalid view\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("note.md"),
+        "---\ntitle: Ordinary note\n---\nBody\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("broken.md"),
+        "---\ntitle: [unterminated\n---\nOpaque\n",
+    )
+    .unwrap();
+
+    let snapshot = FilesystemProvider::open(directory.path())
+        .unwrap()
+        .snapshot()
+        .unwrap();
+
+    let view_resources = snapshot
+        .resources
+        .iter()
+        .filter(|resource| resource.kind == CollectionSnapshotResourceKind::View)
+        .collect::<Vec<_>>();
+    assert_eq!(view_resources.len(), 1);
+    assert_eq!(view_resources[0].path, "views/tasks.md");
+    assert_eq!(
+        snapshot
+            .records
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect::<Vec<_>>(),
+        ["broken.md", "note.md", "views/invalid.md"]
+    );
+    assert_eq!(
+        snapshot.records[0].frontmatter_error.as_deref(),
+        Some("Failed to parse YAML frontmatter")
+    );
+}
+
+#[test]
 fn provider_snapshot_includes_contract_and_schema_resources() {
     let directory = collection();
     fs::create_dir(directory.path().join("_contracts")).unwrap();

@@ -195,8 +195,6 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
             CollectionSnapshotResourceKind::View,
         )?);
     }
-    resources[1..].sort_by(|left, right| left.path.cmp(&right.path));
-
     let mut paths = collection
         .scan_collection_files_checked()
         .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
@@ -208,8 +206,19 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
             .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?
             .to_string_lossy()
             .replace('\\', "/");
-        records.push(collection.snapshot_record(&path)?);
+        let record = collection.snapshot_record(&path)?;
+        if path.ends_with(".md") && is_canonical_view(&record) {
+            resources.push(CollectionSnapshotResource {
+                path: record.path,
+                kind: CollectionSnapshotResourceKind::View,
+                revision: record.revision,
+                document: record.document,
+            });
+        } else {
+            records.push(record);
+        }
     }
+    resources[1..].sort_by(|left, right| left.path.cmp(&right.path));
 
     let spec_version = serde_yaml::from_str::<serde_yaml::Value>(&resources[0].document)
         .ok()
@@ -229,6 +238,16 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
         resources,
         records,
     })
+}
+
+fn is_canonical_view(record: &CollectionSnapshotRecord) -> bool {
+    record.frontmatter_error.is_none()
+        && !crate::v03::validate_view(
+            &Value::Object(record.frontmatter.clone()),
+            record.path.as_str(),
+        )
+        .iter()
+        .any(|diagnostic| diagnostic.severity == "error")
 }
 
 pub(crate) fn materialize_snapshot_record(
