@@ -484,7 +484,10 @@ fn validate_entry_path(
                 "mdbase.yaml" | "mdbase.lock.yaml" | "mdbase.provisions.yaml"
             ) || resource.starts_with(&collection.settings.types_folder)
                 || resource.starts_with(&collection.settings.contracts_folder)
-                || resource.extension().and_then(|value| value.to_str()) == Some("base")
+                || matches!(
+                    resource.extension().and_then(|value| value.to_str()),
+                    Some("base" | "md")
+                )
                 || (resource.extension().and_then(|value| value.to_str()) == Some("json")
                     && resource.components().any(|component| {
                         matches!(component.as_os_str().to_str(), Some("schemas" | "_schemas"))

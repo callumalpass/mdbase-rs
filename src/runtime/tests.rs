@@ -1393,40 +1393,48 @@ fn runtime_commits_saved_view_resources_through_the_single_writer() {
     .unwrap();
     fs::create_dir(directory.path().join("views")).unwrap();
     let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
-    let document = "views:\n  - type: table\n    name: Inbox\n";
+    let documents = [
+        ("views/inbox.base", "views:\n  - type: table\n    name: Inbox\n"),
+        (
+            "views/inbox.md",
+            "---\ntype: view\nid: inbox.views\nversion: 1\nname: Inbox\nquery: {}\nviews:\n  - id: all\n    name: Inbox\n---\n",
+        ),
+    ];
 
-    let created = runtime
-        .execute(&OperationRequest::new(
-            OperationKind::CreateViewSource,
-            json!({"path": "views/inbox.base", "document": document}),
-        ))
-        .unwrap();
-    assert!(created.valid, "{created:?}");
-    let revision = created.result["revision"].as_str().unwrap();
+    for (path, document) in documents {
+        let created = runtime
+            .execute(&OperationRequest::new(
+                OperationKind::CreateViewSource,
+                json!({"path": path, "document": document}),
+            ))
+            .unwrap();
+        assert!(created.valid, "{created:?}");
+        let revision = created.result["revision"].as_str().unwrap();
 
-    let updated = runtime
-        .execute(&OperationRequest::new(
-            OperationKind::UpdateViewSource,
-            json!({
-                "path": "views/inbox.base",
-                "if_revision": revision,
-                "document": document.replace("Inbox", "Focused")
-            }),
-        ))
-        .unwrap();
-    assert!(updated.valid, "{updated:?}");
+        let updated = runtime
+            .execute(&OperationRequest::new(
+                OperationKind::UpdateViewSource,
+                json!({
+                    "path": path,
+                    "if_revision": revision,
+                    "document": document.replace("Inbox", "Focused")
+                }),
+            ))
+            .unwrap();
+        assert!(updated.valid, "{updated:?}");
 
-    let deleted = runtime
-        .execute(&OperationRequest::new(
-            OperationKind::DeleteViewSource,
-            json!({
-                "path": "views/inbox.base",
-                "if_revision": updated.result["revision"]
-            }),
-        ))
-        .unwrap();
-    assert!(deleted.valid, "{deleted:?}");
-    assert!(!directory.path().join("views/inbox.base").exists());
+        let deleted = runtime
+            .execute(&OperationRequest::new(
+                OperationKind::DeleteViewSource,
+                json!({
+                    "path": path,
+                    "if_revision": updated.result["revision"]
+                }),
+            ))
+            .unwrap();
+        assert!(deleted.valid, "{deleted:?}");
+        assert!(!directory.path().join(path).exists());
+    }
 }
 
 #[test]
