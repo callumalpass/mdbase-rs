@@ -598,10 +598,10 @@ collection:
         let record_path = root.path().join("tasks/one.md");
         std::fs::write(&record_path, document).unwrap();
         let metadata = std::fs::metadata(&record_path).unwrap();
-        let mtime = metadata.modified().ok().map(|time| {
-            let datetime: chrono::DateTime<chrono::Utc> = time.into();
-            datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-        });
+        let mtime = metadata
+            .modified()
+            .ok()
+            .map(crate::time::system_time_to_rfc3339);
         let input = json!({"path": "tasks/one.md", "include_document": true});
         let collection = Collection::open(root.path()).unwrap();
         let filesystem = collection.v03_operations().unwrap().read(&input);

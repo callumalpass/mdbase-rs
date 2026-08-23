@@ -69,13 +69,7 @@ fn replace_cache_snapshot(conn: &Connection) -> Result<String, CacheError> {
 
 /// Convert nanoseconds-since-epoch to ISO 8601 string.
 fn ns_to_iso(ns: i64) -> String {
-    use chrono::{TimeZone, Utc};
-    let secs = ns / 1_000_000_000;
-    let nsec = (ns % 1_000_000_000) as u32;
-    match Utc.timestamp_opt(secs, nsec) {
-        chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        _ => String::new(),
-    }
+    crate::time::unix_nanos_to_rfc3339(ns)
 }
 
 impl Collection {
@@ -450,14 +444,11 @@ impl Collection {
                         path: file_path.clone(),
                         source,
                     })?;
-            let file_mtime_iso = Some({
-                let dt: chrono::DateTime<chrono::Utc> = modified.into();
-                dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-            });
-            let file_ctime_iso = metadata.created().ok().map(|t| {
-                let dt: chrono::DateTime<chrono::Utc> = t.into();
-                dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-            });
+            let file_mtime_iso = Some(crate::time::system_time_to_rfc3339(modified));
+            let file_ctime_iso = metadata
+                .created()
+                .ok()
+                .map(crate::time::system_time_to_rfc3339);
 
             records.push(FileRecord {
                 rel_path,

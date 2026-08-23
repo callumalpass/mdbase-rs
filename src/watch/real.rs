@@ -226,6 +226,7 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
     let mut pending_rescans = Vec::new();
     let mut pending_paths = BTreeSet::new();
     let mut full_rescan = true;
+    let mut last_refresh_error: Option<(String, Instant)> = None;
 
     loop {
         let current_time = Instant::now();
@@ -292,6 +293,7 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
             } else {
                 snapshot.refresh_paths(&root, &pending_paths)
             };
+            let refresh_succeeded = refreshed.is_ok();
             match refreshed {
                 Ok(changes) => {
                     for event in changes {
@@ -310,14 +312,30 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
                     }
                 }
                 Err(error) => {
-                    sequence += 1;
-                    if events
-                        .send(watch_error_event(sequence, error.to_string()))
-                        .is_err()
-                    {
-                        return;
+                    // A transient symlink replacement or atomic-save gap must not
+                    // consume the recovery request. Keep reconciling, but back
+                    // off and coalesce identical diagnostics so a broken path
+                    // cannot spin the worker or flood its consumer.
+                    full_rescan = true;
+                    let message = error.to_string();
+                    let should_report = last_refresh_error.as_ref().is_none_or(|(previous, at)| {
+                        previous != &message || at.elapsed() >= Duration::from_secs(1)
+                    });
+                    if should_report {
+                        sequence += 1;
+                        if events
+                            .send(watch_error_event(sequence, message.clone()))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        last_refresh_error = Some((message, Instant::now()));
                     }
+                    deadline = Some(Instant::now() + Duration::from_millis(250));
                 }
+            }
+            if refresh_succeeded {
+                last_refresh_error = None;
             }
             if watch_profile_enabled() {
                 eprintln!(
@@ -327,8 +345,10 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
                     refresh_started.elapsed().as_micros(),
                 );
             }
-            pending_paths.clear();
-            full_rescan = false;
+            if refresh_succeeded {
+                pending_paths.clear();
+                full_rescan = false;
+            }
             for ready in pending_rescans.drain(..) {
                 let _ = ready.send(());
             }
@@ -465,6 +485,12 @@ impl Snapshot {
     }
 
     fn invalidation_paths(&self, root: &Path, event: &Event) -> Option<BTreeSet<PathBuf>> {
+        // Rename notifications are intentionally conservative. In particular,
+        // directory renames often carry no record extension, so returning an
+        // empty incremental set would permanently miss the moved subtree.
+        if matches!(event.kind, EventKind::Modify(ModifyKind::Name(_))) {
+            return None;
+        }
         if event.paths.is_empty() || matches!(event.kind, EventKind::Any | EventKind::Other) {
             return None;
         }
@@ -838,6 +864,74 @@ mod tests {
             .expect("record event");
         assert_eq!(event.event_type, "mdbase.record.created");
         assert_eq!(event.payload["path"], "note.md");
+    }
+
+    #[test]
+    fn directory_rename_forces_a_full_rescan() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        let snapshot = Snapshot::load(directory.path()).unwrap();
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )))
+        .add_path(directory.path().join("old"))
+        .add_path(directory.path().join("new"));
+        assert_eq!(snapshot.invalidation_paths(directory.path(), &event), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_watcher_recovers_after_directory_rename_and_symlink_episode() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("old")).unwrap();
+        fs::write(
+            directory.path().join("old/note.md"),
+            "---\ntitle: Before\n---\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(40)).unwrap();
+
+        fs::rename(directory.path().join("old"), directory.path().join("new")).unwrap();
+        watcher.rescan().unwrap();
+        let renamed = watcher
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .expect("directory rename must converge through a full rescan");
+        assert_eq!(renamed.event_type, "mdbase.record.renamed");
+        assert_eq!(renamed.payload["to"], "new/note.md");
+
+        let note = directory.path().join("new/note.md");
+        let target = directory.path().join("target.md");
+        fs::rename(&note, &target).unwrap();
+        symlink("target.md", &note).unwrap();
+        watcher.rescan_paths(["new/note.md"]).unwrap();
+        while watcher.recv_timeout(Duration::ZERO).unwrap().is_some() {}
+        fs::remove_file(&note).unwrap();
+        fs::rename(&target, &note).unwrap();
+        fs::write(&note, "---\ntitle: After\n---\n").unwrap();
+        watcher.rescan_paths(["new/note.md"]).unwrap();
+        watcher.rescan().unwrap();
+        let recovered = (0..8)
+            .filter_map(|_| watcher.recv_timeout(Duration::from_millis(500)).unwrap())
+            .find(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "mdbase.record.created" | "mdbase.record.modified"
+                )
+            })
+            .expect("ordinary edits must ingest after symlink replacement");
+        assert_eq!(recovered.payload["after"]["title"], "After");
     }
 
     #[test]
