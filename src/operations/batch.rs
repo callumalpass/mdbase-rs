@@ -511,17 +511,11 @@ impl Collection {
                 let file_mtime = file_metadata
                     .as_ref()
                     .and_then(|m| m.modified().ok())
-                    .map(|t| {
-                        let dt: chrono::DateTime<chrono::Utc> = t.into();
-                        dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-                    });
+                    .map(crate::time::system_time_to_rfc3339);
                 let file_ctime = file_metadata
                     .as_ref()
                     .and_then(|m| m.created().ok())
-                    .map(|t| {
-                        let dt: chrono::DateTime<chrono::Utc> = t.into();
-                        dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-                    });
+                    .map(crate::time::system_time_to_rfc3339);
 
                 let eval_ctx = QueryEvalContext {
                     frontmatter: &effective,

@@ -56,10 +56,7 @@ impl Collection {
             mtime: file_metadata
                 .as_ref()
                 .and_then(|metadata| metadata.modified().ok())
-                .map(|time| {
-                    let datetime: chrono::DateTime<chrono::Utc> = time.into();
-                    datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-                }),
+                .map(crate::time::system_time_to_rfc3339),
         };
         self.read_document(path.as_str(), &content, &file_facts, input.include_document)
     }

@@ -965,10 +965,31 @@ fn execute_direct_pack(
 }
 
 pub fn execute_args(args: DirectArgs) -> CommandResult {
-    let root = args
-        .root
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    execute_direct(&root, args.command)
+    let explicit_root = args.root.is_some();
+    let mut command = args.command;
+    let root = match args.root {
+        Some(root) => root,
+        None => {
+            let positional_directory = match &command {
+                Command::Validate { path: Some(path) } => {
+                    let candidate = PathBuf::from(path);
+                    candidate.is_dir().then_some(candidate)
+                }
+                _ => None,
+            };
+            positional_directory
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        }
+    };
+    // A directory positional argument selects the collection only when --root
+    // was omitted. Once selected, validation is collection-wide; --root keeps
+    // its precedence and preserves positional file validation semantics.
+    if !explicit_root
+        && matches!(&command, Command::Validate { path: Some(path) } if PathBuf::from(path).is_dir())
+    {
+        command = Command::Validate { path: None };
+    }
+    execute_direct(&root, command)
 }
 
 /// Derive the stable CLI exit status from a portable operation result.
