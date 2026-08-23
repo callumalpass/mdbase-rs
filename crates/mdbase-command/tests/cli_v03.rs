@@ -44,6 +44,40 @@ fn run(root: &tempfile::TempDir, arguments: &[&str]) -> (i32, Value) {
     (result.exit_code, result.value)
 }
 
+fn run_without_root(arguments: &[String]) -> (i32, Value) {
+    let mut argv = vec!["mdbase".to_string()];
+    argv.extend(arguments.iter().cloned());
+    let result = execute_args(DirectArgs::try_parse_from(argv).expect("valid command arguments"));
+    (result.exit_code, result.value)
+}
+
+#[test]
+fn validate_accepts_an_existing_directory_without_changing_explicit_root_precedence() {
+    let root = cli_collection();
+    fs::create_dir(root.path().join("tasks")).unwrap();
+    fs::write(
+        root.path().join("tasks/first.md"),
+        "---\ntype: task\ntitle: First\n---\n",
+    )
+    .unwrap();
+
+    let (status, collection) = run_without_root(&[
+        "validate".to_string(),
+        root.path().to_string_lossy().into_owned(),
+    ]);
+    assert_eq!(status, 0, "{collection:#}");
+    assert_eq!(collection["valid"], true);
+
+    let (status, file) = run(&root, &["validate", "tasks/first.md"]);
+    assert_eq!(status, 0, "{file:#}");
+    assert_eq!(file["valid"], true);
+
+    let absolute_nested = root.path().join("tasks").to_string_lossy().into_owned();
+    let (status, explicit_root) = run(&root, &["validate", &absolute_nested]);
+    assert_ne!(status, 0, "{explicit_root:#}");
+    assert_eq!(explicit_root["diagnostics"][0]["code"], "invalid_path");
+}
+
 #[test]
 fn canonical_cli_runs_a_typed_record_lifecycle() {
     let root = cli_collection();

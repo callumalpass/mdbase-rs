@@ -227,6 +227,7 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
     let mut pending_paths = BTreeSet::new();
     let mut full_rescan = true;
     let mut last_refresh_error: Option<(String, Instant)> = None;
+    let mut refresh_retry_delay = Duration::from_millis(250);
 
     loop {
         let current_time = Instant::now();
@@ -237,15 +238,18 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
             Ok(WorkerInput::Command(Command::Stop)) => return,
             Ok(WorkerInput::Command(Command::Rescan(ready))) => {
                 deadline = Some(Instant::now());
+                refresh_retry_delay = Duration::from_millis(250);
                 full_rescan = true;
                 pending_rescans.push(ready);
             }
             Ok(WorkerInput::Command(Command::RescanPaths(paths, ready))) => {
                 deadline = Some(Instant::now());
+                refresh_retry_delay = Duration::from_millis(250);
                 pending_paths.extend(paths);
                 pending_rescans.push(ready);
             }
             Ok(WorkerInput::Filesystem(Ok(event))) if invalidates_snapshot(&event) => {
+                refresh_retry_delay = Duration::from_millis(250);
                 let invalidation = snapshot.invalidation_paths(&root, &event);
                 if watch_profile_enabled() {
                     eprintln!(
@@ -331,11 +335,13 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
                         }
                         last_refresh_error = Some((message, Instant::now()));
                     }
-                    deadline = Some(Instant::now() + Duration::from_millis(250));
+                    deadline = Some(Instant::now() + refresh_retry_delay);
+                    refresh_retry_delay = (refresh_retry_delay * 2).min(Duration::from_secs(5));
                 }
             }
             if refresh_succeeded {
                 last_refresh_error = None;
+                refresh_retry_delay = Duration::from_millis(250);
             }
             if watch_profile_enabled() {
                 eprintln!(
