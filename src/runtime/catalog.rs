@@ -124,6 +124,7 @@ impl CompiledCatalog {
                 path: resource.path,
                 name,
                 version: definition.get("version").and_then(Value::as_u64),
+                revision: resource.revision,
                 frontmatter: resource.definition,
                 schema: resource.schema,
             });

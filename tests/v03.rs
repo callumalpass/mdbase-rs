@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use mdbase::v03;
-use mdbase::{Collection, SpecProfile};
+use mdbase::{Collection, CollectionResources, SpecProfile};
 use tempfile::TempDir;
 
 fn write(root: &Path, relative: &str, content: &str) {
@@ -53,6 +53,37 @@ collection:
 #[test]
 fn canonical_v03_schemas_compile() {
     v03::validate_canonical_schemas().expect("canonical schemas compile");
+}
+
+#[test]
+fn resource_open_does_not_read_records_or_create_runtime_state() {
+    let directory = v03_collection();
+    for index in 0..1_000 {
+        write(
+            directory.path(),
+            &format!("tasks/{index}.md"),
+            "This is deliberately not a valid typed Markdown record.",
+        );
+    }
+
+    let configuration = v03::inspect_configuration(directory.path())
+        .expect("configuration inspection ignores types and records");
+    let collection = CollectionResources::open(directory.path())
+        .expect("resource catalog ignores ordinary records");
+
+    let inspected = v03::inspect_collection(directory.path());
+    assert_eq!(configuration["spec_version"], "0.3.0");
+    assert_eq!(collection.spec_profile(), SpecProfile::V03);
+    let task = collection.types().get("task").expect("task resource");
+    assert_eq!(
+        task.source_revision.as_ref(),
+        Some(&inspected.types[0].revision),
+        "loaded definitions retain the digest of the exact parsed source"
+    );
+    assert!(
+        !directory.path().join(".mdbase").exists(),
+        "resource loading must not create runtime indexes or feeds"
+    );
 }
 
 #[test]

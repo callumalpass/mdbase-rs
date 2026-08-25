@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
 
@@ -26,6 +26,79 @@ pub const SQLITE_SCHEMA_VERSION: u32 = 2;
 const SQLITE_WORK_QUEUE_CAPACITY: usize = 64;
 
 type SqliteCommand = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SqliteRecoveryState {
+    pub due_timers: bool,
+    pub pending_runs: bool,
+}
+
+impl SqliteRecoveryState {
+    pub fn has_work(self) -> bool {
+        self.due_timers || self.pending_runs
+    }
+}
+
+/// Inspect an existing runtime store without creating or migrating it.
+pub fn inspect_sqlite_recovery(
+    path: impl AsRef<Path>,
+    now: DateTime<Utc>,
+) -> RuntimeResult<SqliteRecoveryState> {
+    let path = path.as_ref();
+    if !path.is_file() {
+        return Ok(SqliteRecoveryState::default());
+    }
+    let connection =
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(store_error)?;
+    let installed = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+        .map_err(store_error)?;
+    if installed > SQLITE_SCHEMA_VERSION {
+        return Err(RuntimeError::diagnostic(
+            "runtime_schema_too_new",
+            format!(
+                "SQLite runtime schema version {installed} is newer than supported version {SQLITE_SCHEMA_VERSION}."
+            ),
+        ));
+    }
+    let table_exists = |name: &str| -> RuntimeResult<bool> {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(store_error)
+    };
+    let due_timers = table_exists("runtime_timers")?
+        && connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM runtime_timers
+                    WHERE status IN ('scheduled', 'firing') AND fire_at <= ?1
+                 )",
+                [timestamp(now)],
+                |row| row.get(0),
+            )
+            .map_err(store_error)?;
+    let pending_runs = table_exists("runtime_runs")?
+        && connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM runtime_runs
+                    WHERE status IN ('queued', 'running')
+                      AND not_before <= ?1
+                      AND (lease_token IS NULL OR lease_expires_at <= ?1)
+                 )",
+                [timestamp(now)],
+                |row| row.get(0),
+            )
+            .map_err(store_error)?;
+    Ok(SqliteRecoveryState {
+        due_timers,
+        pending_runs,
+    })
+}
 
 #[derive(Clone)]
 pub struct SqliteRuntimeStore {
@@ -1274,5 +1347,67 @@ mod tests {
             .expect("dedicated SQLite work must not starve the Tokio executor");
         assert_eq!(heartbeat, "executor-responsive");
         database_work.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn recovery_inspection_is_read_only_and_reports_only_actionable_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.sqlite");
+        assert_eq!(
+            inspect_sqlite_recovery(&missing, Utc::now()).unwrap(),
+            SqliteRecoveryState::default()
+        );
+        assert!(!missing.exists());
+
+        let path = directory.path().join("runtime.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 2;
+                 CREATE TABLE runtime_timers(status TEXT NOT NULL, fire_at TEXT NOT NULL);
+                 CREATE TABLE runtime_runs(
+                    status TEXT NOT NULL,
+                    not_before TEXT NOT NULL,
+                    lease_token TEXT,
+                    lease_expires_at TEXT
+                 );",
+            )
+            .unwrap();
+        let now = Utc::now();
+        connection
+            .execute(
+                "INSERT INTO runtime_timers(status, fire_at) VALUES ('scheduled', ?1)",
+                [timestamp(now + TimeDelta::minutes(5))],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runtime_runs(status, not_before) VALUES ('queued', ?1)",
+                [timestamp(now + TimeDelta::minutes(5))],
+            )
+            .unwrap();
+        assert_eq!(
+            inspect_sqlite_recovery(&path, now).unwrap(),
+            SqliteRecoveryState::default()
+        );
+        connection
+            .execute(
+                "INSERT INTO runtime_timers(status, fire_at) VALUES ('firing', ?1)",
+                [timestamp(now)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runtime_runs(status, not_before) VALUES ('queued', ?1)",
+                [timestamp(now)],
+            )
+            .unwrap();
+        assert_eq!(
+            inspect_sqlite_recovery(&path, now).unwrap(),
+            SqliteRecoveryState {
+                due_timers: true,
+                pending_runs: true,
+            }
+        );
     }
 }
