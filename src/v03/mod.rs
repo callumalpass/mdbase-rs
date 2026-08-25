@@ -168,6 +168,8 @@ pub struct TypeFile {
     pub path: String,
     pub name: String,
     pub version: Option<u64>,
+    /// Digest of the exact Markdown source parsed into this definition.
+    pub revision: String,
     pub frontmatter: Value,
     pub schema: Value,
 }
@@ -322,6 +324,23 @@ pub fn validate_schema_instance(
     type_name: Option<&str>,
 ) -> Vec<Diagnostic> {
     validate_value(schema, value, path, "embedded://type/schema", type_name)
+}
+
+/// Read and validate only a collection's canonical configuration resource.
+///
+/// This does not inspect type definitions or ordinary records.
+pub fn inspect_configuration(root: &Path) -> Result<Value, Vec<Diagnostic>> {
+    let path = root.join("mdbase.yaml");
+    let value = read_yaml_document(&path, "mdbase.yaml").map_err(|diagnostic| vec![*diagnostic])?;
+    let diagnostics = validate_config(&value, "mdbase.yaml");
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == "error")
+    {
+        Err(diagnostics)
+    } else {
+        Ok(value)
+    }
 }
 
 pub fn inspect_collection(root: &Path) -> CollectionReport {
@@ -521,6 +540,7 @@ pub fn parse_type_file(
         path: relative_path.to_string(),
         name,
         version,
+        revision: format!("sha256:{:x}", Sha256::digest(text.as_bytes())),
         frontmatter,
         schema,
     })

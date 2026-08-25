@@ -110,6 +110,41 @@ impl Default for Settings {
     }
 }
 
+/// A read-only catalog of collection configuration, types, and contracts.
+///
+/// Unlike [`Collection`], this type exposes no record operations and never
+/// owns durable transaction recovery, indexes, watchers, or change feeds.
+pub struct CollectionResources {
+    collection: Collection,
+}
+
+impl CollectionResources {
+    pub fn open(root: &Path) -> Result<Self, serde_json::Value> {
+        Collection::open_with_recovery(root, false).map(|collection| Self { collection })
+    }
+
+    pub fn spec_profile(&self) -> SpecProfile {
+        self.collection.spec_profile()
+    }
+
+    pub fn types(&self) -> &HashMap<String, TypeDef> {
+        self.collection.types()
+    }
+
+    pub fn list_data_contracts(&self) -> Vec<data_contracts::DataContractDefinition> {
+        self.collection.list_data_contracts()
+    }
+
+    pub fn get_data_contract_implementations(
+        &self,
+        contract: &str,
+        version: &str,
+    ) -> Vec<data_contracts::DataContractImplementationDescriptor> {
+        self.collection
+            .get_data_contract_implementations(contract, version)
+    }
+}
+
 /// A loaded mdbase collection.
 pub struct Collection {
     pub(crate) root: PathBuf,
@@ -173,11 +208,6 @@ impl Collection {
     }
 
     /// Load collection state for an observer that must never own recovery.
-    ///
-    /// Watchers use this path while a coordinated runtime remains the sole
-    /// owner of durable transaction settlement. The returned collection is a
-    /// point-in-time reader; callers must tolerate a later reconciliation when
-    /// an in-flight transaction reaches its final state.
     pub(crate) fn open_for_observation(root: &Path) -> Result<Self, serde_json::Value> {
         Self::open_with_recovery(root, false)
     }

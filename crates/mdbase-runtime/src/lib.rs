@@ -45,7 +45,9 @@ pub use provider::{
 };
 pub use schemas::validate_runtime_record;
 #[cfg(feature = "sqlite")]
-pub use sqlite::{SqliteRuntimeStore, SQLITE_SCHEMA_VERSION};
+pub use sqlite::{
+    inspect_sqlite_recovery, SqliteRecoveryState, SqliteRuntimeStore, SQLITE_SCHEMA_VERSION,
+};
 pub use store::{
     AdmitOutcome, Claim, EventPage, PreparedEvent, RuntimeStore, StoreSnapshot, TimerClaim,
     TimerReconcileOutcome,

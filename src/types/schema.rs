@@ -79,6 +79,8 @@ pub struct TypeDef {
     pub implementations: Vec<DataContractImplementation>,
     pub v03_frontmatter: Option<serde_json::Value>,
     pub source_path: Option<String>,
+    /// Digest of the exact type source parsed into this definition.
+    pub source_revision: Option<String>,
 }
 
 /// Strictness mode for unknown fields.

@@ -5,6 +5,7 @@ use std::path::Path;
 
 use super::schema::*;
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_to_json};
+use sha2::{Digest, Sha256};
 
 /// Result of loading types, including warnings.
 pub struct LoadTypesResult {
@@ -356,6 +357,9 @@ fn parse_type_file(content: &str, path: &Path, collection_root: &Path) -> Result
             .strip_prefix(collection_root)
             .ok()
             .map(|value| value.to_string_lossy().replace('\\', "/")),
+        source_revision: std::fs::read(path)
+            .ok()
+            .map(|bytes| format!("sha256:{:x}", Sha256::digest(&bytes))),
     })
 }
 
@@ -503,6 +507,7 @@ fn v03_type_definition(type_file: crate::v03::TypeFile) -> Result<TypeDef, Strin
             .unwrap_or_default(),
         v03_frontmatter: Some(type_file.frontmatter),
         source_path: Some(type_file.path),
+        source_revision: Some(type_file.revision),
     })
 }
 
