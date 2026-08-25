@@ -182,7 +182,12 @@ impl Collection {
         let output = if document.is_some() && replacement_mapping.as_ref() == Some(&write_mapping) {
             document.as_deref().unwrap_or_default().to_string()
         } else {
-            serializer::serialize_document(&write_mapping, body)
+            // Restore the original UTF-8 BOM so round-trips stay byte-stable.
+            let had_bom = match replacement_doc.as_ref() {
+                Some(candidate) => candidate.had_bom,
+                None => doc.had_bom,
+            };
+            serializer::serialize_document_with_bom(had_bom, &write_mapping, body)
         };
 
         if let Err(error) =

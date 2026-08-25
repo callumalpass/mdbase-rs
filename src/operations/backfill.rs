@@ -17,6 +17,7 @@ enum ChangeKind {
 struct BackfillPlan {
     path: String,
     body: String,
+    had_bom: bool,
     write_obj: serde_json::Map<String, serde_json::Value>,
     changed_fields: Vec<String>,
 }
@@ -234,6 +235,7 @@ impl Collection {
             plans.push(BackfillPlan {
                 path: path.to_string(),
                 body: doc.body.clone(),
+                had_bom: doc.had_bom,
                 write_obj,
                 changed_fields: changes.keys().cloned().collect(),
             });
@@ -259,7 +261,8 @@ impl Collection {
             let yaml_mapping = crate::frontmatter::parser::json_to_yaml_mapping(
                 &serde_json::Value::Object(plan.write_obj),
             );
-            let output = serializer::serialize_document(&yaml_mapping, &plan.body);
+            let output =
+                serializer::serialize_document_with_bom(plan.had_bom, &yaml_mapping, &plan.body);
             if let Err(e) = crate::operations::atomic_write(&full_path, output.as_bytes()) {
                 failed += 1;
                 details.push(serde_json::json!({

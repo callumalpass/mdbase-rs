@@ -11,6 +11,14 @@ pub struct ParsedDocument {
     pub body: String,
     /// Whether the document had frontmatter delimiters.
     pub has_frontmatter: bool,
+    /// Whether the original content began with a UTF-8 BOM (U+FEFF).
+    ///
+    /// BOM write policy: a leading BOM is transparent to parsing but is
+    /// preserved on serialization — callers that rewrite a document read with
+    /// this parser should re-prepend the BOM (see
+    /// `serializer::serialize_document_with_bom`) so external tools that
+    /// emitted it keep seeing byte-stable files.
+    pub had_bom: bool,
 }
 
 /// Structural frontmatter state shared by collection consumers.
@@ -51,12 +59,24 @@ impl ParsedDocument {
 /// Returns the raw YAML value for frontmatter (which may be a mapping, list, scalar, or null)
 /// and the body string. Callers must check that frontmatter is a mapping.
 pub fn parse_document(content: &str) -> ParsedDocument {
+    // A single leading UTF-8 BOM (U+FEFF) is an encoding marker emitted by
+    // some editors/platforms, not document content. Strip exactly one before
+    // the delimiter check so BOM'd frontmatter documents parse normally, and
+    // remember it so writers can restore the byte prefix.
+    let had_bom = content.starts_with('\u{FEFF}');
+    let content = if had_bom {
+        &content['\u{FEFF}'.len_utf8()..]
+    } else {
+        content
+    };
+
     // §3.1: Opening --- must be the very first line
     if !content.starts_with("---") {
         return ParsedDocument {
             frontmatter: None,
             body: content.to_string(),
             has_frontmatter: false,
+            had_bom,
         };
     }
 
@@ -68,6 +88,7 @@ pub fn parse_document(content: &str) -> ParsedDocument {
             frontmatter: None,
             body: content.to_string(),
             has_frontmatter: false,
+            had_bom,
         };
     }
 
@@ -79,6 +100,7 @@ pub fn parse_document(content: &str) -> ParsedDocument {
             frontmatter: None,
             body: content.to_string(),
             has_frontmatter: false,
+            had_bom,
         };
     }
 
@@ -106,6 +128,7 @@ pub fn parse_document(content: &str) -> ParsedDocument {
                 frontmatter: None,
                 body: content.to_string(),
                 has_frontmatter: false,
+                had_bom,
             };
         }
     };
@@ -140,6 +163,7 @@ pub fn parse_document(content: &str) -> ParsedDocument {
                 ))),
                 body,
                 has_frontmatter: true,
+                had_bom,
             };
         }
     };
@@ -155,6 +179,7 @@ pub fn parse_document(content: &str) -> ParsedDocument {
         frontmatter: Some(yaml_value),
         body,
         has_frontmatter: true,
+        had_bom,
     }
 }
 
@@ -322,5 +347,39 @@ mod tests {
             Some("Windows")
         );
         assert_eq!(parsed.body, "Body\r\n");
+    }
+
+    #[test]
+    fn leading_bom_is_stripped_and_recorded_not_treated_as_content() {
+        // BOM write policy: strip exactly one leading U+FEFF at parse time and
+        // record it so serialization can restore the byte prefix.
+        for source in [
+            "\u{feff}---\ntitle: Original\n---\nBody\n",
+            "\u{feff}Body only, no frontmatter.\n",
+        ] {
+            let parsed = parse_document(source);
+            assert!(parsed.had_bom, "{source:?} must record had_bom");
+            assert!(
+                !parsed.body.starts_with('\u{feff}'),
+                "BOM must not leak into body"
+            );
+        }
+
+        let parsed = parse_document("\u{feff}---\ntitle: Original\n---\nBody\n");
+        assert!(parsed.has_frontmatter);
+        assert_eq!(parsed.body, "Body\n");
+
+        // No BOM in, no BOM recorded.
+        let parsed = parse_document("---\ntitle: Original\n---\nBody\n");
+        assert!(!parsed.had_bom);
+    }
+
+    #[test]
+    fn bom_before_a_later_horizontal_rule_stays_body_only() {
+        let source = "\u{feff}Intro\n\n---\nnot frontmatter\n";
+        let parsed = parse_document(source);
+        assert!(!parsed.has_frontmatter);
+        assert!(parsed.had_bom);
+        assert_eq!(parsed.body, source.strip_prefix('\u{feff}').unwrap());
     }
 }

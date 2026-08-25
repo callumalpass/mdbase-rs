@@ -702,7 +702,8 @@ impl<'a> Operations<'a> {
                 let frontmatter = json_to_yaml_mapping(&Value::Object(lifecycle_draft));
                 normalized.insert(
                     "document".to_string(),
-                    Value::String(serializer::serialize_document(
+                    Value::String(serializer::serialize_document_with_bom(
+                        candidate.had_bom,
                         &frontmatter,
                         &candidate.body,
                     )),

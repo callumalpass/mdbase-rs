@@ -7,6 +7,36 @@ use serde_yaml::Value as YamlValue;
 /// Records with no persisted fields are ordinary body-only Markdown files.
 /// Frontmatter delimiters are only emitted when the mapping contains fields.
 pub fn serialize_document(frontmatter: &serde_yaml::Mapping, body: &str) -> String {
+    serialize_document_with_bom(false, frontmatter, body)
+}
+
+/// Serialize a record document, restoring a leading UTF-8 BOM.
+///
+/// BOM write policy: parsing strips one leading `U+FEFF` so BOM'd documents
+/// classify as frontmatter records; serialization re-prepends the byte when
+/// the original content had it. This keeps round-trips byte-stable apart from
+/// the intended edit, which minimizes diffs for external tools that rely on
+/// the marker (e.g. Windows editors/PowerShell).
+///
+/// Records with no persisted fields remain body-only files; with `had_bom`
+/// the BOM is still restored so body-only documents round-trip unchanged too.
+pub fn serialize_document_with_bom(
+    had_bom: bool,
+    frontmatter: &serde_yaml::Mapping,
+    body: &str,
+) -> String {
+    let doc = serialize_inner(frontmatter, body);
+    if had_bom {
+        let mut out = String::with_capacity('\u{FEFF}'.len_utf8() + doc.len());
+        out.push('\u{FEFF}');
+        out.push_str(&doc);
+        out
+    } else {
+        doc
+    }
+}
+
+fn serialize_inner(frontmatter: &serde_yaml::Mapping, body: &str) -> String {
     if frontmatter.is_empty() {
         return body.to_string();
     }
@@ -53,7 +83,7 @@ pub fn merge_fields(
 
 #[cfg(test)]
 mod tests {
-    use super::serialize_document;
+    use super::{serialize_document, serialize_document_with_bom};
     use serde_yaml::{Mapping, Value};
 
     #[test]
@@ -76,6 +106,28 @@ mod tests {
         assert_eq!(
             serialize_document(&frontmatter, "# Body"),
             "---\ntitle: Note\n---\n# Body\n"
+        );
+    }
+
+    #[test]
+    fn bom_policy_preserves_leading_bom_on_serialization() {
+        // Documents that originally carried a UTF-8 BOM keep it on write;
+        // BOM-less documents never gain one.
+        let mut frontmatter = Mapping::new();
+        frontmatter.insert(Value::String("title".into()), Value::String("Note".into()));
+
+        assert_eq!(
+            serialize_document_with_bom(true, &frontmatter, "# Body\n"),
+            "\u{feff}---\ntitle: Note\n---\n# Body\n"
+        );
+        assert_eq!(
+            serialize_document_with_bom(false, &frontmatter, "# Body\n"),
+            "---\ntitle: Note\n---\n# Body\n"
+        );
+        // Body-only records restore the marker without inventing frontmatter.
+        assert_eq!(
+            serialize_document_with_bom(true, &Mapping::new(), "# Body\n"),
+            "\u{feff}# Body\n"
         );
     }
 }
