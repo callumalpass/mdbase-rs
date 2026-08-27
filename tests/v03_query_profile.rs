@@ -485,23 +485,30 @@ fn incompatible_cache_schema_falls_back_and_rebuild_reports_failure() {
 }
 
 #[test]
-fn unreadable_markdown_fails_the_snapshot_instead_of_disappearing() {
+fn invalid_utf8_is_a_canonical_stub_while_legacy_query_envelope_is_unchanged() {
     let (root, collection) = query_collection();
     assert_eq!(collection.cache_rebuild()["success"], true);
     let unreadable = root.path().join("tasks/unreadable.md");
     fs::write(&unreadable, [0xff, 0xfe]).unwrap();
 
     let canonical = query(&collection, json!({"types": ["task"]}));
-    assert!(!canonical.valid);
-    assert_eq!(canonical.diagnostics.len(), 1);
-    assert_eq!(canonical.diagnostics[0].code, "collection_snapshot_failed");
+    assert!(canonical.valid, "{canonical:#?}");
+    assert_eq!(canonical.result["meta"]["total_count"], 3);
+    assert!(canonical.diagnostics.is_empty());
+
+    let untyped = query(&collection, json!({}));
+    assert!(untyped.valid, "{untyped:#?}");
+    assert_eq!(untyped.result["meta"]["total_count"], 5);
+    assert_eq!(untyped.diagnostics.len(), 1);
+    assert_eq!(untyped.diagnostics[0].code, "invalid_frontmatter");
     assert_eq!(
-        canonical.diagnostics[0].path.as_deref(),
+        untyped.diagnostics[0].path.as_deref(),
         Some("tasks/unreadable.md")
     );
-    assert!(canonical.diagnostics[0]
-        .message
-        .contains("failed to read collection file"));
+    assert_eq!(
+        untyped.diagnostics[0].details.as_ref().unwrap()["reason"],
+        "invalid_utf8"
+    );
 
     let legacy = collection.query(&json!({"types": ["task"]}));
     assert_eq!(

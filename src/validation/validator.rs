@@ -179,11 +179,49 @@ pub fn validate_frontmatter_full_multi(
 
 // --- impl Collection methods for validation ---
 
-use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to_json};
+use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::generated::derive_path;
 use crate::validation::merge::detect_type_conflicts;
 use crate::Collection;
 use std::collections::{HashMap, HashSet};
+
+fn invalid_record_issue(path: &str, reason: &str) -> Issue {
+    Issue {
+        code: INVALID_FRONTMATTER.to_string(),
+        message: format!("Invalid frontmatter: {reason}"),
+        path: Some(path.to_string()),
+        field: None,
+        severity: Severity::Error,
+        expected: None,
+        actual: Some(serde_json::json!({"reason": reason})),
+        type_name: None,
+        line: None,
+        column: None,
+    }
+}
+
+fn file_read_issue(path: &str) -> Issue {
+    Issue {
+        code: "file_read_failed".to_string(),
+        message: "Collection record could not be read".to_string(),
+        path: Some(path.to_string()),
+        field: None,
+        severity: Severity::Error,
+        expected: None,
+        actual: None,
+        type_name: None,
+        line: None,
+        column: None,
+    }
+}
+
+fn invalid_record_validation(path: &str, reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "valid": false,
+        "path": path,
+        "issues": [crate::errors::issue_to_json(&invalid_record_issue(path, reason))],
+    })
+}
 
 impl Collection {
     /// Validate frontmatter against matched types.
@@ -484,47 +522,15 @@ impl Collection {
                     );
                 }
 
-                // Read and parse
-                let content = match std::fs::read_to_string(&full_path) {
-                    Ok(c) => c,
+                match crate::record_load::load_record(self, &full_path, path) {
+                    Ok(crate::record_load::RecordLoadOutcome::Parsed {
+                        raw_frontmatter, ..
+                    }) => raw_frontmatter,
+                    Ok(crate::record_load::RecordLoadOutcome::Invalid { reason, .. }) => {
+                        return invalid_record_validation(path, reason.as_str());
+                    }
                     Err(_) => {
-                        return crate::errors::op_error(INVALID_FRONTMATTER, "Failed to read file")
-                    }
-                };
-
-                let doc = parse_document(&content);
-
-                // Check for parse errors
-                if let Some(ref fm) = doc.frontmatter {
-                    if is_parse_error(fm) {
-                        return serde_json::json!({
-                            "valid": false,
-                            "path": path,
-                            "issues": [{
-                                "code": INVALID_FRONTMATTER,
-                                "message": "Failed to parse YAML frontmatter",
-                                "severity": "error",
-                                "path": path,
-                            }],
-                        });
-                    }
-                }
-
-                // Check for non-mapping frontmatter
-                match &doc.frontmatter {
-                    Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
-                    Some(serde_yaml::Value::Null) | None => serde_json::json!({}),
-                    Some(_) => {
-                        return serde_json::json!({
-                            "valid": false,
-                            "path": path,
-                            "issues": [{
-                                "code": INVALID_FRONTMATTER,
-                                "message": "Frontmatter must be a YAML mapping",
-                                "severity": "error",
-                                "path": path,
-                            }],
-                        });
+                        return crate::errors::op_error(INVALID_FRONTMATTER, "Failed to read file");
                     }
                 }
             };
@@ -662,20 +668,25 @@ impl Collection {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            let content = match std::fs::read_to_string(file_path) {
-                Ok(c) => c,
-                Err(_) => continue,
+            let outcome = match crate::record_load::load_record(self, file_path, &rel_path) {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    all_issues.push(file_read_issue(&rel_path));
+                    continue;
+                }
             };
-
-            let doc = parse_document(&content);
-            let raw_fm = match &doc.frontmatter {
-                Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
-                _ => continue,
+            let (_raw_fm, effective, type_names) = match outcome {
+                crate::record_load::RecordLoadOutcome::Parsed {
+                    raw_frontmatter,
+                    effective_frontmatter,
+                    type_names,
+                    ..
+                } => (raw_frontmatter, effective_frontmatter, type_names),
+                crate::record_load::RecordLoadOutcome::Invalid { reason, .. } => {
+                    all_issues.push(invalid_record_issue(&rel_path, reason.as_str()));
+                    continue;
+                }
             };
-
-            let type_names = self.determine_types_for_path(&raw_fm, Some(&rel_path));
-            let effective = self.apply_defaults(&raw_fm, &type_names);
-            let effective = self.coerce_types(&effective, &type_names);
 
             // Detect multi-type conflicts
             if type_names.len() > 1 {

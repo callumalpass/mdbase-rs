@@ -8,7 +8,6 @@ use crate::cache::CacheError;
 use crate::expressions::evaluator::{
     extract_embeds_from_body, extract_links_from_body, extract_links_from_fm_value,
 };
-use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json, FrontmatterState};
 use crate::Collection;
 
 /// Parse and index a single file into the cache database.
@@ -22,96 +21,93 @@ pub(crate) fn reindex_file(
     abs_path: &Path,
     rel_path: &str,
 ) -> Result<(), CacheError> {
-    // 1. Read file contents
-    let content = std::fs::read_to_string(abs_path)?;
-    let source_revision = crate::v03::revision(content.as_bytes());
-
-    // 2. Get filesystem metadata
-    let metadata = std::fs::metadata(abs_path)?;
-    use std::time::UNIX_EPOCH;
-    let mtime_ns = metadata
-        .modified()?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_nanos() as i64)
-        .unwrap_or(0);
-    let ctime_ns = metadata
-        .created()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos() as i64);
-    let size = metadata.len() as i64;
-
-    // 3. Parse document
-    let doc = parse_document(&content);
-
-    // 4. Convert frontmatter to JSON, detect parse errors
-    let (frontmatter_json, body, parse_error) = match doc.frontmatter_state() {
-        FrontmatterState::InvalidYaml => {
-            // Parse error: store empty object as frontmatter, flag the error
-            (serde_json::json!({}), doc.body.clone(), 1i64)
-        }
-        FrontmatterState::Mapping(m) => {
-            let fm = yaml_mapping_to_json(m);
-            (fm, doc.body.clone(), 0i64)
-        }
-        FrontmatterState::Null | FrontmatterState::NonMapping(_) => {
-            // Non-mapping frontmatter (scalar, list, etc.) -- treat as empty
-            (serde_json::json!({}), doc.body.clone(), 0i64)
-        }
-        FrontmatterState::Absent => {
-            // No frontmatter delimiters
-            (serde_json::json!({}), doc.body.clone(), 0i64)
-        }
-    };
-
-    // 5. Determine types
-    let type_names = collection.determine_types_for_path(&frontmatter_json, Some(rel_path));
-
-    // 6. Compute effective frontmatter (defaults + coercion)
-    let effective = collection.apply_defaults(&frontmatter_json, &type_names);
-    let effective = collection.coerce_types(&effective, &type_names);
-
-    let fm_str = serde_json::to_string(&frontmatter_json)?;
-    let eff_str = serde_json::to_string(&effective)?;
-
-    // 7. Delete old rows for this path (cascade would handle child tables if we
-    //    had FK ON DELETE CASCADE, but our schema doesn't have it on all tables,
-    //    so delete explicitly).
+    let outcome = crate::record_load::load_record(collection, abs_path, rel_path)?;
+    let facts = outcome.facts().clone();
+    // Keep UTF-8 availability explicit at this boundary; invalid source is not
+    // indexed as a synthetic Markdown body.
+    let _utf8_document = outcome.document();
     remove_file(conn, rel_path)?;
 
-    // 8. Insert into `files`
-    conn.execute(
-        "INSERT INTO files (path, mtime_ns, ctime_ns, size, frontmatter_json, body, effective_json, parse_error) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![rel_path, mtime_ns, ctime_ns, size, fm_str, body, eff_str, parse_error],
-    )?;
-
-    // 9. Insert into `file_types`
-    for type_name in &type_names {
-        conn.execute(
-            "INSERT OR IGNORE INTO file_types (path, type_name) VALUES (?1, ?2)",
-            rusqlite::params![rel_path, type_name],
-        )?;
-    }
-
-    // 10. Extract and insert links
-    insert_links(conn, rel_path, &source_revision, &effective, &body)?;
-
-    // 11. Insert unique values
-    insert_unique_values(conn, collection, rel_path, &effective, &type_names)?;
-
-    // 12. Index the configured collection identity independently of type
-    // membership. Runtime mutation validation uses this as an O(log n)
-    // conflict check instead of reopening every record in the collection.
-    if let Some(value) = effective
-        .get(&collection.settings.id_field)
-        .and_then(canonical_unique_value)
-    {
-        conn.execute(
-            "INSERT OR REPLACE INTO identity_values (value, path) VALUES (?1, ?2)",
-            rusqlite::params![value, rel_path],
-        )?;
+    match outcome {
+        crate::record_load::RecordLoadOutcome::Invalid {
+            path,
+            type_names,
+            reason,
+            ..
+        } => {
+            conn.execute(
+                "INSERT INTO files (path, mtime_ns, ctime_ns, size, frontmatter_json, body, effective_json, parse_error, source_revision, failure_reason) \
+                 VALUES (?1, ?2, ?3, ?4, '{}', '', NULL, 1, ?5, ?6)",
+                rusqlite::params![
+                    path,
+                    facts.mtime_ns,
+                    facts.ctime_ns,
+                    facts.size as i64,
+                    facts.revision,
+                    reason.as_str()
+                ],
+            )?;
+            for type_name in type_names {
+                conn.execute(
+                    "INSERT OR IGNORE INTO file_types (path, type_name) VALUES (?1, ?2)",
+                    rusqlite::params![rel_path, type_name],
+                )?;
+            }
+        }
+        crate::record_load::RecordLoadOutcome::Parsed {
+            path,
+            raw_frontmatter,
+            effective_frontmatter,
+            body,
+            type_names,
+            ..
+        } => {
+            let fm_str = serde_json::to_string(&raw_frontmatter)?;
+            let eff_str = serde_json::to_string(&effective_frontmatter)?;
+            conn.execute(
+                "INSERT INTO files (path, mtime_ns, ctime_ns, size, frontmatter_json, body, effective_json, parse_error, source_revision, failure_reason) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, NULL)",
+                rusqlite::params![
+                    path,
+                    facts.mtime_ns,
+                    facts.ctime_ns,
+                    facts.size as i64,
+                    fm_str,
+                    body,
+                    eff_str,
+                    facts.revision
+                ],
+            )?;
+            for type_name in &type_names {
+                conn.execute(
+                    "INSERT OR IGNORE INTO file_types (path, type_name) VALUES (?1, ?2)",
+                    rusqlite::params![rel_path, type_name],
+                )?;
+            }
+            insert_links(
+                conn,
+                rel_path,
+                &facts.revision,
+                &effective_frontmatter,
+                &body,
+            )?;
+            insert_unique_values(
+                conn,
+                collection,
+                rel_path,
+                &effective_frontmatter,
+                &type_names,
+            )?;
+            if let Some(value) = effective_frontmatter
+                .get(&collection.settings.id_field)
+                .and_then(canonical_unique_value)
+            {
+                conn.execute(
+                    "INSERT OR REPLACE INTO identity_values (value, path) VALUES (?1, ?2)",
+                    rusqlite::params![value, rel_path],
+                )?;
+            }
+        }
     }
     Ok(())
 }

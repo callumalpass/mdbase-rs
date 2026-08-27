@@ -38,6 +38,19 @@ pub(crate) fn evaluation(
     }
 }
 
+pub(crate) fn invalid_record(path: &str, reason: &str) -> Diagnostic {
+    Diagnostic {
+        severity: "warning".to_string(),
+        code: "invalid_frontmatter".to_string(),
+        message: format!("Record could not be loaded: {reason}"),
+        path: Some(path.to_string()),
+        field: None,
+        type_name: None,
+        schema_location: None,
+        details: Some(json!({"reason": reason})),
+    }
+}
+
 pub(super) fn failed(diagnostics: Vec<Diagnostic>) -> OperationResult {
     OperationResult {
         valid: false,
