@@ -2,7 +2,7 @@ use super::{PortableWatchEvent, WatchEvent};
 use crate::runtime::CollectionSnapshotResourceKind;
 use crate::Collection;
 use notify::{
-    event::{MetadataKind, ModifyKind},
+    event::{CreateKind, MetadataKind, ModifyKind, RemoveKind},
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use serde_json::{json, Map, Value};
@@ -186,6 +186,7 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
     // Close the gap between the caller's initial snapshot and OS watch
     // registration before reporting readiness. Hosts can now treat `open` as
     // a stable boundary instead of triggering an additional full rescan.
+    let mut startup_refresh_failure = None;
     match Snapshot::load(&root) {
         Ok(next) => {
             for event in snapshot.diff(&next) {
@@ -205,6 +206,7 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
             snapshot = next;
         }
         Err(error) => {
+            startup_refresh_failure = Some(Instant::now());
             sequence += 1;
             if events
                 .send(watch_error_event(sequence, error.to_string()))
@@ -222,10 +224,15 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
     // Some backends (notably FSEvents) can acknowledge registration before
     // their event stream is observable. Reconcile once after startup so a
     // write immediately following `open` cannot fall through that gap.
-    let mut deadline = Some(Instant::now() + debounce);
+    let mut deadline = Some(startup_refresh_failure.map_or_else(
+        || Instant::now() + debounce,
+        |failed_at| failed_at + INITIAL_REFRESH_RETRY,
+    ));
     let mut pending_rescans = Vec::new();
     let mut pending_paths = BTreeSet::new();
     let mut full_rescan = true;
+    let mut retry_backoff = INITIAL_REFRESH_RETRY;
+    let mut last_refresh_diagnostic = startup_refresh_failure;
 
     loop {
         let current_time = Instant::now();
@@ -236,15 +243,18 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
             Ok(WorkerInput::Command(Command::Stop)) => return,
             Ok(WorkerInput::Command(Command::Rescan(ready))) => {
                 deadline = Some(Instant::now());
+                retry_backoff = INITIAL_REFRESH_RETRY;
                 full_rescan = true;
                 pending_rescans.push(ready);
             }
             Ok(WorkerInput::Command(Command::RescanPaths(paths, ready))) => {
                 deadline = Some(Instant::now());
+                retry_backoff = INITIAL_REFRESH_RETRY;
                 pending_paths.extend(paths);
                 pending_rescans.push(ready);
             }
             Ok(WorkerInput::Filesystem(Ok(event))) if invalidates_snapshot(&event) => {
+                retry_backoff = INITIAL_REFRESH_RETRY;
                 let invalidation = snapshot.invalidation_paths(&root, &event);
                 if watch_profile_enabled() {
                     eprintln!(
@@ -308,14 +318,30 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
                             return;
                         }
                     }
+                    pending_paths.clear();
+                    full_rescan = false;
+                    retry_backoff = INITIAL_REFRESH_RETRY;
+                    last_refresh_diagnostic = None;
+                    for ready in pending_rescans.drain(..) {
+                        let _ = ready.send(());
+                    }
                 }
                 Err(error) => {
-                    sequence += 1;
-                    if events
-                        .send(watch_error_event(sequence, error.to_string()))
-                        .is_err()
-                    {
-                        return;
+                    let failed_at = Instant::now();
+                    deadline = Some(failed_at + retry_backoff);
+                    retry_backoff = retry_backoff.saturating_mul(2).min(MAX_REFRESH_RETRY);
+                    let diagnostic_due = last_refresh_diagnostic.is_none_or(|last| {
+                        failed_at.saturating_duration_since(last) >= REFRESH_DIAGNOSTIC_INTERVAL
+                    });
+                    if diagnostic_due {
+                        sequence += 1;
+                        if events
+                            .send(watch_error_event(sequence, error.to_string()))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        last_refresh_diagnostic = Some(failed_at);
                     }
                 }
             }
@@ -327,14 +353,13 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
                     refresh_started.elapsed().as_micros(),
                 );
             }
-            pending_paths.clear();
-            full_rescan = false;
-            for ready in pending_rescans.drain(..) {
-                let _ = ready.send(());
-            }
         }
     }
 }
+
+const INITIAL_REFRESH_RETRY: Duration = Duration::from_millis(250);
+const MAX_REFRESH_RETRY: Duration = Duration::from_secs(5);
+const REFRESH_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(5);
 
 fn watch_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -465,7 +490,22 @@ impl Snapshot {
     }
 
     fn invalidation_paths(&self, root: &Path, event: &Event) -> Option<BTreeSet<PathBuf>> {
-        if event.paths.is_empty() || matches!(event.kind, EventKind::Any | EventKind::Other) {
+        if event.paths.is_empty()
+            || matches!(event.kind, EventKind::Any | EventKind::Other)
+            || matches!(
+                event.kind,
+                EventKind::Modify(ModifyKind::Name(_))
+                    | EventKind::Create(CreateKind::Folder)
+                    | EventKind::Remove(RemoveKind::Folder)
+            )
+            || matches!(
+                event.kind,
+                EventKind::Create(CreateKind::Any | CreateKind::Other)
+            ) && event.paths.iter().any(|path| {
+                std::fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            })
+        {
             return None;
         }
         let mut records = BTreeSet::new();
@@ -773,7 +813,7 @@ fn collection_error(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, RemoveKind};
+    use notify::event::{AccessKind, AccessMode, DataChange, RenameMode};
     use std::fs;
 
     #[test]
@@ -796,6 +836,46 @@ mod tests {
             EventKind::Other,
         ] {
             assert!(invalidates_snapshot(&Event::new(kind)), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn synthetic_directory_and_rename_events_force_full_reconciliation() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("extant")).unwrap();
+        let snapshot = Snapshot {
+            resources: BTreeMap::new(),
+            records: BTreeMap::new(),
+            types_folder: "_types".to_string(),
+            contracts_folder: "_contracts".to_string(),
+            cache_folder: ".mdbase/cache".to_string(),
+            migrations_folder: ".mdbase/migrations".to_string(),
+            exclude: Vec::new(),
+            include_subfolders: true,
+            record_extensions: BTreeSet::from(["md".to_string()]),
+        };
+
+        for event in [
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)))
+                .add_path(directory.path().join("old"))
+                .add_path(directory.path().join("new")),
+            Event::new(EventKind::Create(CreateKind::Folder))
+                .add_path(directory.path().join("folder")),
+            Event::new(EventKind::Remove(RemoveKind::Folder))
+                .add_path(directory.path().join("folder")),
+            Event::new(EventKind::Create(CreateKind::Any))
+                .add_path(directory.path().join("extant")),
+        ] {
+            assert_eq!(snapshot.invalidation_paths(directory.path(), &event), None);
+        }
+
+        for path in [".hidden/state.json", "assets/image.png"] {
+            let event = Event::new(EventKind::Create(CreateKind::File))
+                .add_path(directory.path().join(path));
+            assert_eq!(
+                snapshot.invalidation_paths(directory.path(), &event),
+                Some(BTreeSet::new())
+            );
         }
     }
 
@@ -962,6 +1042,193 @@ mod tests {
             .recv_timeout(debounce + Duration::from_millis(250))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn watcher_observes_many_first_writes_in_new_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(30)).unwrap();
+        let expected = (0..32)
+            .map(|index| format!("new-{index}/note.md"))
+            .collect::<BTreeSet<_>>();
+
+        for path in &expected {
+            let path = directory.path().join(path);
+            fs::create_dir(path.parent().unwrap()).unwrap();
+            fs::write(path, "---\ntitle: Immediate\n---\n").unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = BTreeSet::new();
+        while observed.len() < expected.len() && Instant::now() < deadline {
+            if let Some(event) = watcher.recv_timeout(Duration::from_millis(100)).unwrap() {
+                if event.event_type == "mdbase.record.created" {
+                    observed.insert(event.payload["path"].as_str().unwrap().to_string());
+                }
+            }
+        }
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn watcher_reconciles_recursive_directory_rename() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::create_dir_all(directory.path().join("before/nested")).unwrap();
+        fs::write(
+            directory.path().join("before/one.md"),
+            "---\ntitle: One\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("before/nested/two.md"),
+            "---\ntitle: Two\n---\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(30)).unwrap();
+
+        fs::rename(
+            directory.path().join("before"),
+            directory.path().join("after"),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut renames = BTreeSet::new();
+        while renames.len() < 2 && Instant::now() < deadline {
+            if let Some(event) = watcher.recv_timeout(Duration::from_millis(100)).unwrap() {
+                if event.event_type == "mdbase.record.renamed" {
+                    renames.insert((
+                        event.payload["from"].as_str().unwrap().to_string(),
+                        event.payload["to"].as_str().unwrap().to_string(),
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            renames,
+            BTreeSet::from([
+                (
+                    "before/nested/two.md".to_string(),
+                    "after/nested/two.md".to_string()
+                ),
+                ("before/one.md".to_string(), "after/one.md".to_string()),
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_does_not_read_through_symlink_poison() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(
+            outside.path().join("poison.md"),
+            "---\ntitle: Poison\n---\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(30)).unwrap();
+
+        symlink(outside.path(), directory.path().join("linked")).unwrap();
+        fs::write(
+            directory.path().join("unrelated.md"),
+            "---\ntitle: Safe\n---\n",
+        )
+        .unwrap();
+
+        let event = watcher
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .expect("unrelated record event");
+        assert_eq!(event.event_type, "mdbase.record.created");
+        assert_eq!(event.payload["path"], "unrelated.md");
+        assert!(watcher
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_refresh_retries_recover_with_bounded_diagnostics() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let config = "spec_version: 0.3.0\nsettings:\n  validation: warn\n";
+        fs::write(directory.path().join("mdbase.yaml"), config).unwrap();
+        fs::write(outside.path().join("mdbase.yaml"), config).unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(20)).unwrap();
+
+        fs::remove_file(directory.path().join("mdbase.yaml")).unwrap();
+        symlink(
+            outside.path().join("mdbase.yaml"),
+            directory.path().join("mdbase.yaml"),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("pending.md"),
+            "---\ntitle: Pending\n---\n",
+        )
+        .unwrap();
+
+        let first = watcher
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .expect("failed refresh diagnostic");
+        assert_eq!(
+            first
+                .payload
+                .pointer("/diagnostic/code")
+                .and_then(Value::as_str),
+            Some("collection_reload_failed")
+        );
+        assert!(watcher
+            .recv_timeout(Duration::from_millis(900))
+            .unwrap()
+            .is_none());
+
+        fs::remove_file(directory.path().join("mdbase.yaml")).unwrap();
+        fs::write(directory.path().join("mdbase.yaml"), config).unwrap();
+        fs::write(
+            directory.path().join("fresh.md"),
+            "---\ntitle: Fresh\n---\n",
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut created = BTreeSet::new();
+        let mut diagnostics = 1;
+        while created.len() < 2 && Instant::now() < deadline {
+            if let Some(event) = watcher.recv_timeout(Duration::from_millis(100)).unwrap() {
+                if event.payload.get("diagnostic").is_some() {
+                    diagnostics += 1;
+                } else if event.event_type == "mdbase.record.created" {
+                    created.insert(event.payload["path"].as_str().unwrap().to_string());
+                }
+            }
+        }
+        assert_eq!(
+            created,
+            BTreeSet::from(["fresh.md".to_string(), "pending.md".to_string()])
+        );
+        assert_eq!(diagnostics, 1);
     }
 
     #[test]

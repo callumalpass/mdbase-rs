@@ -935,6 +935,99 @@ fn runtime_normalizes_external_changes_and_deduplicates_known_writes() {
 }
 
 #[test]
+fn runtime_external_feed_reopens_with_stable_unacknowledged_replay() {
+    let directory = collection();
+    let owner = ChangeFeedOwnerId::generate();
+    let expected = {
+        let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(20)).unwrap();
+        let feed = runtime
+            .open_change_feed(&owner, &OperationContext::legacy())
+            .unwrap();
+        runtime
+            .establish_change_feed_baseline(&feed, &OperationContext::legacy())
+            .unwrap();
+
+        fs::write(
+            directory.path().join("external.md"),
+            "---\ntitle: Created\n---\nBody\n",
+        )
+        .unwrap();
+        let created = runtime
+            .ingest_external_timeout(Duration::from_secs(3), &OperationContext::legacy())
+            .unwrap()
+            .expect("external create");
+        fs::write(
+            directory.path().join("external.md"),
+            "---\ntitle: Modified\n---\nChanged body\n",
+        )
+        .unwrap();
+        let modified = runtime
+            .ingest_external_timeout(Duration::from_secs(3), &OperationContext::legacy())
+            .unwrap()
+            .expect("external modify");
+
+        for (event, kind) in [
+            (&created, RecordChangeKind::Created),
+            (&modified, RecordChangeKind::Updated),
+        ] {
+            assert_eq!(event.origin, ChangeOrigin::Filesystem);
+            let ChangeSet::Exact(changes) = &event.changes else {
+                panic!("external record operation must remain exact")
+            };
+            let [CanonicalChange::Record(change)] = changes.items() else {
+                panic!("external operation must contain one record change")
+            };
+            assert_eq!(change.kind, kind);
+            assert_eq!(change.path.as_str(), "external.md");
+        }
+        assert_eq!(created.identity.watermark.get(), 1);
+        assert_eq!(modified.identity.watermark.get(), 2);
+        vec![created, modified]
+    };
+
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(20)).unwrap();
+    let feed = runtime
+        .open_change_feed(&owner, &OperationContext::legacy())
+        .unwrap();
+    let replay = runtime
+        .read_change_events(
+            &feed,
+            None,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    assert_eq!(replay.feed_head.get(), 2);
+    assert_eq!(replay.events, expected);
+
+    let stable = runtime
+        .read_change_events(
+            &feed,
+            None,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    assert_eq!(stable.events, replay.events);
+    runtime
+        .ack_change_events(&feed, replay.feed_head, &OperationContext::legacy())
+        .unwrap();
+    let empty = runtime
+        .read_change_events(
+            &feed,
+            Some(replay.feed_head),
+            std::num::NonZeroUsize::new(8).unwrap(),
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    assert!(empty.events.is_empty());
+    assert!(runtime
+        .ingest_external_timeout(Duration::from_millis(100), &OperationContext::legacy())
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn runtime_read_cursor_pins_generation_replays_and_expires_on_release() {
     let directory = collection();
     for name in ["a", "b", "c"] {
