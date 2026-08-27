@@ -146,6 +146,12 @@ pub(crate) fn open_regular_record_no_follow(
         };
         directory = next;
     }
+    let Some(metadata) = open_result_or_unavailable(directory.symlink_metadata(leaf))? else {
+        return Ok(None);
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let Some(file) = open_result_or_unavailable(directory.open_with(leaf, &options))? else {

@@ -531,6 +531,15 @@ impl Snapshot {
         if event.paths.is_empty() {
             return None;
         }
+        // FSEvents and other coalescing backends can report the watched root
+        // rather than a changed leaf. An empty relative path is collection-wide,
+        // not irrelevant, so reconcile authoritatively.
+        if event.paths.iter().any(|path| {
+            path.strip_prefix(root)
+                .is_ok_and(|relative| relative.as_os_str().is_empty())
+        }) {
+            return None;
+        }
 
         // Filter paths that can never affect the collection before escalating
         // directory-shaped events. Backends commonly report hidden/cache
@@ -940,6 +949,7 @@ mod tests {
         };
 
         for event in [
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(directory.path().to_path_buf()),
             Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)))
                 .add_path(directory.path().join("old"))
                 .add_path(directory.path().join("new")),
