@@ -108,7 +108,7 @@ pub(crate) fn mutation_record_path(
 ) -> Result<crate::api::CollectionPath, serde_json::Value> {
     collection
         .validate_record_path(path)
-        .map_err(|error| op_error(INVALID_PATH, &error.to_string()))
+        .map_err(|error| path_boundary_error(collection.spec_profile, &error.to_string()))
 }
 
 pub(crate) fn readable_record_path(

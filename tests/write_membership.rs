@@ -220,3 +220,117 @@ fn unknown_explicit_membership_fails_without_writing() {
     assert_eq!(result.diagnostics[0].code, "unknown_type");
     assert!(!root.path().join("bad.md").exists());
 }
+
+#[test]
+fn selected_membership_without_keys_never_reopens_implicitly() {
+    let root = fixture("kind");
+    write(root.path(), "mdbase.yaml", "spec_version: \"0.3.0\"\nsettings:\n  contracts_folder: contracts\n  explicit_type_keys: []\n");
+    let collection = Collection::open(root.path()).unwrap();
+    let result = collection.v03_operations().unwrap().create(&json!({
+        "path":"no.md", "type":"note", "frontmatter":{"kind":"note","title":"matches"}
+    }));
+    assert!(!result.valid);
+    assert_eq!(
+        result.diagnostics[0].code,
+        "type_membership_persistence_failed"
+    );
+    assert!(!root.path().join("no.md").exists());
+    drop(collection);
+    let reopened = Collection::open(root.path()).unwrap();
+    assert!(
+        !reopened
+            .v03_operations()
+            .unwrap()
+            .read(&json!({"path":"no.md"}))
+            .valid
+    );
+}
+
+#[test]
+fn selected_type_owns_derived_path_over_sorted_auxiliary() {
+    let root = fixture("types");
+    write(
+        root.path(),
+        "_types/note.md",
+        r#"---
+kind: mdbase.type
+name: note
+collection:
+  path:
+    pattern: notes/{title}.md
+schema:
+  dialect: json-schema-2020-12
+  value: {type: object}
+implements:
+  - contract: example.note
+    version: 1.0.0
+    fields: {}
+---
+"#,
+    );
+    write(
+        root.path(),
+        "_types/aux.md",
+        r#"---
+kind: mdbase.type
+name: aux
+collection:
+  path:
+    pattern: wrong/{title}.md
+schema:
+  dialect: json-schema-2020-12
+  value: {type: object}
+---
+"#,
+    );
+    for contract in [false, true] {
+        let collection = Collection::open(root.path()).unwrap();
+        let title = if contract { "contract" } else { "top" };
+        let mut request = json!({"type":"note","frontmatter":{"types":["aux"],"title":title}});
+        if contract {
+            request["contract"] = json!("example.note");
+            request["contract_version"] = json!("1.0.0");
+        }
+        let result = collection.v03_operations().unwrap().create(&request);
+        assert!(result.valid, "{result:#?}");
+        assert!(root.path().join(format!("notes/{title}.md")).exists());
+        assert!(!root.path().join(format!("wrong/{title}.md")).exists());
+    }
+}
+
+#[test]
+fn update_implicit_matching_receives_only_canonical_path() {
+    let root = fixture("kind");
+    write(root.path(), "mdbase.yaml", "spec_version: \"0.3.0\"\nsettings:\n  contracts_folder: contracts\n  explicit_type_keys: []\n");
+    write(
+        root.path(),
+        "_types/note.md",
+        r#"---
+kind: mdbase.type
+name: note
+match:
+  expr:
+    $expr: 'file.path == "notes/a.md"'
+schema:
+  dialect: json-schema-2020-12
+  value: {type: object}
+---
+"#,
+    );
+    write(root.path(), "notes/a.md", "---\ntitle: old\n---\nbody\n");
+    let collection = Collection::open(root.path()).unwrap();
+    for path in ["notes/a.md", "notes\\a.md"] {
+        let result = collection
+            .v03_operations()
+            .unwrap()
+            .update(&json!({"path":path,"fields":{"title":"new"}}));
+        assert!(result.valid, "{path}: {result:#?}");
+    }
+    let bytes = fs::read(root.path().join("notes/a.md")).unwrap();
+    let rejected = collection
+        .v03_operations()
+        .unwrap()
+        .update(&json!({"path":"../notes/a.md","fields":{"title":"bad"}}));
+    assert!(!rejected.valid);
+    assert_eq!(fs::read(root.path().join("notes/a.md")).unwrap(), bytes);
+}

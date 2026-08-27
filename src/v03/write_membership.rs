@@ -2,17 +2,26 @@ use semver::Version;
 use serde_json::{Map, Value};
 
 use super::Diagnostic;
+use crate::expressions::evaluator::EvaluationClock;
 use crate::Collection;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedWriteMembership {
     types: Vec<String>,
+    path_type: Option<String>,
     designated_contract_type: Option<String>,
+    evaluation_clock: Option<EvaluationClock>,
 }
 
 impl ResolvedWriteMembership {
     pub(crate) fn types(&self) -> &[String] {
         &self.types
+    }
+
+    pub(crate) fn path_type(&self) -> Option<&str> {
+        self.path_type
+            .as_deref()
+            .or_else(|| self.types.first().map(String::as_str))
     }
 
     pub(crate) fn resolve_create(
@@ -28,6 +37,11 @@ impl ResolvedWriteMembership {
         let designated = resolve_contract(collection, input, requested.as_deref(), path)?;
         let selected = designated.as_ref().or(requested.as_ref());
 
+        let evaluation_clock = if declarations_present || selected.is_some() {
+            None
+        } else {
+            Some(capture_clock(collection, path)?)
+        };
         let mut types = if declarations_present || selected.is_some() {
             if let Some(name) = selected {
                 explicit.push(name.clone());
@@ -35,12 +49,20 @@ impl ResolvedWriteMembership {
             canonicalize(&mut explicit);
             explicit
         } else {
-            implicit_membership(collection, draft, path)?
+            implicit_membership(collection, draft, path, evaluation_clock.as_ref().unwrap())?
         };
 
         if let Some(name) = selected {
+            if collection.settings.explicit_type_keys.is_empty() {
+                return Err(vec![persistence_failure(
+                    path,
+                    &types,
+                    &[],
+                    "No explicit type keys are configured.",
+                )]);
+            }
             persist_selected(collection, draft, name, path)?;
-            let reopened = match classify(collection, draft, path) {
+            let reopened = match classify(collection, draft, path, None) {
                 Ok(reopened) => reopened,
                 Err(_) if collection.settings.explicit_type_keys.is_empty() => {
                     return Err(vec![persistence_failure(
@@ -65,7 +87,9 @@ impl ResolvedWriteMembership {
         }
         Ok(Self {
             types,
+            path_type: selected.cloned(),
             designated_contract_type: designated,
+            evaluation_clock,
         })
     }
 
@@ -74,9 +98,12 @@ impl ResolvedWriteMembership {
         draft: &Map<String, Value>,
         path: &str,
     ) -> Result<Self, Vec<Diagnostic>> {
+        let clock = capture_clock(collection, path)?;
         Ok(Self {
-            types: classify(collection, draft, path)?,
+            types: classify(collection, draft, path, Some(&clock))?,
+            path_type: None,
             designated_contract_type: None,
+            evaluation_clock: Some(clock),
         })
     }
 
@@ -86,7 +113,7 @@ impl ResolvedWriteMembership {
         raw: &Map<String, Value>,
         path: &str,
     ) -> Result<(), Vec<Diagnostic>> {
-        let after = classify(collection, raw, path)?;
+        let after = classify(collection, raw, path, self.evaluation_clock.as_ref())?;
         if after != self.types {
             return Err(vec![changed(
                 "type_membership_changed",
@@ -252,12 +279,21 @@ fn classify(
     collection: &Collection,
     draft: &Map<String, Value>,
     path: &str,
+    clock: Option<&EvaluationClock>,
 ) -> Result<Vec<String>, Vec<Diagnostic>> {
     let (explicit, present) = explicit_membership(collection, draft, path)?;
     if present {
         Ok(explicit)
     } else {
-        implicit_membership(collection, draft, path)
+        let captured;
+        let clock = match clock {
+            Some(clock) => clock,
+            None => {
+                captured = capture_clock(collection, path)?;
+                &captured
+            }
+        };
+        implicit_membership(collection, draft, path, clock)
     }
 }
 
@@ -307,9 +343,13 @@ fn implicit_membership(
     collection: &Collection,
     draft: &Map<String, Value>,
     path: &str,
+    clock: &EvaluationClock,
 ) -> Result<Vec<String>, Vec<Diagnostic>> {
-    let (mut types, failures) =
-        collection.determine_types_for_path_checked(&Value::Object(draft.clone()), Some(path));
+    let (mut types, failures) = collection.determine_types_for_path_checked_with_clock(
+        &Value::Object(draft.clone()),
+        Some(path),
+        clock,
+    );
     let mut errors = failures
         .into_iter()
         .map(|(name, failure)| {
@@ -330,6 +370,18 @@ fn implicit_membership(
     }
     canonicalize(&mut types);
     Ok(types)
+}
+
+fn capture_clock(collection: &Collection, path: &str) -> Result<EvaluationClock, Vec<Diagnostic>> {
+    super::cel::operation_clock(collection.settings.timezone.as_deref()).map_err(|failure| {
+        vec![diagnostic(
+            failure.code,
+            failure.message,
+            path,
+            Some("match.expr"),
+            None,
+        )]
+    })
 }
 
 fn persist_selected(

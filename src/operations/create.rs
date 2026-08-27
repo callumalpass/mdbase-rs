@@ -100,7 +100,11 @@ impl Collection {
             }
             None => {
                 // Try to derive from path_pattern or filename_pattern
-                if let Some(tn) = type_names.first() {
+                let path_type = membership
+                    .as_ref()
+                    .and_then(|membership| membership.path_type())
+                    .or_else(|| type_names.first().map(String::as_str));
+                if let Some(tn) = path_type {
                     if let Some(type_def) = self.types.get(tn) {
                         let pattern = type_def
                             .path_pattern

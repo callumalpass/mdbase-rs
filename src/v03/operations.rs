@@ -655,7 +655,6 @@ impl<'a> Operations<'a> {
             None,
             path,
         )?;
-        membership.revalidate(self.collection, &lifecycle_draft, path)?;
         normalized.insert("frontmatter".to_string(), Value::Object(lifecycle_draft));
         Ok((Value::Object(normalized), membership))
     }
@@ -664,16 +663,20 @@ impl<'a> Operations<'a> {
         &self,
         input: &Value,
     ) -> Result<(Value, super::write_membership::ResolvedWriteMembership), Vec<Diagnostic>> {
-        let Some(path) = input.get("path").and_then(Value::as_str) else {
+        let Some(raw_path) = input.get("path").and_then(Value::as_str) else {
             return Err(vec![Diagnostic::error(
                 "invalid_request",
                 "Update requires path.",
                 None,
             )]);
         };
-        let read = self.collection.read(&serde_json::json!({"path": path}));
+        let path = match crate::operations::mutation_record_path(self.collection, raw_path) {
+            Ok(path) => path.to_string(),
+            Err(error) => return Err(collect_diagnostics(&error, Some(raw_path), "error")),
+        };
+        let read = self.collection.read(&serde_json::json!({"path": &path}));
         if read.get("error").is_some() {
-            return Err(collect_diagnostics(&read, Some(path), "error"));
+            return Err(collect_diagnostics(&read, Some(&path), "error"));
         }
         let old = read
             .get("frontmatter")
@@ -719,18 +722,17 @@ impl<'a> Operations<'a> {
         let membership = super::write_membership::ResolvedWriteMembership::resolve_update(
             self.collection,
             &draft,
-            path,
+            &path,
         )?;
         let lifecycle_draft = self.collection.apply_v03_lifecycle(
             LifecycleEvent::Update,
             membership.types(),
             draft.clone(),
             Some(&old),
-            path,
+            &path,
         )?;
-        membership.revalidate(self.collection, &lifecycle_draft, path)?;
-
         let mut normalized = input.as_object().cloned().unwrap_or_default();
+        normalized.insert("path".to_string(), Value::String(path.clone()));
         // Preparation read and locked core reread form one optimistic operation.
         // When the caller omitted a precondition, carry the prepared revision so
         // an intervening write cannot be merged into stale preparation.
