@@ -222,11 +222,19 @@ fn legacy_v02_create_and_update_keep_implicit_matching_and_output() {
         fs::read_to_string(root.path().join("legacy.md")).unwrap(),
         "---\ntitle: Before\n---\nBody\n"
     );
+    assert_eq!(
+        collection.read(&json!({"path":"legacy.md"}))["types"],
+        json!(["note"])
+    );
     let updated = collection.update(&json!({"path":"legacy.md","fields":{"title":"After"}}));
     assert!(updated.get("error").is_none(), "{updated:#?}");
     assert_eq!(
         fs::read_to_string(root.path().join("legacy.md")).unwrap(),
         "---\ntitle: After\n---\nBody\n"
+    );
+    assert_eq!(
+        collection.read(&json!({"path":"legacy.md"}))["types"],
+        json!(["note"])
     );
 }
 

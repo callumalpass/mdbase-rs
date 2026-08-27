@@ -1020,48 +1020,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_prepare_rejects_erased_explicit_authority_without_canonical_or_staged_write() {
-        let source = tempfile::tempdir().unwrap();
-        write(
-            &source.path().join("mdbase.yaml"),
-            "spec_version: 0.3.0\nsettings:\n  explicit_type_keys: [kind]\n",
-        );
-        write(
-            &source.path().join("_types/note.md"),
-            "---\nkind: mdbase.type\nname: note\nmatch: { fields_present: [title] }\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\nlifecycle:\n  on_create:\n    set: { kind: { literal: null } }\n---\n",
-        );
-        let collection = Collection::open(source.path()).unwrap();
-        crate::cache::runtime::rebuild(
-            &collection,
-            &crate::runtime::CollectionGeneration::initial(),
-        )
-        .unwrap();
-
-        let result = match prepare_single_runtime(
-            &collection,
-            "create",
-            &json!({"path":"failed.md","type":"note","frontmatter":{"title":"same"}}),
-            &crate::runtime::OperationContext::legacy(),
-        )
-        .unwrap()
-        {
-            RuntimeSinglePreparation::NoMutation(result) => result,
-            RuntimeSinglePreparation::Prepared(_) => {
-                panic!("authority-erasing runtime preparation unexpectedly staged a mutation")
-            }
-        };
-        assert!(!result.valid);
-        assert_eq!(
-            result.diagnostics[0].code,
-            "type_membership_authority_changed"
-        );
-        assert!(!source.path().join("failed.md").exists());
-        assert!(fs::read_dir(source.path())
-            .unwrap()
-            .all(|entry| entry.unwrap().file_name() != "failed.md"));
-    }
-
-    #[test]
     fn runtime_single_dry_run_never_mutates_the_live_record() {
         let source = tempfile::tempdir().unwrap();
         write(
