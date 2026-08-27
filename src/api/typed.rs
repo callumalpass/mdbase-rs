@@ -218,6 +218,12 @@ pub struct CreateRequest {
     /// Explicit type name used for path derivation and type membership.
     #[serde(default, rename = "type")]
     pub type_name: Option<String>,
+    /// Exact data-contract identifier, paired with `contract_version`.
+    #[serde(default)]
+    pub contract: Option<String>,
+    /// Exact semantic version, paired with `contract`.
+    #[serde(default)]
+    pub contract_version: Option<String>,
     /// Persisted frontmatter object.
     #[serde(default = "empty_json_object")]
     pub frontmatter: Value,
@@ -238,6 +244,8 @@ impl CreateRequest {
         Self {
             path: Some(path),
             type_name: None,
+            contract: None,
+            contract_version: None,
             frontmatter: empty_json_object(),
             body: String::new(),
             if_revision: None,
@@ -250,6 +258,8 @@ impl CreateRequest {
         Self {
             path: None,
             type_name: None,
+            contract: None,
+            contract_version: None,
             frontmatter: empty_json_object(),
             body: String::new(),
             if_revision: None,
@@ -266,6 +276,17 @@ impl CreateRequest {
     /// Set the explicit type name.
     pub fn with_type(mut self, type_name: impl Into<String>) -> Self {
         self.type_name = Some(type_name.into());
+        self
+    }
+
+    /// Select an exact data contract and version atomically.
+    pub fn with_contract(
+        mut self,
+        contract: impl Into<String>,
+        version: impl Into<String>,
+    ) -> Self {
+        self.contract = Some(contract.into());
+        self.contract_version = Some(version.into());
         self
     }
 
@@ -288,6 +309,12 @@ impl CreateRequest {
         });
         set_optional(&mut input, "path", self.path.map(|path| json!(path)));
         set_optional(&mut input, "type", self.type_name.map(Value::String));
+        set_optional(&mut input, "contract", self.contract.map(Value::String));
+        set_optional(
+            &mut input,
+            "contract_version",
+            self.contract_version.map(Value::String),
+        );
         set_optional(
             &mut input,
             "if_revision",

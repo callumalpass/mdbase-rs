@@ -13,6 +13,22 @@ use crate::Collection;
 impl Collection {
     /// Update a file (§12.3).
     pub fn update(&self, input: &serde_json::Value) -> serde_json::Value {
+        self.update_prepared(input, None)
+    }
+
+    pub(crate) fn update_v03_prepared(
+        &self,
+        input: &serde_json::Value,
+        membership: crate::v03::write_membership::ResolvedWriteMembership,
+    ) -> serde_json::Value {
+        self.update_prepared(input, Some(membership))
+    }
+
+    fn update_prepared(
+        &self,
+        input: &serde_json::Value,
+        membership: Option<crate::v03::write_membership::ResolvedWriteMembership>,
+    ) -> serde_json::Value {
         let input = match UpdateInput::parse(input) {
             Ok(parsed) => parsed,
             Err(err) => return err,
@@ -108,8 +124,12 @@ impl Collection {
         };
         let merged_json = yaml_mapping_to_json(&merged);
 
-        // Determine types
-        let type_names = self.determine_types(&merged_json);
+        // Canonical v0.3 callers carry the membership frozen before lifecycle.
+        // Legacy callers retain historical inference unchanged.
+        let type_names = membership.as_ref().map_or_else(
+            || self.determine_types(&merged_json),
+            |membership| membership.types().to_vec(),
+        );
 
         // Apply generated (now_on_write)
         let mut merged_obj = match merged_json.as_object() {
@@ -117,6 +137,12 @@ impl Collection {
             None => serde_json::Map::new(),
         };
         self.apply_generated(&mut merged_obj, &type_names, false, Some(path.as_str()));
+
+        if let Some(membership) = &membership {
+            if let Err(diagnostics) = membership.revalidate(self, &merged_obj, path.as_str()) {
+                return crate::v03::write_membership::diagnostics_error(diagnostics);
+            }
+        }
 
         // Apply defaults for effective frontmatter
         let effective =

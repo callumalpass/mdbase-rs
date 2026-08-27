@@ -14,6 +14,22 @@ use crate::Collection;
 impl Collection {
     /// Create a file (§12.1).
     pub fn create(&self, input: &serde_json::Value) -> serde_json::Value {
+        self.create_prepared(input, None)
+    }
+
+    pub(crate) fn create_v03_prepared(
+        &self,
+        input: &serde_json::Value,
+        membership: crate::v03::write_membership::ResolvedWriteMembership,
+    ) -> serde_json::Value {
+        self.create_prepared(input, Some(membership))
+    }
+
+    fn create_prepared(
+        &self,
+        input: &serde_json::Value,
+        membership: Option<crate::v03::write_membership::ResolvedWriteMembership>,
+    ) -> serde_json::Value {
         let input = CreateInput::parse(input);
         let type_name = input.type_name.as_deref();
         let frontmatter_input = input.frontmatter;
@@ -21,22 +37,26 @@ impl Collection {
         let path_input = input.path.as_deref();
         let if_revision = input.if_revision.as_deref();
 
-        // Determine type names
-        let mut type_names: Vec<String> = Vec::new();
-        if let Some(tn) = type_name {
-            let tn_lower = tn.to_lowercase();
-            if !self.types.contains_key(&tn_lower) {
-                return op_error(UNKNOWN_TYPE, &format!("Unknown type: {}", tn));
+        // Canonical v0.3 callers freeze membership before lifecycle/default/generated behavior.
+        // Legacy callers retain the historical inference path unchanged.
+        let type_names = if let Some(membership) = &membership {
+            membership.types().to_vec()
+        } else {
+            let mut names = Vec::new();
+            if let Some(tn) = type_name {
+                let tn_lower = tn.to_lowercase();
+                if !self.types.contains_key(&tn_lower) {
+                    return op_error(UNKNOWN_TYPE, &format!("Unknown type: {}", tn));
+                }
+                names.push(tn_lower);
             }
-            type_names.push(tn_lower);
-        }
-        // Also check frontmatter for type key
-        let fm_types = self.determine_types(&frontmatter_input);
-        for t in fm_types {
-            if !type_names.contains(&t) {
-                type_names.push(t);
+            for name in self.determine_types(&frontmatter_input) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
             }
-        }
+            names
+        };
 
         // Build frontmatter early so path_pattern can use generated/default values
         let mut fm_obj = match frontmatter_input.as_object() {
@@ -45,15 +65,17 @@ impl Collection {
         };
 
         // Add type key if specified and explicit_type_keys is non-empty
-        if let Some(tn) = type_name {
-            if !self.settings.explicit_type_keys.is_empty()
-                && !fm_obj.contains_key("type")
-                && !fm_obj.contains_key("types")
-            {
-                fm_obj.insert(
-                    "type".to_string(),
-                    serde_json::Value::String(tn.to_string()),
-                );
+        if membership.is_none() {
+            if let Some(tn) = type_name {
+                if !self.settings.explicit_type_keys.is_empty()
+                    && !fm_obj.contains_key("type")
+                    && !fm_obj.contains_key("types")
+                {
+                    fm_obj.insert(
+                        "type".to_string(),
+                        serde_json::Value::String(tn.to_string()),
+                    );
+                }
             }
         }
 
@@ -136,6 +158,12 @@ impl Collection {
                     path.as_str()
                 ),
             );
+        }
+
+        if let Some(membership) = &membership {
+            if let Err(diagnostics) = membership.revalidate(self, &fm_obj, path.as_str()) {
+                return crate::v03::write_membership::diagnostics_error(diagnostics);
+            }
         }
 
         // Apply defaults for effective frontmatter (for validation and output)

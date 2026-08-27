@@ -21,6 +21,7 @@ mod lifecycle;
 mod operations;
 pub(crate) mod query;
 mod type_pack;
+pub(crate) mod write_membership;
 
 pub use cel::{
     evaluate_runtime_expression, evaluate_runtime_template, validate_runtime_expression,
