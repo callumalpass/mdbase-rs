@@ -1,5 +1,6 @@
 //! Canonical byte-first record loading boundary.
 
+use std::io::Read;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -73,9 +74,21 @@ pub(crate) fn load_record(
     abs_path: &Path,
     rel_path: &str,
 ) -> std::io::Result<RecordLoadOutcome> {
-    let bytes = std::fs::read(abs_path)?;
-    let metadata = std::fs::metadata(abs_path)?;
-    let facts = facts(&bytes, &metadata);
+    let mut file = std::fs::File::open(abs_path)?;
+    let before = file.metadata()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || bytes.len() as u64 != after.len()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "record changed while it was being loaded",
+        ));
+    }
+    let facts = facts(&bytes, &after);
     Ok(classify_bytes(collection, rel_path, bytes, facts))
 }
 
@@ -228,5 +241,75 @@ mod tests {
             }
             assert_eq!(outcome.facts().revision, crate::v03::revision(source));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_bytes_and_metadata_stay_on_one_file_version_during_replacement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, SystemTime};
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        let path = root.path().join("note.md");
+        let versions = [
+            (
+                b"first version\n".as_slice(),
+                UNIX_EPOCH + Duration::from_secs(10),
+            ),
+            (
+                b"a distinct and longer second version\n".as_slice(),
+                UNIX_EPOCH + Duration::from_secs(20),
+            ),
+        ];
+        let write_version = |index: usize| {
+            let temporary = root.path().join(format!("note-{index}.tmp"));
+            std::fs::write(&temporary, versions[index].0).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&temporary)
+                .unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(versions[index].1))
+                .unwrap();
+            std::fs::rename(temporary, &path).unwrap();
+        };
+        write_version(0);
+        let collection = Collection::open(root.path()).unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let writer_running = Arc::clone(&running);
+        let writer_root = root.path().to_path_buf();
+        let writer = std::thread::spawn(move || {
+            let mut index = 1;
+            while writer_running.load(Ordering::Relaxed) {
+                let temporary = writer_root.join(format!("writer-{index}.tmp"));
+                std::fs::write(&temporary, versions[index].0).unwrap();
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&temporary)
+                    .unwrap();
+                file.set_times(std::fs::FileTimes::new().set_modified(versions[index].1))
+                    .unwrap();
+                std::fs::rename(temporary, writer_root.join("note.md")).unwrap();
+                index = 1 - index;
+            }
+        });
+        for _ in 0..500 {
+            let outcome = load_record(&collection, &path, "note.md").unwrap();
+            let facts = outcome.facts();
+            let index = versions
+                .iter()
+                .position(|(bytes, _)| crate::v03::revision(bytes) == facts.revision)
+                .expect("loaded one complete known version");
+            assert_eq!(facts.size, versions[index].0.len() as u64);
+            let expected_mtime = versions[index]
+                .1
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64;
+            assert_eq!(facts.mtime_ns, expected_mtime);
+        }
+        running.store(false, Ordering::Relaxed);
+        writer.join().unwrap();
     }
 }

@@ -222,6 +222,21 @@ fn cache_commits_invalid_rows_and_repair_converges_to_parsed_state() {
 }
 
 #[test]
+fn valid_raw_document_create_preserves_exact_source_bytes() {
+    let (root, collection) = collection();
+    let source = "\u{feff}---\r\ntitle: 'Exact' # preserve comment\r\ncustom: null\r\n---\r\nBody with CRLF.\r\n";
+    let created = collection
+        .v03_operations()
+        .unwrap()
+        .create(&json!({"path": "exact-create.md", "document": source}));
+    assert!(created.valid, "{created:#?}");
+    assert_eq!(
+        fs::read(root.path().join("exact-create.md")).unwrap(),
+        source.as_bytes()
+    );
+}
+
+#[test]
 fn malformed_raw_document_create_and_update_are_atomic() {
     let (root, collection) = collection();
     let operations = collection.v03_operations().unwrap();
@@ -272,6 +287,37 @@ fn full_replacement_repairs_malformed_record_but_patch_cannot() {
     }));
     assert!(repaired.valid, "{repaired:#?}");
     assert_eq!(fs::read(&path).unwrap(), replacement.as_bytes());
+}
+
+#[test]
+fn full_replacement_repairs_nonmapping_and_invalid_utf8_records() {
+    let (root, collection) = collection();
+    let operations = collection.v03_operations().unwrap();
+    for (path, original) in [
+        (
+            "nonmapping.md",
+            b"---\n- one\n- two\n---\nOpaque\n".as_slice(),
+        ),
+        ("binary.md", b"---\ntitle: \xff\n---\nOpaque\n".as_slice()),
+    ] {
+        fs::write(root.path().join(path), original).unwrap();
+        let patched = operations.update(&json!({"path": path, "patch": {"title": "No"}}));
+        assert!(!patched.valid);
+        assert_eq!(patched.diagnostics[0].code, "invalid_frontmatter");
+        assert_eq!(fs::read(root.path().join(path)).unwrap(), original);
+
+        let replacement = format!("---\ntitle: Repaired {path}\n---\nVisible\n");
+        let repaired = operations.update(&json!({
+            "path": path,
+            "document": replacement,
+            "include_document": true
+        }));
+        assert!(repaired.valid, "{path}: {repaired:#?}");
+        assert_eq!(
+            fs::read(root.path().join(path)).unwrap(),
+            replacement.as_bytes()
+        );
+    }
 }
 
 #[test]

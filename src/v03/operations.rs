@@ -653,7 +653,6 @@ impl<'a> Operations<'a> {
         let path = canonical_path.as_deref().unwrap_or("");
         if let Some(candidate) = classify_raw_candidate(input, path)? {
             draft = candidate.frontmatter;
-            normalized.remove("document");
             normalized.insert("body".to_string(), Value::String(candidate.document.body));
         }
         let membership = super::write_membership::ResolvedWriteMembership::resolve_create(
@@ -689,28 +688,40 @@ impl<'a> Operations<'a> {
             Err(error) => return Err(collect_diagnostics(&error, Some(raw_path), "error")),
         };
         let candidate = classify_raw_candidate(input, &path)?;
-        let read = self.collection.read(&serde_json::json!({"path": &path}));
-        let (old, prepared_revision) = if read.get("error").is_some() {
-            let repairable = read.pointer("/error/code").and_then(Value::as_str)
-                == Some("invalid_frontmatter")
-                && candidate.is_some();
-            if !repairable {
-                return Err(collect_diagnostics(&read, Some(&path), "error"));
-            }
-            match self.collection.snapshot_record(&path) {
-                Ok(record) if record.frontmatter_error.is_some() => {
-                    (Map::new(), Some(Value::String(record.revision)))
+        if let Err(error) = crate::operations::ensure_no_symlink_components(
+            &self.collection.root,
+            &path,
+            self.collection.spec_profile,
+        ) {
+            return Err(collect_diagnostics(&error, Some(&path), "error"));
+        }
+        let full_path = self.collection.root.join(&path);
+        if let Err(error) = crate::operations::ensure_regular_record_file(&full_path, &path) {
+            return Err(collect_diagnostics(&error, Some(&path), "error"));
+        }
+        let loaded =
+            crate::record_load::load_record(self.collection, &full_path, &path).map_err(|_| {
+                vec![Diagnostic::error(
+                    "file_read_failed",
+                    "Record could not be read.",
+                    Some(path.clone()),
+                )]
+            })?;
+        let (old, prepared_revision) = match loaded {
+            crate::record_load::RecordLoadOutcome::Parsed {
+                raw_frontmatter,
+                facts,
+                ..
+            } => (
+                raw_frontmatter.as_object().cloned().unwrap_or_default(),
+                Some(Value::String(facts.revision)),
+            ),
+            crate::record_load::RecordLoadOutcome::Invalid { facts, reason, .. } => {
+                if candidate.is_none() {
+                    return Err(vec![invalid_record_diagnostic(&path, reason.as_str())]);
                 }
-                _ => return Err(collect_diagnostics(&read, Some(&path), "error")),
+                (Map::new(), Some(Value::String(facts.revision)))
             }
-        } else {
-            (
-                read.get("frontmatter")
-                    .and_then(Value::as_object)
-                    .cloned()
-                    .unwrap_or_default(),
-                read.get("revision").cloned(),
-            )
         };
         let draft = if let Some(candidate) = candidate.as_ref() {
             candidate.frontmatter.clone()
@@ -786,6 +797,16 @@ impl<'a> Operations<'a> {
             .diagnostics
             .extend(match_failure_diagnostics(path, failures));
     }
+}
+
+fn invalid_record_diagnostic(path: &str, reason: &str) -> Diagnostic {
+    let mut diagnostic = Diagnostic::error(
+        "invalid_frontmatter",
+        format!("Invalid frontmatter: {reason}"),
+        Some(path.to_string()),
+    );
+    diagnostic.details = Some(serde_json::json!({"reason": reason}));
+    diagnostic
 }
 
 struct RawCandidate {

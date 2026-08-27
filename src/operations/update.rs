@@ -82,15 +82,19 @@ impl Collection {
             }
         }
 
-        let content = match std::fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(e) => return op_error(FILE_NOT_FOUND, &format!("Failed to read: {}", e)),
+        let content = match std::fs::read(&full_path) {
+            Ok(content) => content,
+            Err(error) => return op_error(FILE_NOT_FOUND, &format!("Failed to read: {error}")),
         };
         if let Err(error) = ensure_revision(&full_path, path.as_str(), if_revision.as_deref()) {
             return error;
         }
 
-        let (doc, original_had_bom) = parse_document_for_rewrite(&content);
+        let existing = match String::from_utf8(content) {
+            Ok(content) => Some(parse_document_for_rewrite(&content)),
+            Err(_) if document.is_some() => None,
+            Err(_) => return op_error(INVALID_FRONTMATTER, "File contains invalid UTF-8"),
+        };
         let replacement = document.as_deref().map(parse_document_for_rewrite);
         let replacement_doc = replacement.as_ref().map(|(doc, _)| doc);
         let replacement_mapping = match replacement_doc
@@ -110,8 +114,11 @@ impl Collection {
 
         let existing_mapping = match replacement_mapping.as_ref() {
             Some(mapping) => mapping.clone(),
-            None => match &doc.frontmatter {
-                Some(serde_yaml::Value::Mapping(m)) => m.clone(),
+            None => match existing
+                .as_ref()
+                .and_then(|(document, _)| document.frontmatter.as_ref())
+            {
+                Some(serde_yaml::Value::Mapping(mapping)) => mapping.clone(),
                 _ => serde_yaml::Mapping::new(),
             },
         };
@@ -200,18 +207,22 @@ impl Collection {
             crate::frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
         let body = match replacement_doc.as_ref() {
             Some(candidate) => candidate.body.as_str(),
-            None => match new_body {
-                Some(b) => b,
-                None => &doc.body,
-            },
+            None => new_body
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .map(|(document, _)| document.body.as_str())
+                })
+                .unwrap_or_default(),
         };
         let output = if document.is_some() && replacement_mapping.as_ref() == Some(&write_mapping) {
             document.as_deref().unwrap_or_default().to_string()
         } else {
             // Restore the original UTF-8 BOM so round-trips stay byte-stable.
+            let existing_had_bom = existing.as_ref().is_some_and(|(_, had_bom)| *had_bom);
             let had_bom = replacement
                 .as_ref()
-                .map_or(original_had_bom, |(_, had_bom)| *had_bom);
+                .map_or(existing_had_bom, |(_, had_bom)| *had_bom);
             serializer::serialize_document_with_bom(had_bom, &write_mapping, body)
         };
 
