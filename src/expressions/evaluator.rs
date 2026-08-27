@@ -2592,7 +2592,7 @@ fn parse_iso8601_duration_ms(source: &str) -> Option<i64> {
 /// range. User-controlled durations (e.g. `"99999999999y"`) must not panic.
 fn date_overflow_error(date_str: &str, duration_str: &str) -> EvalError {
     EvalError::type_error(&format!(
-        "Date arithmetic overflow: '{}' + '{}' is out of range",
+        "Date arithmetic overflow: date '{}' with duration '{}' is out of range",
         date_str.trim(),
         duration_str.trim()
     ))
