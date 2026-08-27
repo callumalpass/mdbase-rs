@@ -1,5 +1,5 @@
 use super::{PortableWatchEvent, WatchEvent};
-use crate::operations::{ensure_no_symlink_components, read::RecordFileFacts};
+use crate::operations::read::RecordFileFacts;
 use crate::runtime::{snapshot::materialize_snapshot_record, CollectionSnapshotResourceKind};
 use crate::Collection;
 use notify::{
@@ -264,6 +264,7 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
                 pending_rescans.push(ready);
             }
             Ok(WorkerInput::Filesystem(Ok(event))) if invalidates_snapshot(&event) => {
+                let pathless = event.paths.is_empty();
                 let invalidation = snapshot.invalidation_paths(&root, &event);
                 let relevant = invalidation.as_ref().is_none_or(|paths| !paths.is_empty());
                 if relevant {
@@ -283,12 +284,15 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
                         Some(paths) => pending_paths.extend(paths),
                         None => full_rescan = true,
                     }
-                    schedule_relevant_refresh(
-                        &mut deadline,
-                        &mut retry_backoff,
-                        last_refresh_diagnostic.is_some(),
-                        debounce,
-                    );
+                    let refresh_is_failing = last_refresh_diagnostic.is_some();
+                    if !(pathless && refresh_is_failing) {
+                        schedule_relevant_refresh(
+                            &mut deadline,
+                            &mut retry_backoff,
+                            refresh_is_failing,
+                            debounce,
+                        );
+                    }
                 }
             }
             Ok(WorkerInput::Filesystem(Ok(_))) => {}
@@ -693,16 +697,26 @@ fn record_events(
         .filter(|path| !before.contains_key(*path))
         .cloned()
         .collect();
+    let revision_counts = |paths: &BTreeSet<String>, states: &BTreeMap<String, RecordState>| {
+        let mut counts = BTreeMap::<String, usize>::new();
+        for path in paths {
+            *counts.entry(states[path].revision.clone()).or_default() += 1;
+        }
+        counts
+    };
+    let deleted_revisions = revision_counts(&deleted, before);
+    let created_revisions = revision_counts(&created, after);
     let deleted_paths = deleted.iter().cloned().collect::<Vec<_>>();
     for from in deleted_paths {
         let previous = &before[&from];
-        let matches = created
-            .iter()
-            .filter(|to| after[*to].revision == previous.revision)
-            .cloned()
-            .collect::<Vec<_>>();
-        if matches.len() == 1 {
-            let to = matches[0].clone();
+        if deleted_revisions.get(&previous.revision) == Some(&1)
+            && created_revisions.get(&previous.revision) == Some(&1)
+        {
+            let to = created
+                .iter()
+                .find(|to| after[*to].revision == previous.revision)
+                .expect("unique created revision has one path")
+                .clone();
             let current = &after[&to];
             deleted.remove(&from);
             created.remove(&to);
@@ -813,40 +827,20 @@ fn safely_read_local_record(
     collection: &Collection,
     path: &str,
 ) -> Result<Option<(String, RecordFileFacts)>, WatchError> {
-    if ensure_no_symlink_components(&collection.root, path, collection.spec_profile).is_err() {
+    let Some(mut file) = open_local_record_no_follow(&collection.root, path)
+        .map_err(|error| WatchError::Collection(error.to_string()))?
+    else {
         return Ok(None);
-    }
-    let full_path = collection.root.join(path);
-    let path_metadata = match std::fs::symlink_metadata(&full_path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
-        Ok(_) => return Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(WatchError::Collection(error.to_string())),
     };
-    let mut file = match std::fs::File::open(&full_path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(WatchError::Collection(error.to_string())),
-    };
-    let opened_metadata = file
+    let metadata = file
         .metadata()
         .map_err(|error| WatchError::Collection(error.to_string()))?;
-    let current_metadata = match std::fs::symlink_metadata(&full_path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
-        Ok(_) => return Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(WatchError::Collection(error.to_string())),
-    };
-    if !same_file_identity(&path_metadata, &opened_metadata)
-        || !same_file_identity(&opened_metadata, &current_metadata)
-        || ensure_no_symlink_components(&collection.root, path, collection.spec_profile).is_err()
-    {
+    if !metadata.is_file() {
         return Ok(None);
     }
-
     let file_facts = RecordFileFacts {
-        size: opened_metadata.len(),
-        mtime: opened_metadata.modified().ok().map(|time| {
+        size: metadata.len(),
+        mtime: metadata.modified().ok().map(|time| {
             let datetime: chrono::DateTime<chrono::Utc> = time.into();
             datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string()
         }),
@@ -860,23 +854,155 @@ fn safely_read_local_record(
 }
 
 #[cfg(unix)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
+fn open_local_record_no_follow(root: &Path, path: &str) -> std::io::Result<Option<std::fs::File>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    fn open_at(directory: i32, name: &std::ffi::OsStr, flags: i32) -> std::io::Result<i32> {
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // SAFETY: `directory` is a live directory descriptor, `name` is a
+        // NUL-terminated component, and the returned descriptor is owned by
+        // the caller on success.
+        let descriptor = unsafe { libc::openat(directory, name.as_ptr(), flags) };
+        if descriptor >= 0 {
+            Ok(descriptor)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    let root = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: `root` is NUL-terminated. The descriptor is immediately wrapped
+    // in `File`, which takes ownership on success.
+    let root_descriptor = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `root_descriptor` is newly opened and uniquely owned here.
+    let mut directory = unsafe { std::fs::File::from_raw_fd(root_descriptor) };
+    let components = Path::new(path)
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Ok(name),
+            _ => Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let Some((leaf, parents)) = components.split_last() else {
+        return Ok(None);
+    };
+    for component in parents {
+        let descriptor = match open_at(
+            directory.as_raw_fd(),
+            component,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) if unavailable_unix_path(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        // SAFETY: `descriptor` is newly opened and uniquely owned here.
+        directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    }
+    let descriptor = match open_at(
+        directory.as_raw_fd(),
+        leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) if unavailable_unix_path(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // SAFETY: `descriptor` is newly opened and uniquely owned here.
+    Ok(Some(unsafe { std::fs::File::from_raw_fd(descriptor) }))
+}
+
+#[cfg(unix)]
+fn unavailable_unix_path(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::ELOOP || code == libc::ENOTDIR)
 }
 
 #[cfg(windows)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
+fn open_local_record_no_follow(root: &Path, path: &str) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    if Path::new(path)
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Ok(None);
+    }
+    let root_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root)?;
+    let expected = PathBuf::from(final_windows_handle_path(&root_handle)?).join(path);
+    let file = match std::fs::File::open(root.join(path)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let actual = PathBuf::from(final_windows_handle_path(&file)?);
+    if normalize_windows_path(&actual) != normalize_windows_path(&expected) {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+#[cfg(windows)]
+fn final_windows_handle_path(file: &std::fs::File) -> std::io::Result<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    let mut buffer = vec![0_u16; 32_768];
+    // SAFETY: the handle remains live for the call and `buffer` exposes its
+    // full writable capacity in UTF-16 code units.
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle() as _,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            0,
+        )
+    };
+    if length == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if length as usize >= buffer.len() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+    }
+    String::from_utf16(&buffer[..length as usize])
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))
+}
+
+#[cfg(windows)]
+fn normalize_windows_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
 }
 
 #[cfg(not(any(unix, windows)))]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    left.len() == right.len()
-        && left.modified().ok() == right.modified().ok()
-        && left.created().ok() == right.created().ok()
+fn open_local_record_no_follow(
+    _root: &Path,
+    _path: &str,
+) -> std::io::Result<Option<std::fs::File>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "safe watcher reads are unsupported on this platform",
+    ))
 }
 
 fn is_invalid_yaml_frontmatter(read: &Value) -> bool {
@@ -1255,6 +1381,52 @@ mod tests {
     }
 
     #[test]
+    fn asymmetric_duplicate_revisions_never_invent_rename_identity() {
+        let state = || RecordState {
+            revision: "sha256:duplicate".to_string(),
+            raw_frontmatter: Map::new(),
+            effective_frontmatter: json!({}),
+            types: json!([]),
+            body: "same".to_string(),
+        };
+        for (before, after) in [
+            (
+                BTreeMap::from([
+                    ("before-a.md".to_string(), state()),
+                    ("before-b.md".to_string(), state()),
+                ]),
+                BTreeMap::from([("after.md".to_string(), state())]),
+            ),
+            (
+                BTreeMap::from([("before.md".to_string(), state())]),
+                BTreeMap::from([
+                    ("after-a.md".to_string(), state()),
+                    ("after-b.md".to_string(), state()),
+                ]),
+            ),
+        ] {
+            let events = record_events(&before, &after);
+            assert!(events
+                .iter()
+                .all(|event| event.event_type != "mdbase.record.renamed"));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == "mdbase.record.deleted")
+                    .count(),
+                before.len()
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == "mdbase.record.created")
+                    .count(),
+                after.len()
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_content_recursive_rename_stays_exact_and_has_no_duplicates() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(
@@ -1485,6 +1657,10 @@ mod tests {
             )
             .unwrap();
             fs::remove_dir_all(hidden).unwrap();
+            watcher
+                .commands
+                .send(WorkerInput::Filesystem(Ok(Event::new(EventKind::Other))))
+                .unwrap();
             index += 1;
             thread::sleep(Duration::from_millis(15));
         }
