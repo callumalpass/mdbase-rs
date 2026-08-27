@@ -133,27 +133,132 @@ pub(crate) fn open_regular_record_no_follow(
     let Some((leaf, parents)) = components.split_last() else {
         return Ok(None);
     };
+
+    #[cfg(test)]
+    if let Some(error) = injected_record_open_failure(collection_root, relative_path) {
+        return open_result_or_unavailable(Err(error));
+    }
+
     let mut directory = Dir::open_ambient_dir(collection_root, cap_std::ambient_authority())?;
     for component in parents {
-        directory = match directory.open_dir_nofollow(component) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Err(error)
-            }
-            Err(_) => return Ok(None),
+        let Some(next) = open_result_or_unavailable(directory.open_dir_nofollow(component))? else {
+            return Ok(None);
         };
+        directory = next;
     }
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
-    let file = match directory.open_with(leaf, &options) {
-        Ok(file) => file.into_std(),
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Err(error),
-        Err(_) => return Ok(None),
+    let Some(file) = open_result_or_unavailable(directory.open_with(leaf, &options))? else {
+        return Ok(None);
     };
+    let file = file.into_std();
     if !file.metadata()?.is_file() {
         return Ok(None);
     }
     Ok(Some(file))
+}
+
+fn open_result_or_unavailable<T>(result: std::io::Result<T>) -> std::io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if is_unavailable_no_follow_error(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_unavailable_no_follow_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+
+    if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) {
+        return true;
+    }
+
+    // Linux reports a non-directory component and O_NOFOLLOW refusal as
+    // ENOTDIR and ELOOP. Keep the raw-code fallback because capability-backed
+    // open implementations do not always preserve the newer ErrorKind values.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if matches!(error.raw_os_error(), Some(2 | 20 | 40)) {
+        return true;
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "openbsd"
+    ))]
+    if matches!(error.raw_os_error(), Some(2 | 20 | 62)) {
+        return true;
+    }
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+    if matches!(error.raw_os_error(), Some(2 | 20 | 31)) {
+        return true;
+    }
+    #[cfg(target_os = "netbsd")]
+    if matches!(error.raw_os_error(), Some(2 | 20 | 79)) {
+        return true;
+    }
+    #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+    if matches!(error.raw_os_error(), Some(2 | 20 | 90)) {
+        return true;
+    }
+    #[cfg(target_os = "aix")]
+    if matches!(error.raw_os_error(), Some(2 | 20 | 85)) {
+        return true;
+    }
+
+    // cap-std reports Windows nofollow symlinks/reparse points with
+    // ERROR_STOPPED_ON_SYMLINK. ERROR_DIRECTORY covers a non-directory parent;
+    // sharing violations and other transient failures deliberately remain Err.
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(2 | 3 | 267 | 681)) {
+        return true;
+    }
+
+    false
+}
+
+#[cfg(test)]
+fn record_open_failures() -> &'static std::sync::Mutex<
+    std::collections::BTreeMap<(std::path::PathBuf, String), std::io::ErrorKind>,
+> {
+    static FAILURES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::BTreeMap<(std::path::PathBuf, String), std::io::ErrorKind>,
+        >,
+    > = std::sync::OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn injected_record_open_failure(
+    collection_root: &Path,
+    relative_path: &str,
+) -> Option<std::io::Error> {
+    record_open_failures()
+        .lock()
+        .expect("record open failure lock")
+        .get(&(collection_root.to_path_buf(), relative_path.to_string()))
+        .copied()
+        .map(std::io::Error::from)
+}
+
+#[cfg(test)]
+pub(crate) fn set_record_open_failure(
+    collection_root: &Path,
+    relative_path: &str,
+    failure: Option<std::io::ErrorKind>,
+) {
+    let key = (collection_root.to_path_buf(), relative_path.to_string());
+    let mut failures = record_open_failures()
+        .lock()
+        .expect("record open failure lock");
+    if let Some(failure) = failure {
+        failures.insert(key, failure);
+    } else {
+        failures.remove(&key);
+    }
 }
 
 pub(crate) fn readable_record_path(
@@ -314,8 +419,11 @@ pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
 mod tests {
     #[cfg(unix)]
     use super::ensure_no_symlink_components;
-    use super::ensure_safe_relative_path;
+    use super::{
+        ensure_safe_relative_path, open_regular_record_no_follow, open_result_or_unavailable,
+    };
     use crate::SpecProfile;
+    use std::io::ErrorKind;
 
     #[test]
     fn durability_primitives_cover_create_replace_cross_directory_rename_and_delete() {
@@ -354,6 +462,107 @@ mod tests {
 
         assert!(ensure_safe_relative_path("notes/inside.md", SpecProfile::V03).is_ok());
         assert!(ensure_safe_relative_path(r"notes\inside.md", SpecProfile::V03).is_ok());
+    }
+
+    #[test]
+    fn nofollow_open_only_classifies_unavailable_failures_as_absence() {
+        for kind in [ErrorKind::NotFound, ErrorKind::NotADirectory] {
+            assert!(
+                open_result_or_unavailable::<()>(Err(std::io::Error::from(kind)))
+                    .expect("unavailable result")
+                    .is_none()
+            );
+        }
+
+        for kind in [
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+            ErrorKind::OutOfMemory,
+            ErrorKind::Other,
+            ErrorKind::PermissionDenied,
+        ] {
+            let error = open_result_or_unavailable::<()>(Err(std::io::Error::from(kind)))
+                .expect_err("transient or unrelated open failure");
+            assert_eq!(error.kind(), kind);
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            for code in [2, 20, 40] {
+                assert!(
+                    open_result_or_unavailable::<()>(Err(std::io::Error::from_raw_os_error(code,)))
+                        .expect("Linux unavailable result")
+                        .is_none()
+                );
+            }
+            for code in [4, 5, 11, 24] {
+                assert!(
+                    open_result_or_unavailable::<()>(Err(std::io::Error::from_raw_os_error(code,)))
+                        .is_err()
+                );
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            for code in [2, 3, 267, 681] {
+                assert!(
+                    open_result_or_unavailable::<()>(Err(std::io::Error::from_raw_os_error(code,)))
+                        .expect("Windows unavailable result")
+                        .is_none()
+                );
+            }
+            for code in [4, 32, 33, 995] {
+                assert!(
+                    open_result_or_unavailable::<()>(Err(std::io::Error::from_raw_os_error(code,)))
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nofollow_open_preserves_missing_non_directory_and_non_regular_outcomes() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("parent-file"), b"not a directory").unwrap();
+        std::fs::create_dir(root.path().join("directory.md")).unwrap();
+
+        assert!(open_regular_record_no_follow(root.path(), "missing.md")
+            .unwrap()
+            .is_none());
+        assert!(
+            open_regular_record_no_follow(root.path(), "parent-file/record.md")
+                .unwrap()
+                .is_none()
+        );
+        assert!(open_regular_record_no_follow(root.path(), "directory.md")
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_open_rejects_parent_and_leaf_symlinks_as_unavailable() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::write(outside.path().join("record.md"), b"outside").unwrap();
+        symlink(outside.path(), root.path().join("linked-parent")).unwrap();
+        symlink(
+            outside.path().join("record.md"),
+            root.path().join("linked-leaf.md"),
+        )
+        .unwrap();
+
+        assert!(
+            open_regular_record_no_follow(root.path(), "linked-parent/record.md")
+                .unwrap()
+                .is_none()
+        );
+        assert!(open_regular_record_no_follow(root.path(), "linked-leaf.md")
+            .unwrap()
+            .is_none());
     }
 
     #[cfg(unix)]

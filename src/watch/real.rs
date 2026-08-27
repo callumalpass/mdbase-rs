@@ -1457,6 +1457,94 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn transient_record_open_failure_retains_state_waiter_and_pending_reconciliation() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("tracked.md"),
+            "---\ntitle: Before\n---\noriginal body\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(20)).unwrap();
+        watcher.rescan().unwrap();
+        assert!(watcher.recv_timeout(Duration::ZERO).unwrap().is_none());
+
+        crate::operations::set_record_open_failure(
+            directory.path(),
+            "tracked.md",
+            Some(std::io::ErrorKind::Interrupted),
+        );
+        fs::write(
+            directory.path().join("tracked.md"),
+            "---\ntitle: After\n---\nupdated body\n",
+        )
+        .unwrap();
+        let (waiter, waiter_rx) = mpsc::sync_channel(0);
+        watcher
+            .commands
+            .send(WorkerInput::Command(Command::RescanPaths(
+                vec![PathBuf::from("tracked.md")],
+                waiter,
+            )))
+            .unwrap();
+
+        let diagnostic = watcher
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .expect("failed refresh diagnostic");
+        assert_eq!(
+            diagnostic
+                .payload
+                .pointer("/diagnostic/code")
+                .and_then(Value::as_str),
+            Some("collection_reload_failed")
+        );
+        assert!(!diagnostic.payload.to_string().contains("tracked.md"));
+        assert!(matches!(
+            waiter_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let quiet_until = Instant::now() + Duration::from_millis(350);
+        while Instant::now() < quiet_until {
+            if let Some(event) = watcher.recv_timeout(Duration::from_millis(25)).unwrap() {
+                assert_ne!(event.event_type, "mdbase.record.deleted");
+                assert!(event.payload.get("diagnostic").is_some());
+            }
+        }
+        assert!(matches!(
+            waiter_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        crate::operations::set_record_open_failure(directory.path(), "tracked.md", None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let modified = loop {
+            assert!(Instant::now() < deadline, "pending refresh did not recover");
+            let Some(event) = watcher.recv_timeout(Duration::from_millis(100)).unwrap() else {
+                continue;
+            };
+            assert_ne!(event.event_type, "mdbase.record.deleted");
+            if event.event_type == "mdbase.record.modified" {
+                break event;
+            }
+        };
+        assert_eq!(modified.payload["path"], "tracked.md");
+        assert_eq!(modified.payload["before"]["title"], "Before");
+        assert_eq!(modified.payload["after"]["title"], "After");
+        waiter_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retained waiter completes after retry");
+        assert!(watcher
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap()
+            .is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn failed_refresh_retries_recover_with_bounded_diagnostics() {
