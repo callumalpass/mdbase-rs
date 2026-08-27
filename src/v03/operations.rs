@@ -627,7 +627,21 @@ impl<'a> Operations<'a> {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+        // An explicit path is canonicalized before it can affect membership.
+        // A derived path intentionally starts path-independent; the designated
+        // type selects its path pattern and the core create performs the final,
+        // authoritative canonical-path revalidation.
+        let canonical_path = match input.get("path").and_then(Value::as_str) {
+            Some(path) => match crate::operations::mutation_record_path(self.collection, path) {
+                Ok(path) => Some(path.to_string()),
+                Err(error) => return Err(collect_diagnostics(&error, Some(path), "error")),
+            },
+            None => None,
+        };
+        if let Some(path) = &canonical_path {
+            normalized.insert("path".to_string(), Value::String(path.clone()));
+        }
+        let path = canonical_path.as_deref().unwrap_or("");
         let membership = super::write_membership::ResolvedWriteMembership::resolve_create(
             self.collection,
             input,
@@ -717,6 +731,14 @@ impl<'a> Operations<'a> {
         membership.revalidate(self.collection, &lifecycle_draft, path)?;
 
         let mut normalized = input.as_object().cloned().unwrap_or_default();
+        // Preparation read and locked core reread form one optimistic operation.
+        // When the caller omitted a precondition, carry the prepared revision so
+        // an intervening write cannot be merged into stale preparation.
+        if normalized.get("if_revision").is_none() {
+            if let Some(revision) = read.get("revision") {
+                normalized.insert("if_revision".to_string(), revision.clone());
+            }
+        }
         if let Some((candidate, had_bom)) = candidate {
             if lifecycle_draft != draft {
                 let frontmatter = json_to_yaml_mapping(&Value::Object(lifecycle_draft));

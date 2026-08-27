@@ -170,35 +170,34 @@ impl Collection {
         let effective =
             self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
 
-        // Check match rules (§6.3, §6.4): created file must satisfy type match rules
-        for tn in &type_names {
-            if let Some(type_def) = self.types.get(tn) {
-                if let Some(ref rules) = type_def.match_rules {
-                    let match_frontmatter = if self.spec_profile == crate::SpecProfile::V03 {
-                        &serde_json::Value::Object(fm_obj.clone())
-                    } else {
-                        &effective
-                    };
-                    let compiled = self
-                        .type_plans
-                        .get(tn)
-                        .and_then(|plan| plan.match_expression.as_deref());
-                    if !matches_rules_checked_compiled(
-                        rules,
-                        compiled,
-                        path.as_str(),
-                        match_frontmatter,
-                        self.settings.timezone.as_deref(),
-                    )
-                    .unwrap_or(false)
-                    {
-                        return op_error(
-                            "match_failed",
-                            &format!(
-                                "Created file does not satisfy match rules for type '{}'",
-                                tn
-                            ),
-                        );
+        // Prepared v0.3 writes have already crossed the checked classification
+        // boundary and are checked again above on the canonical path. Keep the
+        // historical per-type rule only for legacy v0.2 callers.
+        if membership.is_none() {
+            for tn in &type_names {
+                if let Some(type_def) = self.types.get(tn) {
+                    if let Some(ref rules) = type_def.match_rules {
+                        let compiled = self
+                            .type_plans
+                            .get(tn)
+                            .and_then(|plan| plan.match_expression.as_deref());
+                        if !matches_rules_checked_compiled(
+                            rules,
+                            compiled,
+                            path.as_str(),
+                            &effective,
+                            self.settings.timezone.as_deref(),
+                        )
+                        .unwrap_or(false)
+                        {
+                            return op_error(
+                                "match_failed",
+                                &format!(
+                                    "Created file does not satisfy match rules for type '{}'",
+                                    tn
+                                ),
+                            );
+                        }
                     }
                 }
             }

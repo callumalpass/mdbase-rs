@@ -85,6 +85,129 @@ fn malformed_contract_envelopes_never_create_a_file() {
     }
 }
 
+fn add_throwing_type(root: &Path, name: &str) {
+    write(
+        root,
+        &format!("_types/{name}.md"),
+        &format!(
+            "---\nkind: mdbase.type\nname: {name}\nmatch:\n  expr:\n    $expr: '\"not-a-number\" - 1 > 1'\nschema:\n  dialect: json-schema-2020-12\n  value: {{type: object}}\n---\n"
+        ),
+    );
+}
+
+#[test]
+fn selected_membership_never_evaluates_unrelated_throwing_rules() {
+    for contract in [false, true] {
+        let root = fixture("kind");
+        add_throwing_type(root.path(), "throwing");
+        let collection = Collection::open(root.path()).unwrap();
+        let mut request = json!({"path":"selected.md","type":"note","frontmatter":{"title":"ok"}});
+        if contract {
+            request["contract"] = json!("example.note");
+            request["contract_version"] = json!("1.0.0");
+        }
+        let result = collection.v03_operations().unwrap().create(&request);
+        assert!(result.valid, "{result:#?}");
+        assert!(result
+            .diagnostics
+            .iter()
+            .all(|d| d.code != "expression_evaluation_error"));
+    }
+}
+
+#[test]
+fn malformed_explicit_declarations_are_complete_sorted_errors() {
+    for declaration in [
+        json!(""),
+        json!([]),
+        json!(["", 7, "missing"]),
+        json!("missing"),
+    ] {
+        let root = fixture("kind");
+        add_throwing_type(root.path(), "throwing");
+        let collection = Collection::open(root.path()).unwrap();
+        let result = collection.v03_operations().unwrap().create(&json!({
+            "path":"bad.md", "frontmatter":{"kind":declaration,"title":"bad"}
+        }));
+        assert!(!result.valid);
+        assert!(!root.path().join("bad.md").exists());
+        assert!(result
+            .diagnostics
+            .iter()
+            .all(|d| d.code == "invalid_type_declaration" || d.code == "unknown_type"));
+        let order = result
+            .diagnostics
+            .iter()
+            .map(|d| (&d.field, &d.type_name, &d.message))
+            .collect::<Vec<_>>();
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted);
+    }
+}
+
+#[test]
+fn implicit_throwing_errors_are_complete_sorted_and_explicit_repairs_skip_them() {
+    let root = fixture("kind");
+    add_throwing_type(root.path(), "z_throw");
+    add_throwing_type(root.path(), "a_throw");
+    let collection = Collection::open(root.path()).unwrap();
+    let failed = collection.v03_operations().unwrap().create(&json!({
+        "path":"implicit.md", "frontmatter":{"title":"bad"}
+    }));
+    assert!(!failed.valid);
+    assert_eq!(
+        failed
+            .diagnostics
+            .iter()
+            .map(|d| d.type_name.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("a_throw"), Some("z_throw")]
+    );
+    assert!(!root.path().join("implicit.md").exists());
+
+    write(
+        root.path(),
+        "repair.md",
+        "---\nkind: missing\ntitle: old\n---\n",
+    );
+    let repaired = collection.v03_operations().unwrap().update(&json!({
+        "path":"repair.md", "patch":{"kind":"note","title":"fixed"}
+    }));
+    assert!(repaired.valid, "{repaired:#?}");
+}
+
+#[test]
+fn persistence_prefers_secondary_key_over_scalar_shape_change() {
+    let root = fixture("kind, types");
+    write(root.path(), "_types/aux.md", "---\nkind: mdbase.type\nname: aux\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\n---\n");
+    write(root.path(), "_types/note.md", "---\nkind: mdbase.type\nname: note\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    required: [title]\nimplements:\n  - contract: example.note\n    version: 1.0.0\n    fields: {}\n---\n");
+    let collection = Collection::open(root.path()).unwrap();
+    let result = collection.v03_operations().unwrap().create(&json!({
+        "path":"multi.md", "type":"note", "frontmatter":{"kind":"aux","title":"ok"}
+    }));
+    assert!(result.valid, "{result:#?}");
+    assert_eq!(result.result["frontmatter"]["kind"], "aux");
+    assert_eq!(result.result["frontmatter"]["types"], "note");
+    assert_eq!(result.result["types"], json!(["aux", "note"]));
+}
+
+#[test]
+fn occupied_scalar_without_a_secondary_key_fails_before_write() {
+    let root = fixture("kind");
+    write(root.path(), "_types/aux.md", "---\nkind: mdbase.type\nname: aux\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\n---\n");
+    let collection = Collection::open(root.path()).unwrap();
+    let result = collection.v03_operations().unwrap().create(&json!({
+        "path":"blocked.md", "type":"note", "frontmatter":{"kind":"aux","title":"ok"}
+    }));
+    assert!(!result.valid);
+    assert_eq!(
+        result.diagnostics[0].code,
+        "type_membership_persistence_failed"
+    );
+    assert!(!root.path().join("blocked.md").exists());
+}
+
 #[test]
 fn unknown_explicit_membership_fails_without_writing() {
     let root = fixture("kind");
