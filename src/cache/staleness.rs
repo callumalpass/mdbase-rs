@@ -22,14 +22,21 @@ pub(crate) fn find_changes(
     root: &Path,
     files: &[PathBuf],
 ) -> Result<CacheChanges, CacheError> {
-    let mut cached = HashMap::<String, i64>::new();
-    let mut statement = conn.prepare("SELECT path, mtime_ns FROM files")?;
+    let mut cached = HashMap::<String, (i64, bool)>::new();
+    let mut statement =
+        conn.prepare("SELECT path, mtime_ns, parse_error, failure_reason FROM files")?;
     let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        let parse_error = row.get::<_, i64>(2)? != 0;
+        let failure_reason = row.get::<_, Option<String>>(3)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            parse_error && failure_reason.is_none(),
+        ))
     })?;
     for row in rows {
-        let (path, mtime) = row?;
-        cached.insert(path, mtime);
+        let (path, mtime, legacy_unclassified) = row?;
+        cached.insert(path, (mtime, legacy_unclassified));
     }
 
     let mut disk_paths = HashSet::with_capacity(files.len());
@@ -47,7 +54,7 @@ pub(crate) fn find_changes(
             .ok()
             .map(|duration| duration.as_nanos() as i64)
             .unwrap_or(0);
-        if cached.get(&rel_path).copied() != Some(filesystem_mtime) {
+        if !matches!(cached.get(&rel_path), Some((mtime, false)) if *mtime == filesystem_mtime) {
             stale.push(file_path.clone());
         }
     }

@@ -5,10 +5,37 @@ use crate::errors::*;
 use crate::frontmatter::parser::{parse_document_for_rewrite, yaml_mapping_to_json};
 use crate::frontmatter::serializer;
 use crate::operations::{
-    atomic_write, ensure_no_symlink_components, ensure_regular_record_file, ensure_revision,
-    mutation_record_path,
+    atomic_write, ensure_no_symlink_components, ensure_regular_record_file, mutation_record_path,
 };
 use crate::Collection;
+
+#[cfg(test)]
+fn injected_publication_replacements(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>> {
+    static REPLACEMENTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>>,
+    > = std::sync::OnceLock::new();
+    REPLACEMENTS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn inject_publication_replacement(path: &std::path::Path, replacement: std::path::PathBuf) {
+    injected_publication_replacements()
+        .lock()
+        .expect("publication replacement lock")
+        .insert(path.to_path_buf(), replacement);
+}
+
+#[cfg(test)]
+fn apply_injected_publication_replacement(path: &std::path::Path) {
+    let replacement = injected_publication_replacements()
+        .lock()
+        .expect("publication replacement lock")
+        .remove(path);
+    if let Some(replacement) = replacement {
+        std::fs::rename(replacement, path).expect("injected atomic publication replacement");
+    }
+}
 
 impl Collection {
     /// Update a file (§12.3).
@@ -61,36 +88,48 @@ impl Collection {
             return error;
         }
 
-        // Concurrent modification detection: record mtime at read time
-        let read_mtime = std::fs::metadata(&full_path)
-            .and_then(|m| m.modified())
-            .ok();
-
-        // If caller provides last_known_mtime, check for external modifications
+        // Load bytes, metadata, and revision from one open handle. The loaded
+        // revision is also the mandatory publication precondition, including
+        // when a legacy caller omitted `if_revision`.
+        let loaded = match crate::record_load::load_record(self, &full_path, path.as_str()) {
+            Ok(loaded) => loaded,
+            Err(error) => return op_error(FILE_NOT_FOUND, &format!("Failed to read: {error}")),
+        };
+        let loaded_facts = loaded.facts().clone();
         if let Some(known_ms) = last_known_mtime {
-            if let Some(current) = &read_mtime {
-                let current_ms = current
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                if current_ms != known_ms {
-                    return op_error(
-                        CONCURRENT_MODIFICATION,
-                        &format!("File '{}' was modified externally", path.as_str()),
-                    );
-                }
+            let current_ms = loaded_facts.mtime_ns.max(0) as u64 / 1_000_000;
+            if current_ms != known_ms {
+                return op_error(
+                    CONCURRENT_MODIFICATION,
+                    &format!("File '{}' was modified externally", path.as_str()),
+                );
             }
         }
-
-        let content = match std::fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(e) => return op_error(FILE_NOT_FOUND, &format!("Failed to read: {}", e)),
-        };
-        if let Err(error) = ensure_revision(&full_path, path.as_str(), if_revision.as_deref()) {
-            return error;
+        if if_revision
+            .as_deref()
+            .is_some_and(|expected| expected != loaded_facts.revision)
+        {
+            return op_error(
+                CONCURRENT_MODIFICATION,
+                &format!("File '{}' was modified externally", path.as_str()),
+            );
         }
-
-        let (doc, original_had_bom) = parse_document_for_rewrite(&content);
+        let existing = match loaded {
+            crate::record_load::RecordLoadOutcome::Parsed { document, .. } => {
+                Some(parse_document_for_rewrite(&document))
+            }
+            crate::record_load::RecordLoadOutcome::Invalid { document: raw, .. }
+                if document.is_some() =>
+            {
+                raw.map(|raw| parse_document_for_rewrite(&raw))
+            }
+            crate::record_load::RecordLoadOutcome::Invalid { reason, .. } => {
+                return op_error(
+                    INVALID_FRONTMATTER,
+                    &format!("Invalid frontmatter: {}", reason.as_str()),
+                )
+            }
+        };
         let replacement = document.as_deref().map(parse_document_for_rewrite);
         let replacement_doc = replacement.as_ref().map(|(doc, _)| doc);
         let replacement_mapping = match replacement_doc
@@ -110,8 +149,11 @@ impl Collection {
 
         let existing_mapping = match replacement_mapping.as_ref() {
             Some(mapping) => mapping.clone(),
-            None => match &doc.frontmatter {
-                Some(serde_yaml::Value::Mapping(m)) => m.clone(),
+            None => match existing
+                .as_ref()
+                .and_then(|(document, _)| document.frontmatter.as_ref())
+            {
+                Some(serde_yaml::Value::Mapping(mapping)) => mapping.clone(),
                 _ => serde_yaml::Mapping::new(),
             },
         };
@@ -163,18 +205,6 @@ impl Collection {
             }
         }
 
-        // Concurrent modification check before write
-        if let Some(recorded) = &read_mtime {
-            if let Ok(current) = std::fs::metadata(&full_path).and_then(|m| m.modified()) {
-                if current != *recorded {
-                    return op_error(
-                        CONCURRENT_MODIFICATION,
-                        &format!("File '{}' was modified during operation", path.as_str()),
-                    );
-                }
-            }
-        }
-
         // Build frontmatter for writing (honor write_defaults/write_nulls)
         let mut write_obj = merged_obj.clone();
         if self.spec_profile != crate::SpecProfile::V03 && self.settings.write_defaults {
@@ -200,18 +230,22 @@ impl Collection {
             crate::frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
         let body = match replacement_doc.as_ref() {
             Some(candidate) => candidate.body.as_str(),
-            None => match new_body {
-                Some(b) => b,
-                None => &doc.body,
-            },
+            None => new_body
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .map(|(document, _)| document.body.as_str())
+                })
+                .unwrap_or_default(),
         };
         let output = if document.is_some() && replacement_mapping.as_ref() == Some(&write_mapping) {
             document.as_deref().unwrap_or_default().to_string()
         } else {
             // Restore the original UTF-8 BOM so round-trips stay byte-stable.
+            let existing_had_bom = existing.as_ref().is_some_and(|(_, had_bom)| *had_bom);
             let had_bom = replacement
                 .as_ref()
-                .map_or(original_had_bom, |(_, had_bom)| *had_bom);
+                .map_or(existing_had_bom, |(_, had_bom)| *had_bom);
             serializer::serialize_document_with_bom(had_bom, &write_mapping, body)
         };
 
@@ -220,8 +254,27 @@ impl Collection {
         {
             return error;
         }
-        if let Err(e) = atomic_write(&full_path, output.as_bytes()) {
-            return op_error("io_error", &format!("Failed to write: {}", e));
+        #[cfg(test)]
+        apply_injected_publication_replacement(&full_path);
+
+        // Reopen once at the publication boundary and compare a byte revision,
+        // not only path metadata. This catches atomic replacements (including
+        // forged same-mtime and invalid-UTF-8 files) without weakening the
+        // existing cross-platform atomic replace and crash-safety semantics.
+        let current_facts = match crate::record_load::load_record(self, &full_path, path.as_str()) {
+            Ok(current) => current.facts().clone(),
+            Err(error) => {
+                return op_error("io_error", &format!("Failed to revalidate record: {error}"));
+            }
+        };
+        if current_facts.revision != loaded_facts.revision {
+            return op_error(
+                CONCURRENT_MODIFICATION,
+                &format!("File '{}' was modified during operation", path.as_str()),
+            );
+        }
+        if let Err(error) = atomic_write(&full_path, output.as_bytes()) {
+            return op_error("io_error", &format!("Failed to write: {error}"));
         }
 
         // Collect warnings (deprecated fields, etc.)
@@ -255,5 +308,70 @@ impl Collection {
             warnings: result_warnings,
         }
         .into_json()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inject_publication_replacement;
+    use crate::Collection;
+    use serde_json::json;
+    use std::fs;
+
+    fn collection() -> (tempfile::TempDir, Collection) {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("record.md"),
+            "---\ntitle: Original\n---\noriginal body\n",
+        )
+        .unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        (root, collection)
+    }
+
+    #[test]
+    fn update_revalidation_rejects_same_mtime_atomic_replacement() {
+        let (root, collection) = collection();
+        let record = root.path().join("record.md");
+        let original_mtime = fs::metadata(&record).unwrap().modified().unwrap();
+        let replacement = root.path().join("replacement.tmp");
+        let external = b"---\ntitle: External\n---\nexternal body\n";
+        fs::write(&replacement, external).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        inject_publication_replacement(&record, replacement);
+
+        let result = collection.update(&json!({
+            "path": "record.md",
+            "fields": {"title": "Ours"}
+        }));
+        assert_eq!(result["error"]["code"], "concurrent_modification");
+        assert_eq!(fs::read(record).unwrap(), external);
+    }
+
+    #[test]
+    fn invalid_utf8_replacement_cannot_be_repaired_over_stale_bytes() {
+        let (root, collection) = collection();
+        let record = root.path().join("record.md");
+        let replacement = root.path().join("replacement.tmp");
+        let external = b"external-\xff-invalid";
+        fs::write(&replacement, external).unwrap();
+        inject_publication_replacement(&record, replacement);
+
+        let result = collection.update(&json!({
+            "path": "record.md",
+            "document": "---\ntitle: Repaired\n---\nrepaired\n"
+        }));
+        assert_eq!(result["error"]["code"], "concurrent_modification");
+        assert_eq!(fs::read(record).unwrap(), external);
     }
 }

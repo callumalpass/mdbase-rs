@@ -561,6 +561,32 @@ impl Collection {
             .0
     }
 
+    /// Determine only memberships provable from the path. Invalid records must
+    /// never satisfy frontmatter or expression match conditions.
+    pub(crate) fn determine_types_for_path_only(&self, rel_path: &str) -> Vec<String> {
+        let empty = serde_json::json!({});
+        let mut types = self
+            .types
+            .iter()
+            .filter_map(|(type_name, definition)| {
+                let mut rules = definition.match_rules.clone()?;
+                if rules.fields_present.is_some()
+                    || rules.where_clause.is_some()
+                    || rules.match_expr.is_some()
+                {
+                    return None;
+                }
+                rules.fields_present = None;
+                rules.where_clause = None;
+                rules.match_expr = None;
+                matches_rules(&rules, rel_path, &empty, self.settings.timezone.as_deref())
+                    .then(|| type_name.clone())
+            })
+            .collect::<Vec<_>>();
+        types.sort();
+        types
+    }
+
     pub(crate) fn determine_types_for_path_checked(
         &self,
         frontmatter: &serde_json::Value,
@@ -638,5 +664,40 @@ impl Collection {
         }
 
         (types, failures)
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn path_glob_and_path_globs_remain_conjunctive() {
+        let rules = MatchRules {
+            path_glob: Some("records/**/*.md".to_string()),
+            path_globs: Some(vec!["**/public/*.md".to_string()]),
+            fields_present: None,
+            where_clause: None,
+            match_expr: None,
+        };
+        let frontmatter = serde_json::json!({});
+        assert!(matches_rules(
+            &rules,
+            "records/public/note.md",
+            &frontmatter,
+            Some("UTC")
+        ));
+        assert!(!matches_rules(
+            &rules,
+            "records/private/note.md",
+            &frontmatter,
+            Some("UTC")
+        ));
+        assert!(!matches_rules(
+            &rules,
+            "archive/public/note.md",
+            &frontmatter,
+            Some("UTC")
+        ));
     }
 }

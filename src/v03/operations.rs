@@ -4,7 +4,8 @@ use serde_json::{Map, Value};
 use super::lifecycle::LifecycleEvent;
 use super::Diagnostic;
 use crate::frontmatter::parser::{
-    is_parse_error, json_to_yaml_mapping, parse_document_for_rewrite, yaml_mapping_to_json,
+    json_to_yaml_mapping, parse_document_for_rewrite, yaml_mapping_to_json, FrontmatterState,
+    ParsedDocument,
 };
 use crate::frontmatter::serializer;
 use crate::{Collection, SpecProfile};
@@ -146,7 +147,15 @@ impl<'a> Operations<'a> {
     }
 
     pub fn validate(&self, input: &Value) -> OperationResult {
-        self.normalize("validate", input, self.collection.validate_op(input))
+        let mut result = self.normalize("validate", input, self.collection.validate_op(input));
+        for diagnostic in &mut result.diagnostics {
+            if diagnostic.code == "invalid_frontmatter" && diagnostic.details.is_none() {
+                if let Some(reason) = diagnostic.message.strip_prefix("Invalid frontmatter: ") {
+                    diagnostic.details = Some(serde_json::json!({"reason": reason}));
+                }
+            }
+        }
+        result
     }
 
     pub fn query(&self, input: &Value) -> OperationResult {
@@ -642,6 +651,10 @@ impl<'a> Operations<'a> {
             normalized.insert("path".to_string(), Value::String(path.clone()));
         }
         let path = canonical_path.as_deref().unwrap_or("");
+        if let Some(candidate) = classify_raw_candidate(input, path)? {
+            draft = candidate.frontmatter;
+            normalized.insert("body".to_string(), Value::String(candidate.document.body));
+        }
         let membership = super::write_membership::ResolvedWriteMembership::resolve_create(
             self.collection,
             input,
@@ -674,39 +687,44 @@ impl<'a> Operations<'a> {
             Ok(path) => path.to_string(),
             Err(error) => return Err(collect_diagnostics(&error, Some(raw_path), "error")),
         };
-        let read = self.collection.read(&serde_json::json!({"path": &path}));
-        if read.get("error").is_some() {
-            return Err(collect_diagnostics(&read, Some(&path), "error"));
+        let candidate = classify_raw_candidate(input, &path)?;
+        if let Err(error) = crate::operations::ensure_no_symlink_components(
+            &self.collection.root,
+            &path,
+            self.collection.spec_profile,
+        ) {
+            return Err(collect_diagnostics(&error, Some(&path), "error"));
         }
-        let old = read
-            .get("frontmatter")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let candidate_document = input.get("document").and_then(Value::as_str);
-        let candidate = candidate_document.map(parse_document_for_rewrite);
-        let draft = if let Some((candidate, _)) = candidate.as_ref() {
-            match candidate.frontmatter.as_ref() {
-                Some(frontmatter) if is_parse_error(frontmatter) => {
-                    return Err(vec![Diagnostic::error(
-                        "invalid_frontmatter",
-                        "Failed to parse replacement document YAML frontmatter.",
-                        Some(path.to_string()),
-                    )]);
+        let full_path = self.collection.root.join(&path);
+        if let Err(error) = crate::operations::ensure_regular_record_file(&full_path, &path) {
+            return Err(collect_diagnostics(&error, Some(&path), "error"));
+        }
+        let loaded =
+            crate::record_load::load_record(self.collection, &full_path, &path).map_err(|_| {
+                vec![Diagnostic::error(
+                    "file_read_failed",
+                    "Record could not be read.",
+                    Some(path.clone()),
+                )]
+            })?;
+        let (old, prepared_revision) = match loaded {
+            crate::record_load::RecordLoadOutcome::Parsed {
+                raw_frontmatter,
+                facts,
+                ..
+            } => (
+                raw_frontmatter.as_object().cloned().unwrap_or_default(),
+                Some(Value::String(facts.revision)),
+            ),
+            crate::record_load::RecordLoadOutcome::Invalid { facts, reason, .. } => {
+                if candidate.is_none() {
+                    return Err(vec![invalid_record_diagnostic(&path, reason.as_str())]);
                 }
-                Some(serde_yaml::Value::Mapping(mapping)) => yaml_mapping_to_json(mapping)
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default(),
-                Some(_) => {
-                    return Err(vec![Diagnostic::error(
-                        "invalid_frontmatter",
-                        "Replacement document frontmatter must be a YAML mapping.",
-                        Some(path.to_string()),
-                    )]);
-                }
-                None => Map::new(),
+                (Map::new(), Some(Value::String(facts.revision)))
             }
+        };
+        let draft = if let Some(candidate) = candidate.as_ref() {
+            candidate.frontmatter.clone()
         } else {
             let patch = input
                 .get("patch")
@@ -737,19 +755,19 @@ impl<'a> Operations<'a> {
         // When the caller omitted a precondition, carry the prepared revision so
         // an intervening write cannot be merged into stale preparation.
         if normalized.get("if_revision").is_none() {
-            if let Some(revision) = read.get("revision") {
-                normalized.insert("if_revision".to_string(), revision.clone());
+            if let Some(revision) = prepared_revision {
+                normalized.insert("if_revision".to_string(), revision);
             }
         }
-        if let Some((candidate, had_bom)) = candidate {
+        if let Some(candidate) = candidate {
             if lifecycle_draft != draft {
                 let frontmatter = json_to_yaml_mapping(&Value::Object(lifecycle_draft));
                 normalized.insert(
                     "document".to_string(),
                     Value::String(serializer::serialize_document_with_bom(
-                        had_bom,
+                        candidate.had_bom,
                         &frontmatter,
-                        &candidate.body,
+                        &candidate.document.body,
                     )),
                 );
             }
@@ -779,6 +797,58 @@ impl<'a> Operations<'a> {
             .diagnostics
             .extend(match_failure_diagnostics(path, failures));
     }
+}
+
+fn invalid_record_diagnostic(path: &str, reason: &str) -> Diagnostic {
+    let mut diagnostic = Diagnostic::error(
+        "invalid_frontmatter",
+        format!("Invalid frontmatter: {reason}"),
+        Some(path.to_string()),
+    );
+    diagnostic.details = Some(serde_json::json!({"reason": reason}));
+    diagnostic
+}
+
+struct RawCandidate {
+    document: ParsedDocument,
+    had_bom: bool,
+    frontmatter: Map<String, Value>,
+}
+
+fn classify_raw_candidate(
+    input: &Value,
+    path: &str,
+) -> Result<Option<RawCandidate>, Vec<Diagnostic>> {
+    let Some(source) = input.get("document").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let (document, had_bom) = parse_document_for_rewrite(source);
+    let frontmatter = match document.frontmatter_state() {
+        FrontmatterState::Absent => Map::new(),
+        FrontmatterState::Mapping(mapping) => yaml_mapping_to_json(mapping)
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        FrontmatterState::InvalidYaml => {
+            return Err(vec![Diagnostic::error(
+                "invalid_frontmatter",
+                "Failed to parse replacement document YAML frontmatter.",
+                Some(path.to_string()),
+            )]);
+        }
+        FrontmatterState::Null | FrontmatterState::NonMapping(_) => {
+            return Err(vec![Diagnostic::error(
+                "invalid_frontmatter",
+                "Replacement document frontmatter must be a YAML mapping.",
+                Some(path.to_string()),
+            )]);
+        }
+    };
+    Ok(Some(RawCandidate {
+        document,
+        had_bom,
+        frontmatter,
+    }))
 }
 
 fn match_failure_diagnostics(
