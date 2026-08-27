@@ -634,7 +634,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::write(
             root.path().join("mdbase.yaml"),
-            "spec_version: 0.3.0\nsettings:\n  explicit_type_keys: [kind]\n  timezone: UTC\n  write_nulls: omit\n",
+            "spec_version: 0.3.0\nsettings:\n  explicit_type_keys: [kind]\n  timezone: UTC\n",
         )
         .unwrap();
         fs::create_dir(root.path().join("_types")).unwrap();
@@ -656,19 +656,25 @@ mod tests {
             .unwrap(),
         ]);
 
-        let collection = Collection::open(root.path()).unwrap();
-        let input = json!({"path":"clock.md", "type":"note", "frontmatter":{}});
-        let mut draft = Map::new();
-        let membership =
-            ResolvedWriteMembership::resolve_create(&collection, &input, &mut draft, "clock.md")
-                .unwrap();
-        assert_eq!(draft.remove("kind"), Some(json!("note")));
-        let diagnostics = membership
-            .revalidate(&collection, &draft, "clock.md")
-            .unwrap_err();
-        assert_eq!(diagnostics[0].code, "type_membership_authority_changed");
+        let mut collection = Collection::open(root.path()).unwrap();
+        // v0.3 currently fixes null serialization to explicit. Override only this
+        // in-memory policy so the public staged-operation boundary reaches the
+        // omission path that final revalidation must guard if it becomes configurable.
+        collection.settings.write_nulls = "omit".to_string();
+        let result = collection
+            .v03_operations()
+            .unwrap()
+            .execute_staged_mutation(
+                "create",
+                &json!({"path":"clock.md", "type":"note", "frontmatter":{}}),
+            );
+        assert!(!result.valid, "{result:#?}");
         assert_eq!(
-            diagnostics[0].details.as_ref().unwrap()["after"],
+            result.diagnostics[0].code,
+            "type_membership_authority_changed"
+        );
+        assert_eq!(
+            result.diagnostics[0].details.as_ref().unwrap()["after"],
             json!(["note"])
         );
         assert_eq!(TEST_CLOCK_CAPTURES.with(|captures| captures.get()), 1);
