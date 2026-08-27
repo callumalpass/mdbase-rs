@@ -14,6 +14,22 @@ use crate::Collection;
 impl Collection {
     /// Create a file (§12.1).
     pub fn create(&self, input: &serde_json::Value) -> serde_json::Value {
+        self.create_prepared(input, None)
+    }
+
+    pub(crate) fn create_v03_prepared(
+        &self,
+        input: &serde_json::Value,
+        membership: crate::v03::write_membership::ResolvedWriteMembership,
+    ) -> serde_json::Value {
+        self.create_prepared(input, Some(membership))
+    }
+
+    fn create_prepared(
+        &self,
+        input: &serde_json::Value,
+        membership: Option<crate::v03::write_membership::ResolvedWriteMembership>,
+    ) -> serde_json::Value {
         let input = CreateInput::parse(input);
         let type_name = input.type_name.as_deref();
         let frontmatter_input = input.frontmatter;
@@ -21,22 +37,26 @@ impl Collection {
         let path_input = input.path.as_deref();
         let if_revision = input.if_revision.as_deref();
 
-        // Determine type names
-        let mut type_names: Vec<String> = Vec::new();
-        if let Some(tn) = type_name {
-            let tn_lower = tn.to_lowercase();
-            if !self.types.contains_key(&tn_lower) {
-                return op_error(UNKNOWN_TYPE, &format!("Unknown type: {}", tn));
+        // Canonical v0.3 callers freeze membership before lifecycle/default/generated behavior.
+        // Legacy callers retain the historical inference path unchanged.
+        let type_names = if let Some(membership) = &membership {
+            membership.types().to_vec()
+        } else {
+            let mut names = Vec::new();
+            if let Some(tn) = type_name {
+                let tn_lower = tn.to_lowercase();
+                if !self.types.contains_key(&tn_lower) {
+                    return op_error(UNKNOWN_TYPE, &format!("Unknown type: {}", tn));
+                }
+                names.push(tn_lower);
             }
-            type_names.push(tn_lower);
-        }
-        // Also check frontmatter for type key
-        let fm_types = self.determine_types(&frontmatter_input);
-        for t in fm_types {
-            if !type_names.contains(&t) {
-                type_names.push(t);
+            for name in self.determine_types(&frontmatter_input) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
             }
-        }
+            names
+        };
 
         // Build frontmatter early so path_pattern can use generated/default values
         let mut fm_obj = match frontmatter_input.as_object() {
@@ -45,15 +65,17 @@ impl Collection {
         };
 
         // Add type key if specified and explicit_type_keys is non-empty
-        if let Some(tn) = type_name {
-            if !self.settings.explicit_type_keys.is_empty()
-                && !fm_obj.contains_key("type")
-                && !fm_obj.contains_key("types")
-            {
-                fm_obj.insert(
-                    "type".to_string(),
-                    serde_json::Value::String(tn.to_string()),
-                );
+        if membership.is_none() {
+            if let Some(tn) = type_name {
+                if !self.settings.explicit_type_keys.is_empty()
+                    && !fm_obj.contains_key("type")
+                    && !fm_obj.contains_key("types")
+                {
+                    fm_obj.insert(
+                        "type".to_string(),
+                        serde_json::Value::String(tn.to_string()),
+                    );
+                }
             }
         }
 
@@ -78,7 +100,11 @@ impl Collection {
             }
             None => {
                 // Try to derive from path_pattern or filename_pattern
-                if let Some(tn) = type_names.first() {
+                let path_type = membership
+                    .as_ref()
+                    .and_then(|membership| membership.path_type())
+                    .or_else(|| type_names.first().map(String::as_str));
+                if let Some(tn) = path_type {
                     if let Some(type_def) = self.types.get(tn) {
                         let pattern = type_def
                             .path_pattern
@@ -142,35 +168,34 @@ impl Collection {
         let effective =
             self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
 
-        // Check match rules (§6.3, §6.4): created file must satisfy type match rules
-        for tn in &type_names {
-            if let Some(type_def) = self.types.get(tn) {
-                if let Some(ref rules) = type_def.match_rules {
-                    let match_frontmatter = if self.spec_profile == crate::SpecProfile::V03 {
-                        &serde_json::Value::Object(fm_obj.clone())
-                    } else {
-                        &effective
-                    };
-                    let compiled = self
-                        .type_plans
-                        .get(tn)
-                        .and_then(|plan| plan.match_expression.as_deref());
-                    if !matches_rules_checked_compiled(
-                        rules,
-                        compiled,
-                        path.as_str(),
-                        match_frontmatter,
-                        self.settings.timezone.as_deref(),
-                    )
-                    .unwrap_or(false)
-                    {
-                        return op_error(
-                            "match_failed",
-                            &format!(
-                                "Created file does not satisfy match rules for type '{}'",
-                                tn
-                            ),
-                        );
+        // Prepared v0.3 writes have already crossed the checked classification
+        // boundary and are checked again above on the canonical path. Keep the
+        // historical per-type rule only for legacy v0.2 callers.
+        if membership.is_none() {
+            for tn in &type_names {
+                if let Some(type_def) = self.types.get(tn) {
+                    if let Some(ref rules) = type_def.match_rules {
+                        let compiled = self
+                            .type_plans
+                            .get(tn)
+                            .and_then(|plan| plan.match_expression.as_deref());
+                        if !matches_rules_checked_compiled(
+                            rules,
+                            compiled,
+                            path.as_str(),
+                            &effective,
+                            self.settings.timezone.as_deref(),
+                        )
+                        .unwrap_or(false)
+                        {
+                            return op_error(
+                                "match_failed",
+                                &format!(
+                                    "Created file does not satisfy match rules for type '{}'",
+                                    tn
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -234,6 +259,11 @@ impl Collection {
         }
         if self.settings.write_nulls == "omit" {
             write_obj.retain(|_, v| !v.is_null());
+        }
+        if let Some(membership) = &membership {
+            if let Err(diagnostics) = membership.revalidate(self, &write_obj, path.as_str()) {
+                return crate::v03::write_membership::diagnostics_error(diagnostics);
+            }
         }
 
         // Write file

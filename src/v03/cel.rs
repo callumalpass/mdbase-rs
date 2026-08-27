@@ -247,6 +247,7 @@ pub(crate) fn evaluate_workflow_template(input: &Value) -> OperationResult {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn evaluate_match_expression(
     source: &str,
     raw: &Value,
@@ -257,11 +258,22 @@ pub(crate) fn evaluate_match_expression(
     evaluate_match_expression_compiled(&parsed, raw, path, timezone)
 }
 
+#[allow(dead_code)]
 pub(crate) fn evaluate_match_expression_compiled(
     parsed: &Expr,
     raw: &Value,
     path: &str,
     timezone: Option<&str>,
+) -> Result<bool, CelFailure> {
+    let clock = operation_clock(timezone)?;
+    evaluate_match_expression_compiled_with_clock(parsed, raw, path, &clock)
+}
+
+pub(crate) fn evaluate_match_expression_compiled_with_clock(
+    parsed: &Expr,
+    raw: &Value,
+    path: &str,
+    clock: &EvaluationClock,
 ) -> Result<bool, CelFailure> {
     let mut context = EvalContext::empty();
     let known = raw.as_object().into_iter().flat_map(|object| object.keys());
@@ -270,8 +282,7 @@ pub(crate) fn evaluate_match_expression_compiled(
     context.note_namespace_source = NoteNamespaceSource::Effective;
     context.file_path = Some(path.to_string());
     context.string_concat = false;
-    let clock = operation_clock(timezone)?;
-    let value = evaluate_compiled(parsed, &context, &clock)?;
+    let value = evaluate_compiled(parsed, &context, clock)?;
     Ok(value == Value::Bool(true))
 }
 

@@ -291,22 +291,30 @@ impl<'a> Operations<'a> {
         if let Some(result) = invalid_revision_input(input) {
             return result;
         }
-        let input = match self.prepare_create(input) {
-            Ok(input) => input,
+        let (input, membership) = match self.prepare_create(input) {
+            Ok(prepared) => prepared,
             Err(diagnostics) => return failed_result(diagnostics),
         };
-        self.normalize("create", &input, self.collection.create(&input))
+        self.normalize(
+            "create",
+            &input,
+            self.collection.create_v03_prepared(&input, membership),
+        )
     }
 
     fn update_direct(&self, input: &Value) -> OperationResult {
         if let Some(result) = invalid_revision_input(input) {
             return result;
         }
-        let input = match self.prepare_update(input) {
-            Ok(input) => input,
+        let (input, membership) = match self.prepare_update(input) {
+            Ok(prepared) => prepared,
             Err(diagnostics) => return failed_result(diagnostics),
         };
-        self.normalize("update", &input, self.collection.update(&input))
+        self.normalize(
+            "update",
+            &input,
+            self.collection.update_v03_prepared(&input, membership),
+        )
     }
 
     fn delete_direct(&self, input: &Value) -> OperationResult {
@@ -608,7 +616,10 @@ impl<'a> Operations<'a> {
         }
     }
 
-    fn prepare_create(&self, input: &Value) -> Result<Value, Vec<Diagnostic>> {
+    fn prepare_create(
+        &self,
+        input: &Value,
+    ) -> Result<(Value, super::write_membership::ResolvedWriteMembership), Vec<Diagnostic>> {
         let mut normalized = input.as_object().cloned().unwrap_or_default();
         let mut draft = input
             .get("frontmatter")
@@ -616,32 +627,56 @@ impl<'a> Operations<'a> {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        if let Some(type_name) = input.get("type").and_then(Value::as_str) {
-            draft
-                .entry("type".to_string())
-                .or_insert_with(|| Value::String(type_name.to_string()));
+        // An explicit path is canonicalized before it can affect membership.
+        // A derived path intentionally starts path-independent; the designated
+        // type selects its path pattern and the core create performs the final,
+        // authoritative canonical-path revalidation.
+        let canonical_path = match input.get("path").and_then(Value::as_str) {
+            Some(path) => match crate::operations::mutation_record_path(self.collection, path) {
+                Ok(path) => Some(path.to_string()),
+                Err(error) => return Err(collect_diagnostics(&error, Some(path), "error")),
+            },
+            None => None,
+        };
+        if let Some(path) = &canonical_path {
+            normalized.insert("path".to_string(), Value::String(path.clone()));
         }
-        let path = input.get("path").and_then(Value::as_str).unwrap_or("");
-        let type_names = create_type_membership(self.collection, input, &draft, path);
+        let path = canonical_path.as_deref().unwrap_or("");
+        let membership = super::write_membership::ResolvedWriteMembership::resolve_create(
+            self.collection,
+            input,
+            &mut draft,
+            path,
+        )?;
         let lifecycle_draft = self.collection.apply_v03_lifecycle(
             LifecycleEvent::Create,
-            &type_names,
+            membership.types(),
             draft,
             None,
             path,
         )?;
-        ensure_membership_unchanged(self.collection, &type_names, &lifecycle_draft, path)?;
         normalized.insert("frontmatter".to_string(), Value::Object(lifecycle_draft));
-        Ok(Value::Object(normalized))
+        Ok((Value::Object(normalized), membership))
     }
 
-    fn prepare_update(&self, input: &Value) -> Result<Value, Vec<Diagnostic>> {
-        let Some(path) = input.get("path").and_then(Value::as_str) else {
-            return Ok(input.clone());
+    fn prepare_update(
+        &self,
+        input: &Value,
+    ) -> Result<(Value, super::write_membership::ResolvedWriteMembership), Vec<Diagnostic>> {
+        let Some(raw_path) = input.get("path").and_then(Value::as_str) else {
+            return Err(vec![Diagnostic::error(
+                "invalid_request",
+                "Update requires path.",
+                None,
+            )]);
         };
-        let read = self.collection.read(&serde_json::json!({"path": path}));
+        let path = match crate::operations::mutation_record_path(self.collection, raw_path) {
+            Ok(path) => path.to_string(),
+            Err(error) => return Err(collect_diagnostics(&error, Some(raw_path), "error")),
+        };
+        let read = self.collection.read(&serde_json::json!({"path": &path}));
         if read.get("error").is_some() {
-            return Ok(input.clone());
+            return Err(collect_diagnostics(&read, Some(&path), "error"));
         }
         let old = read
             .get("frontmatter")
@@ -684,19 +719,28 @@ impl<'a> Operations<'a> {
             apply_patch(&mut draft, &patch, &self.collection.settings.write_nulls);
             draft
         };
-        let type_names = self
-            .collection
-            .determine_types_for_path(&Value::Object(draft.clone()), Some(path));
+        let membership = super::write_membership::ResolvedWriteMembership::resolve_update(
+            self.collection,
+            &draft,
+            &path,
+        )?;
         let lifecycle_draft = self.collection.apply_v03_lifecycle(
             LifecycleEvent::Update,
-            &type_names,
+            membership.types(),
             draft.clone(),
             Some(&old),
-            path,
+            &path,
         )?;
-        ensure_membership_unchanged(self.collection, &type_names, &lifecycle_draft, path)?;
-
         let mut normalized = input.as_object().cloned().unwrap_or_default();
+        normalized.insert("path".to_string(), Value::String(path.clone()));
+        // Preparation read and locked core reread form one optimistic operation.
+        // When the caller omitted a precondition, carry the prepared revision so
+        // an intervening write cannot be merged into stale preparation.
+        if normalized.get("if_revision").is_none() {
+            if let Some(revision) = read.get("revision") {
+                normalized.insert("if_revision".to_string(), revision.clone());
+            }
+        }
         if let Some((candidate, had_bom)) = candidate {
             if lifecycle_draft != draft {
                 let frontmatter = json_to_yaml_mapping(&Value::Object(lifecycle_draft));
@@ -718,7 +762,7 @@ impl<'a> Operations<'a> {
                 Value::Object(diff_frontmatter(&old, &lifecycle_draft)),
             );
         }
-        Ok(Value::Object(normalized))
+        Ok((Value::Object(normalized), membership))
     }
 
     fn attach_match_diagnostics(&self, result: &mut OperationResult) {
@@ -760,53 +804,6 @@ fn match_failure_diagnostics(
             })),
         })
         .collect()
-}
-
-fn create_type_membership(
-    collection: &Collection,
-    input: &Value,
-    draft: &Map<String, Value>,
-    path: &str,
-) -> Vec<String> {
-    let mut type_names = Vec::new();
-    if let Some(type_name) = input.get("type").and_then(Value::as_str) {
-        type_names.push(type_name.to_lowercase());
-    }
-    for type_name in collection.determine_types_for_path(&Value::Object(draft.clone()), Some(path))
-    {
-        if !type_names.contains(&type_name) {
-            type_names.push(type_name);
-        }
-    }
-    type_names
-}
-
-fn ensure_membership_unchanged(
-    collection: &Collection,
-    before: &[String],
-    draft: &Map<String, Value>,
-    path: &str,
-) -> Result<(), Vec<Diagnostic>> {
-    let after = collection.determine_types_for_path(&Value::Object(draft.clone()), Some(path));
-    let mut before_sorted = before.to_vec();
-    let mut after_sorted = after;
-    before_sorted.sort();
-    before_sorted.dedup();
-    after_sorted.sort();
-    after_sorted.dedup();
-    if before_sorted == after_sorted {
-        return Ok(());
-    }
-    let mut diagnostic = Diagnostic::error(
-        "type_membership_changed",
-        "Lifecycle policy changed the record's matched type membership.",
-        Some(path.to_string()),
-    );
-    diagnostic.details = Some(serde_json::json!({
-        "before": before_sorted,
-        "after": after_sorted,
-    }));
-    Err(vec![diagnostic])
 }
 
 fn apply_patch(draft: &mut Map<String, Value>, patch: &Map<String, Value>, write_nulls: &str) {

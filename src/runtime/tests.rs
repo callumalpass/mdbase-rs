@@ -1438,6 +1438,61 @@ fn runtime_commits_saved_view_resources_through_the_single_writer() {
 }
 
 #[test]
+fn public_runtime_prepare_rejects_erased_authority_without_staging_or_generation_change() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("mdbase.yaml"),
+        "spec_version: 0.3.0\nsettings:\n  explicit_type_keys: [kind]\n",
+    )
+    .unwrap();
+    fs::create_dir(directory.path().join("_types")).unwrap();
+    fs::write(
+        directory.path().join("_types/note.md"),
+        "---\nkind: mdbase.type\nname: note\nmatch: { fields_present: [title] }\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\nlifecycle:\n  on_create:\n    set: { kind: { literal: null } }\n---\n",
+    )
+    .unwrap();
+    let baseline = FilesystemProvider::open(directory.path())
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    let claim = HostClaimId::generate();
+    let prepared = runtime
+        .prepare(
+            &OperationRequest::new(
+                OperationKind::Create,
+                json!({"path":"failed.md","type":"note","frontmatter":{"title":"same"}}),
+            ),
+            &claim,
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    let PreparationOutcome::NoMutation(outcome) = prepared else {
+        panic!("authority-erasing public runtime request must not stage a mutation")
+    };
+    assert!(!outcome.result.valid);
+    assert_eq!(
+        outcome.result.diagnostics[0].code,
+        "type_membership_authority_changed"
+    );
+    assert_eq!(
+        FilesystemProvider::open(directory.path())
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .revision,
+        baseline.revision
+    );
+    assert!(matches!(outcome.changes, ChangeSet::None));
+    assert!(outcome.commit_id.is_none());
+    assert!(runtime
+        .attach_prepared(&claim, &OperationContext::legacy())
+        .unwrap()
+        .is_none());
+    assert!(!directory.path().join("failed.md").exists());
+}
+
+#[test]
 fn runtime_uniqueness_uses_the_generation_bound_index() {
     let directory = collection();
     fs::write(
