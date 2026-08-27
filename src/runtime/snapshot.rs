@@ -1,13 +1,13 @@
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json, FrontmatterState};
 use crate::operations::{
-    ensure_no_symlink_components, ensure_regular_record_file, ensure_safe_relative_path,
-    readable_record_path,
+    ensure_safe_relative_path, open_regular_record_no_follow, readable_record_path,
 };
 use crate::Collection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use walkdir::WalkDir;
 
 use super::ProviderError;
@@ -80,12 +80,17 @@ impl Collection {
             .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
         let record_path = readable_record_path(self, path)
             .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
-        ensure_no_symlink_components(&self.root, record_path.as_str(), self.spec_profile)
-            .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
-        let absolute = record_path.under(&self.root);
-        ensure_regular_record_file(&absolute, record_path.as_str())
-            .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
-        let document = fs::read_to_string(&absolute).map_err(|error| {
+        let mut file = open_regular_record_no_follow(&self.root, record_path.as_str())
+            .map_err(|error| {
+                ProviderError::CollectionOpen(format!(
+                    "failed to open collection record '{path}': {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ProviderError::CollectionOpen(format!("collection record '{path}' is unavailable"))
+            })?;
+        let mut document = String::new();
+        file.read_to_string(&mut document).map_err(|error| {
             ProviderError::CollectionOpen(format!(
                 "failed to read collection record '{path}': {error}"
             ))
