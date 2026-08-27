@@ -51,6 +51,19 @@ impl ParsedDocument {
 /// Returns the raw YAML value for frontmatter (which may be a mapping, list, scalar, or null)
 /// and the body string. Callers must check that frontmatter is a mapping.
 pub fn parse_document(content: &str) -> ParsedDocument {
+    parse_document_for_rewrite(content).0
+}
+
+/// Parse while retaining encoding information needed by internal rewrite paths.
+/// This keeps BOM bookkeeping out of the public `ParsedDocument` layout.
+pub(crate) fn parse_document_for_rewrite(content: &str) -> (ParsedDocument, bool) {
+    // Strip exactly one marker. A second marker is document content.
+    let had_bom = content.starts_with('\u{FEFF}');
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
+    (parse_document_without_bom(content), had_bom)
+}
+
+fn parse_document_without_bom(content: &str) -> ParsedDocument {
     // §3.1: Opening --- must be the very first line
     if !content.starts_with("---") {
         return ParsedDocument {
@@ -322,5 +335,36 @@ mod tests {
             Some("Windows")
         );
         assert_eq!(parsed.body, "Body\r\n");
+    }
+
+    #[test]
+    fn leading_bom_is_stripped_and_recorded_not_treated_as_content() {
+        // BOM write policy: strip exactly one leading U+FEFF at parse time and
+        // record it so serialization can restore the byte prefix.
+        for source in [
+            "\u{feff}---\ntitle: Original\n---\nBody\n",
+            "\u{feff}Body only, no frontmatter.\n",
+        ] {
+            let parsed = parse_document(source);
+            assert!(
+                !parsed.body.starts_with('\u{feff}'),
+                "BOM must not leak into body"
+            );
+        }
+
+        let parsed = parse_document("\u{feff}---\ntitle: Original\n---\nBody\n");
+        assert!(parsed.has_frontmatter);
+        assert_eq!(parsed.body, "Body\n");
+
+        let parsed = parse_document("---\ntitle: Original\n---\nBody\n");
+        assert!(parsed.has_frontmatter);
+    }
+
+    #[test]
+    fn bom_before_a_later_horizontal_rule_stays_body_only() {
+        let source = "\u{feff}Intro\n\n---\nnot frontmatter\n";
+        let parsed = parse_document(source);
+        assert!(!parsed.has_frontmatter);
+        assert_eq!(parsed.body, source.strip_prefix('\u{feff}').unwrap());
     }
 }

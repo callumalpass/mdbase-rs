@@ -6,7 +6,10 @@ mod link_rewrite;
 
 use crate::api::operations::RenameInput;
 use crate::errors::*;
-use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
+use crate::frontmatter::parser::{
+    parse_document, parse_document_for_rewrite, yaml_mapping_to_json,
+};
+use crate::frontmatter::serializer;
 use crate::operations::{
     atomic_rename_noclobber, ensure_no_symlink_components, ensure_regular_record_file,
     ensure_revision, mutation_record_path,
@@ -314,7 +317,9 @@ impl Collection {
                 Err(_) => continue,
             };
 
-            let doc = parse_document(&content);
+            // Rewrite parsing strips exactly one encoding marker and returns
+            // its state separately, so every write path can restore it.
+            let (doc, had_bom) = parse_document_for_rewrite(&content);
             let source_dir = std::path::Path::new(&rel_path)
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
@@ -414,33 +419,31 @@ impl Collection {
                 }
 
                 let output = if fm_changed {
-                    let new_fm = fm_yaml.as_ref().expect("changed frontmatter is a mapping");
-                    let mut output = String::new();
-                    output.push_str("---\n");
-                    let yaml_str = serde_yaml::to_string(new_fm).unwrap_or_default();
-                    output.push_str(&yaml_str);
-                    if !yaml_str.ends_with('\n') {
-                        output.push('\n');
-                    }
-                    output.push_str("---\n");
-                    if !new_body.is_empty() {
-                        output.push_str(&new_body);
-                        if !new_body.ends_with('\n') {
-                            output.push('\n');
-                        }
-                    }
-                    output
+                    let new_fm = fm_yaml
+                        .as_ref()
+                        .and_then(serde_yaml::Value::as_mapping)
+                        .expect("changed frontmatter is a mapping");
+                    serializer::serialize_document_with_bom(had_bom, new_fm, &new_body)
                 } else if doc.has_frontmatter {
-                    let prefix_length = content
+                    // A body-only edit must preserve valid or malformed
+                    // frontmatter bytes exactly, including delimiter style.
+                    let body_offset = content
                         .len()
                         .checked_sub(doc.body.len())
                         .expect("parsed body is an exact document suffix");
-                    let mut output = String::with_capacity(prefix_length + new_body.len());
-                    output.push_str(&content[..prefix_length]);
+                    let mut output = String::with_capacity(body_offset + new_body.len());
+                    output.push_str(&content[..body_offset]);
                     output.push_str(&new_body);
                     output
                 } else {
-                    new_body
+                    // Includes ordinary body-only files and the two-BOM case:
+                    // the first marker is restored while the second remains
+                    // part of `new_body` according to parser policy.
+                    serializer::serialize_document_with_bom(
+                        had_bom,
+                        &serde_yaml::Mapping::new(),
+                        &new_body,
+                    )
                 };
                 if let Err(e) = crate::operations::atomic_write(file_path, output.as_bytes()) {
                     ref_update_failures.push(serde_json::json!({

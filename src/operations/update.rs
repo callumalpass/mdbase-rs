@@ -2,7 +2,7 @@
 
 use crate::api::operations::{UpdateInput, UpdateOutput};
 use crate::errors::*;
-use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
+use crate::frontmatter::parser::{parse_document_for_rewrite, yaml_mapping_to_json};
 use crate::frontmatter::serializer;
 use crate::operations::{
     atomic_write, ensure_no_symlink_components, ensure_regular_record_file, ensure_revision,
@@ -74,8 +74,9 @@ impl Collection {
             return error;
         }
 
-        let doc = parse_document(&content);
-        let replacement_doc = document.as_deref().map(parse_document);
+        let (doc, original_had_bom) = parse_document_for_rewrite(&content);
+        let replacement = document.as_deref().map(parse_document_for_rewrite);
+        let replacement_doc = replacement.as_ref().map(|(doc, _)| doc);
         let replacement_mapping = match replacement_doc
             .as_ref()
             .and_then(|doc| doc.frontmatter.as_ref())
@@ -182,7 +183,11 @@ impl Collection {
         let output = if document.is_some() && replacement_mapping.as_ref() == Some(&write_mapping) {
             document.as_deref().unwrap_or_default().to_string()
         } else {
-            serializer::serialize_document(&write_mapping, body)
+            // Restore the original UTF-8 BOM so round-trips stay byte-stable.
+            let had_bom = replacement
+                .as_ref()
+                .map_or(original_had_bom, |(_, had_bom)| *had_bom);
+            serializer::serialize_document_with_bom(had_bom, &write_mapping, body)
         };
 
         if let Err(error) =
