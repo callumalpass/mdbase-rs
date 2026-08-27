@@ -2,6 +2,7 @@ use super::*;
 use crate::v03::OperationResult;
 use crate::Collection;
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::fs;
 use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
 use std::thread;
@@ -1023,6 +1024,200 @@ fn runtime_external_feed_reopens_with_stable_unacknowledged_replay() {
     assert!(empty.events.is_empty());
     assert!(runtime
         .ingest_external_timeout(Duration::from_millis(100), &OperationContext::legacy())
+        .unwrap()
+        .is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_external_recursive_changes_and_symlink_poison_replay_exactly_once() {
+    use std::os::unix::fs::symlink;
+
+    fn ingest_exact(runtime: &FilesystemRuntime, count: usize) -> Vec<super::RuntimeChangeEvent> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut events = Vec::new();
+        while events.len() < count && std::time::Instant::now() < deadline {
+            if let Some(event) = runtime
+                .ingest_external_timeout(Duration::from_millis(500), &OperationContext::legacy())
+                .unwrap()
+            {
+                assert_eq!(event.origin, ChangeOrigin::Filesystem);
+                assert!(matches!(event.changes, ChangeSet::Exact(_)));
+                events.push(event);
+            }
+        }
+        assert_eq!(events.len(), count);
+        events
+    }
+
+    fn record_effects(
+        events: &[super::RuntimeChangeEvent],
+    ) -> BTreeSet<(RecordChangeKind, String, Option<String>)> {
+        events
+            .iter()
+            .map(|event| {
+                let ChangeSet::Exact(changes) = &event.changes else {
+                    unreachable!()
+                };
+                let [CanonicalChange::Record(change)] = changes.items() else {
+                    panic!("filesystem observation must contain one exact record change")
+                };
+                (
+                    change.kind,
+                    change.path.as_str().to_string(),
+                    change.from.as_ref().map(|path| path.as_str().to_string()),
+                )
+            })
+            .collect()
+    }
+
+    let directory = collection();
+    let outside = tempfile::tempdir().unwrap();
+    let marker = "EXTERNAL_RUNTIME_MARKER_MUST_NOT_APPEAR";
+    fs::write(
+        outside.path().join("poison.md"),
+        format!("---\ntitle: Poison\nmarker: {marker}\n---\n"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("tracked.md"),
+        "---\ntitle: Tracked\n---\n",
+    )
+    .unwrap();
+
+    let owner = ChangeFeedOwnerId::generate();
+    let expected = {
+        let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(25)).unwrap();
+        let feed = runtime
+            .open_change_feed(&owner, &OperationContext::legacy())
+            .unwrap();
+        runtime
+            .establish_change_feed_baseline(&feed, &OperationContext::legacy())
+            .unwrap();
+        let mut events = Vec::new();
+
+        fs::create_dir_all(directory.path().join("before/nested")).unwrap();
+        fs::write(
+            directory.path().join("before/nested/immediate.md"),
+            "---\ntitle: Immediate\n---\n",
+        )
+        .unwrap();
+        events.extend(ingest_exact(&runtime, 1));
+        assert_eq!(
+            record_effects(&events),
+            BTreeSet::from([(
+                RecordChangeKind::Created,
+                "before/nested/immediate.md".to_string(),
+                None
+            )])
+        );
+
+        fs::write(
+            directory.path().join("before/second.md"),
+            "---\ntitle: Second\n---\n",
+        )
+        .unwrap();
+        events.extend(ingest_exact(&runtime, 1));
+        fs::rename(
+            directory.path().join("before"),
+            directory.path().join("after"),
+        )
+        .unwrap();
+        let renamed = ingest_exact(&runtime, 2);
+        assert_eq!(
+            record_effects(&renamed),
+            BTreeSet::from([
+                (
+                    RecordChangeKind::Renamed,
+                    "after/nested/immediate.md".to_string(),
+                    Some("before/nested/immediate.md".to_string())
+                ),
+                (
+                    RecordChangeKind::Renamed,
+                    "after/second.md".to_string(),
+                    Some("before/second.md".to_string())
+                ),
+            ])
+        );
+        events.extend(renamed);
+
+        fs::remove_dir_all(directory.path().join("after")).unwrap();
+        let removed = ingest_exact(&runtime, 2);
+        assert_eq!(
+            record_effects(&removed),
+            BTreeSet::from([
+                (
+                    RecordChangeKind::Deleted,
+                    "after/nested/immediate.md".to_string(),
+                    None
+                ),
+                (
+                    RecordChangeKind::Deleted,
+                    "after/second.md".to_string(),
+                    None
+                ),
+            ])
+        );
+        events.extend(removed);
+
+        fs::remove_file(directory.path().join("tracked.md")).unwrap();
+        symlink(
+            outside.path().join("poison.md"),
+            directory.path().join("tracked.md"),
+        )
+        .unwrap();
+        fs::write(directory.path().join("safe.md"), "---\ntitle: Safe\n---\n").unwrap();
+        let poisoned = ingest_exact(&runtime, 2);
+        assert_eq!(
+            record_effects(&poisoned),
+            BTreeSet::from([
+                (RecordChangeKind::Deleted, "tracked.md".to_string(), None),
+                (RecordChangeKind::Created, "safe.md".to_string(), None),
+            ])
+        );
+        assert!(poisoned
+            .iter()
+            .all(|event| !format!("{event:?}").contains(marker)));
+        events.extend(poisoned);
+
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.identity.watermark.get(), (index + 1) as u64);
+        }
+        assert!(runtime
+            .ingest_external_timeout(Duration::from_millis(200), &OperationContext::legacy())
+            .unwrap()
+            .is_none());
+        events
+    };
+
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(25)).unwrap();
+    let feed = runtime
+        .open_change_feed(&owner, &OperationContext::legacy())
+        .unwrap();
+    let replay = runtime
+        .read_change_events(
+            &feed,
+            None,
+            std::num::NonZeroUsize::new(32).unwrap(),
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    assert_eq!(replay.events, expected);
+    assert_eq!(replay.events.len(), 8);
+    runtime
+        .ack_change_events(&feed, replay.feed_head, &OperationContext::legacy())
+        .unwrap();
+    let empty = runtime
+        .read_change_events(
+            &feed,
+            Some(replay.feed_head),
+            std::num::NonZeroUsize::new(32).unwrap(),
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    assert!(empty.events.is_empty());
+    assert!(runtime
+        .ingest_external_timeout(Duration::from_millis(200), &OperationContext::legacy())
         .unwrap()
         .is_none());
 }

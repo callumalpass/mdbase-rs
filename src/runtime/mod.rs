@@ -29,7 +29,7 @@ mod projection;
 mod provider;
 mod record_resolution;
 mod record_structure;
-mod snapshot;
+pub(crate) mod snapshot;
 
 pub use crate::data_contracts::{ResolvedRecordContract, ResolvedRecordContractImplementation};
 pub use api::CollectionRuntime;

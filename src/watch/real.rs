@@ -1,5 +1,6 @@
 use super::{PortableWatchEvent, WatchEvent};
-use crate::runtime::CollectionSnapshotResourceKind;
+use crate::operations::{ensure_no_symlink_components, read::RecordFileFacts};
+use crate::runtime::{snapshot::materialize_snapshot_record, CollectionSnapshotResourceKind};
 use crate::Collection;
 use notify::{
     event::{CreateKind, MetadataKind, ModifyKind, RemoveKind},
@@ -7,6 +8,7 @@ use notify::{
 };
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -242,37 +244,52 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
         match inputs.recv_timeout(wait) {
             Ok(WorkerInput::Command(Command::Stop)) => return,
             Ok(WorkerInput::Command(Command::Rescan(ready))) => {
-                deadline = Some(Instant::now());
-                retry_backoff = INITIAL_REFRESH_RETRY;
+                schedule_relevant_refresh(
+                    &mut deadline,
+                    &mut retry_backoff,
+                    last_refresh_diagnostic.is_some(),
+                    Duration::ZERO,
+                );
                 full_rescan = true;
                 pending_rescans.push(ready);
             }
             Ok(WorkerInput::Command(Command::RescanPaths(paths, ready))) => {
-                deadline = Some(Instant::now());
-                retry_backoff = INITIAL_REFRESH_RETRY;
+                schedule_relevant_refresh(
+                    &mut deadline,
+                    &mut retry_backoff,
+                    last_refresh_diagnostic.is_some(),
+                    Duration::ZERO,
+                );
                 pending_paths.extend(paths);
                 pending_rescans.push(ready);
             }
             Ok(WorkerInput::Filesystem(Ok(event))) if invalidates_snapshot(&event) => {
-                retry_backoff = INITIAL_REFRESH_RETRY;
                 let invalidation = snapshot.invalidation_paths(&root, &event);
-                if watch_profile_enabled() {
-                    eprintln!(
-                        "mdbase_watch invalidation kind={:?} mode={} record_paths={}",
-                        event.kind,
-                        if invalidation.is_some() {
-                            "incremental"
-                        } else {
-                            "full"
-                        },
-                        invalidation.as_ref().map_or(0, BTreeSet::len),
+                let relevant = invalidation.as_ref().is_none_or(|paths| !paths.is_empty());
+                if relevant {
+                    if watch_profile_enabled() {
+                        eprintln!(
+                            "mdbase_watch invalidation kind={:?} mode={} record_paths={}",
+                            event.kind,
+                            if invalidation.is_some() {
+                                "incremental"
+                            } else {
+                                "full"
+                            },
+                            invalidation.as_ref().map_or(0, BTreeSet::len),
+                        );
+                    }
+                    match invalidation {
+                        Some(paths) => pending_paths.extend(paths),
+                        None => full_rescan = true,
+                    }
+                    schedule_relevant_refresh(
+                        &mut deadline,
+                        &mut retry_backoff,
+                        last_refresh_diagnostic.is_some(),
+                        debounce,
                     );
                 }
-                match invalidation {
-                    Some(paths) => pending_paths.extend(paths),
-                    None => full_rescan = true,
-                }
-                deadline = Some(Instant::now() + debounce)
             }
             Ok(WorkerInput::Filesystem(Ok(_))) => {}
             Ok(WorkerInput::Filesystem(Err(error))) => {
@@ -360,6 +377,23 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
 const INITIAL_REFRESH_RETRY: Duration = Duration::from_millis(250);
 const MAX_REFRESH_RETRY: Duration = Duration::from_secs(5);
 const REFRESH_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(5);
+
+fn schedule_relevant_refresh(
+    deadline: &mut Option<Instant>,
+    retry_backoff: &mut Duration,
+    refresh_is_failing: bool,
+    debounce: Duration,
+) {
+    let now = Instant::now();
+    if refresh_is_failing {
+        *retry_backoff = INITIAL_REFRESH_RETRY;
+        let fresh_retry = now + INITIAL_REFRESH_RETRY;
+        *deadline = Some(deadline.map_or(fresh_retry, |existing| existing.min(fresh_retry)));
+    } else {
+        *deadline = Some(now + debounce);
+        *retry_backoff = INITIAL_REFRESH_RETRY;
+    }
+}
 
 fn watch_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -490,31 +524,47 @@ impl Snapshot {
     }
 
     fn invalidation_paths(&self, root: &Path, event: &Event) -> Option<BTreeSet<PathBuf>> {
-        if event.paths.is_empty()
-            || matches!(event.kind, EventKind::Any | EventKind::Other)
-            || matches!(
-                event.kind,
-                EventKind::Modify(ModifyKind::Name(_))
-                    | EventKind::Create(CreateKind::Folder)
-                    | EventKind::Remove(RemoveKind::Folder)
-            )
-            || matches!(
-                event.kind,
-                EventKind::Create(CreateKind::Any | CreateKind::Other)
-            ) && event.paths.iter().any(|path| {
-                std::fs::symlink_metadata(path)
-                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-            })
-        {
+        if event.paths.is_empty() {
             return None;
         }
+
+        // Filter paths that can never affect the collection before escalating
+        // directory-shaped events. Backends commonly report hidden/cache
+        // directory churn as folder create/remove events.
+        let visible = event
+            .paths
+            .iter()
+            .filter_map(|path| {
+                let relative = path.strip_prefix(root).unwrap_or(path);
+                let normalized = relative.to_string_lossy().replace('\\', "/");
+                (!normalized.is_empty() && !self.is_ignored_path(&normalized))
+                    .then_some((path, relative, normalized))
+            })
+            .collect::<Vec<_>>();
+        if visible.is_empty() {
+            return Some(BTreeSet::new());
+        }
+        if matches!(event.kind, EventKind::Any | EventKind::Other) {
+            return None;
+        }
+
+        if matches!(
+            event.kind,
+            EventKind::Modify(ModifyKind::Name(_))
+                | EventKind::Create(CreateKind::Folder)
+                | EventKind::Remove(RemoveKind::Folder | RemoveKind::Any | RemoveKind::Other)
+        ) || matches!(
+            event.kind,
+            EventKind::Create(CreateKind::Any | CreateKind::Other)
+        ) && visible.iter().any(|(path, _, _)| {
+            std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        }) {
+            return None;
+        }
+
         let mut records = BTreeSet::new();
-        for path in &event.paths {
-            let relative = path.strip_prefix(root).unwrap_or(path);
-            let normalized = relative.to_string_lossy().replace('\\', "/");
-            if normalized.is_empty() {
-                return None;
-            }
+        for (_, relative, normalized) in visible {
             if normalized == "mdbase.yaml"
                 || normalized == "mdbase.lock.yaml"
                 || normalized == "mdbase.provisions.yaml"
@@ -527,9 +577,6 @@ impl Snapshot {
                 || relative.extension().and_then(|value| value.to_str()) == Some("base")
             {
                 return None;
-            }
-            if self.is_ignored_path(&normalized) {
-                continue;
             }
             let extension = relative.extension().and_then(|value| value.to_str());
             if extension.is_some_and(|extension| self.record_extensions.contains(extension)) {
@@ -737,36 +784,99 @@ fn load_record(collection: &Collection, path: &str) -> Result<Option<RecordState
     if collection.is_excluded(path) || !collection.is_valid_extension(path) {
         return Ok(None);
     }
-    let full_path = collection.root.join(path);
-    match std::fs::symlink_metadata(&full_path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
-        Ok(_) => return Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(WatchError::Collection(error.to_string())),
-    }
-    let read = collection.read(&json!({"path": path}));
+    let Some((document, file_facts)) = safely_read_local_record(collection, path)? else {
+        return Ok(None);
+    };
+    let read = collection.read_document(path, &document, &file_facts, false);
     let revision = match read.get("revision").and_then(Value::as_str) {
         Some(revision) => revision.to_string(),
         None if is_invalid_yaml_frontmatter(&read) => return Ok(None),
         None => return Err(WatchError::Collection(collection_error(&read))),
     };
-    let canonical = collection
-        .snapshot_record(path)
-        .map_err(|error| WatchError::Collection(error.to_string()))?;
+    let canonical = materialize_snapshot_record(collection, path, document);
     let raw_frontmatter = canonical.frontmatter;
     let effective_frontmatter = read
         .get("effective_frontmatter")
         .cloned()
         .unwrap_or_else(|| Value::Object(raw_frontmatter.clone()));
     let types = read.get("types").cloned().unwrap_or_else(|| json!([]));
-    let body = canonical.body;
     Ok(Some(RecordState {
         revision,
         raw_frontmatter,
         effective_frontmatter,
         types,
-        body,
+        body: canonical.body,
     }))
+}
+
+fn safely_read_local_record(
+    collection: &Collection,
+    path: &str,
+) -> Result<Option<(String, RecordFileFacts)>, WatchError> {
+    if ensure_no_symlink_components(&collection.root, path, collection.spec_profile).is_err() {
+        return Ok(None);
+    }
+    let full_path = collection.root.join(path);
+    let path_metadata = match std::fs::symlink_metadata(&full_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(WatchError::Collection(error.to_string())),
+    };
+    let mut file = match std::fs::File::open(&full_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(WatchError::Collection(error.to_string())),
+    };
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| WatchError::Collection(error.to_string()))?;
+    let current_metadata = match std::fs::symlink_metadata(&full_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(WatchError::Collection(error.to_string())),
+    };
+    if !same_file_identity(&path_metadata, &opened_metadata)
+        || !same_file_identity(&opened_metadata, &current_metadata)
+        || ensure_no_symlink_components(&collection.root, path, collection.spec_profile).is_err()
+    {
+        return Ok(None);
+    }
+
+    let file_facts = RecordFileFacts {
+        size: opened_metadata.len(),
+        mtime: opened_metadata.modified().ok().map(|time| {
+            let datetime: chrono::DateTime<chrono::Utc> = time.into();
+            datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        }),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| WatchError::Collection(error.to_string()))?;
+    let document = String::from_utf8(bytes)
+        .map_err(|_| WatchError::Collection("File contains invalid UTF-8".to_string()))?;
+    Ok(Some((document, file_facts)))
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.created().ok() == right.created().ok()
 }
 
 fn is_invalid_yaml_frontmatter(read: &Value) -> bool {
@@ -869,13 +979,27 @@ mod tests {
             assert_eq!(snapshot.invalidation_paths(directory.path(), &event), None);
         }
 
-        for path in [".hidden/state.json", "assets/image.png"] {
-            let event = Event::new(EventKind::Create(CreateKind::File))
-                .add_path(directory.path().join(path));
+        for (kind, path) in [
+            (EventKind::Create(CreateKind::Folder), ".hidden/folder"),
+            (EventKind::Remove(RemoveKind::Folder), ".hidden/folder"),
+            (EventKind::Remove(RemoveKind::Any), ".mdbase/cache/gone"),
+            (EventKind::Remove(RemoveKind::Other), ".hidden/gone"),
+            (EventKind::Create(CreateKind::File), ".hidden/state.json"),
+            (EventKind::Other, ".hidden/unknown"),
+            (EventKind::Create(CreateKind::File), "assets/image.png"),
+        ] {
+            let event = Event::new(kind).add_path(directory.path().join(path));
             assert_eq!(
                 snapshot.invalidation_paths(directory.path(), &event),
-                Some(BTreeSet::new())
+                Some(BTreeSet::new()),
+                "{path}"
             );
+        }
+
+        for kind in [RemoveKind::Any, RemoveKind::Other] {
+            let event =
+                Event::new(EventKind::Remove(kind)).add_path(directory.path().join("visible-gone"));
+            assert_eq!(snapshot.invalidation_paths(directory.path(), &event), None);
         }
     }
 
@@ -1124,11 +1248,112 @@ mod tests {
                 ("before/one.md".to_string(), "after/one.md".to_string()),
             ])
         );
+        assert!(watcher
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn duplicate_content_recursive_rename_stays_exact_and_has_no_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::create_dir_all(directory.path().join("before/nested")).unwrap();
+        let duplicate = "---\ntitle: Duplicate\n---\nSame\n";
+        fs::write(directory.path().join("before/one.md"), duplicate).unwrap();
+        fs::write(directory.path().join("before/nested/two.md"), duplicate).unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(30)).unwrap();
+
+        fs::rename(
+            directory.path().join("before"),
+            directory.path().join("after"),
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while events.len() < 4 && Instant::now() < deadline {
+            if let Some(event) = watcher.recv_timeout(Duration::from_millis(100)).unwrap() {
+                events.push((
+                    event.event_type,
+                    event.payload["path"].as_str().unwrap().to_string(),
+                ));
+            }
+        }
+        assert_eq!(
+            events,
+            vec![
+                (
+                    "mdbase.record.deleted".to_string(),
+                    "before/nested/two.md".to_string()
+                ),
+                (
+                    "mdbase.record.deleted".to_string(),
+                    "before/one.md".to_string()
+                ),
+                (
+                    "mdbase.record.created".to_string(),
+                    "after/nested/two.md".to_string()
+                ),
+                (
+                    "mdbase.record.created".to_string(),
+                    "after/one.md".to_string()
+                ),
+            ]
+        );
+        assert!(watcher
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn watcher_reconciles_real_recursive_directory_removal_once() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::create_dir_all(directory.path().join("gone/nested")).unwrap();
+        fs::write(
+            directory.path().join("gone/one.md"),
+            "---\ntitle: One\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("gone/nested/two.md"),
+            "---\ntitle: Two\n---\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(30)).unwrap();
+
+        fs::remove_dir_all(directory.path().join("gone")).unwrap();
+        let mut deleted = BTreeSet::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while deleted.len() < 2 && Instant::now() < deadline {
+            if let Some(event) = watcher.recv_timeout(Duration::from_millis(100)).unwrap() {
+                assert_eq!(event.event_type, "mdbase.record.deleted");
+                deleted.insert(event.payload["path"].as_str().unwrap().to_string());
+            }
+        }
+        assert_eq!(
+            deleted,
+            BTreeSet::from(["gone/nested/two.md".to_string(), "gone/one.md".to_string()])
+        );
+        assert!(watcher
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap()
+            .is_none());
     }
 
     #[cfg(unix)]
     #[test]
-    fn watcher_does_not_read_through_symlink_poison() {
+    fn watcher_rejects_tracked_symlink_replacements_and_keeps_converging() {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
@@ -1138,26 +1363,70 @@ mod tests {
             "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
         )
         .unwrap();
+        let marker = "EXTERNAL_MARKER_MUST_NOT_BE_READ";
         fs::write(
             outside.path().join("poison.md"),
-            "---\ntitle: Poison\n---\n",
+            format!("---\ntitle: Poison\nmarker: {marker}\n---\n"),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("tracked.md"),
+            "---\ntitle: Tracked\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("dangling.md"),
+            "---\ntitle: Dangling\n---\n",
         )
         .unwrap();
         let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(30)).unwrap();
 
-        symlink(outside.path(), directory.path().join("linked")).unwrap();
+        fs::remove_file(directory.path().join("tracked.md")).unwrap();
+        symlink(
+            outside.path().join("poison.md"),
+            directory.path().join("tracked.md"),
+        )
+        .unwrap();
+        fs::remove_file(directory.path().join("dangling.md")).unwrap();
+        symlink(
+            outside.path().join("missing.md"),
+            directory.path().join("dangling.md"),
+        )
+        .unwrap();
         fs::write(
             directory.path().join("unrelated.md"),
             "---\ntitle: Safe\n---\n",
         )
         .unwrap();
 
-        let event = watcher
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .expect("unrelated record event");
-        assert_eq!(event.event_type, "mdbase.record.created");
-        assert_eq!(event.payload["path"], "unrelated.md");
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while events.len() < 3 && Instant::now() < deadline {
+            if let Some(event) = watcher.recv_timeout(Duration::from_millis(100)).unwrap() {
+                assert!(!event.payload.to_string().contains(marker));
+                events.push((event.event_type, event.payload));
+            }
+        }
+        assert_eq!(
+            events
+                .iter()
+                .map(|(kind, payload)| (kind.as_str(), payload["path"].as_str().unwrap()))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                ("mdbase.record.deleted", "dangling.md"),
+                ("mdbase.record.deleted", "tracked.md"),
+                ("mdbase.record.created", "unrelated.md"),
+            ])
+        );
+        fs::write(
+            directory.path().join("continued.md"),
+            "---\ntitle: Continued\n---\n",
+        )
+        .unwrap();
+        watcher.rescan_paths(["continued.md"]).unwrap();
+        let continued = watcher.recv_timeout(Duration::ZERO).unwrap().unwrap();
+        assert_eq!(continued.payload["path"], "continued.md");
+        assert!(!continued.payload.to_string().contains(marker));
         assert!(watcher
             .recv_timeout(Duration::from_millis(200))
             .unwrap()
@@ -1199,10 +1468,30 @@ mod tests {
                 .and_then(Value::as_str),
             Some("collection_reload_failed")
         );
-        assert!(watcher
-            .recv_timeout(Duration::from_millis(900))
-            .unwrap()
-            .is_none());
+        let (waiter, waiter_rx) = mpsc::sync_channel(0);
+        watcher
+            .commands
+            .send(WorkerInput::Command(Command::Rescan(waiter)))
+            .unwrap();
+        let churn_until = Instant::now() + Duration::from_millis(900);
+        let mut index = 0;
+        while Instant::now() < churn_until {
+            let hidden = directory.path().join(format!(".hidden-{index}"));
+            fs::create_dir(&hidden).unwrap();
+            fs::write(hidden.join("state.json"), b"ignored").unwrap();
+            fs::write(
+                directory.path().join(format!("attachment-{index}.bin")),
+                b"binary",
+            )
+            .unwrap();
+            fs::remove_dir_all(hidden).unwrap();
+            index += 1;
+            thread::sleep(Duration::from_millis(15));
+        }
+        assert!(
+            waiter_rx.try_recv().is_err(),
+            "failed refresh waiter settled early"
+        );
 
         fs::remove_file(directory.path().join("mdbase.yaml")).unwrap();
         fs::write(directory.path().join("mdbase.yaml"), config).unwrap();
@@ -1229,6 +1518,9 @@ mod tests {
             BTreeSet::from(["fresh.md".to_string(), "pending.md".to_string()])
         );
         assert_eq!(diagnostics, 1);
+        waiter_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retained waiter completes after recovery");
     }
 
     #[test]
