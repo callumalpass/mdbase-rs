@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 use super::lifecycle::LifecycleEvent;
 use super::Diagnostic;
 use crate::frontmatter::parser::{
-    is_parse_error, json_to_yaml_mapping, parse_document, yaml_mapping_to_json,
+    is_parse_error, json_to_yaml_mapping, parse_document_for_rewrite, yaml_mapping_to_json,
 };
 use crate::frontmatter::serializer;
 use crate::{Collection, SpecProfile};
@@ -649,8 +649,8 @@ impl<'a> Operations<'a> {
             .cloned()
             .unwrap_or_default();
         let candidate_document = input.get("document").and_then(Value::as_str);
-        let candidate = candidate_document.map(parse_document);
-        let draft = if let Some(candidate) = candidate.as_ref() {
+        let candidate = candidate_document.map(parse_document_for_rewrite);
+        let draft = if let Some((candidate, _)) = candidate.as_ref() {
             match candidate.frontmatter.as_ref() {
                 Some(frontmatter) if is_parse_error(frontmatter) => {
                     return Err(vec![Diagnostic::error(
@@ -697,13 +697,13 @@ impl<'a> Operations<'a> {
         ensure_membership_unchanged(self.collection, &type_names, &lifecycle_draft, path)?;
 
         let mut normalized = input.as_object().cloned().unwrap_or_default();
-        if let Some(candidate) = candidate {
+        if let Some((candidate, had_bom)) = candidate {
             if lifecycle_draft != draft {
                 let frontmatter = json_to_yaml_mapping(&Value::Object(lifecycle_draft));
                 normalized.insert(
                     "document".to_string(),
                     Value::String(serializer::serialize_document_with_bom(
-                        candidate.had_bom,
+                        had_bom,
                         &frontmatter,
                         &candidate.body,
                     )),

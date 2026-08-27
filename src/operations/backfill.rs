@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::errors::*;
-use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
+use crate::frontmatter::parser::{parse_document_for_rewrite, yaml_mapping_to_json};
 use crate::frontmatter::serializer;
 use crate::types::schema::GeneratedStrategy;
 use crate::Collection;
@@ -90,7 +90,7 @@ impl Collection {
                     continue;
                 }
             };
-            let doc = parse_document(&content);
+            let (doc, had_bom) = parse_document_for_rewrite(&content);
             let raw_frontmatter = match &doc.frontmatter {
                 Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
                 _ => serde_json::json!({}),
@@ -235,7 +235,7 @@ impl Collection {
             plans.push(BackfillPlan {
                 path: path.to_string(),
                 body: doc.body.clone(),
-                had_bom: doc.had_bom,
+                had_bom,
                 write_obj,
                 changed_fields: changes.keys().cloned().collect(),
             });

@@ -57,11 +57,11 @@ fn bom_prefixed_frontmatter_parses_title_fields_and_body() {
     let fm = parsed.frontmatter.expect("frontmatter present");
     let mapping = fm.as_mapping().expect("frontmatter is a mapping");
     let title = mapping
-        .get(&serde_yaml::Value::String("title".into()))
+        .get(serde_yaml::Value::String("title".into()))
         .and_then(|v| v.as_str());
     assert_eq!(title, Some("Original"));
     let status = mapping
-        .get(&serde_yaml::Value::String("status".into()))
+        .get(serde_yaml::Value::String("status".into()))
         .and_then(|v| v.as_str());
     assert_eq!(status, Some("draft"));
     assert_eq!(parsed.body, "\nBody paragraph.\n");
@@ -138,13 +138,13 @@ fn patch_update_preserves_bom_with_exactly_one_frontmatter_block() {
     let mapping = fm.as_mapping().expect("mapping");
     assert_eq!(
         mapping
-            .get(&serde_yaml::Value::String("title".into()))
+            .get(serde_yaml::Value::String("title".into()))
             .and_then(|v| v.as_str()),
         Some("Updated")
     );
     assert_eq!(
         mapping
-            .get(&serde_yaml::Value::String("status".into()))
+            .get(serde_yaml::Value::String("status".into()))
             .and_then(|v| v.as_str()),
         Some("final")
     );
@@ -178,10 +178,109 @@ fn no_bom_control_round_trips_without_introducing_a_bom() {
     let mapping = fm.as_mapping().expect("mapping");
     assert_eq!(
         mapping
-            .get(&serde_yaml::Value::String("title".into()))
+            .get(serde_yaml::Value::String("title".into()))
             .and_then(|v| v.as_str()),
         Some("Updated")
     );
+}
+
+#[test]
+fn backfill_preserves_one_original_bom() {
+    let tmp = TempDir::new().expect("tempdir");
+    write_file(
+        &tmp.path().join("mdbase.yaml"),
+        "spec_version: 0.2.1\nsettings:\n  write_defaults: true\n",
+    );
+    write_file(
+        &tmp.path().join("_types/task.md"),
+        "---\nname: task\nfields:\n  title: { type: string }\n  status: { type: string, default: open }\n---\n",
+    );
+    write_file(
+        &tmp.path().join("task.md"),
+        &format!("{BOM}---\ntype: task\ntitle: One\n---\nBody\n"),
+    );
+    let collection = mdbase::Collection::open(tmp.path()).unwrap();
+    let result = collection.backfill(&serde_json::json!({"type": "task"}));
+    assert!(result.get("error").is_none(), "{result:?}");
+    let raw = fs::read_to_string(tmp.path().join("task.md")).unwrap();
+    assert!(raw.starts_with(BOM));
+    assert_eq!(raw.matches(BOM).count(), 1);
+    assert!(raw.contains("status: open"));
+}
+
+#[test]
+fn canonical_v03_lifecycle_rewrite_preserves_bom() {
+    let tmp = TempDir::new().expect("tempdir");
+    write_file(&tmp.path().join("mdbase.yaml"), "spec_version: 0.3.0\n");
+    write_file(
+        &tmp.path().join("_types/task.md"),
+        "---\nkind: mdbase.type\nname: task\nversion: 1\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    properties:\n      type: { const: task }\n      title: { type: string }\n      touched: { type: boolean }\nlifecycle:\n  on_update:\n    set:\n      touched: { literal: true }\n---\n",
+    );
+    write_file(
+        &tmp.path().join("task.md"),
+        &format!("{BOM}---\ntype: task\ntitle: Old\n---\nBody\n"),
+    );
+    let collection = mdbase::Collection::open(tmp.path()).unwrap();
+    let operations = collection.v03_operations().unwrap();
+    let result = operations.update(&serde_json::json!({
+        "path": "task.md",
+        "document": format!("{BOM}---\ntype: task\ntitle: New\n---\nBody\n")
+    }));
+    assert!(result.valid, "{result:?}");
+    let raw = fs::read_to_string(tmp.path().join("task.md")).unwrap();
+    assert!(raw.starts_with(BOM));
+    assert_eq!(raw.matches(BOM).count(), 1);
+    assert!(raw.contains("touched: true"));
+}
+
+#[test]
+fn exact_replacement_preserves_replacement_bytes_and_bom() {
+    let tmp = TempDir::new().expect("tempdir");
+    let collection = setup_collection(tmp.path());
+    write_file(&tmp.path().join("note.md"), "---\ntitle: Old\n---\nOld\n");
+    let replacement = format!("{BOM}---\ntitle: New\n---\nNew\n");
+    let result = collection.update(&serde_json::json!({
+        "path": "note.md",
+        "document": replacement,
+    }));
+    assert!(result.get("error").is_none(), "{result:?}");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("note.md")).unwrap(),
+        replacement
+    );
+}
+
+#[test]
+fn malformed_frontmatter_keeps_bom_transparent_to_structure() {
+    let parsed =
+        mdbase::frontmatter::parser::parse_document(&format!("{BOM}---\ninvalid: [\n---\nBody\n"));
+    assert!(parsed.has_frontmatter);
+    assert_eq!(parsed.body, "Body\n");
+    assert!(parsed.frontmatter.is_some());
+}
+
+#[test]
+fn two_leading_boms_strip_only_the_encoding_marker() {
+    let source = format!("{BOM}{BOM}---\ntitle: Hidden\n---\nBody\n");
+    let parsed = mdbase::frontmatter::parser::parse_document(&source);
+    assert!(!parsed.has_frontmatter);
+    assert!(parsed.body.starts_with(BOM));
+}
+
+#[test]
+fn parsed_document_public_layout_remains_constructible_and_destructurable() {
+    use mdbase::frontmatter::parser::ParsedDocument;
+    let value = ParsedDocument {
+        frontmatter: None,
+        body: String::new(),
+        has_frontmatter: false,
+    };
+    let ParsedDocument {
+        frontmatter,
+        body,
+        has_frontmatter,
+    } = value;
+    assert!(frontmatter.is_none() && body.is_empty() && !has_frontmatter);
 }
 
 #[test]
