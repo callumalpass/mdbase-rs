@@ -180,6 +180,56 @@ fn ordinary_explicit_update_cannot_change_to_equal_implicit_authority() {
     assert_eq!(fs::read(root.path().join("ordinary.md")).unwrap(), before);
 }
 
+#[test]
+fn batch_authority_failure_commits_neither_failed_record_nor_sibling() {
+    let root = fixture("kind");
+    authority_erasing_type(root.path());
+    write(root.path(), "_types/aux.md", "---\nkind: mdbase.type\nname: aux\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\n---\n");
+    let collection = Collection::open(root.path()).unwrap();
+    let result = collection.v03_operations().unwrap().batch(&json!({
+        "operations": [
+            {"kind":"create","input":{"path":"sibling.md","frontmatter":{"kind":"aux","title":"sibling"}}},
+            {"kind":"create","input":{"path":"failed.md","type":"note","frontmatter":{"title":"same"}}}
+        ]
+    }));
+    assert!(!result.valid, "{result:#?}");
+    assert!(!root.path().join("sibling.md").exists());
+    assert!(!root.path().join("failed.md").exists());
+}
+
+#[test]
+fn explicit_membership_succeeds_with_non_default_timezone() {
+    let root = fixture("kind");
+    write(root.path(), "mdbase.yaml", "spec_version: \"0.3.0\"\nsettings:\n  contracts_folder: contracts\n  explicit_type_keys: [kind]\n  timezone: Pacific/Auckland\n");
+    let collection = Collection::open(root.path()).unwrap();
+    let result = collection.v03_operations().unwrap().create(&json!({
+        "path":"zoned.md", "frontmatter":{"kind":"note","title":"zoned"}
+    }));
+    assert!(result.valid, "{result:#?}");
+    assert!(root.path().join("zoned.md").exists());
+}
+
+#[test]
+fn legacy_v02_create_and_update_keep_implicit_matching_and_output() {
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "mdbase.yaml", "spec_version: 0.2.0\n");
+    write(root.path(), "_types/note.md", "---\nname: note\nmatch:\n  fields_present: [title]\nfields:\n  title: { type: string }\n---\n");
+    let collection = Collection::open(root.path()).unwrap();
+    let created = collection
+        .create(&json!({"path":"legacy.md","frontmatter":{"title":"Before"},"body":"Body\n"}));
+    assert!(created.get("error").is_none(), "{created:#?}");
+    assert_eq!(
+        fs::read_to_string(root.path().join("legacy.md")).unwrap(),
+        "---\ntitle: Before\n---\nBody\n"
+    );
+    let updated = collection.update(&json!({"path":"legacy.md","fields":{"title":"After"}}));
+    assert!(updated.get("error").is_none(), "{updated:#?}");
+    assert_eq!(
+        fs::read_to_string(root.path().join("legacy.md")).unwrap(),
+        "---\ntitle: After\n---\nBody\n"
+    );
+}
+
 fn add_throwing_type(root: &Path, name: &str) {
     write(
         root,

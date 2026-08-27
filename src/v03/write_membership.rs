@@ -119,7 +119,9 @@ impl ResolvedWriteMembership {
             match explicit_membership(collection, raw, path) {
                 Ok(classified) => classified,
                 Err(_) if self.initially_explicit => {
-                    return Err(vec![authority_changed(path, &self.types, &[])]);
+                    let after = implicit_membership(collection, raw, path, &self.evaluation_clock)
+                        .unwrap_or_default();
+                    return Err(vec![authority_changed(path, &self.types, &after)]);
                 }
                 Err(errors) => return Err(errors),
             };
@@ -389,7 +391,21 @@ fn implicit_membership(
     Ok(types)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CLOCKS: std::cell::RefCell<Vec<EvaluationClock>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TEST_CLOCK_CAPTURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn capture_clock(collection: &Collection, path: &str) -> Result<EvaluationClock, Vec<Diagnostic>> {
+    #[cfg(test)]
+    if let Some(clock) = TEST_CLOCKS.with(|clocks| {
+        let mut clocks = clocks.borrow_mut();
+        (!clocks.is_empty()).then(|| clocks.remove(0))
+    }) {
+        TEST_CLOCK_CAPTURES.with(|captures| captures.set(captures.get() + 1));
+        return Ok(clock);
+    }
     super::cel::operation_clock(collection.settings.timezone.as_deref()).map_err(|failure| {
         vec![diagnostic(
             failure.code,
@@ -586,4 +602,61 @@ pub(crate) fn diagnostics_error(diagnostics: Vec<Diagnostic>) -> Value {
         .map(|d| d.message.as_str())
         .unwrap_or("Operation failed.");
     serde_json::json!({"error":{"code":code,"message":message,"issues":diagnostics}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+    use std::fs;
+
+    #[test]
+    fn explicit_authority_fallback_reuses_the_single_injected_operation_clock() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  explicit_type_keys: [kind]\n  timezone: UTC\n",
+        )
+        .unwrap();
+        fs::create_dir(root.path().join("_types")).unwrap();
+        fs::write(
+            root.path().join("_types/note.md"),
+            "---\nkind: mdbase.type\nname: note\nmatch:\n  expr:\n    $expr: 'today() == \"2020-01-01\"'\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\nlifecycle:\n  on_create:\n    set: { kind: { literal: null } }\n---\n",
+        )
+        .unwrap();
+        TEST_CLOCKS.with(|clocks| {
+            *clocks.borrow_mut() = vec![
+                EvaluationClock::from_utc(
+                    Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap(),
+                    Some("UTC"),
+                )
+                .unwrap(),
+                EvaluationClock::from_utc(
+                    Utc.with_ymd_and_hms(2020, 1, 2, 12, 0, 0).unwrap(),
+                    Some("UTC"),
+                )
+                .unwrap(),
+            ];
+        });
+        TEST_CLOCK_CAPTURES.with(|captures| captures.set(0));
+
+        let collection = Collection::open(root.path()).unwrap();
+        let result = collection.v03_operations().unwrap().create(&json!({
+            "path":"clock.md", "type":"note", "frontmatter":{}
+        }));
+        assert!(!result.valid, "{result:#?}");
+        assert_eq!(
+            result.diagnostics[0].code,
+            "type_membership_authority_changed"
+        );
+        assert_eq!(
+            result.diagnostics[0].details.as_ref().unwrap()["after"],
+            json!(["note"])
+        );
+        assert_eq!(TEST_CLOCK_CAPTURES.with(|captures| captures.get()), 1);
+        assert_eq!(TEST_CLOCKS.with(|clocks| clocks.borrow().len()), 1);
+        assert!(!root.path().join("clock.md").exists());
+        TEST_CLOCKS.with(|clocks| clocks.borrow_mut().clear());
+    }
 }
