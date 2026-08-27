@@ -532,12 +532,17 @@ impl Snapshot {
             return None;
         }
         // FSEvents and other coalescing backends can report the watched root
-        // rather than a changed leaf. An empty relative path is collection-wide,
-        // not irrelevant, so reconcile authoritatively.
-        if event.paths.iter().any(|path| {
-            path.strip_prefix(root)
-                .is_ok_and(|relative| relative.as_os_str().is_empty())
-        }) {
+        // rather than a changed leaf, and may canonicalize an aliased root (for
+        // example `/var` to `/private/var`). Empty or non-relative backend paths
+        // are collection-wide, not irrelevant, so reconcile authoritatively.
+        if event
+            .paths
+            .iter()
+            .any(|path| match path.strip_prefix(root) {
+                Ok(relative) => relative.as_os_str().is_empty(),
+                Err(_) => true,
+            })
+        {
             return None;
         }
 
@@ -950,6 +955,13 @@ mod tests {
 
         for event in [
             Event::new(EventKind::Modify(ModifyKind::Any)).add_path(directory.path().to_path_buf()),
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(
+                directory
+                    .path()
+                    .parent()
+                    .unwrap()
+                    .join("reported-root-alias"),
+            ),
             Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)))
                 .add_path(directory.path().join("old"))
                 .add_path(directory.path().join("new")),
