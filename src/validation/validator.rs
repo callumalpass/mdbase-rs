@@ -223,6 +223,14 @@ fn invalid_record_validation(path: &str, reason: &str) -> serde_json::Value {
     })
 }
 
+fn file_read_validation(path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "valid": false,
+        "path": path,
+        "issues": [crate::errors::issue_to_json(&file_read_issue(path))],
+    })
+}
+
 impl Collection {
     /// Validate frontmatter against matched types.
     pub(crate) fn validate(
@@ -529,9 +537,7 @@ impl Collection {
                     Ok(crate::record_load::RecordLoadOutcome::Invalid { reason, .. }) => {
                         return invalid_record_validation(path, reason.as_str());
                     }
-                    Err(_) => {
-                        return crate::errors::op_error(INVALID_FRONTMATTER, "Failed to read file");
-                    }
+                    Err(_) => return file_read_validation(path),
                 }
             };
 

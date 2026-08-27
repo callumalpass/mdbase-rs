@@ -188,6 +188,18 @@ fn full_validation_reports_yaml_and_binary_without_aborting_siblings() {
 }
 
 #[test]
+fn targeted_validation_preserves_file_read_failed_outcome() {
+    let (root, collection) = collection();
+    fs::create_dir(root.path().join("unreadable.md")).unwrap();
+
+    let result = collection.validate_op(&json!({"path": "unreadable.md"}));
+    assert_eq!(result["valid"], false, "{result:#}");
+    assert_eq!(result["path"], "unreadable.md");
+    assert_eq!(result["issues"][0]["code"], "file_read_failed");
+    assert_ne!(result["issues"][0]["code"], "invalid_frontmatter");
+}
+
+#[test]
 fn cache_commits_invalid_rows_and_repair_converges_to_parsed_state() {
     let (root, collection) = collection();
     assert_eq!(collection.cache_rebuild()["success"], true);
