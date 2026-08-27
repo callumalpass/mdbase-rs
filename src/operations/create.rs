@@ -30,6 +30,16 @@ impl Collection {
         input: &serde_json::Value,
         membership: Option<crate::v03::write_membership::ResolvedWriteMembership>,
     ) -> serde_json::Value {
+        let raw_document = membership.as_ref().and_then(|_| {
+            input
+                .get("document")
+                .and_then(serde_json::Value::as_str)
+                .map(|source| {
+                    let (document, had_bom) =
+                        crate::frontmatter::parser::parse_document_for_rewrite(source);
+                    (source.to_string(), document, had_bom)
+                })
+        });
         let input = CreateInput::parse(input);
         let type_name = input.type_name.as_deref();
         let frontmatter_input = input.frontmatter;
@@ -269,7 +279,25 @@ impl Collection {
         // Write file
         let yaml_mapping =
             frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
-        let content = serializer::serialize_document(&yaml_mapping, body);
+        let content = match raw_document {
+            Some((source, candidate, had_bom)) => {
+                let candidate_mapping = match candidate.frontmatter.as_ref() {
+                    Some(serde_yaml::Value::Mapping(mapping)) => Some(mapping),
+                    None => None,
+                    _ => unreachable!("prepared raw create has mapping frontmatter"),
+                };
+                let mapping_unchanged = candidate_mapping.map_or_else(
+                    || yaml_mapping.is_empty(),
+                    |mapping| mapping == &yaml_mapping,
+                );
+                if mapping_unchanged && candidate.body == body {
+                    source
+                } else {
+                    serializer::serialize_document_with_bom(had_bom, &yaml_mapping, body)
+                }
+            }
+            None => serializer::serialize_document(&yaml_mapping, body),
+        };
 
         if let Err(error) =
             ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)

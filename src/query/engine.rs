@@ -232,6 +232,17 @@ impl Collection {
                 return crate::errors::op_error("collection_snapshot_failed", &error.to_string())
             }
         };
+        // The legacy query envelope retains its fail-closed snapshot behavior.
+        // Canonical v0.3 queries consume bounded invalid-record stubs instead.
+        if let Some(invalid) = snapshot.invalid_records.first() {
+            return crate::errors::op_error(
+                "collection_snapshot_failed",
+                &format!(
+                    "failed to read collection file '{}': {}",
+                    invalid.rel_path, invalid.reason
+                ),
+            );
+        }
         let file_records = snapshot.records;
         let all_files_arc = snapshot.all_files;
         let backlinks_arc = snapshot.backlinks;

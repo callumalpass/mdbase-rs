@@ -8,7 +8,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::expressions::evaluator::ResolvedFileData;
-use crate::query::cache_source::FileRecord;
+use crate::query::cache_source::{FileRecord, InvalidRecordStub};
 
 /// A consistent set of records loaded for one read operation.
 ///
@@ -16,6 +16,7 @@ use crate::query::cache_source::FileRecord;
 /// Cache failures are handled before this value is constructed.
 pub(crate) struct CollectionSnapshot {
     pub records: Vec<FileRecord>,
+    pub invalid_records: Vec<InvalidRecordStub>,
     pub all_files: Option<Arc<Vec<ResolvedFileData>>>,
     pub backlinks: Option<Arc<HashMap<String, Vec<String>>>>,
 }
@@ -65,18 +66,6 @@ pub(crate) enum SnapshotError {
         #[source]
         source: io::Error,
     },
-    #[error("failed to inspect collection file '{}': {source}", path.display())]
-    InspectFile {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to read modification time for '{}': {source}", path.display())]
-    ReadModifiedTime {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
 }
 
 impl SnapshotError {
@@ -87,9 +76,7 @@ impl SnapshotError {
             | Self::Scan(CollectionScanError::InspectEntry { path, .. })
             | Self::Scan(CollectionScanError::OutsideRoot { path })
             | Self::OutsideRoot { path }
-            | Self::ReadFile { path, .. }
-            | Self::InspectFile { path, .. }
-            | Self::ReadModifiedTime { path, .. } => Some(path),
+            | Self::ReadFile { path, .. } => Some(path),
             Self::Scan(CollectionScanError::ReadEntry { directory, .. }) => Some(directory),
         }
     }

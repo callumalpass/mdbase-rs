@@ -10,7 +10,7 @@ use super::model::{Candidate, Query};
 use super::preflight::{self, CompiledSelection};
 use super::result::{build_groups, compare_values, serialize_candidate, sort_candidates};
 use crate::expressions::evaluator::resolve_execution_timezone;
-use crate::query::cache_source::FileRecord;
+use crate::query::cache_source::{InvalidRecordStub, LocalRecord};
 use crate::v03::{cel, validate_query, Diagnostic, OperationResult};
 use crate::{Collection, OperationCancellation, OperationCancelled};
 
@@ -248,24 +248,34 @@ fn execute_profiled_cancellable(
             )]));
         }
     };
-    let records = snapshot.records;
+    let local_records = snapshot
+        .records
+        .into_iter()
+        .map(LocalRecord::Parsed)
+        .chain(
+            snapshot
+                .invalid_records
+                .into_iter()
+                .map(LocalRecord::Invalid),
+        )
+        .collect::<Vec<_>>();
     let all_files = snapshot.all_files;
     let backlinks = snapshot.backlinks;
     performance.load_us = micros(phase.elapsed());
     if let Some(load) = load_profile {
         apply_load_performance(&mut performance, &load);
     } else {
-        performance.records_loaded = records.len();
+        performance.records_loaded = local_records.len();
     }
     cancellation.check()?;
 
     if metadata_page_plan {
         let phase = Instant::now();
-        let mut ordered = records
+        let mut ordered = local_records
             .iter()
             .filter(|record| {
                 compiled.query.types.is_empty()
-                    || record.type_names.iter().any(|actual| {
+                    || record.types().iter().any(|actual| {
                         compiled
                             .query
                             .types
@@ -285,7 +295,7 @@ fn execute_profiled_cancellable(
                     return comparison;
                 }
             }
-            left.rel_path.cmp(&right.rel_path)
+            left.path().cmp(right.path())
         });
         performance.sort_us = micros(phase.elapsed());
         performance.candidates = ordered.len();
@@ -317,6 +327,13 @@ fn execute_profiled_cancellable(
         finish!(result);
     }
 
+    let records = local_records
+        .iter()
+        .filter_map(|record| match record {
+            LocalRecord::Parsed(record) => Some(record),
+            LocalRecord::Invalid(_) => None,
+        })
+        .collect::<Vec<_>>();
     let type_definitions = Arc::new(collection.types.clone());
     let phase = Instant::now();
     let context = match load_context(
@@ -548,7 +565,7 @@ fn apply_load_performance(
 fn build_metadata_page_result(
     collection: &Collection,
     compiled: &preflight::CompiledQuery,
-    records: &[&FileRecord],
+    records: &[&LocalRecord],
     total_count: usize,
     has_more: bool,
     performance: &mut QueryPerformance,
@@ -558,6 +575,13 @@ fn build_metadata_page_result(
     let results = records
         .iter()
         .map(|record| {
+            let LocalRecord::Parsed(record) = record else {
+                let LocalRecord::Invalid(stub) = record else {
+                    unreachable!()
+                };
+                query_diagnostics.push(diagnostics::invalid_record(&stub.rel_path, &stub.reason));
+                return serialize_invalid_stub(stub);
+            };
             let (types, failures) = collection
                 .determine_types_for_path_checked(&record.raw_frontmatter, Some(&record.rel_path));
             query_diagnostics.extend(failures.into_iter().map(|(type_name, failure)| {
@@ -616,32 +640,55 @@ fn millis_to_micros(milliseconds: f64) -> u64 {
     (milliseconds * 1_000.0).min(u64::MAX as f64) as u64
 }
 
-fn record_metadata_value(record: &FileRecord, field: &str) -> Value {
+fn serialize_invalid_stub(stub: &InvalidRecordStub) -> Value {
+    json!({
+        "path": stub.rel_path,
+        "types": stub.type_names,
+        "file": {
+            "path": stub.rel_path,
+            "name": std::path::Path::new(&stub.rel_path).file_name().and_then(|value| value.to_str()).unwrap_or(""),
+            "folder": std::path::Path::new(&stub.rel_path).parent().and_then(|value| value.to_str()).unwrap_or(""),
+            "size": stub.file_size,
+            "mtime": stub.file_mtime_iso,
+            "ctime": stub.file_ctime_iso,
+            "revision": stub.source_revision,
+        }
+    })
+}
+
+fn record_metadata_value(record: &LocalRecord, field: &str) -> Value {
     match field {
-        "file.path" => Value::String(record.rel_path.clone()),
+        "file.path" => Value::String(record.path().to_string()),
         "file.name" => Value::String(
-            std::path::Path::new(&record.rel_path)
+            std::path::Path::new(record.path())
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or("")
                 .to_string(),
         ),
         "file.folder" => Value::String(
-            std::path::Path::new(&record.rel_path)
+            std::path::Path::new(record.path())
                 .parent()
                 .and_then(|value| value.to_str())
                 .unwrap_or("")
                 .to_string(),
         ),
-        "file.size" => json!(record.file_size),
-        "file.mtime" => record
-            .file_mtime_iso
-            .as_ref()
-            .map_or(Value::Null, |value| Value::String(value.clone())),
-        "file.ctime" => record
-            .file_ctime_iso
-            .as_ref()
-            .map_or(Value::Null, |value| Value::String(value.clone())),
+        "file.size" => json!(match record {
+            LocalRecord::Parsed(record) => record.file_size,
+            LocalRecord::Invalid(stub) => stub.file_size,
+        }),
+        "file.mtime" => match record {
+            LocalRecord::Parsed(record) => &record.file_mtime_iso,
+            LocalRecord::Invalid(stub) => &stub.file_mtime_iso,
+        }
+        .as_ref()
+        .map_or(Value::Null, |value| Value::String(value.clone())),
+        "file.ctime" => match record {
+            LocalRecord::Parsed(record) => &record.file_ctime_iso,
+            LocalRecord::Invalid(stub) => &stub.file_ctime_iso,
+        }
+        .as_ref()
+        .map_or(Value::Null, |value| Value::String(value.clone())),
         _ => Value::Null,
     }
 }

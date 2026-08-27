@@ -32,6 +32,17 @@ fn init_schema(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "files", "ctime_ns")? {
         conn.execute_batch("ALTER TABLE files ADD COLUMN ctime_ns INTEGER;")?;
     }
+    if !table_has_column(conn, "files", "source_revision")? {
+        conn.execute_batch(
+            "ALTER TABLE files ADD COLUMN source_revision TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    if !table_has_column(conn, "files", "failure_reason")? {
+        conn.execute_batch("ALTER TABLE files ADD COLUMN failure_reason TEXT;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_files_failure_reason ON files(failure_reason) WHERE failure_reason IS NOT NULL;",
+    )?;
     if !table_has_column(conn, "links", "source_revision")? {
         conn.execute_batch(
             "ALTER TABLE links ADD COLUMN source_revision TEXT NOT NULL DEFAULT '';",

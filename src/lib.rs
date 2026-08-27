@@ -28,6 +28,7 @@ pub mod links;
 pub mod matching;
 pub mod operations;
 pub mod query;
+pub(crate) mod record_load;
 pub mod record_path;
 pub mod runtime;
 pub(crate) mod snapshot;

@@ -6,7 +6,9 @@ CREATE TABLE IF NOT EXISTS files (
     frontmatter_json TEXT NOT NULL,
     body TEXT NOT NULL,
     effective_json TEXT,
-    parse_error INTEGER DEFAULT 0
+    parse_error INTEGER DEFAULT 0,
+    source_revision TEXT NOT NULL DEFAULT '',
+    failure_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS file_types (
