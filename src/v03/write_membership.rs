@@ -10,7 +10,8 @@ pub(crate) struct ResolvedWriteMembership {
     types: Vec<String>,
     path_type: Option<String>,
     designated_contract_type: Option<String>,
-    evaluation_clock: Option<EvaluationClock>,
+    initially_explicit: bool,
+    evaluation_clock: EvaluationClock,
 }
 
 impl ResolvedWriteMembership {
@@ -36,12 +37,11 @@ impl ResolvedWriteMembership {
         let requested = requested_type(collection, input, path)?;
         let designated = resolve_contract(collection, input, requested.as_deref(), path)?;
         let selected = designated.as_ref().or(requested.as_ref());
+        let initially_explicit = declarations_present || selected.is_some();
 
-        let evaluation_clock = if declarations_present || selected.is_some() {
-            None
-        } else {
-            Some(capture_clock(collection, path)?)
-        };
+        // Freeze one clock even for explicit authority. If a later stage erases the
+        // declaration, the diagnostic classification must not observe a new time.
+        let evaluation_clock = capture_clock(collection, path)?;
         let mut types = if declarations_present || selected.is_some() {
             if let Some(name) = selected {
                 explicit.push(name.clone());
@@ -49,7 +49,7 @@ impl ResolvedWriteMembership {
             canonicalize(&mut explicit);
             explicit
         } else {
-            implicit_membership(collection, draft, path, evaluation_clock.as_ref().unwrap())?
+            implicit_membership(collection, draft, path, &evaluation_clock)?
         };
 
         if let Some(name) = selected {
@@ -62,7 +62,7 @@ impl ResolvedWriteMembership {
                 )]);
             }
             persist_selected(collection, draft, name, path)?;
-            let reopened = match classify(collection, draft, path, None) {
+            let reopened = match classify(collection, draft, path, Some(&evaluation_clock)) {
                 Ok(reopened) => reopened,
                 Err(_) if collection.settings.explicit_type_keys.is_empty() => {
                     return Err(vec![persistence_failure(
@@ -89,6 +89,7 @@ impl ResolvedWriteMembership {
             types,
             path_type: selected.cloned(),
             designated_contract_type: designated,
+            initially_explicit,
             evaluation_clock,
         })
     }
@@ -103,7 +104,8 @@ impl ResolvedWriteMembership {
             types: classify(collection, draft, path, Some(&clock))?,
             path_type: None,
             designated_contract_type: None,
-            evaluation_clock: Some(clock),
+            initially_explicit: explicit_membership(collection, draft, path)?.1,
+            evaluation_clock: clock,
         })
     }
 
@@ -113,7 +115,22 @@ impl ResolvedWriteMembership {
         raw: &Map<String, Value>,
         path: &str,
     ) -> Result<(), Vec<Diagnostic>> {
-        let after = classify(collection, raw, path, self.evaluation_clock.as_ref())?;
+        let (explicit_after, declarations_present) =
+            match explicit_membership(collection, raw, path) {
+                Ok(classified) => classified,
+                Err(_) if self.initially_explicit => {
+                    return Err(vec![authority_changed(path, &self.types, &[])]);
+                }
+                Err(errors) => return Err(errors),
+            };
+        let after = if declarations_present {
+            explicit_after
+        } else {
+            implicit_membership(collection, raw, path, &self.evaluation_clock)?
+        };
+        if self.initially_explicit && !declarations_present {
+            return Err(vec![authority_changed(path, &self.types, &after)]);
+        }
         if after != self.types {
             return Err(vec![changed(
                 "type_membership_changed",
@@ -508,6 +525,27 @@ fn contract_diagnostic(
     );
     d
 }
+fn authority_changed(path: &str, before: &[String], after: &[String]) -> Diagnostic {
+    let mut diagnostic = changed(
+        "type_membership_authority_changed",
+        "Lifecycle or generated values removed authoritative explicit type membership.",
+        path,
+        before,
+        after,
+    );
+    if let Some(Value::Object(details)) = &mut diagnostic.details {
+        details.insert(
+            "before_authority".to_string(),
+            Value::String("explicit".to_string()),
+        );
+        details.insert(
+            "after_authority".to_string(),
+            Value::String("implicit".to_string()),
+        );
+    }
+    diagnostic
+}
+
 fn persistence_failure(
     path: &str,
     before: &[String],

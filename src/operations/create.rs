@@ -164,12 +164,6 @@ impl Collection {
             );
         }
 
-        if let Some(membership) = &membership {
-            if let Err(diagnostics) = membership.revalidate(self, &fm_obj, path.as_str()) {
-                return crate::v03::write_membership::diagnostics_error(diagnostics);
-            }
-        }
-
         // Apply defaults for effective frontmatter (for validation and output)
         let effective =
             self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
@@ -265,6 +259,11 @@ impl Collection {
         }
         if self.settings.write_nulls == "omit" {
             write_obj.retain(|_, v| !v.is_null());
+        }
+        if let Some(membership) = &membership {
+            if let Err(diagnostics) = membership.revalidate(self, &write_obj, path.as_str()) {
+                return crate::v03::write_membership::diagnostics_error(diagnostics);
+            }
         }
 
         // Write file

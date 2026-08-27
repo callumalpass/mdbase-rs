@@ -85,6 +85,101 @@ fn malformed_contract_envelopes_never_create_a_file() {
     }
 }
 
+fn authority_erasing_type(root: &Path) {
+    write(
+        root,
+        "mdbase.yaml",
+        "spec_version: \"0.3.0\"\nsettings:\n  contracts_folder: contracts\n  explicit_type_keys: [kind]\n  write_nulls: omit\n",
+    );
+    write(
+        root,
+        "_types/note.md",
+        r#"---
+kind: mdbase.type
+name: note
+match:
+  fields_present: [title]
+schema:
+  dialect: json-schema-2020-12
+  value: {type: object}
+implements:
+  - contract: example.note
+    version: 1.0.0
+    fields: {}
+lifecycle:
+  on_create:
+    set: { kind: { literal: null } }
+  on_update:
+    set: { kind: { literal: null } }
+---
+"#,
+    );
+}
+
+#[test]
+fn top_level_selected_authority_cannot_be_erased_into_identical_implicit_membership() {
+    let root = fixture("kind");
+    authority_erasing_type(root.path());
+    let collection = Collection::open(root.path()).unwrap();
+    let result = collection.v03_operations().unwrap().create(&json!({
+        "path":"selected.md", "type":"note", "frontmatter":{"title":"same"}
+    }));
+    assert!(!result.valid, "{result:#?}");
+    assert_eq!(
+        result.diagnostics[0].code,
+        "type_membership_authority_changed"
+    );
+    assert!(!root.path().join("selected.md").exists());
+}
+
+#[test]
+fn contract_selected_authority_cannot_be_erased_or_reopened_implicitly() {
+    let root = fixture("kind");
+    authority_erasing_type(root.path());
+    let collection = Collection::open(root.path()).unwrap();
+    let result = collection.v03_operations().unwrap().create(&json!({
+        "path":"contract.md", "contract":"example.note", "contract_version":"1.0.0",
+        "frontmatter":{"title":"same"}
+    }));
+    assert!(!result.valid, "{result:#?}");
+    assert_eq!(
+        result.diagnostics[0].code,
+        "type_membership_authority_changed"
+    );
+    assert!(!root.path().join("contract.md").exists());
+    drop(collection);
+    let reopened = Collection::open(root.path()).unwrap();
+    assert!(
+        !reopened
+            .v03_operations()
+            .unwrap()
+            .read(&json!({"path":"contract.md"}))
+            .valid
+    );
+}
+
+#[test]
+fn ordinary_explicit_update_cannot_change_to_equal_implicit_authority() {
+    let root = fixture("kind");
+    authority_erasing_type(root.path());
+    write(
+        root.path(),
+        "ordinary.md",
+        "---\nkind: note\ntitle: same\n---\nbody\n",
+    );
+    let before = fs::read(root.path().join("ordinary.md")).unwrap();
+    let collection = Collection::open(root.path()).unwrap();
+    let result = collection.v03_operations().unwrap().update(&json!({
+        "path":"ordinary.md", "fields":{"title":"changed"}
+    }));
+    assert!(!result.valid, "{result:#?}");
+    assert_eq!(
+        result.diagnostics[0].code,
+        "type_membership_authority_changed"
+    );
+    assert_eq!(fs::read(root.path().join("ordinary.md")).unwrap(), before);
+}
+
 fn add_throwing_type(root: &Path, name: &str) {
     write(
         root,

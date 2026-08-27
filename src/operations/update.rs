@@ -138,12 +138,6 @@ impl Collection {
         };
         self.apply_generated(&mut merged_obj, &type_names, false, Some(path.as_str()));
 
-        if let Some(membership) = &membership {
-            if let Err(diagnostics) = membership.revalidate(self, &merged_obj, path.as_str()) {
-                return crate::v03::write_membership::diagnostics_error(diagnostics);
-            }
-        }
-
         // Apply defaults for effective frontmatter
         let effective =
             self.apply_defaults(&serde_json::Value::Object(merged_obj.clone()), &type_names);
@@ -194,6 +188,11 @@ impl Collection {
         }
         if self.settings.write_nulls == "omit" && document.is_none() {
             write_obj.retain(|_, v| !v.is_null());
+        }
+        if let Some(membership) = &membership {
+            if let Err(diagnostics) = membership.revalidate(self, &write_obj, path.as_str()) {
+                return crate::v03::write_membership::diagnostics_error(diagnostics);
+            }
         }
 
         // Write file
