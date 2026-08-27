@@ -111,6 +111,51 @@ pub(crate) fn mutation_record_path(
         .map_err(|error| path_boundary_error(collection.spec_profile, &error.to_string()))
 }
 
+/// Open one regular record relative to an already-authorized root without
+/// following symbolic links in any path component.
+///
+/// Capability-relative handles bind every component to the opened root on
+/// Unix and Windows, eliminating pathname replacement races before reads.
+pub(crate) fn open_regular_record_no_follow(
+    collection_root: &Path,
+    relative_path: &str,
+) -> std::io::Result<Option<std::fs::File>> {
+    use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+    use cap_std::fs::{Dir, OpenOptions};
+
+    let components = Path::new(relative_path)
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name),
+            _ => Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let Some((leaf, parents)) = components.split_last() else {
+        return Ok(None);
+    };
+    let mut directory = Dir::open_ambient_dir(collection_root, cap_std::ambient_authority())?;
+    for component in parents {
+        directory = match directory.open_dir_nofollow(component) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(error)
+            }
+            Err(_) => return Ok(None),
+        };
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = match directory.open_with(leaf, &options) {
+        Ok(file) => file.into_std(),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Err(error),
+        Err(_) => return Ok(None),
+    };
+    if !file.metadata()?.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
 pub(crate) fn readable_record_path(
     collection: &Collection,
     path: &str,
