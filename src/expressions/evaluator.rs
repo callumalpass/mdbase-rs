@@ -977,7 +977,9 @@ fn eval_add(left: &Value, right: &Value, string_concat: bool) -> Result<Value, E
     if let (Value::String(date_str), Value::String(dur_str)) = (left, right) {
         if is_date_string(date_str) || is_datetime_string(date_str) {
             if parse_duration_ms(dur_str).is_some() {
-                if let Some(result) = add_duration_to_date(date_str, dur_str)? {
+                if let Some(result) =
+                    apply_duration_to_date(date_str, dur_str, DurationDirection::Add)?
+                {
                     return Ok(Value::String(result));
                 }
             }
@@ -992,7 +994,8 @@ fn eval_add(left: &Value, right: &Value, string_concat: bool) -> Result<Value, E
         if (is_date_string(date_str) || is_datetime_string(date_str))
             && parse_duration_ms(dur_str).is_some()
         {
-            if let Some(result) = add_duration_to_date(date_str, dur_str)? {
+            if let Some(result) = apply_duration_to_date(date_str, dur_str, DurationDirection::Add)?
+            {
                 return Ok(Value::String(result));
             }
         }
@@ -1035,19 +1038,10 @@ fn eval_arithmetic(left: &Value, right: &Value, op: &str) -> Result<Value, EvalE
     if op == "-" {
         if let (Value::String(date_str), Value::String(dur_str)) = (left, right) {
             if is_date_string(date_str) && parse_duration_ms(dur_str).is_some() {
-                // Negate the duration and add
-                if let Some(_ms) = parse_duration_ms(dur_str) {
-                    let unit_start = dur_str
-                        .trim()
-                        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
-                        .unwrap_or(dur_str.len());
-                    let unit = &dur_str.trim()[unit_start..];
-                    let num_str = &dur_str.trim()[..unit_start];
-                    let num: f64 = num_str.parse().unwrap_or(0.0);
-                    let neg_dur = format!("{}{}", -num, unit);
-                    if let Some(result) = add_duration_to_date(date_str, &neg_dur)? {
-                        return Ok(Value::String(result));
-                    }
+                if let Some(result) =
+                    apply_duration_to_date(date_str, dur_str, DurationDirection::Subtract)?
+                {
+                    return Ok(Value::String(result));
                 }
             }
             // Date - Date = milliseconds
@@ -2634,7 +2628,17 @@ fn add_months_checked(
 /// `Ok(None)` means the inputs are not a recognizable date + duration pair;
 /// `Err` means the duration is valid but the result overflows the representable
 /// range (previously this panicked on unchecked chrono arithmetic).
-fn add_duration_to_date(date_str: &str, duration_str: &str) -> Result<Option<String>, EvalError> {
+#[derive(Clone, Copy)]
+enum DurationDirection {
+    Add,
+    Subtract,
+}
+
+fn apply_duration_to_date(
+    date_str: &str,
+    duration_str: &str,
+    direction: DurationDirection,
+) -> Result<Option<String>, EvalError> {
     use chrono::Datelike;
 
     let dur_str = duration_str.trim();
@@ -2663,8 +2667,14 @@ fn add_duration_to_date(date_str: &str, duration_str: &str) -> Result<Option<Str
             "y" | "year" | "years" => (0i64, num),
             _ => return Ok(None),
         };
-        let Some(months_total) = years.checked_mul(12).and_then(|m| months.checked_add(m)) else {
+        let Some(parsed_months) = years.checked_mul(12).and_then(|m| months.checked_add(m)) else {
             return Err(date_overflow_error(date_str, duration_str));
+        };
+        let months_total = match direction {
+            DurationDirection::Add => parsed_months,
+            DurationDirection::Subtract => 0_i64
+                .checked_sub(parsed_months)
+                .ok_or_else(|| date_overflow_error(date_str, duration_str))?,
         };
 
         // Calendar arithmetic with month clamping (all checked)
@@ -2700,26 +2710,32 @@ fn add_duration_to_date(date_str: &str, duration_str: &str) -> Result<Option<Str
     if let Ok(d) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
         let delta = chrono::TimeDelta::try_days(days)
             .ok_or_else(|| date_overflow_error(date_str, duration_str))?;
-        let new_date = d
-            .checked_add_signed(delta)
-            .ok_or_else(|| date_overflow_error(date_str, duration_str))?;
+        let new_date = match direction {
+            DurationDirection::Add => d.checked_add_signed(delta),
+            DurationDirection::Subtract => d.checked_sub_signed(delta),
+        }
+        .ok_or_else(|| date_overflow_error(date_str, duration_str))?;
         return Ok(Some(new_date.format("%Y-%m-%d").to_string()));
     }
 
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(date_str, "%Y-%m-%dT%H:%M:%S") {
         let delta = chrono::TimeDelta::try_milliseconds(ms)
             .ok_or_else(|| date_overflow_error(date_str, duration_str))?;
-        let new_dt = dt
-            .checked_add_signed(delta)
-            .ok_or_else(|| date_overflow_error(date_str, duration_str))?;
+        let new_dt = match direction {
+            DurationDirection::Add => dt.checked_add_signed(delta),
+            DurationDirection::Subtract => dt.checked_sub_signed(delta),
+        }
+        .ok_or_else(|| date_overflow_error(date_str, duration_str))?;
         return Ok(Some(new_dt.format("%Y-%m-%dT%H:%M:%S").to_string()));
     }
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(date_str, "%Y-%m-%dT%H:%M:%SZ") {
         let delta = chrono::TimeDelta::try_milliseconds(ms)
             .ok_or_else(|| date_overflow_error(date_str, duration_str))?;
-        let new_dt = dt
-            .checked_add_signed(delta)
-            .ok_or_else(|| date_overflow_error(date_str, duration_str))?;
+        let new_dt = match direction {
+            DurationDirection::Add => dt.checked_add_signed(delta),
+            DurationDirection::Subtract => dt.checked_sub_signed(delta),
+        }
+        .ok_or_else(|| date_overflow_error(date_str, duration_str))?;
         return Ok(Some(new_dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()));
     }
     // Offset-aware datetime: preserve local time
@@ -2727,9 +2743,11 @@ fn add_duration_to_date(date_str: &str, duration_str: &str) -> Result<Option<Str
         let local = dt.naive_local();
         let delta = chrono::TimeDelta::try_milliseconds(ms)
             .ok_or_else(|| date_overflow_error(date_str, duration_str))?;
-        let new_dt = local
-            .checked_add_signed(delta)
-            .ok_or_else(|| date_overflow_error(date_str, duration_str))?;
+        let new_dt = match direction {
+            DurationDirection::Add => local.checked_add_signed(delta),
+            DurationDirection::Subtract => local.checked_sub_signed(delta),
+        }
+        .ok_or_else(|| date_overflow_error(date_str, duration_str))?;
         return Ok(Some(new_dt.format("%Y-%m-%dT%H:%M:%S").to_string()));
     }
 
@@ -3301,6 +3319,43 @@ mod duration_overflow_tests {
         assert_eq!(error.code, "type_error");
         let error = subtract("2026-07-22", "99999999999y").unwrap_err();
         assert_eq!(error.code, "type_error");
+    }
+
+    #[test]
+    fn subtraction_is_integer_exact_and_errors_are_stable_at_extrema() {
+        for duration in [
+            "9007199254740991d",
+            "9007199254740992d",
+            "9007199254740993d",
+            "9223372036854775807d",
+            "-9223372036854775808d",
+            "9223372036854775807M",
+            "-9223372036854775808M",
+            "9223372036854775807y",
+            "-9223372036854775808y",
+        ] {
+            let error = subtract("2026-07-22", duration).unwrap_err();
+            assert_eq!(error.code, "type_error", "{duration}: {error:?}");
+            assert!(error.message.contains("overflow"), "{duration}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn positive_and_negative_calendar_and_day_directions_are_explicit() {
+        for (duration, expected) in [
+            ("1d", "2026-03-30"),
+            ("-1d", "2026-04-01"),
+            ("1M", "2026-02-28"),
+            ("-1M", "2026-04-30"),
+            ("1y", "2025-03-31"),
+            ("-1y", "2027-03-31"),
+        ] {
+            assert_eq!(
+                subtract("2026-03-31", duration).unwrap(),
+                Value::String(expected.to_string()),
+                "{duration}"
+            );
+        }
     }
 
     #[test]
