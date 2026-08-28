@@ -273,6 +273,22 @@ pub(crate) fn cache_lifecycle_waiter_count(root: &Path, cache_folder: &str) -> u
     .unwrap_or(0)
 }
 
+fn is_lifecycle_lock_contention(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    // `LockFileEx` reports ERROR_LOCK_VIOLATION, which Rust currently leaves
+    // as `Uncategorized` rather than mapping to `WouldBlock`.
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(33)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn lock_cache_lifecycle(
     root: &Path,
     cache_folder: &str,
@@ -315,7 +331,7 @@ fn lock_cache_lifecycle(
                     in_process: Some(in_process),
                 });
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if is_lifecycle_lock_contention(&error) => {
                 if first_contention_error.is_none() {
                     first_contention_error = Some(error);
                 }
