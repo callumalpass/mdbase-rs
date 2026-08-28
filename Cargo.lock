@@ -1357,6 +1357,7 @@ dependencies = [
  "rand 0.8.7",
  "regex",
  "rusqlite",
+ "same-file",
  "semver",
  "serde",
  "serde_jcs",

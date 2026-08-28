@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -31,6 +33,20 @@ pub struct FilesystemRuntime {
     order: Arc<Mutex<RuntimeOrder>>,
     settlement: Arc<SettlementCoordinator>,
     cursors: Mutex<super::cursor::CursorStore>,
+    #[cfg(test)]
+    watcher_test_control: crate::watch::WatcherTestControl,
+    #[cfg(test)]
+    maintenance_notification_injections: AtomicUsize,
+    #[cfg(test)]
+    maintenance_transaction_commits: AtomicUsize,
+    #[cfg(test)]
+    validation_drop_callback_injections: AtomicUsize,
+    #[cfg(test)]
+    acknowledgement_completions: Arc<AtomicUsize>,
+    #[cfg(test)]
+    drop_callback_preceded_ack: Arc<AtomicBool>,
+    #[cfg(test)]
+    drop_callback_preceded_connection_close: Arc<AtomicBool>,
 }
 
 struct RuntimeOrder {
@@ -77,6 +93,8 @@ impl FilesystemRuntime {
         )?;
         provider.initialize_runtime_cache(&reconciled.generation)?;
         let watcher = CollectionWatcher::open(root, debounce)?;
+        #[cfg(test)]
+        let watcher_test_control = watcher.test_control();
         let runtime_epoch = reconciled.generation.runtime_epoch().to_string();
         Ok(Self {
             provider,
@@ -91,6 +109,20 @@ impl FilesystemRuntime {
                 changed: Condvar::new(),
             }),
             cursors: Mutex::new(super::cursor::CursorStore::new(runtime_epoch)),
+            #[cfg(test)]
+            watcher_test_control,
+            #[cfg(test)]
+            maintenance_notification_injections: AtomicUsize::new(0),
+            #[cfg(test)]
+            maintenance_transaction_commits: AtomicUsize::new(0),
+            #[cfg(test)]
+            validation_drop_callback_injections: AtomicUsize::new(0),
+            #[cfg(test)]
+            acknowledgement_completions: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            drop_callback_preceded_ack: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            drop_callback_preceded_connection_close: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -610,12 +642,234 @@ impl FilesystemRuntime {
         &self,
         context: &OperationContext,
     ) -> Result<(), ProviderError> {
-        context.check()?;
-        self.watcher_lock(context)?.rescan()?;
-        context.check()
+        self.synchronize_reconciliation(None, context)
     }
 
-    fn current_generation(&self) -> Result<CollectionGeneration, ProviderError> {
+    #[cfg(test)]
+    pub(crate) fn set_watcher_revision_for_test(&self, value: u64) {
+        self.watcher_test_control.set_invalidation_revision(value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invoke_installed_watcher_modify_callback_for_test(&self, path: &str) {
+        self.watcher_test_control
+            .invoke_installed_modify_callback(&self.provider.root().join(path));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_watcher_for_test(&self) {
+        self.watcher_test_control.poison();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_cache_commit_linearization_hook_for_test(
+        &self,
+    ) -> crate::watch::LinearizationRace {
+        self.watcher_test_control
+            .install_cache_commit_linearization_hook()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_rescan_count_for_test(&self) -> usize {
+        self.watcher_test_control.pending_rescan_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synchronize_paths_for_test(&self, paths: &[&str]) -> Result<(), ProviderError> {
+        self.synchronize_reconciliation(Some(paths), &OperationContext::legacy())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_cache_notifications_for_test(&self, count: usize) {
+        self.maintenance_notification_injections
+            .store(count, Ordering::Release);
+        self.maintenance_transaction_commits
+            .store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_cache_notification_on_validation_open_for_test(&self) {
+        let root = self.provider.root().to_path_buf();
+        let collection = crate::Collection::open(&root).unwrap();
+        let cache_folder = collection.settings.cache_folder.clone();
+        let callback = self.watcher_test_control.clone();
+        let callback_root = root.clone();
+        crate::cache::sqlite::set_read_only_open_hook(&root, &cache_folder, move || {
+            callback.invoke_installed_modify_callback(&callback_root);
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_validation_open_notification_for_test(&self) -> bool {
+        let root = self.provider.root();
+        let collection = crate::Collection::open(root).unwrap();
+        crate::cache::sqlite::clear_read_only_open_hook(root, &collection.settings.cache_folder)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_installed_callback_on_validated_seal_drop_for_test(&self) {
+        self.validation_drop_callback_injections
+            .store(1, Ordering::Release);
+        self.drop_callback_preceded_ack
+            .store(false, Ordering::Release);
+        self.drop_callback_preceded_connection_close
+            .store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_callback_preceded_ack_for_test(&self) -> bool {
+        self.drop_callback_preceded_ack.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_callback_preceded_connection_close_for_test(&self) -> bool {
+        self.drop_callback_preceded_connection_close
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watcher_revision_for_test(&self) -> u64 {
+        self.watcher_test_control.invalidation_revision()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn maintenance_attempt_counts_for_test(&self) -> (usize, usize) {
+        (
+            self.maintenance_transaction_commits.load(Ordering::Acquire),
+            self.maintenance_notification_injections
+                .load(Ordering::Acquire),
+        )
+    }
+
+    #[cfg(test)]
+    fn inject_cache_notification_after_write_for_test(&self) {
+        if self
+            .maintenance_notification_injections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                (remaining > 0).then(|| remaining - 1)
+            })
+            .is_ok()
+        {
+            // macOS can report a recursive hidden-cache write at the watched
+            // root. Exercise that installed-callback path deterministically.
+            self.watcher_test_control
+                .invoke_installed_modify_callback(self.provider.root());
+        }
+    }
+
+    fn synchronize_reconciliation(
+        &self,
+        paths: Option<&[&str]>,
+        context: &OperationContext,
+    ) -> Result<(), ProviderError> {
+        const MAX_STALE_RETRIES: usize = 3;
+        let mut maintenance_seal = None;
+        for _ in 0..MAX_STALE_RETRIES {
+            context.check()?;
+            // Capture ownership before observation. The provider compares this
+            // exact epoch+sequence again only after acquiring its write gate.
+            let expected_generation = self.current_generation()?;
+            let observation = {
+                let watcher = self.watcher_lock(context)?;
+                match paths {
+                    Some(paths) => watcher
+                        .rescan_paths_observation_with_context(paths.iter().copied(), context)?,
+                    None => watcher.rescan_observation_with_context(context)?,
+                }
+            };
+            context.check()?;
+            let observation_token = observation.token();
+            // A seal is single-use and belongs only to the immediately next
+            // observation. Taking it before validation prevents a mismatched
+            // state from becoming valid again after any intervening retry.
+            #[allow(unused_mut)]
+            let mut validated_seal = match maintenance_seal.take() {
+                Some(seal) => self.provider.validate_runtime_invalid_maintenance_seal(
+                    seal,
+                    observation.invalid_records.as_ref(),
+                    observation.removed_invalid_records.as_ref(),
+                    &expected_generation,
+                    &observation_token,
+                    context,
+                )?,
+                None => None,
+            };
+            #[cfg(test)]
+            if let Some(seal) = validated_seal.as_mut() {
+                if self
+                    .validation_drop_callback_injections
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        (remaining > 0).then(|| remaining - 1)
+                    })
+                    .is_ok()
+                {
+                    let callback = self.watcher_test_control.clone();
+                    let callback_root = self.provider.root().to_path_buf();
+                    let completions = self.acknowledgement_completions.clone();
+                    let completed_before = completions.load(Ordering::Acquire);
+                    let preceded_ack = self.drop_callback_preceded_ack.clone();
+                    let preceded_close = self.drop_callback_preceded_connection_close.clone();
+                    let connection_closed = Arc::new(AtomicBool::new(false));
+                    let hook_connection_closed = connection_closed.clone();
+                    seal.set_drop_hook(connection_closed, move || {
+                        if completions.load(Ordering::Acquire) <= completed_before {
+                            preceded_ack.store(true, Ordering::Release);
+                        }
+                        if !hook_connection_closed.load(Ordering::Acquire) {
+                            preceded_close.store(true, Ordering::Release);
+                        }
+                        callback.invoke_installed_modify_callback(&callback_root);
+                    });
+                }
+            }
+            let maintenance = if validated_seal.is_some() {
+                crate::cache::runtime::InvalidMaintenanceOutcome::Current
+            } else {
+                self.provider.apply_runtime_invalid_maintenance(
+                    observation.invalid_records.as_ref(),
+                    observation.removed_invalid_records.as_ref(),
+                    observation.epoch.as_ref(),
+                    &expected_generation,
+                    observation_token,
+                    context,
+                )?
+            };
+            match maintenance {
+                crate::cache::runtime::InvalidMaintenanceOutcome::Stale => continue,
+                crate::cache::runtime::InvalidMaintenanceOutcome::Current => {}
+                crate::cache::runtime::InvalidMaintenanceOutcome::Applied(seal) => {
+                    maintenance_seal = Some(seal);
+                    #[cfg(test)]
+                    {
+                        self.maintenance_transaction_commits
+                            .fetch_add(1, Ordering::AcqRel);
+                        self.inject_cache_notification_after_write_for_test();
+                    }
+                }
+            }
+            let acknowledgement = self
+                .watcher_lock(context)?
+                .acknowledge_observation_with_context(observation, context);
+            #[cfg(test)]
+            self.acknowledgement_completions
+                .fetch_add(1, Ordering::AcqRel);
+            // The validated seal owns the retained SQLite connection. Closing it
+            // only after the acknowledgement attempt prevents a close callback
+            // from invalidating the operation it just validated.
+            drop(validated_seal);
+            let acknowledged = acknowledgement?;
+            if acknowledged {
+                return context.check();
+            }
+        }
+        Err(ProviderError::Transaction {
+            code: "stale_reconciliation",
+            message: "watcher reconciliation repeatedly lost runtime generation ownership"
+                .to_string(),
+        })
+    }
+
+    pub(crate) fn current_generation(&self) -> Result<CollectionGeneration, ProviderError> {
         self.order
             .lock()
             .map(|order| order.generation.clone())

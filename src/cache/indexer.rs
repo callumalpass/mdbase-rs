@@ -1,6 +1,6 @@
 //! File -> cache indexing.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -22,6 +22,224 @@ pub(crate) fn reindex_file(
     rel_path: &str,
 ) -> Result<(), CacheError> {
     let outcome = crate::record_load::load_record(collection, abs_path, rel_path)?;
+    index_record_outcome(conn, collection, rel_path, outcome)
+}
+
+/// Revalidate a classified-invalid maintenance hint through the capability-
+/// relative no-follow boundary. A still-invalid record gets a bounded stub and
+/// an absent record is removed. A repaired record is left to its ordered public
+/// create/modify event, so a private hint cannot expose successor content in an
+/// earlier runtime generation. Transient failures roll back the transaction.
+pub(crate) fn refresh_invalid_file_no_follow(
+    conn: &Connection,
+    collection: &Collection,
+    rel_path: &str,
+) -> Result<Option<MaintenanceExpectation>, CacheError> {
+    match crate::record_load::load_record_no_follow(collection, rel_path)? {
+        Some(outcome @ crate::record_load::RecordLoadOutcome::Invalid { .. }) => {
+            let crate::record_load::RecordLoadOutcome::Invalid {
+                facts,
+                reason,
+                type_names,
+                ..
+            } = &outcome
+            else {
+                unreachable!();
+            };
+            let expectation = MaintenanceExpectation::Invalid {
+                revision: facts.revision.clone(),
+                reason: *reason,
+                size: facts.size,
+                mtime_ns: facts.mtime_ns,
+                ctime_ns: facts.ctime_ns,
+                type_names: type_names.iter().cloned().collect(),
+            };
+            index_record_outcome(conn, collection, rel_path, outcome)?;
+            Ok(Some(expectation))
+        }
+        Some(crate::record_load::RecordLoadOutcome::Parsed { .. }) => Ok(None),
+        None => {
+            remove_file(conn, rel_path)?;
+            Ok(Some(MaintenanceExpectation::Absent))
+        }
+    }
+}
+
+/// Apply a private removal only when the capability-relative loader confirms
+/// that the record is genuinely absent. Recreated records are handled by a
+/// later observation or their ordered public event.
+pub(crate) fn remove_invalid_file_no_follow_if_absent(
+    conn: &Connection,
+    collection: &Collection,
+    rel_path: &str,
+) -> Result<Option<MaintenanceExpectation>, CacheError> {
+    if crate::record_load::load_record_no_follow(collection, rel_path)?.is_none() {
+        remove_file(conn, rel_path)?;
+        return Ok(Some(MaintenanceExpectation::Absent));
+    }
+    Ok(None)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MaintenanceExpectation {
+    Absent,
+    Invalid {
+        revision: String,
+        reason: crate::record_load::InvalidRecordReason,
+        size: u64,
+        mtime_ns: i64,
+        ctime_ns: Option<i64>,
+        type_names: std::collections::BTreeSet<String>,
+    },
+}
+
+pub(crate) fn refresh_maintenance_expectation(
+    collection: &Collection,
+    rel_path: &str,
+) -> Result<Option<MaintenanceExpectation>, CacheError> {
+    match crate::record_load::load_record_no_follow(collection, rel_path)? {
+        Some(crate::record_load::RecordLoadOutcome::Invalid {
+            facts,
+            reason,
+            type_names,
+            ..
+        }) => Ok(Some(MaintenanceExpectation::Invalid {
+            revision: facts.revision,
+            reason,
+            size: facts.size,
+            mtime_ns: facts.mtime_ns,
+            ctime_ns: facts.ctime_ns,
+            type_names: type_names.into_iter().collect(),
+        })),
+        Some(crate::record_load::RecordLoadOutcome::Parsed { .. }) | None => Ok(None),
+    }
+}
+
+pub(crate) fn maintenance_cache_expectation_is_exact(
+    conn: &Connection,
+    rel_path: &str,
+    expected: &MaintenanceExpectation,
+) -> Result<bool, CacheError> {
+    let row = conn
+        .query_row(
+            "SELECT mtime_ns, ctime_ns, size, frontmatter_json, body, effective_json, parse_error, source_revision, failure_reason FROM files WHERE path = ?1",
+            [rel_path],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let row_exact = match expected {
+        MaintenanceExpectation::Absent => row.is_none(),
+        MaintenanceExpectation::Invalid {
+            revision,
+            reason,
+            size,
+            mtime_ns,
+            ctime_ns,
+            ..
+        } => {
+            row == Some((
+                *mtime_ns,
+                *ctime_ns,
+                *size as i64,
+                "{}".to_string(),
+                String::new(),
+                None,
+                1,
+                revision.clone(),
+                Some(reason.as_str().to_string()),
+            ))
+        }
+    };
+    if !row_exact {
+        return Ok(false);
+    }
+
+    let expected_types = match expected {
+        MaintenanceExpectation::Absent => std::collections::BTreeSet::new(),
+        MaintenanceExpectation::Invalid { type_names, .. } => type_names.clone(),
+    };
+    let mut statement = conn.prepare("SELECT type_name FROM file_types WHERE path = ?1")?;
+    let actual_types = statement
+        .query_map([rel_path], |row| row.get::<_, String>(0))?
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    if actual_types != expected_types {
+        return Ok(false);
+    }
+
+    for (table, column) in [
+        ("links", "source_path"),
+        ("unique_values", "path"),
+        ("identity_values", "path"),
+    ] {
+        let count: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+            [rel_path],
+            |row| row.get(0),
+        )?;
+        if count != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) fn maintenance_expectation_still_current(
+    collection: &Collection,
+    rel_path: &str,
+    expected: &MaintenanceExpectation,
+) -> Result<bool, CacheError> {
+    let current = crate::record_load::load_record_no_follow(collection, rel_path)?;
+    Ok(match (expected, current) {
+        (MaintenanceExpectation::Absent, None) => true,
+        (
+            MaintenanceExpectation::Invalid {
+                revision,
+                reason,
+                size,
+                mtime_ns,
+                ctime_ns,
+                type_names,
+            },
+            Some(crate::record_load::RecordLoadOutcome::Invalid {
+                facts,
+                reason: current_reason,
+                type_names: current_types,
+                ..
+            }),
+        ) => {
+            facts.revision == *revision
+                && current_reason == *reason
+                && facts.size == *size
+                && facts.mtime_ns == *mtime_ns
+                && facts.ctime_ns == *ctime_ns
+                && current_types
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == *type_names
+        }
+        _ => false,
+    })
+}
+
+fn index_record_outcome(
+    conn: &Connection,
+    collection: &Collection,
+    rel_path: &str,
+    outcome: crate::record_load::RecordLoadOutcome,
+) -> Result<(), CacheError> {
     let facts = outcome.facts().clone();
     // Keep UTF-8 availability explicit at this boundary; invalid source is not
     // indexed as a synthetic Markdown body.

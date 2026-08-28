@@ -74,7 +74,26 @@ pub(crate) fn load_record(
     abs_path: &Path,
     rel_path: &str,
 ) -> std::io::Result<RecordLoadOutcome> {
-    let mut file = std::fs::File::open(abs_path)?;
+    load_open_record(collection, std::fs::File::open(abs_path)?, rel_path)
+}
+
+/// Load a record through the collection's capability-relative, no-follow
+/// boundary. Missing, non-regular, and symlinked paths are bounded absence;
+/// failures that may recover remain errors for the caller to retry.
+pub(crate) fn load_record_no_follow(
+    collection: &Collection,
+    rel_path: &str,
+) -> std::io::Result<Option<RecordLoadOutcome>> {
+    crate::operations::open_regular_record_no_follow(collection.root(), rel_path)?
+        .map(|file| load_open_record(collection, file, rel_path))
+        .transpose()
+}
+
+fn load_open_record(
+    collection: &Collection,
+    mut file: std::fs::File,
+    rel_path: &str,
+) -> std::io::Result<RecordLoadOutcome> {
     let before = file.metadata()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;

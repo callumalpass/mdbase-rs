@@ -48,4 +48,5 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE INDEX IF NOT EXISTS idx_file_types_type ON file_types(type_name);
 CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_path);
 CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_path);
+CREATE INDEX IF NOT EXISTS idx_unique_values_path ON unique_values(path);
 CREATE INDEX IF NOT EXISTS idx_identity_values_path ON identity_values(path);

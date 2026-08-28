@@ -1,13 +1,12 @@
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json, FrontmatterState};
-use crate::operations::{
-    ensure_safe_relative_path, open_regular_record_no_follow, readable_record_path,
-};
+use crate::operations::{ensure_safe_relative_path, readable_record_path};
+use crate::record_load::{InvalidRecordReason, RecordLoadOutcome};
 use crate::Collection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
-use std::io::Read;
 use walkdir::WalkDir;
 
 use super::ProviderError;
@@ -67,43 +66,56 @@ impl Collection {
     /// Long-running hosts should normally call [`super::FilesystemProvider::snapshot`],
     /// which also holds the provider's read gate for the full capture.
     pub fn snapshot(&self) -> Result<CollectionSnapshot, ProviderError> {
-        collection_snapshot(self)
+        Ok(collection_snapshot(self, InvalidRecordPolicy::Strict)?.snapshot)
+    }
+
+    /// Capture watcher state without changing the public synchronization
+    /// contract. Classified invalid records are reported out-of-band so the
+    /// watcher can retain prior state; genuine capture failures remain errors.
+    pub(crate) fn snapshot_for_watcher(&self) -> Result<WatcherSnapshot, ProviderError> {
+        collection_snapshot(self, InvalidRecordPolicy::Observe)
     }
 
     /// Materialize one record for provider and synchronization boundaries.
     ///
     /// Malformed or non-object frontmatter is preserved byte-for-byte as an
-    /// opaque body while structured fields remain empty. Typed `read` remains
-    /// strict, but transport layers no longer need to reimplement this policy.
+    /// opaque body while structured fields remain empty. Invalid UTF-8 cannot
+    /// be represented by the string-valued synchronization contract and is
+    /// reported as a bounded error without inventing content or expanding the
+    /// wire format. Typed `read` remains strict, but transport layers do not
+    /// reimplement parsing policy.
     pub fn snapshot_record(&self, path: &str) -> Result<CollectionSnapshotRecord, ProviderError> {
         ensure_safe_relative_path(path, self.spec_profile)
             .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
         let record_path = readable_record_path(self, path)
             .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
-        let mut file = open_regular_record_no_follow(&self.root, record_path.as_str())
-            .map_err(|error| {
-                ProviderError::CollectionOpen(format!(
-                    "failed to open collection record '{path}': {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                ProviderError::CollectionOpen(format!("collection record '{path}' is unavailable"))
-            })?;
-        let mut document = String::new();
-        file.read_to_string(&mut document).map_err(|error| {
-            ProviderError::CollectionOpen(format!(
-                "failed to read collection record '{path}': {error}"
-            ))
-        })?;
-        Ok(materialize_snapshot_record(
-            self,
-            record_path.as_str(),
-            document,
-        ))
+        match load_snapshot_record(self, record_path.as_str())? {
+            SnapshotRecordLoad::Record(record) => Ok(record),
+            SnapshotRecordLoad::InvalidUtf8 => Err(ProviderError::CollectionOpen(format!(
+                "collection record '{path}' contains invalid UTF-8"
+            ))),
+            SnapshotRecordLoad::Absent => Err(ProviderError::CollectionOpen(format!(
+                "collection record '{path}' is unavailable"
+            ))),
+        }
     }
 }
 
-fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, ProviderError> {
+pub(crate) struct WatcherSnapshot {
+    pub(crate) snapshot: CollectionSnapshot,
+    pub(crate) invalid_records: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy)]
+enum InvalidRecordPolicy {
+    Strict,
+    Observe,
+}
+
+fn collection_snapshot(
+    collection: &Collection,
+    invalid_policy: InvalidRecordPolicy,
+) -> Result<WatcherSnapshot, ProviderError> {
     let root = collection.root();
     let configuration = read_resource(
         root.join("mdbase.yaml"),
@@ -205,13 +217,44 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
         .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
     paths.sort();
     let mut records = Vec::with_capacity(paths.len());
+    let mut invalid_records = BTreeSet::new();
     for absolute in paths {
         let path = absolute
             .strip_prefix(root)
             .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?
             .to_string_lossy()
             .replace('\\', "/");
-        let record = collection.snapshot_record(&path)?;
+        let record = match load_snapshot_record(collection, &path)? {
+            SnapshotRecordLoad::Record(record) => {
+                if record.frontmatter_error.is_some()
+                    && matches!(invalid_policy, InvalidRecordPolicy::Observe)
+                {
+                    invalid_records.insert(path.clone());
+                }
+                record
+            }
+            SnapshotRecordLoad::InvalidUtf8 => {
+                if matches!(invalid_policy, InvalidRecordPolicy::Strict) {
+                    return Err(ProviderError::CollectionOpen(format!(
+                        "collection record '{path}' contains invalid UTF-8"
+                    )));
+                }
+                invalid_records.insert(path);
+                continue;
+            }
+            // Enumeration races and no-follow/non-regular outcomes are
+            // absence for observation. Strict synchronization fails rather
+            // than publishing a checkpoint that silently lost an enumerated
+            // record.
+            SnapshotRecordLoad::Absent => {
+                if matches!(invalid_policy, InvalidRecordPolicy::Strict) {
+                    return Err(ProviderError::CollectionOpen(format!(
+                        "collection record '{path}' became unavailable during snapshot capture"
+                    )));
+                }
+                continue;
+            }
+        };
         if path.ends_with(".md") && is_canonical_view(&record) {
             resources.push(CollectionSnapshotResource {
                 path: record.path,
@@ -236,12 +279,15 @@ fn collection_snapshot(collection: &Collection) -> Result<CollectionSnapshot, Pr
         .unwrap_or_else(|| crate::v03::SPEC_VERSION.to_string());
     let resource_revision = resource_revision(&resources);
     let revision = snapshot_revision(&resources, &records);
-    Ok(CollectionSnapshot {
-        revision,
-        resource_revision,
-        spec_version,
-        resources,
-        records,
+    Ok(WatcherSnapshot {
+        snapshot: CollectionSnapshot {
+            revision,
+            resource_revision,
+            spec_version,
+            resources,
+            records,
+        },
+        invalid_records,
     })
 }
 
@@ -253,6 +299,72 @@ fn is_canonical_view(record: &CollectionSnapshotRecord) -> bool {
         )
         .iter()
         .any(|diagnostic| diagnostic.severity == "error")
+}
+
+enum SnapshotRecordLoad {
+    Record(CollectionSnapshotRecord),
+    InvalidUtf8,
+    Absent,
+}
+
+fn load_snapshot_record(
+    collection: &Collection,
+    path: &str,
+) -> Result<SnapshotRecordLoad, ProviderError> {
+    let Some(outcome) =
+        crate::record_load::load_record_no_follow(collection, path).map_err(|error| {
+            ProviderError::CollectionOpen(format!(
+                "failed to read collection record '{path}': {error}"
+            ))
+        })?
+    else {
+        return Ok(SnapshotRecordLoad::Absent);
+    };
+    match outcome {
+        RecordLoadOutcome::Parsed {
+            path,
+            facts,
+            document,
+            raw_frontmatter,
+            body,
+            type_names,
+            ..
+        } => Ok(SnapshotRecordLoad::Record(CollectionSnapshotRecord {
+            path,
+            revision: facts.revision,
+            frontmatter: raw_frontmatter.as_object().cloned().unwrap_or_default(),
+            body,
+            types: type_names,
+            document,
+            frontmatter_error: None,
+        })),
+        RecordLoadOutcome::Invalid {
+            reason: InvalidRecordReason::InvalidUtf8,
+            ..
+        } => Ok(SnapshotRecordLoad::InvalidUtf8),
+        RecordLoadOutcome::Invalid {
+            path,
+            facts,
+            document: Some(document),
+            reason,
+            ..
+        } => {
+            let mut record = materialize_snapshot_record(collection, &path, document);
+            record.revision = facts.revision;
+            debug_assert_eq!(
+                record.frontmatter_error.as_deref(),
+                Some(match reason {
+                    InvalidRecordReason::InvalidYaml => "Failed to parse YAML frontmatter",
+                    InvalidRecordReason::NonMappingFrontmatter => {
+                        "Frontmatter must be a YAML mapping"
+                    }
+                    InvalidRecordReason::InvalidUtf8 => unreachable!(),
+                })
+            );
+            Ok(SnapshotRecordLoad::Record(record))
+        }
+        RecordLoadOutcome::Invalid { document: None, .. } => Ok(SnapshotRecordLoad::InvalidUtf8),
+    }
 }
 
 pub(crate) fn materialize_snapshot_record(

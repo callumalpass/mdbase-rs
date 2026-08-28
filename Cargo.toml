@@ -55,6 +55,7 @@ thiserror = "2"
 rand = "0.8.6"
 jsonschema = { version = "0.18", features = ["draft202012"] }
 walkdir = "2"
+same-file = "1"
 notify = "8"
 tempfile = "3"
 tracing = { version = "0.1", optional = true }

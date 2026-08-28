@@ -511,6 +511,105 @@ impl FilesystemProvider {
         Ok(())
     }
 
+    /// Validate a single-use maintenance seal against one coherent SQLite
+    /// snapshot plus a BEGIN IMMEDIATE reservation on the connection that
+    /// committed it. The path performs no SQLite open, logical cache write, DDL,
+    /// or schema initialization; the returned seal retains the reservation and
+    /// lifecycle lock through acknowledgement.
+    pub(crate) fn validate_runtime_invalid_maintenance_seal(
+        &self,
+        mut seal: Box<crate::cache::runtime::InvalidMaintenanceSeal>,
+        refresh: &std::collections::BTreeSet<String>,
+        remove: &std::collections::BTreeSet<String>,
+        expected_generation: &super::CollectionGeneration,
+        observation: &crate::watch::ReconciliationToken,
+        context: &OperationContext,
+    ) -> Result<Option<Box<crate::cache::runtime::InvalidMaintenanceSeal>>, ProviderError> {
+        let _guard = self.write_lock(context)?;
+        context.check()?;
+        if observation.is_exhausted()
+            || !seal.matches(refresh, remove, expected_generation, observation)
+            || self
+                .runtime_cache_generation
+                .read()
+                .map_err(|_| ProviderError::LockPoisoned)?
+                .as_ref()
+                != Some(expected_generation)
+        {
+            return Ok(None);
+        }
+        let collection = self.current_collection()?;
+        if !seal.cache_is_current(collection.as_ref()).unwrap_or(false) {
+            return Ok(None);
+        }
+        context.check()?;
+        // Cooperative cache writers are fenced by the provider gate, SQLite
+        // reservation, lifecycle lock, and exact tokens above. Revalidate
+        // handle-bound filesystem facts last. A callback delivered before
+        // acknowledgement advances the
+        // watcher revision and rejects that acknowledgement; a raw edit whose
+        // notification arrives later is a subsequent eventual watcher event.
+        if !seal
+            .filesystem_is_current(collection.as_ref())
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        context.check()?;
+        // This is the third path-handle comparison: before the reservation,
+        // under it after logical checks, and now immediately after final
+        // filesystem revalidation.
+        if !seal
+            .final_identity_is_current(collection.as_ref())
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        Ok(Some(seal))
+    }
+
+    pub(crate) fn apply_runtime_invalid_maintenance(
+        &self,
+        refresh: &std::collections::BTreeSet<String>,
+        remove: &std::collections::BTreeSet<String>,
+        epoch: &crate::watch::WatcherEpoch,
+        expected_generation: &super::CollectionGeneration,
+        observation: crate::watch::ReconciliationToken,
+        context: &OperationContext,
+    ) -> Result<crate::cache::runtime::InvalidMaintenanceOutcome, ProviderError> {
+        use crate::cache::runtime::InvalidMaintenanceOutcome;
+
+        let _guard = self.write_lock(context)?;
+        context.check()?;
+        if epoch.is_exhausted() {
+            return Ok(InvalidMaintenanceOutcome::Stale);
+        }
+        if self
+            .runtime_cache_generation
+            .read()
+            .map_err(|_| ProviderError::LockPoisoned)?
+            .as_ref()
+            != Some(expected_generation)
+        {
+            return Ok(InvalidMaintenanceOutcome::Stale);
+        }
+        let collection = self.current_collection()?;
+        if !crate::cache::runtime::matches_generation(collection.as_ref(), expected_generation)
+            .map_err(cache_error)?
+        {
+            return Ok(InvalidMaintenanceOutcome::Stale);
+        }
+        crate::cache::runtime::apply_invalid_maintenance(
+            collection.as_ref(),
+            refresh,
+            remove,
+            epoch,
+            expected_generation,
+            observation,
+        )
+        .map_err(cache_error)
+    }
+
     pub(crate) fn apply_runtime_cache_changes(
         &self,
         changes: &super::ChangeSet,
