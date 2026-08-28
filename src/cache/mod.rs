@@ -185,8 +185,7 @@ mod tests {
 
     #[test]
     fn cache_lifecycle_exclusive_waits_for_retained_shared_guard() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{mpsc, Arc};
+        use std::sync::mpsc;
 
         let directory = tempfile::tempdir().unwrap();
         let shared = sqlite::lock_cache_lifecycle_shared(
@@ -195,25 +194,23 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap();
-        let contention_counter = Arc::new(AtomicUsize::new(0));
-        let waiter_counter = contention_counter.clone();
         let root = directory.path().to_path_buf();
+        let waiter_root = root.clone();
         let (result_sender, result_receiver) = mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
-            let result = sqlite::lock_cache_lifecycle_exclusive_with_contention_counter(
-                &root,
+            let result = sqlite::lock_cache_lifecycle_exclusive(
+                &waiter_root,
                 ".cache",
                 Duration::from_millis(500),
-                waiter_counter,
             );
             result_sender.send(result).unwrap();
         });
 
         let evidence_deadline = Instant::now() + Duration::from_secs(2);
-        while contention_counter.load(Ordering::Acquire) == 0 {
+        while sqlite::cache_lifecycle_waiter_count(&root, ".cache") == 0 {
             assert!(
                 Instant::now() < evidence_deadline,
-                "exclusive acquisition never observed actual shared-lock contention"
+                "exclusive acquisition never entered in-process contention"
             );
             std::thread::yield_now();
         }

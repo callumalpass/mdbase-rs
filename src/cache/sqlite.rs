@@ -3,31 +3,11 @@
 #[cfg(test)]
 use rusqlite::OpenFlags;
 use rusqlite::{Connection, Result};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(test)]
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
-
-#[cfg(test)]
-thread_local! {
-    static EXCLUSIVE_CONTENTION_COUNTER: std::cell::RefCell<Option<Arc<AtomicUsize>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-struct ExclusiveContentionCounterGuard;
-
-#[cfg(test)]
-impl Drop for ExclusiveContentionCounterGuard {
-    fn drop(&mut self) {
-        EXCLUSIVE_CONTENTION_COUNTER.with(|slot| {
-            slot.replace(None);
-        });
-    }
-}
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct CacheDbIdentity(same_file::Handle);
@@ -47,14 +27,221 @@ pub(crate) fn cache_db_path(root: &Path, cache_folder: &str) -> PathBuf {
 
 const CACHE_LIFECYCLE_LOCK: &str = "cache.lifecycle.lock";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleLockMode {
+    Shared,
+    Exclusive,
+}
+
+#[derive(Debug)]
+struct LifecycleWaiter {
+    id: u64,
+    mode: LifecycleLockMode,
+}
+
+#[derive(Debug, Default)]
+struct LifecycleState {
+    shared_owners: usize,
+    exclusive_owner: bool,
+    next_waiter_id: u64,
+    waiters: VecDeque<LifecycleWaiter>,
+}
+
+#[derive(Debug)]
+struct LifecycleEntry {
+    identity: PathBuf,
+    state: Mutex<LifecycleState>,
+    changed: Condvar,
+}
+
+impl LifecycleEntry {
+    fn new(identity: PathBuf) -> Self {
+        Self {
+            identity,
+            state: Mutex::new(LifecycleState::default()),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+impl Drop for LifecycleEntry {
+    fn drop(&mut self) {
+        let mut registry = lock_unpoisoned(&LIFECYCLE_REGISTRY);
+        let registered_here = registry
+            .get(&self.identity)
+            .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self));
+        if registered_here {
+            registry.remove(&self.identity);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EnqueuedLifecycleWaiter {
+    entry: Arc<LifecycleEntry>,
+    id: Option<u64>,
+}
+
+impl EnqueuedLifecycleWaiter {
+    fn new(entry: Arc<LifecycleEntry>) -> Self {
+        Self { entry, id: None }
+    }
+
+    fn disarm(&mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for EnqueuedLifecycleWaiter {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        let mut state = lock_unpoisoned(&self.entry.state);
+        if let Some(position) = state.waiters.iter().position(|waiter| waiter.id == id) {
+            state.waiters.remove(position);
+            self.entry.changed.notify_all();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InProcessLifecycleGuard {
+    entry: Arc<LifecycleEntry>,
+    mode: LifecycleLockMode,
+}
+
+impl Drop for InProcessLifecycleGuard {
+    fn drop(&mut self) {
+        let mut state = lock_unpoisoned(&self.entry.state);
+        match self.mode {
+            LifecycleLockMode::Shared => {
+                state.shared_owners = state
+                    .shared_owners
+                    .checked_sub(1)
+                    .expect("shared lifecycle owner count underflow");
+            }
+            LifecycleLockMode::Exclusive => {
+                debug_assert!(state.exclusive_owner);
+                state.exclusive_owner = false;
+            }
+        }
+        self.entry.changed.notify_all();
+    }
+}
+
+static LIFECYCLE_REGISTRY: LazyLock<Mutex<HashMap<PathBuf, Weak<LifecycleEntry>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lifecycle_entry(identity: PathBuf) -> Arc<LifecycleEntry> {
+    let mut registry = lock_unpoisoned(&LIFECYCLE_REGISTRY);
+    // Weak entries avoid keeping unused cache identities alive. The entry's
+    // destructor removes its own key when the final owner releases it.
+    registry.retain(|_, entry| entry.strong_count() != 0);
+    if let Some(entry) = registry.get(&identity).and_then(Weak::upgrade) {
+        // An upgraded Arc can become the final owner concurrently. Release the
+        // registry before it can be dropped and run LifecycleEntry::drop.
+        drop(registry);
+        return entry;
+    }
+    let entry = Arc::new(LifecycleEntry::new(identity.clone()));
+    registry.insert(identity, Arc::downgrade(&entry));
+    drop(registry);
+    entry
+}
+
+#[cfg(test)]
+fn with_registered_lifecycle_entry<T>(
+    identity: &Path,
+    operation: impl FnOnce(&LifecycleEntry) -> T,
+) -> Option<T> {
+    let entry = {
+        let registry = lock_unpoisoned(&LIFECYCLE_REGISTRY);
+        registry.get(identity).and_then(Weak::upgrade)
+    };
+    entry.as_deref().map(operation)
+}
+
+fn acquire_in_process_lifecycle(
+    identity: PathBuf,
+    mode: LifecycleLockMode,
+    deadline: Instant,
+) -> std::io::Result<InProcessLifecycleGuard> {
+    let entry = lifecycle_entry(identity);
+    // Declare cleanup before the state guard so unwind always releases the
+    // mutex before cleanup tries to remove the queued waiter.
+    let mut queued = EnqueuedLifecycleWaiter::new(Arc::clone(&entry));
+    let mut state = lock_unpoisoned(&entry.state);
+    let waiter_id = state.next_waiter_id;
+    state.next_waiter_id = waiter_id
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("cache lifecycle waiter ticket space exhausted"))?;
+    queued.id = Some(waiter_id);
+    state.waiters.push_back(LifecycleWaiter {
+        id: waiter_id,
+        mode,
+    });
+
+    loop {
+        let is_front = state.waiters.front().map(|waiter| waiter.id) == Some(waiter_id);
+        let compatible = match mode {
+            LifecycleLockMode::Shared => !state.exclusive_owner,
+            LifecycleLockMode::Exclusive => !state.exclusive_owner && state.shared_owners == 0,
+        };
+        if is_front && compatible {
+            let waiter = state.waiters.pop_front().expect("front waiter disappeared");
+            queued.disarm();
+            debug_assert_eq!(waiter.mode, mode);
+            match mode {
+                LifecycleLockMode::Shared => {
+                    state.shared_owners = state
+                        .shared_owners
+                        .checked_add(1)
+                        .expect("shared lifecycle owner count overflow");
+                }
+                LifecycleLockMode::Exclusive => state.exclusive_owner = true,
+            }
+            // Let consecutive shared waiters join immediately while preserving
+            // FIFO order in front of later exclusive owners.
+            entry.changed.notify_all();
+            drop(state);
+            return Ok(InProcessLifecycleGuard { entry, mode });
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for in-process cache lifecycle lock",
+            ));
+        }
+        let remaining = deadline - now;
+        state = entry
+            .changed
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct CacheLifecycleGuard {
     file: File,
+    in_process: Option<InProcessLifecycleGuard>,
 }
 
 impl Drop for CacheLifecycleGuard {
     fn drop(&mut self) {
+        // Release the cross-process side before allowing the next local owner
+        // to attempt it.
         let _ = fs2::FileExt::unlock(&self.file);
+        drop(self.in_process.take());
     }
 }
 
@@ -75,20 +262,15 @@ pub(crate) fn lock_cache_lifecycle_exclusive(
 }
 
 #[cfg(test)]
-pub(crate) fn lock_cache_lifecycle_exclusive_with_contention_counter(
-    root: &Path,
-    cache_folder: &str,
-    timeout: Duration,
-    contention_counter: Arc<AtomicUsize>,
-) -> std::io::Result<CacheLifecycleGuard> {
-    EXCLUSIVE_CONTENTION_COUNTER.with(|slot| {
-        assert!(
-            slot.replace(Some(contention_counter)).is_none(),
-            "exclusive contention counter already installed on this thread"
-        );
-    });
-    let _counter_guard = ExclusiveContentionCounterGuard;
-    lock_cache_lifecycle_exclusive(root, cache_folder, timeout)
+pub(crate) fn cache_lifecycle_waiter_count(root: &Path, cache_folder: &str) -> usize {
+    let identity = match std::fs::canonicalize(root.join(cache_folder).join(CACHE_LIFECYCLE_LOCK)) {
+        Ok(identity) => identity,
+        Err(_) => return 0,
+    };
+    with_registered_lifecycle_entry(&identity, |entry| {
+        lock_unpoisoned(&entry.state).waiters.len()
+    })
+    .unwrap_or(0)
 }
 
 fn lock_cache_lifecycle(
@@ -97,16 +279,29 @@ fn lock_cache_lifecycle(
     timeout: Duration,
     exclusive: bool,
 ) -> std::io::Result<CacheLifecycleGuard> {
+    let deadline = Instant::now() + timeout;
     let cache_root = root.join(cache_folder);
     std::fs::create_dir_all(&cache_root)?;
+    let lock_path = cache_root.join(CACHE_LIFECYCLE_LOCK);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(cache_root.join(CACHE_LIFECYCLE_LOCK))?;
-    let deadline = Instant::now() + timeout;
-    let mut first_error = None;
+        .open(&lock_path)?;
+    // Canonicalization gives aliases one exact key and preserves the filesystem's
+    // canonical spelling/case on Windows. It is intentionally the lock path,
+    // not the caller's potentially case-variant cache path.
+    let identity = std::fs::canonicalize(&lock_path)?;
+    let mode = if exclusive {
+        LifecycleLockMode::Exclusive
+    } else {
+        LifecycleLockMode::Shared
+    };
+    let in_process = acquire_in_process_lifecycle(identity, mode, deadline)?;
+    // Once the OS reports contention, preserve that first platform error (and
+    // its raw OS code) if the single end-to-end deadline expires.
+    let mut first_contention_error = None;
     loop {
         let result = if exclusive {
             fs2::FileExt::try_lock_exclusive(&file)
@@ -114,22 +309,19 @@ fn lock_cache_lifecycle(
             fs2::FileExt::try_lock_shared(&file)
         };
         match result {
-            Ok(()) => return Ok(CacheLifecycleGuard { file }),
+            Ok(()) => {
+                return Ok(CacheLifecycleGuard {
+                    file,
+                    in_process: Some(in_process),
+                });
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                #[cfg(test)]
-                if exclusive {
-                    EXCLUSIVE_CONTENTION_COUNTER.with(|slot| {
-                        if let Some(counter) = slot.borrow().as_ref() {
-                            counter.fetch_add(1, Ordering::AcqRel);
-                        }
-                    });
-                }
-                if first_error.is_none() {
-                    first_error = Some(error);
+                if first_contention_error.is_none() {
+                    first_contention_error = Some(error);
                 }
                 let now = Instant::now();
                 if now >= deadline {
-                    return Err(first_error.expect("lock failure was recorded"));
+                    return Err(first_contention_error.expect("lock failure was recorded"));
                 }
                 std::thread::sleep(Duration::from_millis(10).min(deadline - now));
             }
@@ -376,5 +568,319 @@ mod tests {
                 .unwrap(),
             "second"
         );
+    }
+
+    fn wait_until_queued(root: &Path, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cache_lifecycle_waiter_count(root, ".cache") < expected {
+            assert!(Instant::now() < deadline, "lifecycle waiter was not queued");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn cache_lifecycle_shared_guards_coexist() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = lock_cache_lifecycle_shared(directory.path(), ".cache", Duration::from_secs(1))
+            .unwrap();
+        let root = directory.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            sender
+                .send(lock_cache_lifecycle_shared(
+                    &root,
+                    ".cache",
+                    Duration::from_secs(1),
+                ))
+                .unwrap();
+        });
+
+        let second = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        drop(first);
+        drop(second);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn cache_lifecycle_exclusive_guards_serialize_fifo() {
+        let directory = tempfile::tempdir().unwrap();
+        let first =
+            lock_cache_lifecycle_exclusive(directory.path(), ".cache", Duration::from_secs(1))
+                .unwrap();
+        let root = directory.path().to_path_buf();
+        let waiter_root = root.clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let guard =
+                lock_cache_lifecycle_exclusive(&waiter_root, ".cache", Duration::from_secs(1));
+            sender.send(guard).unwrap();
+        });
+
+        wait_until_queued(&root, 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(first);
+        drop(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+        );
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn cache_lifecycle_wait_timeout_recovers_without_stranding_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared =
+            lock_cache_lifecycle_shared(directory.path(), ".cache", Duration::from_secs(1))
+                .unwrap();
+        let error =
+            lock_cache_lifecycle_exclusive(directory.path(), ".cache", Duration::from_millis(25))
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+
+        drop(shared);
+        drop(
+            lock_cache_lifecycle_exclusive(directory.path(), ".cache", Duration::from_secs(1))
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    #[ignore = "helper process for cache_lifecycle_cross_process_preserves_os_error"]
+    fn cache_lifecycle_cross_process_lock_holder() {
+        let Some(root) = std::env::var_os("MDBASE_LIFECYCLE_TEST_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let guard = lock_cache_lifecycle_exclusive(&root, ".cache", Duration::from_secs(1))
+            .expect("helper must acquire lifecycle lock");
+        File::create(root.join("holder-ready")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !root.join("holder-release").exists() {
+            assert!(Instant::now() < deadline, "parent did not release helper");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn cache_lifecycle_cross_process_preserves_os_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("cache::sqlite::tests::cache_lifecycle_cross_process_lock_holder")
+            .arg("--ignored")
+            .arg("--test-threads=1")
+            .env("MDBASE_LIFECYCLE_TEST_ROOT", directory.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !directory.path().join("holder-ready").exists() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "helper did not acquire lock"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let started = Instant::now();
+        let error =
+            lock_cache_lifecycle_shared(directory.path(), ".cache", Duration::from_millis(40))
+                .unwrap_err();
+        let elapsed = started.elapsed();
+        File::create(directory.path().join("holder-release")).unwrap();
+        assert!(child.wait().unwrap().success());
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(error.raw_os_error().is_some());
+        assert!(elapsed >= Duration::from_millis(40));
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cache_lifecycle_alias_uses_one_local_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared =
+            lock_cache_lifecycle_shared(directory.path(), ".cache", Duration::from_secs(1))
+                .unwrap();
+        let alias = directory.path().join(".");
+        let started = Instant::now();
+        let error = lock_cache_lifecycle_exclusive(&alias, ".cache", Duration::from_millis(40))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(elapsed >= Duration::from_millis(40));
+        assert!(elapsed < Duration::from_secs(1));
+        assert_eq!(cache_lifecycle_waiter_count(directory.path(), ".cache"), 0);
+        drop(shared);
+    }
+
+    #[test]
+    fn cache_lifecycle_waiter_ticket_exhaustion_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join(".cache")).unwrap();
+        let lock_path = directory.path().join(".cache").join(CACHE_LIFECYCLE_LOCK);
+        File::create(&lock_path).unwrap();
+        let identity = std::fs::canonicalize(lock_path).unwrap();
+        let entry = lifecycle_entry(identity.clone());
+        lock_unpoisoned(&entry.state).next_waiter_id = u64::MAX;
+
+        let error = acquire_in_process_lifecycle(
+            identity,
+            LifecycleLockMode::Shared,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(lock_unpoisoned(&entry.state).waiters.is_empty());
+    }
+
+    #[test]
+    fn cache_lifecycle_enqueued_waiter_is_removed_on_panic() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = directory.path().join("panic-safe-lifecycle-entry");
+        let entry = lifecycle_entry(identity);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut queued = EnqueuedLifecycleWaiter::new(Arc::clone(&entry));
+            let mut state = lock_unpoisoned(&entry.state);
+            let id = state.next_waiter_id;
+            state.next_waiter_id = id.checked_add(1).unwrap();
+            queued.id = Some(id);
+            state.waiters.push_back(LifecycleWaiter {
+                id,
+                mode: LifecycleLockMode::Exclusive,
+            });
+            panic!("exercise queued waiter unwind");
+        }));
+
+        assert!(result.is_err());
+        assert!(lock_unpoisoned(&entry.state).waiters.is_empty());
+    }
+
+    #[test]
+    fn cache_lifecycle_final_upgraded_arc_drops_after_registry_unlock() {
+        let directory = tempfile::tempdir().unwrap();
+        let guard = lock_cache_lifecycle_shared(directory.path(), ".cache", Duration::from_secs(1))
+            .unwrap();
+        let identity =
+            std::fs::canonicalize(directory.path().join(".cache").join(CACHE_LIFECYCLE_LOCK))
+                .unwrap();
+        let (upgraded_sender, upgraded_receiver) = std::sync::mpsc::sync_channel(0);
+        let (continue_sender, continue_receiver) = std::sync::mpsc::sync_channel(0);
+        let (done_sender, done_receiver) = std::sync::mpsc::sync_channel(0);
+        let thread = std::thread::spawn(move || {
+            let found = with_registered_lifecycle_entry(&identity, |_| {
+                upgraded_sender.send(()).unwrap();
+                continue_receiver.recv().unwrap();
+            });
+            done_sender.send(found.is_some()).unwrap();
+        });
+
+        upgraded_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        drop(guard);
+        continue_sender.send(()).unwrap();
+        assert!(done_receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn cache_lifecycle_registry_key_is_removed_with_last_guard() {
+        let directory = tempfile::tempdir().unwrap();
+        let guard = lock_cache_lifecycle_shared(directory.path(), ".cache", Duration::from_secs(1))
+            .unwrap();
+        let identity =
+            std::fs::canonicalize(directory.path().join(".cache").join(CACHE_LIFECYCLE_LOCK))
+                .unwrap();
+        assert!(lock_unpoisoned(&LIFECYCLE_REGISTRY).contains_key(&identity));
+
+        drop(guard);
+
+        assert!(!lock_unpoisoned(&LIFECYCLE_REGISTRY).contains_key(&identity));
+    }
+
+    #[test]
+    fn cache_lifecycle_distinct_caches_do_not_block_each_other() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let retained =
+            lock_cache_lifecycle_exclusive(first.path(), ".cache", Duration::from_secs(1)).unwrap();
+        let independent =
+            lock_cache_lifecycle_exclusive(second.path(), ".cache", Duration::from_millis(100))
+                .unwrap();
+        drop(independent);
+        drop(retained);
+    }
+
+    #[test]
+    fn cache_lifecycle_guard_releases_during_panic_unwind() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let _guard =
+                lock_cache_lifecycle_shared(&root, ".cache", Duration::from_secs(1)).unwrap();
+            sender.send(()).unwrap();
+            panic!("exercise lifecycle guard unwind");
+        });
+        receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(thread.join().is_err());
+
+        drop(
+            lock_cache_lifecycle_exclusive(directory.path(), ".cache", Duration::from_secs(1))
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn cache_lifecycle_queued_exclusive_precedes_later_shared() {
+        let directory = tempfile::tempdir().unwrap();
+        let retained =
+            lock_cache_lifecycle_shared(directory.path(), ".cache", Duration::from_secs(1))
+                .unwrap();
+        let root = directory.path().to_path_buf();
+        let exclusive_root = root.clone();
+        let (order_sender, order_receiver) = std::sync::mpsc::channel();
+        let exclusive_sender = order_sender.clone();
+        let exclusive = std::thread::spawn(move || {
+            let guard =
+                lock_cache_lifecycle_exclusive(&exclusive_root, ".cache", Duration::from_secs(2))
+                    .unwrap();
+            exclusive_sender.send("exclusive").unwrap();
+            drop(guard);
+        });
+        wait_until_queued(&root, 1);
+
+        let shared_root = root.clone();
+        let shared = std::thread::spawn(move || {
+            let _guard =
+                lock_cache_lifecycle_shared(&shared_root, ".cache", Duration::from_secs(2))
+                    .unwrap();
+            order_sender.send("shared").unwrap();
+        });
+        wait_until_queued(&root, 2);
+        drop(retained);
+
+        assert_eq!(
+            order_receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "exclusive"
+        );
+        assert_eq!(
+            order_receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "shared"
+        );
+        exclusive.join().unwrap();
+        shared.join().unwrap();
     }
 }
