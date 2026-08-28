@@ -1004,14 +1004,25 @@ fn merge_pending_paths(
     }
 }
 
+fn take_released_pending_rescans(pending: &mut Vec<PendingRescan>) -> Vec<PendingRescan> {
+    let released = std::mem::take(pending);
+    // A received result is the synchronous completion boundary. Empty the
+    // worker's waiter state and release every bounded-queue permit before any
+    // caller can observe that boundary, including when several requests were
+    // coalesced into one reconciliation.
+    for pending in &released {
+        pending.ticket.release();
+    }
+    released
+}
+
 fn fail_pending_rescans(pending: &mut Vec<PendingRescan>) {
-    for pending in pending.drain(..) {
+    for pending in take_released_pending_rescans(pending) {
         if !pending.ticket.cancelled.load(Ordering::Acquire) {
             let _ = pending
                 .ready
                 .send(Err(ReconciliationFailure::RevisionExhausted));
         }
-        pending.ticket.release();
     }
 }
 
@@ -1028,13 +1039,12 @@ fn complete_pending_rescans(
     } else {
         Ok(outcome)
     };
-    for pending in pending.drain(..) {
+    for pending in take_released_pending_rescans(pending) {
         if !pending.ticket.cancelled.load(Ordering::Acquire) {
             // Arc cloning is O(1), and unbounded send cannot block while the
             // poison linearization gate is held.
             let _ = pending.ready.send(result.clone());
         }
-        pending.ticket.release();
     }
 }
 
