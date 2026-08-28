@@ -691,6 +691,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
 
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join(".cache").join(CACHE_LIFECYCLE_LOCK))
+            .unwrap();
+        let expected = fs2::FileExt::try_lock_shared(&probe).unwrap_err();
         let started = Instant::now();
         let error =
             lock_cache_lifecycle_shared(directory.path(), ".cache", Duration::from_millis(40))
@@ -699,7 +705,8 @@ mod tests {
         File::create(directory.path().join("holder-release")).unwrap();
         assert!(child.wait().unwrap().success());
 
-        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(error.kind(), expected.kind());
+        assert_eq!(error.raw_os_error(), expected.raw_os_error());
         assert!(error.raw_os_error().is_some());
         assert!(elapsed >= Duration::from_millis(40));
         assert!(elapsed < Duration::from_secs(1));
