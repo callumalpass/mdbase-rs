@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::Path;
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -39,6 +39,14 @@ pub struct FilesystemRuntime {
     maintenance_notification_injections: AtomicUsize,
     #[cfg(test)]
     maintenance_transaction_commits: AtomicUsize,
+    #[cfg(test)]
+    validation_drop_callback_injections: AtomicUsize,
+    #[cfg(test)]
+    acknowledgement_completions: Arc<AtomicUsize>,
+    #[cfg(test)]
+    drop_callback_preceded_ack: Arc<AtomicBool>,
+    #[cfg(test)]
+    drop_callback_preceded_connection_close: Arc<AtomicBool>,
 }
 
 struct RuntimeOrder {
@@ -107,6 +115,14 @@ impl FilesystemRuntime {
             maintenance_notification_injections: AtomicUsize::new(0),
             #[cfg(test)]
             maintenance_transaction_commits: AtomicUsize::new(0),
+            #[cfg(test)]
+            validation_drop_callback_injections: AtomicUsize::new(0),
+            #[cfg(test)]
+            acknowledgement_completions: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            drop_callback_preceded_ack: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            drop_callback_preceded_connection_close: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -672,6 +688,51 @@ impl FilesystemRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_cache_notification_on_validation_open_for_test(&self) {
+        let root = self.provider.root().to_path_buf();
+        let collection = crate::Collection::open(&root).unwrap();
+        let cache_folder = collection.settings.cache_folder.clone();
+        let callback = self.watcher_test_control.clone();
+        let callback_root = root.clone();
+        crate::cache::sqlite::set_read_only_open_hook(&root, &cache_folder, move || {
+            callback.invoke_installed_modify_callback(&callback_root);
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_validation_open_notification_for_test(&self) -> bool {
+        let root = self.provider.root();
+        let collection = crate::Collection::open(root).unwrap();
+        crate::cache::sqlite::clear_read_only_open_hook(root, &collection.settings.cache_folder)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_installed_callback_on_validated_seal_drop_for_test(&self) {
+        self.validation_drop_callback_injections
+            .store(1, Ordering::Release);
+        self.drop_callback_preceded_ack
+            .store(false, Ordering::Release);
+        self.drop_callback_preceded_connection_close
+            .store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_callback_preceded_ack_for_test(&self) -> bool {
+        self.drop_callback_preceded_ack.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_callback_preceded_connection_close_for_test(&self) -> bool {
+        self.drop_callback_preceded_connection_close
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watcher_revision_for_test(&self) -> u64 {
+        self.watcher_test_control.invalidation_revision()
+    }
+
+    #[cfg(test)]
     pub(crate) fn maintenance_attempt_counts_for_test(&self) -> (usize, usize) {
         (
             self.maintenance_transaction_commits.load(Ordering::Acquire),
@@ -721,7 +782,8 @@ impl FilesystemRuntime {
             // A seal is single-use and belongs only to the immediately next
             // observation. Taking it before validation prevents a mismatched
             // state from becoming valid again after any intervening retry.
-            let sealed_current = match maintenance_seal.take() {
+            #[allow(unused_mut)]
+            let mut validated_seal = match maintenance_seal.take() {
                 Some(seal) => self.provider.validate_runtime_invalid_maintenance_seal(
                     seal,
                     observation.invalid_records.as_ref(),
@@ -730,9 +792,37 @@ impl FilesystemRuntime {
                     &observation_token,
                     context,
                 )?,
-                None => false,
+                None => None,
             };
-            let maintenance = if sealed_current {
+            #[cfg(test)]
+            if let Some(seal) = validated_seal.as_mut() {
+                if self
+                    .validation_drop_callback_injections
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        (remaining > 0).then(|| remaining - 1)
+                    })
+                    .is_ok()
+                {
+                    let callback = self.watcher_test_control.clone();
+                    let callback_root = self.provider.root().to_path_buf();
+                    let completions = self.acknowledgement_completions.clone();
+                    let completed_before = completions.load(Ordering::Acquire);
+                    let preceded_ack = self.drop_callback_preceded_ack.clone();
+                    let preceded_close = self.drop_callback_preceded_connection_close.clone();
+                    let connection_closed = Arc::new(AtomicBool::new(false));
+                    let hook_connection_closed = connection_closed.clone();
+                    seal.set_drop_hook(connection_closed, move || {
+                        if completions.load(Ordering::Acquire) <= completed_before {
+                            preceded_ack.store(true, Ordering::Release);
+                        }
+                        if !hook_connection_closed.load(Ordering::Acquire) {
+                            preceded_close.store(true, Ordering::Release);
+                        }
+                        callback.invoke_installed_modify_callback(&callback_root);
+                    });
+                }
+            }
+            let maintenance = if validated_seal.is_some() {
                 crate::cache::runtime::InvalidMaintenanceOutcome::Current
             } else {
                 self.provider.apply_runtime_invalid_maintenance(
@@ -757,9 +847,17 @@ impl FilesystemRuntime {
                     }
                 }
             }
-            let acknowledged = self
+            let acknowledgement = self
                 .watcher_lock(context)?
-                .acknowledge_observation_with_context(observation, context)?;
+                .acknowledge_observation_with_context(observation, context);
+            #[cfg(test)]
+            self.acknowledgement_completions
+                .fetch_add(1, Ordering::AcqRel);
+            // The validated seal owns the retained SQLite connection. Closing it
+            // only after the acknowledgement attempt prevents a close callback
+            // from invalidating the operation it just validated.
+            drop(validated_seal);
+            let acknowledged = acknowledgement?;
             if acknowledged {
                 return context.check();
             }

@@ -67,6 +67,10 @@ impl WatcherTestControl {
         self.invalidation_revision.store(value, Ordering::Release);
     }
 
+    pub(crate) fn invalidation_revision(&self) -> u64 {
+        self.invalidation_revision.load(Ordering::Acquire)
+    }
+
     pub(crate) fn invoke_installed_modify_callback(&self, path: &Path) {
         (self.filesystem_callback)(Ok(Event {
             kind: EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),

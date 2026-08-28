@@ -1,7 +1,97 @@
 //! SQLite setup and helpers.
 
-use rusqlite::{Connection, OpenFlags, Result};
-use std::path::Path;
+#[cfg(test)]
+use rusqlite::OpenFlags;
+use rusqlite::{Connection, Result};
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CacheDbIdentity(same_file::Handle);
+
+impl CacheDbIdentity {
+    pub(crate) fn capture(path: &Path) -> std::io::Result<Self> {
+        // Keep the identity handle alive with the SQLite connection. This makes
+        // Unix device/inode and Windows volume/file-index comparison robust
+        // against path removal, replacement, and identifier reuse.
+        same_file::Handle::from_path(path).map(Self)
+    }
+}
+
+pub(crate) fn cache_db_path(root: &Path, cache_folder: &str) -> PathBuf {
+    root.join(cache_folder).join("cache.db")
+}
+
+const CACHE_LIFECYCLE_LOCK: &str = "cache.lifecycle.lock";
+
+#[derive(Debug)]
+pub(crate) struct CacheLifecycleGuard {
+    file: File,
+}
+
+impl Drop for CacheLifecycleGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+pub(crate) fn lock_cache_lifecycle_shared(
+    root: &Path,
+    cache_folder: &str,
+    timeout: Duration,
+) -> std::io::Result<CacheLifecycleGuard> {
+    lock_cache_lifecycle(root, cache_folder, timeout, false)
+}
+
+pub(crate) fn lock_cache_lifecycle_exclusive(
+    root: &Path,
+    cache_folder: &str,
+    timeout: Duration,
+) -> std::io::Result<CacheLifecycleGuard> {
+    lock_cache_lifecycle(root, cache_folder, timeout, true)
+}
+
+fn lock_cache_lifecycle(
+    root: &Path,
+    cache_folder: &str,
+    timeout: Duration,
+    exclusive: bool,
+) -> std::io::Result<CacheLifecycleGuard> {
+    let cache_root = root.join(cache_folder);
+    std::fs::create_dir_all(&cache_root)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(cache_root.join(CACHE_LIFECYCLE_LOCK))?;
+    let deadline = Instant::now() + timeout;
+    let mut first_error = None;
+    loop {
+        let result = if exclusive {
+            fs2::FileExt::try_lock_exclusive(&file)
+        } else {
+            fs2::FileExt::try_lock_shared(&file)
+        };
+        match result {
+            Ok(()) => return Ok(CacheLifecycleGuard { file }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(first_error.expect("lock failure was recorded"));
+                }
+                std::thread::sleep(Duration::from_millis(10).min(deadline - now));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// Open (or create) the cache database at `<root>/<cache_folder>/cache.db`.
 pub(crate) fn open_cache_db(root: &Path, cache_folder: &str) -> Result<Connection> {
@@ -18,20 +108,61 @@ pub(crate) fn open_cache_db(root: &Path, cache_folder: &str) -> Result<Connectio
     Ok(conn)
 }
 
-/// Open an existing cache read-only without schema initialization, DDL, or
-/// logical cache writes. SQLite retains ownership of WAL shared-memory details.
+/// Test the behavior of opening an existing cache read-only without schema
+/// initialization, DDL, or logical cache writes. Production seal validation
+/// deliberately reuses its committing connection instead of taking this path.
+#[cfg(test)]
 pub(crate) fn open_cache_db_read_only_existing(
     root: &Path,
     cache_folder: &str,
 ) -> Result<Connection> {
-    let db_path = root.join(cache_folder).join("cache.db");
+    let db_path = cache_db_path(root, cache_folder);
     if !db_path.is_file() {
         return Err(rusqlite::Error::InvalidPath(db_path));
     }
-    Connection::open_with_flags(
-        db_path,
+    let connection = Connection::open_with_flags(
+        &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
+    )?;
+    #[cfg(test)]
+    run_read_only_open_hook(&db_path);
+    Ok(connection)
+}
+
+#[cfg(test)]
+type ReadOnlyOpenHooks = std::collections::BTreeMap<PathBuf, Box<dyn FnOnce() + Send>>;
+
+#[cfg(test)]
+static READ_ONLY_OPEN_HOOKS: LazyLock<Mutex<ReadOnlyOpenHooks>> =
+    LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
+
+#[cfg(test)]
+pub(crate) fn set_read_only_open_hook(
+    root: &Path,
+    cache_folder: &str,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    READ_ONLY_OPEN_HOOKS
+        .lock()
+        .unwrap()
+        .insert(cache_db_path(root, cache_folder), Box::new(hook));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_read_only_open_hook(root: &Path, cache_folder: &str) -> bool {
+    READ_ONLY_OPEN_HOOKS
+        .lock()
+        .unwrap()
+        .remove(&cache_db_path(root, cache_folder))
+        .is_some()
+}
+
+#[cfg(test)]
+fn run_read_only_open_hook(path: &Path) {
+    let hook = READ_ONLY_OPEN_HOOKS.lock().unwrap().remove(path);
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 /// Open an in-memory cache database (for testing).

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::path::PathBuf;
 #[cfg(test)]
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
@@ -144,9 +144,48 @@ pub(crate) struct InvalidMaintenanceSeal {
     observation: crate::watch::ReconciliationToken,
     query_snapshot: String,
     schema_version: i64,
+    data_version: i64,
+    connection: Option<Connection>,
+    cache_db_identity: sqlite::CacheDbIdentity,
+    _lifecycle_guard: sqlite::CacheLifecycleGuard,
+    #[cfg(test)]
+    drop_hook: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    connection_close_marker: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Drop for InvalidMaintenanceSeal {
+    fn drop(&mut self) {
+        // A validated seal can own an active BEGIN IMMEDIATE reservation. End
+        // that transaction and close SQLite before modeling any resulting
+        // watcher callback. The lifecycle guard remains held until the seal is
+        // fully dropped, so official clear/recreate cannot interleave here.
+        if let Some(connection) = self.connection.take() {
+            let _ = connection.execute_batch("ROLLBACK");
+            drop(connection);
+        }
+        #[cfg(test)]
+        if let Some(marker) = self.connection_close_marker.take() {
+            marker.store(true, std::sync::atomic::Ordering::Release);
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.drop_hook.take() {
+            hook();
+        }
+    }
 }
 
 impl InvalidMaintenanceSeal {
+    #[cfg(test)]
+    pub(crate) fn set_drop_hook(
+        &mut self,
+        connection_close_marker: Arc<std::sync::atomic::AtomicBool>,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        self.connection_close_marker = Some(connection_close_marker);
+        self.drop_hook = Some(Box::new(hook));
+    }
+
     pub(crate) fn matches(
         &self,
         refresh: &BTreeSet<String>,
@@ -172,25 +211,42 @@ impl InvalidMaintenanceSeal {
         Ok(true)
     }
 
-    pub(crate) fn cache_is_current(&self, collection: &Collection) -> Result<bool, CacheError> {
-        let mut connection = sqlite::open_cache_db_read_only_existing(
-            &collection.root,
-            &collection.settings.cache_folder,
-        )?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let schema_version =
-            transaction.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))?;
-        if schema_version != self.schema_version {
+    pub(crate) fn cache_is_current(&mut self, collection: &Collection) -> Result<bool, CacheError> {
+        let db_path = sqlite::cache_db_path(&collection.root, &collection.settings.cache_folder);
+        if sqlite::CacheDbIdentity::capture(&db_path)? != self.cache_db_identity {
             return Ok(false);
         }
-        let generation = transaction
+        #[cfg(test)]
+        run_seal_validation_hook(
+            &db_path,
+            SealValidationBoundary::AfterPreTransactionIdentity,
+        );
+
+        // Reuse the connection that performed the maintenance commit. BEGIN
+        // IMMEDIATE takes a write reservation without making a logical write;
+        // cooperative SQLite writers cannot commit between these exact checks
+        // and watcher acknowledgement. Busy means this seal is stale.
+        let connection = self
+            .connection
+            .as_mut()
+            .ok_or(CacheError::Sql(rusqlite::Error::InvalidQuery))?;
+        connection.busy_timeout(std::time::Duration::ZERO)?;
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let schema_version =
+            connection.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))?;
+        let data_version =
+            connection.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?;
+        if schema_version != self.schema_version || data_version != self.data_version {
+            return Ok(false);
+        }
+        let generation = connection
             .query_row(
                 "SELECT value FROM meta WHERE key = ?1",
                 [GENERATION_KEY],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        let query_snapshot = transaction
+        let query_snapshot = connection
             .query_row(
                 "SELECT value FROM meta WHERE key = 'query_snapshot'",
                 [],
@@ -203,18 +259,37 @@ impl InvalidMaintenanceSeal {
             return Ok(false);
         }
         for (path, expectation) in &self.expectations {
-            if !indexer::maintenance_cache_expectation_is_exact(&transaction, path, expectation)? {
+            if !indexer::maintenance_cache_expectation_is_exact(connection, path, expectation)? {
                 return Ok(false);
             }
         }
+        #[cfg(test)]
+        run_seal_validation_hook(&db_path, SealValidationBoundary::BeforeReservedDataVersion);
+        let reserved_data_version =
+            connection.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?;
+        if reserved_data_version != self.data_version
+            || sqlite::CacheDbIdentity::capture(&db_path)? != self.cache_db_identity
+        {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        run_seal_validation_hook(&db_path, SealValidationBoundary::AfterReservedIdentity);
         Ok(true)
+    }
+
+    pub(crate) fn final_identity_is_current(
+        &self,
+        collection: &Collection,
+    ) -> Result<bool, CacheError> {
+        let db_path = sqlite::cache_db_path(&collection.root, &collection.settings.cache_folder);
+        Ok(sqlite::CacheDbIdentity::capture(&db_path)? == self.cache_db_identity)
     }
 }
 
 pub(crate) enum InvalidMaintenanceOutcome {
     Stale,
     Current,
-    Applied(InvalidMaintenanceSeal),
+    Applied(Box<InvalidMaintenanceSeal>),
 }
 
 impl std::fmt::Debug for InvalidMaintenanceOutcome {
@@ -275,6 +350,13 @@ pub(crate) fn apply_invalid_maintenance(
         }
         expected.insert(path.clone(), indexer::MaintenanceExpectation::Absent);
     }
+    // Official clear/recreate takes this advisory lock exclusively. Acquire the
+    // shared side before opening SQLite and retain it in the seal through ack.
+    let lifecycle_guard = sqlite::lock_cache_lifecycle_shared(
+        &collection.root,
+        &collection.settings.cache_folder,
+        std::time::Duration::from_secs(1),
+    )?;
     let mut connection =
         sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -304,6 +386,15 @@ pub(crate) fn apply_invalid_maintenance(
     let query_snapshot = advance_generation(&transaction, generation)?;
     let schema_version =
         transaction.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))?;
+    // Capture the baseline while the IMMEDIATE transaction excludes commits by
+    // every other SQLite writer. This connection's own commit does not advance
+    // its PRAGMA data_version value.
+    let data_version =
+        transaction.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?;
+    let cache_db_identity = sqlite::CacheDbIdentity::capture(&sqlite::cache_db_path(
+        &collection.root,
+        &collection.settings.cache_folder,
+    ))?;
     run_maintenance_revalidation_hook(collection);
     // External writers do not participate in SQLite locking. Re-open every
     // path whose row changed at the final pre-commit boundary and roll back if
@@ -323,15 +414,66 @@ pub(crate) fn apply_invalid_maintenance(
         return Ok(InvalidMaintenanceOutcome::Stale);
     }
     transaction.commit()?;
-    Ok(InvalidMaintenanceOutcome::Applied(InvalidMaintenanceSeal {
-        refresh: refresh.clone(),
-        remove: remove.clone(),
-        expectations: expected,
-        generation: generation.clone(),
-        observation,
-        query_snapshot,
-        schema_version,
-    }))
+    Ok(InvalidMaintenanceOutcome::Applied(Box::new(
+        InvalidMaintenanceSeal {
+            refresh: refresh.clone(),
+            remove: remove.clone(),
+            expectations: expected,
+            generation: generation.clone(),
+            observation,
+            query_snapshot,
+            schema_version,
+            data_version,
+            connection: Some(connection),
+            cache_db_identity,
+            _lifecycle_guard: lifecycle_guard,
+            #[cfg(test)]
+            drop_hook: None,
+            #[cfg(test)]
+            connection_close_marker: None,
+        },
+    )))
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum SealValidationBoundary {
+    AfterPreTransactionIdentity,
+    BeforeReservedDataVersion,
+    AfterReservedIdentity,
+}
+
+#[cfg(test)]
+type SealValidationHooks = BTreeMap<(PathBuf, SealValidationBoundary), Box<dyn FnOnce() + Send>>;
+
+#[cfg(test)]
+static SEAL_VALIDATION_HOOKS: LazyLock<Mutex<SealValidationHooks>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+#[cfg(test)]
+pub(crate) fn set_seal_validation_hook(
+    collection: &Collection,
+    boundary: SealValidationBoundary,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    SEAL_VALIDATION_HOOKS.lock().unwrap().insert(
+        (
+            sqlite::cache_db_path(&collection.root, &collection.settings.cache_folder),
+            boundary,
+        ),
+        Box::new(hook),
+    );
+}
+
+#[cfg(test)]
+fn run_seal_validation_hook(path: &std::path::Path, boundary: SealValidationBoundary) {
+    let hook = SEAL_VALIDATION_HOOKS
+        .lock()
+        .unwrap()
+        .remove(&(path.to_path_buf(), boundary));
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[cfg(test)]

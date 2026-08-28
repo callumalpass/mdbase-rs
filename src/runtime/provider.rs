@@ -511,19 +511,20 @@ impl FilesystemProvider {
         Ok(())
     }
 
-    /// Apply private watcher maintenance only if the expected generation still
-    /// Validate a single-use maintenance seal against one coherent, read-only
-    /// SQLite snapshot. The path performs no logical cache write, DDL, or schema
-    /// initialization; query-snapshot and schema tokens fence every cache writer.
+    /// Validate a single-use maintenance seal against one coherent SQLite
+    /// snapshot plus a BEGIN IMMEDIATE reservation on the connection that
+    /// committed it. The path performs no SQLite open, logical cache write, DDL,
+    /// or schema initialization; the returned seal retains the reservation and
+    /// lifecycle lock through acknowledgement.
     pub(crate) fn validate_runtime_invalid_maintenance_seal(
         &self,
-        seal: crate::cache::runtime::InvalidMaintenanceSeal,
+        mut seal: Box<crate::cache::runtime::InvalidMaintenanceSeal>,
         refresh: &std::collections::BTreeSet<String>,
         remove: &std::collections::BTreeSet<String>,
         expected_generation: &super::CollectionGeneration,
         observation: &crate::watch::ReconciliationToken,
         context: &OperationContext,
-    ) -> Result<bool, ProviderError> {
+    ) -> Result<Option<Box<crate::cache::runtime::InvalidMaintenanceSeal>>, ProviderError> {
         let _guard = self.write_lock(context)?;
         context.check()?;
         if observation.is_exhausted()
@@ -535,23 +536,36 @@ impl FilesystemProvider {
                 .as_ref()
                 != Some(expected_generation)
         {
-            return Ok(false);
+            return Ok(None);
         }
         let collection = self.current_collection()?;
         if !seal.cache_is_current(collection.as_ref()).unwrap_or(false) {
-            return Ok(false);
+            return Ok(None);
         }
         context.check()?;
-        // Cooperative cache writers are fenced by the provider gate and the
-        // query-snapshot/schema tokens above. Revalidate handle-bound filesystem
-        // facts last. A callback delivered before acknowledgement advances the
+        // Cooperative cache writers are fenced by the provider gate, SQLite
+        // reservation, lifecycle lock, and exact tokens above. Revalidate
+        // handle-bound filesystem facts last. A callback delivered before
+        // acknowledgement advances the
         // watcher revision and rejects that acknowledgement; a raw edit whose
         // notification arrives later is a subsequent eventual watcher event.
-        let current = seal
+        if !seal
             .filesystem_is_current(collection.as_ref())
-            .unwrap_or(false);
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
         context.check()?;
-        Ok(current)
+        // This is the third path-handle comparison: before the reservation,
+        // under it after logical checks, and now immediately after final
+        // filesystem revalidation.
+        if !seal
+            .final_identity_is_current(collection.as_ref())
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        Ok(Some(seal))
     }
 
     pub(crate) fn apply_runtime_invalid_maintenance(

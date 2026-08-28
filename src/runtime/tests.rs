@@ -1969,6 +1969,62 @@ fn cache_write_notifications_do_not_exhaust_reconciliation_ownership_retries() {
 }
 
 #[test]
+fn validated_connection_closes_only_after_ack_and_later_callback_converges() {
+    let directory = collection();
+    fs::write(directory.path().join("invalid.md"), b"bad\xffutf8\n").unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+
+    // The first cache-write callback rejects attempt 1's acknowledgement. The
+    // retained seal validates attempt 2; dropping it first rolls back and closes
+    // SQLite, then invokes the exact installed watcher callback after attempt 2's
+    // successful ack. Native close notification behavior requires hosted macOS;
+    // this hook deterministically proves the lifecycle ordering.
+    runtime.inject_cache_notifications_for_test(1);
+    runtime.inject_installed_callback_on_validated_seal_drop_for_test();
+    runtime.synchronize().unwrap();
+    assert!(!runtime.drop_callback_preceded_ack_for_test());
+    assert!(!runtime.drop_callback_preceded_connection_close_for_test());
+    assert_eq!(runtime.maintenance_attempt_counts_for_test(), (1, 0));
+    assert_eq!(runtime.watcher_revision_for_test(), 4);
+
+    // The close callback is a later eventual event. It converges with one normal
+    // maintenance pass and no callback/retry rewrite loop.
+    runtime.synchronize().unwrap();
+    assert_eq!(runtime.maintenance_attempt_counts_for_test(), (2, 0));
+    assert_eq!(runtime.watcher_revision_for_test(), 5);
+    assert_eq!(
+        runtime_query_paths(&runtime),
+        BTreeSet::from(["invalid.md".to_string()])
+    );
+}
+
+#[test]
+fn validation_reuses_committing_connection_without_manufacturing_invalidation() {
+    let directory = collection();
+    fs::write(directory.path().join("invalid.md"), b"bad\xffutf8\n").unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+
+    // Attempt 1 is Applied and its deterministic cache-write callback advances
+    // the watcher from observation 1 to revision 2. Attempt 2 observes revision
+    // 3 and must validate as Current without opening another SQLite connection.
+    // The armed open hook models the extra macOS root callback that an open
+    // against WAL/SHM used to produce; it must remain armed and acknowledgement
+    // of observation 3 must succeed.
+    runtime.inject_cache_notifications_for_test(1);
+    runtime.inject_cache_notification_on_validation_open_for_test();
+    assert_eq!(runtime.watcher_revision_for_test(), 0);
+    runtime.synchronize().unwrap();
+
+    assert_eq!(runtime.maintenance_attempt_counts_for_test(), (1, 0));
+    assert_eq!(runtime.watcher_revision_for_test(), 3);
+    assert!(runtime.clear_validation_open_notification_for_test());
+    assert_eq!(
+        runtime_query_paths(&runtime),
+        BTreeSet::from(["invalid.md".to_string()])
+    );
+}
+
+#[test]
 fn runtime_reconciliation_keeps_all_classified_invalid_query_stubs() {
     let directory = collection();
     let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
@@ -2134,9 +2190,13 @@ fn invalid_replacement_before_cache_commit_rolls_back_and_indexes_final_revision
         "invalid.md",
         replacement.to_vec(),
     );
+    // Deterministically exercise Stale (replacement hook), Applied (one cache
+    // write/callback), then Current (retained-connection validation).
+    runtime.inject_cache_notifications_for_test(1);
 
     runtime.synchronize().unwrap();
 
+    assert_eq!(runtime.maintenance_attempt_counts_for_test(), (1, 0));
     assert_eq!(
         runtime_query_revision(&runtime, "invalid.md"),
         crate::v03::revision(replacement)
@@ -2440,6 +2500,7 @@ fn maintenance_seals_are_single_successor_epoch_and_cache_identity_bound() {
                 &OperationContext::legacy(),
             )
             .unwrap()
+            .is_some()
     };
 
     let collection = Collection::open(directory.path()).unwrap();
@@ -2494,7 +2555,70 @@ fn maintenance_seals_are_single_successor_epoch_and_cache_identity_bound() {
         &BTreeSet::new(),
     ));
 
-    let schema_seal = make_seal(4);
+    let data_seal = make_seal(4);
+    let writer_root = collection.root.clone();
+    let writer_cache_folder = collection.settings.cache_folder.clone();
+    crate::cache::runtime::set_seal_validation_hook(
+        &collection,
+        crate::cache::runtime::SealValidationBoundary::AfterPreTransactionIdentity,
+        move || {
+            // Commit deterministically after the first path identity check but
+            // before validation acquires its BEGIN IMMEDIATE reservation.
+            let connection =
+                crate::cache::sqlite::open_cache_db(&writer_root, &writer_cache_folder).unwrap();
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('external_writer', 'changed')",
+                    [],
+                )
+                .unwrap();
+        },
+    );
+    assert!(!validate(
+        data_seal,
+        crate::watch::ReconciliationToken::for_test(epoch.clone(), 5),
+        &refresh,
+    ));
+
+    // Once validation owns BEGIN IMMEDIATE, an external cooperative writer is
+    // rejected at both remaining identity/data-version boundaries. The seal
+    // remains valid and its reservation is released only when the guard drops.
+    for (revision, boundary) in [
+        (
+            40,
+            crate::cache::runtime::SealValidationBoundary::BeforeReservedDataVersion,
+        ),
+        (
+            42,
+            crate::cache::runtime::SealValidationBoundary::AfterReservedIdentity,
+        ),
+    ] {
+        let seal = make_seal(revision);
+        let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_blocked = blocked.clone();
+        let writer_path = crate::cache::sqlite::cache_db_path(
+            &collection.root,
+            &collection.settings.cache_folder,
+        );
+        crate::cache::runtime::set_seal_validation_hook(&collection, boundary, move || {
+            let result = rusqlite::Connection::open(&writer_path).and_then(|connection| {
+                connection.busy_timeout(Duration::ZERO)?;
+                connection.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('reserved_writer', 'blocked')",
+                    [],
+                )
+            });
+            hook_blocked.store(result.is_err(), std::sync::atomic::Ordering::Release);
+        });
+        assert!(validate(
+            seal,
+            crate::watch::ReconciliationToken::for_test(epoch.clone(), revision + 1),
+            &refresh,
+        ));
+        assert!(blocked.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    let schema_seal = make_seal(5);
     let connection =
         crate::cache::sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)
             .unwrap();
@@ -2504,34 +2628,137 @@ fn maintenance_seals_are_single_successor_epoch_and_cache_identity_bound() {
     drop(connection);
     assert!(!validate(
         schema_seal,
-        crate::watch::ReconciliationToken::for_test(epoch.clone(), 5),
+        crate::watch::ReconciliationToken::for_test(epoch.clone(), 6),
         &refresh,
     ));
 
-    let second_runtime_seal = make_seal(5);
-    let rebuild_seal = make_seal(6);
-    let clear_seal = make_seal(7);
+    let second_runtime_seal = make_seal(6);
+    let rebuild_seal = make_seal(7);
     let second_runtime =
         FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
     assert!(!validate(
         second_runtime_seal,
-        crate::watch::ReconciliationToken::for_test(epoch.clone(), 6),
-        &refresh,
-    ));
-    drop(second_runtime);
-    assert_eq!(collection.cache_rebuild()["success"], true);
-    assert!(!validate(
-        rebuild_seal,
         crate::watch::ReconciliationToken::for_test(epoch.clone(), 7),
         &refresh,
     ));
+    drop(second_runtime);
 
+    // Official rebuild and clear/recreate take the lifecycle lock exclusively,
+    // so neither can cross a retained seal on any platform. Both remain bounded,
+    // report the lock error, and succeed once acknowledgement would drop it.
+    let blocked_rebuild = collection.cache_rebuild();
+    assert_eq!(blocked_rebuild["success"], false);
+    assert_eq!(blocked_rebuild["error"]["code"], "cache_rebuild_failed");
+    drop(rebuild_seal);
+    assert_eq!(collection.cache_rebuild()["success"], true);
+}
+
+#[test]
+fn retained_seal_orders_official_clear_before_recreate() {
+    use crate::cache::runtime::InvalidMaintenanceOutcome;
+
+    let directory = collection();
+    fs::write(directory.path().join("invalid.md"), b"bad\xffutf8\n").unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+    let generation = runtime.current_generation().unwrap();
+    let epoch = Arc::new(crate::watch::WatcherEpoch::new());
+    let refresh = BTreeSet::from(["invalid.md".to_string()]);
+    let seal = match runtime
+        .provider()
+        .apply_runtime_invalid_maintenance(
+            &refresh,
+            &BTreeSet::new(),
+            epoch.as_ref(),
+            &generation,
+            crate::watch::ReconciliationToken::for_test(epoch.clone(), 0),
+            &OperationContext::legacy(),
+        )
+        .unwrap()
+    {
+        InvalidMaintenanceOutcome::Applied(seal) => seal,
+        other => panic!("expected retained seal, got {other:?}"),
+    };
+    let collection = Collection::open(directory.path()).unwrap();
+    let blocked = collection.cache_clear();
+    assert_eq!(blocked["success"], false);
+    assert_eq!(blocked["error"]["code"], "cache_clear_failed");
+    drop(seal);
     assert_eq!(collection.cache_clear()["success"], true);
-    assert!(!validate(
-        clear_seal,
-        crate::watch::ReconciliationToken::for_test(epoch.clone(), 8),
-        &refresh,
-    ));
+    assert_eq!(collection.cache_rebuild()["success"], true);
+}
+
+#[cfg(windows)]
+#[test]
+fn hosted_windows_retained_seal_lock_clear_ordering() {
+    // Hosted Windows executes the same retained-SQLite-handle ordering with its
+    // native deletion sharing semantics in addition to the advisory lock.
+    retained_seal_orders_official_clear_before_recreate();
+}
+
+#[cfg(unix)]
+#[test]
+fn seal_identity_replacement_between_every_validation_boundary_is_rejected() {
+    use crate::cache::runtime::{InvalidMaintenanceOutcome, SealValidationBoundary};
+
+    for boundary in [
+        SealValidationBoundary::AfterPreTransactionIdentity,
+        SealValidationBoundary::AfterReservedIdentity,
+    ] {
+        let directory = collection();
+        fs::write(directory.path().join("invalid.md"), b"bad\xffutf8\n").unwrap();
+        let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+        let generation = runtime.current_generation().unwrap();
+        let epoch = Arc::new(crate::watch::WatcherEpoch::new());
+        let refresh = BTreeSet::from(["invalid.md".to_string()]);
+        let seal = match runtime
+            .provider()
+            .apply_runtime_invalid_maintenance(
+                &refresh,
+                &BTreeSet::new(),
+                epoch.as_ref(),
+                &generation,
+                crate::watch::ReconciliationToken::for_test(epoch.clone(), 0),
+                &OperationContext::legacy(),
+            )
+            .unwrap()
+        {
+            InvalidMaintenanceOutcome::Applied(seal) => seal,
+            other => panic!("expected seal before {boundary:?}, got {other:?}"),
+        };
+        let replacement = Collection::open(directory.path()).unwrap();
+        let hook_collection = Collection::open(directory.path()).unwrap();
+        crate::cache::runtime::set_seal_validation_hook(&hook_collection, boundary, move || {
+            // Deliberately bypass the advisory lifecycle contract to model raw
+            // Unix unlink/recreate. Official cache_clear/cache_rebuild cannot do
+            // this while the seal holds its shared guard.
+            let cache_root = replacement.root.join(&replacement.settings.cache_folder);
+            for name in ["cache.db", "cache.db-wal", "cache.db-shm"] {
+                match fs::remove_file(cache_root.join(name)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("raw cache replacement failed: {error}"),
+                }
+            }
+            let mut connection = crate::cache::sqlite::open_cache_db(
+                &replacement.root,
+                &replacement.settings.cache_folder,
+            )
+            .unwrap();
+            crate::cache::indexer::reindex_all(&mut connection, &replacement).unwrap();
+        });
+        assert!(runtime
+            .provider()
+            .validate_runtime_invalid_maintenance_seal(
+                seal,
+                &refresh,
+                &BTreeSet::new(),
+                &generation,
+                &crate::watch::ReconciliationToken::for_test(epoch.clone(), 1),
+                &OperationContext::legacy(),
+            )
+            .unwrap()
+            .is_none());
+    }
 }
 
 #[test]
