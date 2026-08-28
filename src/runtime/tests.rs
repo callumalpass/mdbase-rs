@@ -155,6 +155,51 @@ fn provider_snapshot_preserves_invalid_frontmatter_as_opaque_markdown() {
 }
 
 #[test]
+fn provider_snapshot_rejects_unrepresentable_utf8_without_synthetic_wire_content() {
+    let directory = collection();
+    fs::write(directory.path().join("binary.md"), b"bad\xffutf8\n").unwrap();
+    fs::write(
+        directory.path().join("healthy.md"),
+        "---\ntitle: Healthy\n---\nBody\n",
+    )
+    .unwrap();
+
+    let provider = FilesystemProvider::open(directory.path()).unwrap();
+    let error = provider
+        .snapshot()
+        .expect_err("strict synchronization snapshot must not omit invalid bytes");
+    assert!(error.to_string().contains("binary.md"));
+    assert!(error.to_string().contains("invalid UTF-8"));
+
+    let error = provider
+        .snapshot_record("binary.md")
+        .expect_err("targeted synchronization snapshot must also fail");
+    assert!(error.to_string().contains("invalid UTF-8"));
+}
+
+#[test]
+fn strict_snapshot_rejects_post_enumeration_record_disappearance() {
+    let directory = collection();
+    fs::write(
+        directory.path().join("tracked.md"),
+        "---\ntitle: Present\n---\n",
+    )
+    .unwrap();
+    let collection = Collection::open(directory.path()).unwrap();
+    crate::operations::set_record_open_failure(
+        directory.path(),
+        "tracked.md",
+        Some(std::io::ErrorKind::NotFound),
+    );
+    let error = collection
+        .snapshot()
+        .expect_err("strict snapshot cannot publish an incomplete checkpoint");
+    crate::operations::set_record_open_failure(directory.path(), "tracked.md", None);
+    assert!(error.to_string().contains("tracked.md"));
+    assert!(error.to_string().contains("became unavailable"));
+}
+
+#[test]
 fn provider_snapshot_preserves_non_mapping_frontmatter_as_opaque_markdown() {
     let directory = collection();
     let document = "---\n- one\n- two\n---\nBody\n";

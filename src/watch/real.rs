@@ -1,6 +1,6 @@
 use super::{PortableWatchEvent, WatchEvent};
-use crate::operations::read::RecordFileFacts;
-use crate::runtime::{snapshot::materialize_snapshot_record, CollectionSnapshotResourceKind};
+use crate::record_load::RecordLoadOutcome;
+use crate::runtime::CollectionSnapshotResourceKind;
 use crate::Collection;
 use notify::{
     event::{CreateKind, MetadataKind, ModifyKind, RemoveKind},
@@ -8,7 +8,6 @@ use notify::{
 };
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -190,7 +189,8 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
     // a stable boundary instead of triggering an additional full rescan.
     let mut startup_refresh_failure = None;
     match Snapshot::load(&root) {
-        Ok(next) => {
+        Ok(mut next) => {
+            next.retain_classified_invalid(&snapshot);
             for event in snapshot.diff(&next) {
                 sequence += 1;
                 if events
@@ -315,7 +315,8 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
             let refresh_mode = if full_rescan { "full" } else { "incremental" };
             let refresh_path_count = pending_paths.len();
             let refreshed = if full_rescan {
-                Snapshot::load(&root).map(|next| {
+                Snapshot::load(&root).map(|mut next| {
+                    next.retain_classified_invalid(&snapshot);
                     let diff = snapshot.diff(&next);
                     snapshot = next;
                     diff
@@ -442,6 +443,7 @@ fn now() -> String {
 struct Snapshot {
     resources: BTreeMap<String, ResourceState>,
     records: BTreeMap<String, RecordState>,
+    invalid_records: BTreeSet<String>,
     types_folder: String,
     contracts_folder: String,
     cache_folder: String,
@@ -470,9 +472,11 @@ impl Snapshot {
     fn load(root: &Path) -> Result<Self, WatchError> {
         let collection = Collection::open_for_observation(root)
             .map_err(|error| WatchError::Collection(collection_error(&error)))?;
-        let canonical = collection
-            .snapshot()
+        let observed = collection
+            .snapshot_for_watcher()
             .map_err(|error| WatchError::Collection(error.to_string()))?;
+        let invalid_records = observed.invalid_records;
+        let canonical = observed.snapshot;
         let resources = canonical
             .resources
             .into_iter()
@@ -509,6 +513,7 @@ impl Snapshot {
         Ok(Self {
             resources,
             records,
+            invalid_records,
             types_folder: collection.settings.types_folder.clone(),
             contracts_folder: collection.settings.contracts_folder.clone(),
             cache_folder: collection.settings.cache_folder.clone(),
@@ -525,6 +530,14 @@ impl Snapshot {
                 )
                 .collect(),
         })
+    }
+
+    fn retain_classified_invalid(&mut self, previous: &Self) {
+        for path in &self.invalid_records {
+            if let Some(record) = previous.records.get(path) {
+                self.records.insert(path.clone(), record.clone());
+            }
+        }
     }
 
     fn invalidation_paths(&self, root: &Path, event: &Event) -> Option<BTreeSet<PathBuf>> {
@@ -636,11 +649,19 @@ impl Snapshot {
             }
             replacements.push((relative.clone(), load_record(&collection, &relative)?));
         }
-        for (path, record) in replacements {
-            if let Some(record) = record {
-                self.records.insert(path, record);
-            } else {
-                self.records.remove(&path);
+        for (path, outcome) in replacements {
+            match outcome {
+                WatchRecordLoad::Parsed(record) => {
+                    self.invalid_records.remove(&path);
+                    self.records.insert(path, record);
+                }
+                WatchRecordLoad::Invalid => {
+                    self.invalid_records.insert(path);
+                }
+                WatchRecordLoad::Absent => {
+                    self.invalid_records.remove(&path);
+                    self.records.remove(&path);
+                }
             }
         }
         let after = paths
@@ -808,69 +829,41 @@ fn record_events(
     events
 }
 
-fn load_record(collection: &Collection, path: &str) -> Result<Option<RecordState>, WatchError> {
-    if collection.is_excluded(path) || !collection.is_valid_extension(path) {
-        return Ok(None);
-    }
-    let Some((document, file_facts)) = safely_read_local_record(collection, path)? else {
-        return Ok(None);
-    };
-    let read = collection.read_document(path, &document, &file_facts, false);
-    let revision = match read.get("revision").and_then(Value::as_str) {
-        Some(revision) => revision.to_string(),
-        None if is_invalid_yaml_frontmatter(&read) => return Ok(None),
-        None => return Err(WatchError::Collection(collection_error(&read))),
-    };
-    let canonical = materialize_snapshot_record(collection, path, document);
-    let raw_frontmatter = canonical.frontmatter;
-    let effective_frontmatter = read
-        .get("effective_frontmatter")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(raw_frontmatter.clone()));
-    let types = read.get("types").cloned().unwrap_or_else(|| json!([]));
-    Ok(Some(RecordState {
-        revision,
-        raw_frontmatter,
-        effective_frontmatter,
-        types,
-        body: canonical.body,
-    }))
+enum WatchRecordLoad {
+    Parsed(RecordState),
+    Invalid,
+    Absent,
 }
 
-fn safely_read_local_record(
-    collection: &Collection,
-    path: &str,
-) -> Result<Option<(String, RecordFileFacts)>, WatchError> {
-    let Some(mut file) = crate::operations::open_regular_record_no_follow(&collection.root, path)
+fn load_record(collection: &Collection, path: &str) -> Result<WatchRecordLoad, WatchError> {
+    if collection.is_excluded(path) || !collection.is_valid_extension(path) {
+        return Ok(WatchRecordLoad::Absent);
+    }
+    let Some(outcome) = crate::record_load::load_record_no_follow(collection, path)
         .map_err(|error| WatchError::Collection(error.to_string()))?
     else {
-        return Ok(None);
+        return Ok(WatchRecordLoad::Absent);
     };
-    let metadata = file
-        .metadata()
-        .map_err(|error| WatchError::Collection(error.to_string()))?;
-    if !metadata.is_file() {
-        return Ok(None);
+    match outcome {
+        RecordLoadOutcome::Parsed {
+            facts,
+            raw_frontmatter,
+            effective_frontmatter,
+            body,
+            type_names,
+            ..
+        } => Ok(WatchRecordLoad::Parsed(RecordState {
+            revision: facts.revision,
+            raw_frontmatter: raw_frontmatter.as_object().cloned().unwrap_or_default(),
+            effective_frontmatter,
+            types: json!(type_names),
+            body,
+        })),
+        // Watch events have no invalid-record representation. Keep classified
+        // invalidity distinct from absence so an existing parsed state is not
+        // converted into a synthetic deletion/checkpoint advancement.
+        RecordLoadOutcome::Invalid { .. } => Ok(WatchRecordLoad::Invalid),
     }
-    let file_facts = RecordFileFacts {
-        size: metadata.len(),
-        mtime: metadata.modified().ok().map(|time| {
-            let datetime: chrono::DateTime<chrono::Utc> = time.into();
-            datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-        }),
-    };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| WatchError::Collection(error.to_string()))?;
-    let document = String::from_utf8(bytes)
-        .map_err(|_| WatchError::Collection("File contains invalid UTF-8".to_string()))?;
-    Ok(Some((document, file_facts)))
-}
-
-fn is_invalid_yaml_frontmatter(read: &Value) -> bool {
-    read.pointer("/error/code").and_then(Value::as_str) == Some(crate::errors::INVALID_FRONTMATTER)
-        && read.pointer("/error/message").and_then(Value::as_str)
-            == Some("Failed to parse YAML frontmatter")
 }
 
 struct PendingEvent {
@@ -914,6 +907,21 @@ mod tests {
     use notify::event::{AccessKind, AccessMode, DataChange, RenameMode};
     use std::fs;
 
+    fn bounded_rescan(watcher: &CollectionWatcher, paths: Option<&[&str]>) {
+        let (ready, receiver) = mpsc::sync_channel(0);
+        let command = match paths {
+            Some(paths) => Command::RescanPaths(paths.iter().map(PathBuf::from).collect(), ready),
+            None => Command::Rescan(ready),
+        };
+        watcher
+            .commands
+            .send(WorkerInput::Command(command))
+            .expect("watcher worker remains available");
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reconciliation completes within its bounded test budget");
+    }
+
     #[test]
     fn non_mutating_filesystem_events_do_not_invalidate_the_snapshot() {
         for kind in [
@@ -944,6 +952,7 @@ mod tests {
         let snapshot = Snapshot {
             resources: BTreeMap::new(),
             records: BTreeMap::new(),
+            invalid_records: BTreeSet::new(),
             types_folder: "_types".to_string(),
             contracts_folder: "_contracts".to_string(),
             cache_folder: ".mdbase/cache".to_string(),
@@ -1741,6 +1750,241 @@ mod tests {
             .into_iter()
             .collect()
         );
+    }
+
+    fn assert_valid_to_invalid_retains_state(invalid_document: &[u8], reason: &str, full: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("tracked.md"),
+            "---\ntitle: Before\n---\nOriginal\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("sibling.md"),
+            "---\ntitle: Sibling Before\n---\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_secs(60)).unwrap();
+
+        fs::write(directory.path().join("tracked.md"), invalid_document).unwrap();
+        if full {
+            bounded_rescan(&watcher, None);
+        } else {
+            bounded_rescan(&watcher, Some(&["tracked.md"]));
+        }
+        assert!(
+            watcher.recv_timeout(Duration::ZERO).unwrap().is_none(),
+            "classified {reason} must not emit synthetic deletion"
+        );
+
+        let collection = Collection::open(directory.path()).unwrap();
+        let query = collection
+            .v03_operations()
+            .unwrap()
+            .query(&json!({"frontmatter_mode": "persisted"}));
+        let stub = query.result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["path"] == "tracked.md")
+            .expect("query retains invalid stub");
+        assert!(stub.get("frontmatter").is_none());
+        assert!(stub.get("body").is_none());
+        assert!(stub["file"]["revision"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(query.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path.as_deref() == Some("tracked.md")
+                && diagnostic.details.as_ref().unwrap()["reason"] == reason
+        }));
+
+        fs::write(
+            directory.path().join("sibling.md"),
+            "---\ntitle: Sibling After\n---\n",
+        )
+        .unwrap();
+        if full {
+            bounded_rescan(&watcher, None);
+        } else {
+            bounded_rescan(&watcher, Some(&["sibling.md"]));
+        }
+        let sibling = watcher
+            .recv_timeout(Duration::ZERO)
+            .unwrap()
+            .expect("unrelated sibling remains reconcilable");
+        assert_eq!(sibling.event_type, "mdbase.record.modified");
+        assert_eq!(sibling.payload["path"], "sibling.md");
+
+        fs::write(
+            directory.path().join("tracked.md"),
+            "---\ntitle: Repaired\n---\nVisible\n",
+        )
+        .unwrap();
+        if full {
+            bounded_rescan(&watcher, None);
+        } else {
+            bounded_rescan(&watcher, Some(&["tracked.md"]));
+        }
+        let repaired = watcher
+            .recv_timeout(Duration::ZERO)
+            .unwrap()
+            .expect("repair converges from retained prior state");
+        assert_eq!(repaired.event_type, "mdbase.record.modified");
+        assert_eq!(repaired.payload["path"], "tracked.md");
+        assert_eq!(repaired.payload["before"]["title"], "Before");
+        assert_eq!(repaired.payload["after"]["title"], "Repaired");
+    }
+
+    #[test]
+    fn valid_to_classified_invalid_full_refresh_retains_state_until_modified_repair() {
+        for (document, reason) in [
+            (b"bad\xffutf8\n".as_slice(), "invalid_utf8"),
+            (
+                b"---\ntitle: One\ntitle: Two\n---\n".as_slice(),
+                "invalid_yaml",
+            ),
+            (
+                b"---\n- nonmapping\n---\n".as_slice(),
+                "non_mapping_frontmatter",
+            ),
+        ] {
+            assert_valid_to_invalid_retains_state(document, reason, true);
+        }
+    }
+
+    #[test]
+    fn valid_to_classified_invalid_incremental_refresh_retains_state_until_modified_repair() {
+        for (document, reason) in [
+            (b"bad\xffutf8\n".as_slice(), "invalid_utf8"),
+            (
+                b"---\ntitle: One\ntitle: Two\n---\n".as_slice(),
+                "invalid_yaml",
+            ),
+            (
+                b"---\n- nonmapping\n---\n".as_slice(),
+                "non_mapping_frontmatter",
+            ),
+        ] {
+            assert_valid_to_invalid_retains_state(document, reason, false);
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_full_reconciliation_is_bounded_and_repair_converges() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("healthy.md"),
+            "---\ntitle: Before\n---\nBody\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("broken.md"), b"bad\xffutf8\n").unwrap();
+
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_secs(60))
+            .expect("classified invalid UTF-8 must not prevent watcher startup");
+        bounded_rescan(&watcher, None);
+        assert!(watcher.recv_timeout(Duration::ZERO).unwrap().is_none());
+
+        let collection = Collection::open(directory.path()).unwrap();
+        let query = collection
+            .v03_operations()
+            .unwrap()
+            .query(&json!({"frontmatter_mode": "persisted"}));
+        let broken = query.result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["path"] == "broken.md")
+            .expect("invalid query stub");
+        assert!(broken["file"]["revision"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(broken.get("body").is_none());
+        assert!(broken.get("frontmatter").is_none());
+        assert_eq!(
+            query.diagnostics[0].details.as_ref().unwrap()["reason"],
+            "invalid_utf8"
+        );
+
+        fs::write(
+            directory.path().join("healthy.md"),
+            "---\ntitle: After\n---\nBody\n",
+        )
+        .unwrap();
+        bounded_rescan(&watcher, None);
+        let sibling = watcher
+            .recv_timeout(Duration::ZERO)
+            .unwrap()
+            .expect("healthy sibling event");
+        assert_eq!(sibling.event_type, "mdbase.record.modified");
+        assert_eq!(sibling.payload["path"], "healthy.md");
+        assert_eq!(sibling.payload["after"]["title"], "After");
+
+        fs::write(
+            directory.path().join("broken.md"),
+            "---\ntitle: Repaired\n---\nVisible\n",
+        )
+        .unwrap();
+        bounded_rescan(&watcher, None);
+        let repaired = watcher
+            .recv_timeout(Duration::ZERO)
+            .unwrap()
+            .expect("repair convergence event");
+        assert_eq!(repaired.event_type, "mdbase.record.created");
+        assert_eq!(repaired.payload["path"], "broken.md");
+        assert_eq!(repaired.payload["after"]["title"], "Repaired");
+    }
+
+    #[test]
+    fn invalid_utf8_incremental_reconciliation_is_bounded_and_does_not_wedge_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_secs(60)).unwrap();
+
+        fs::write(directory.path().join("broken.md"), b"bad\xffutf8\n").unwrap();
+        bounded_rescan(&watcher, Some(&["broken.md"]));
+        assert!(watcher.recv_timeout(Duration::ZERO).unwrap().is_none());
+
+        fs::write(
+            directory.path().join("healthy.md"),
+            "---\ntitle: Healthy\n---\n",
+        )
+        .unwrap();
+        bounded_rescan(&watcher, Some(&["healthy.md"]));
+        let sibling = watcher
+            .recv_timeout(Duration::ZERO)
+            .unwrap()
+            .expect("sibling creation after invalid record");
+        assert_eq!(sibling.event_type, "mdbase.record.created");
+        assert_eq!(sibling.payload["path"], "healthy.md");
+
+        fs::write(
+            directory.path().join("broken.md"),
+            "---\ntitle: Repaired\n---\n",
+        )
+        .unwrap();
+        bounded_rescan(&watcher, Some(&["broken.md"]));
+        let repaired = watcher
+            .recv_timeout(Duration::ZERO)
+            .unwrap()
+            .expect("incremental repair convergence");
+        assert_eq!(repaired.event_type, "mdbase.record.created");
+        assert_eq!(repaired.payload["path"], "broken.md");
     }
 
     #[test]
