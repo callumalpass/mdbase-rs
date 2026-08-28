@@ -1154,7 +1154,7 @@ fn invalidates_snapshot(event: &Event) -> bool {
     )
 }
 
-fn watch_error_event(sequence: u64, message: String) -> WatchEvent {
+fn watch_error_event(sequence: u64, _provider_message: String) -> WatchEvent {
     WatchEvent {
         event_type: "mdbase.collection.invalidated".to_string(),
         sequence,
@@ -1163,7 +1163,7 @@ fn watch_error_event(sequence: u64, message: String) -> WatchEvent {
             "diagnostic": {
                 "severity": "error",
                 "code": "collection_reload_failed",
-                "message": message,
+                "message": "Collection reconciliation failed and will retry.",
             }
         }),
     }
