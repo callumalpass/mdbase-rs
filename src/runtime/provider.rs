@@ -511,6 +511,48 @@ impl FilesystemProvider {
         Ok(())
     }
 
+    /// Apply private watcher maintenance only if the expected generation still
+    /// owns both the provider and durable cache after acquiring the exclusive
+    /// gate. Equality includes the opaque runtime epoch. A stale caller is
+    /// rejected before any cache transaction or ownership-field update.
+    pub(crate) fn apply_runtime_invalid_maintenance(
+        &self,
+        refresh: &std::collections::BTreeSet<String>,
+        remove: &std::collections::BTreeSet<String>,
+        epoch: &crate::watch::WatcherEpoch,
+        expected_generation: &super::CollectionGeneration,
+        context: &OperationContext,
+    ) -> Result<bool, ProviderError> {
+        let _guard = self.write_lock(context)?;
+        context.check()?;
+        if epoch.is_exhausted() {
+            return Ok(false);
+        }
+        if self
+            .runtime_cache_generation
+            .read()
+            .map_err(|_| ProviderError::LockPoisoned)?
+            .as_ref()
+            != Some(expected_generation)
+        {
+            return Ok(false);
+        }
+        let collection = self.current_collection()?;
+        if !crate::cache::runtime::matches_generation(collection.as_ref(), expected_generation)
+            .map_err(cache_error)?
+        {
+            return Ok(false);
+        }
+        crate::cache::runtime::apply_invalid_maintenance(
+            collection.as_ref(),
+            refresh,
+            remove,
+            epoch,
+            expected_generation,
+        )
+        .map_err(cache_error)
+    }
+
     pub(crate) fn apply_runtime_cache_changes(
         &self,
         changes: &super::ChangeSet,

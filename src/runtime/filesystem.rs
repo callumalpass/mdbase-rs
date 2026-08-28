@@ -31,6 +31,8 @@ pub struct FilesystemRuntime {
     order: Arc<Mutex<RuntimeOrder>>,
     settlement: Arc<SettlementCoordinator>,
     cursors: Mutex<super::cursor::CursorStore>,
+    #[cfg(test)]
+    watcher_test_control: crate::watch::WatcherTestControl,
 }
 
 struct RuntimeOrder {
@@ -77,6 +79,8 @@ impl FilesystemRuntime {
         )?;
         provider.initialize_runtime_cache(&reconciled.generation)?;
         let watcher = CollectionWatcher::open(root, debounce)?;
+        #[cfg(test)]
+        let watcher_test_control = watcher.test_control();
         let runtime_epoch = reconciled.generation.runtime_epoch().to_string();
         Ok(Self {
             provider,
@@ -91,6 +95,8 @@ impl FilesystemRuntime {
                 changed: Condvar::new(),
             }),
             cursors: Mutex::new(super::cursor::CursorStore::new(runtime_epoch)),
+            #[cfg(test)]
+            watcher_test_control,
         })
     }
 
@@ -610,12 +616,87 @@ impl FilesystemRuntime {
         &self,
         context: &OperationContext,
     ) -> Result<(), ProviderError> {
-        context.check()?;
-        self.watcher_lock(context)?.rescan()?;
-        context.check()
+        self.synchronize_reconciliation(None, context)
     }
 
-    fn current_generation(&self) -> Result<CollectionGeneration, ProviderError> {
+    #[cfg(test)]
+    pub(crate) fn set_watcher_revision_for_test(&self, value: u64) {
+        self.watcher_test_control.set_invalidation_revision(value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invoke_installed_watcher_modify_callback_for_test(&self, path: &str) {
+        self.watcher_test_control
+            .invoke_installed_modify_callback(&self.provider.root().join(path));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_watcher_for_test(&self) {
+        self.watcher_test_control.poison();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_cache_commit_linearization_hook_for_test(
+        &self,
+    ) -> crate::watch::LinearizationRace {
+        self.watcher_test_control
+            .install_cache_commit_linearization_hook()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_rescan_count_for_test(&self) -> usize {
+        self.watcher_test_control.pending_rescan_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synchronize_paths_for_test(&self, paths: &[&str]) -> Result<(), ProviderError> {
+        self.synchronize_reconciliation(Some(paths), &OperationContext::legacy())
+    }
+
+    fn synchronize_reconciliation(
+        &self,
+        paths: Option<&[&str]>,
+        context: &OperationContext,
+    ) -> Result<(), ProviderError> {
+        const MAX_STALE_RETRIES: usize = 3;
+        for _ in 0..MAX_STALE_RETRIES {
+            context.check()?;
+            // Capture ownership before observation. The provider compares this
+            // exact epoch+sequence again only after acquiring its write gate.
+            let expected_generation = self.current_generation()?;
+            let observation = {
+                let watcher = self.watcher_lock(context)?;
+                match paths {
+                    Some(paths) => watcher
+                        .rescan_paths_observation_with_context(paths.iter().copied(), context)?,
+                    None => watcher.rescan_observation_with_context(context)?,
+                }
+            };
+            context.check()?;
+            if !self.provider.apply_runtime_invalid_maintenance(
+                observation.invalid_records.as_ref(),
+                observation.removed_invalid_records.as_ref(),
+                observation.epoch.as_ref(),
+                &expected_generation,
+                context,
+            )? {
+                continue;
+            }
+            let acknowledged = self
+                .watcher_lock(context)?
+                .acknowledge_observation_with_context(observation, context)?;
+            if acknowledged {
+                return context.check();
+            }
+        }
+        Err(ProviderError::Transaction {
+            code: "stale_reconciliation",
+            message: "watcher reconciliation repeatedly lost runtime generation ownership"
+                .to_string(),
+        })
+    }
+
+    pub(crate) fn current_generation(&self) -> Result<CollectionGeneration, ProviderError> {
         self.order
             .lock()
             .map(|order| order.generation.clone())

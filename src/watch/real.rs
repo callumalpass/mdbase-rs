@@ -1,6 +1,6 @@
 use super::{PortableWatchEvent, WatchEvent};
 use crate::record_load::RecordLoadOutcome;
-use crate::runtime::CollectionSnapshotResourceKind;
+use crate::runtime::{CollectionSnapshotResourceKind, OperationContext, ProviderError};
 use crate::Collection;
 use notify::{
     event::{CreateKind, MetadataKind, ModifyKind, RemoveKind},
@@ -9,7 +9,8 @@ use notify::{
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -22,6 +23,10 @@ pub enum WatchError {
     Notify(#[from] notify::Error),
     #[error("collection watcher stopped")]
     Stopped,
+    #[error("collection watcher has too many pending rescans; retry later")]
+    RescanBackpressure,
+    #[error("collection watcher reconciliation revision exhausted")]
+    RevisionExhausted,
 }
 
 /// A debounced stream of collection-level changes.
@@ -34,17 +39,225 @@ pub struct CollectionWatcher {
     events: mpsc::Receiver<WatchEvent>,
     commands: mpsc::Sender<WorkerInput>,
     worker: Option<thread::JoinHandle<()>>,
+    pending_rescans: Arc<AtomicUsize>,
+    next_rescan_id: Arc<AtomicU64>,
+    invalidation_revision: Arc<AtomicU64>,
+    epoch: Arc<WatcherEpoch>,
+    #[cfg(test)]
+    filesystem_callback: FilesystemCallback,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct WatcherTestControl {
+    commands: mpsc::Sender<WorkerInput>,
+    pending_rescans: Arc<AtomicUsize>,
+    invalidation_revision: Arc<AtomicU64>,
+    epoch: Arc<WatcherEpoch>,
+    filesystem_callback: FilesystemCallback,
+}
+
+#[cfg(test)]
+impl WatcherTestControl {
+    pub(crate) fn pending_rescan_count(&self) -> usize {
+        self.pending_rescans.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_invalidation_revision(&self, value: u64) {
+        self.invalidation_revision.store(value, Ordering::Release);
+    }
+
+    pub(crate) fn invoke_installed_modify_callback(&self, path: &Path) {
+        (self.filesystem_callback)(Ok(Event {
+            kind: EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            paths: vec![path.to_path_buf()],
+            attrs: Default::default(),
+        }));
+    }
+
+    pub(crate) fn poison(&self) {
+        poison_watcher(&self.epoch, &self.commands);
+    }
+
+    pub(crate) fn install_acknowledgement_linearization_hook(&self) -> LinearizationRace {
+        self.epoch.install_hook(LinearizationPoint::Acknowledgement)
+    }
+
+    pub(crate) fn install_cache_commit_linearization_hook(&self) -> LinearizationRace {
+        self.epoch.install_hook(LinearizationPoint::CacheCommit)
+    }
+}
+
+type FilesystemCallback = Arc<dyn Fn(Result<Event, notify::Error>) + Send + Sync>;
+
+pub(crate) struct WatcherEpoch {
+    exhausted: AtomicBool,
+    linearization: Mutex<()>,
+    #[cfg(test)]
+    hooks: LinearizationHooks,
+}
+
+impl WatcherEpoch {
+    pub(crate) fn new() -> Self {
+        Self {
+            exhausted: AtomicBool::new(false),
+            linearization: Mutex::new(()),
+            #[cfg(test)]
+            hooks: LinearizationHooks::default(),
+        }
+    }
+
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn linearize(&self) -> MutexGuard<'_, ()> {
+        self.linearization
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    fn install_hook(&self, point: LinearizationPoint) -> LinearizationRace {
+        let (reached_tx, reached_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        *self.hooks.slot(point).lock().unwrap() = Some(LinearizationHook {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        LinearizationRace {
+            reached: reached_rx,
+            resume: resume_tx,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_hook(&self, point: LinearizationPoint) {
+        let hook = self.hooks.slot(point).lock().unwrap().take();
+        if let Some(hook) = hook {
+            let _ = hook.reached.send(());
+            let _ = hook.resume.recv();
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum LinearizationPoint {
+    Waiter,
+    Acknowledgement,
+    CacheCommit,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct LinearizationHooks {
+    waiter: Mutex<Option<LinearizationHook>>,
+    acknowledgement: Mutex<Option<LinearizationHook>>,
+    cache_commit: Mutex<Option<LinearizationHook>>,
+}
+
+#[cfg(test)]
+impl LinearizationHooks {
+    fn slot(&self, point: LinearizationPoint) -> &Mutex<Option<LinearizationHook>> {
+        match point {
+            LinearizationPoint::Waiter => &self.waiter,
+            LinearizationPoint::Acknowledgement => &self.acknowledgement,
+            LinearizationPoint::CacheCommit => &self.cache_commit,
+        }
+    }
+}
+
+#[cfg(test)]
+struct LinearizationHook {
+    reached: mpsc::SyncSender<()>,
+    resume: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) struct LinearizationRace {
+    reached: mpsc::Receiver<()>,
+    resume: mpsc::SyncSender<()>,
+}
+
+#[cfg(test)]
+impl LinearizationRace {
+    pub(crate) fn wait_until_reached(&self) {
+        self.reached.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    pub(crate) fn resume(self) {
+        self.resume.send(()).unwrap();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReconciliationFailure {
+    RevisionExhausted,
+}
+
+type ReconciliationResult = Result<Arc<ReconciliationOutcome>, ReconciliationFailure>;
+type ReconciliationSender = mpsc::Sender<ReconciliationResult>;
+
+struct PendingRescan {
+    id: u64,
+    ready: ReconciliationSender,
+    ticket: Arc<RescanTicket>,
 }
 
 enum Command {
-    Rescan(mpsc::SyncSender<()>),
-    RescanPaths(Vec<PathBuf>, mpsc::SyncSender<()>),
+    Rescan(PendingRescan),
+    RescanPaths(Vec<PathBuf>, PendingRescan),
+    CancelRescan(u64),
+    Acknowledge {
+        outcome: Arc<ReconciliationOutcome>,
+        active: Arc<AtomicBool>,
+        ready: mpsc::Sender<Result<bool, ReconciliationFailure>>,
+    },
     Stop,
+}
+
+pub(crate) struct ReconciliationOutcome {
+    pub(crate) invalid_records: Arc<BTreeSet<String>>,
+    pub(crate) removed_invalid_records: Arc<BTreeSet<String>>,
+    revision: u64,
+    pub(crate) epoch: Arc<WatcherEpoch>,
+}
+
+/// Rescan requests are synchronous, but concurrent callers can enqueue before
+/// the worker reaches them. Reserve a finite slot before sending so both the
+/// command queue and retained waiter vector remain bounded.
+const MAX_PENDING_RESCANS: usize = 64;
+const MAX_PENDING_PATHS: usize = 4_096;
+
+struct RescanTicket {
+    pending: Arc<AtomicUsize>,
+    cancelled: AtomicBool,
+    released: AtomicBool,
+}
+
+impl RescanTicket {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            self.pending.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for RescanTicket {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 enum WorkerInput {
     Command(Command),
     Filesystem(Result<Event, notify::Error>),
+    RevisionExhausted,
 }
 
 impl CollectionWatcher {
@@ -57,7 +270,25 @@ impl CollectionWatcher {
         let initial = Snapshot::load(&root)?;
         let (events_tx, events) = mpsc::channel();
         let (commands, command_rx) = mpsc::channel();
-        let filesystem_tx = commands.clone();
+        let pending_rescans = Arc::new(AtomicUsize::new(0));
+        let invalidation_revision = Arc::new(AtomicU64::new(0));
+        let epoch = Arc::new(WatcherEpoch::new());
+        let callback_root = root.clone();
+        let callback_sender = commands.clone();
+        let callback_revision = invalidation_revision.clone();
+        let callback_epoch = epoch.clone();
+        let filesystem_callback: FilesystemCallback = Arc::new(move |event| {
+            enqueue_filesystem_callback(
+                &callback_sender,
+                &callback_root,
+                &callback_revision,
+                &callback_epoch,
+                event,
+            );
+        });
+        let worker_invalidation_revision = invalidation_revision.clone();
+        let worker_epoch = epoch.clone();
+        let worker_filesystem_callback = filesystem_callback.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("mdbase-watch".to_string())
@@ -68,9 +299,11 @@ impl CollectionWatcher {
                     initial,
                     WorkerChannels {
                         inputs: command_rx,
-                        filesystem_tx,
+                        filesystem_callback: worker_filesystem_callback,
                         events: events_tx,
                         ready: ready_tx,
+                        invalidation_revision: worker_invalidation_revision,
+                        epoch: worker_epoch,
                     },
                 )
             })
@@ -80,6 +313,12 @@ impl CollectionWatcher {
                 events,
                 commands,
                 worker: Some(worker),
+                pending_rescans,
+                next_rescan_id: Arc::new(AtomicU64::new(1)),
+                invalidation_revision,
+                epoch,
+                #[cfg(test)]
+                filesystem_callback,
             }),
             Ok(Err(error)) => {
                 let _ = worker.join();
@@ -121,11 +360,180 @@ impl CollectionWatcher {
     /// Request a snapshot comparison without waiting for an OS notification.
     /// This is useful after an in-process mutation and for deterministic hosts.
     pub fn rescan(&self) -> Result<(), WatchError> {
-        let (ready, receiver) = mpsc::sync_channel(0);
+        self.rescan_observation().map(|_| ())
+    }
+
+    /// Complete a full comparison and return private maintenance hints that
+    /// must not be translated into public record events.
+    pub(crate) fn rescan_observation(&self) -> Result<Arc<ReconciliationOutcome>, WatchError> {
+        let request = self.enqueue_reconciliation(None)?;
+        request
+            .receiver
+            .recv()
+            .map_err(|_| WatchError::Stopped)?
+            .map_err(reconciliation_failure)
+    }
+
+    pub(crate) fn rescan_observation_with_context(
+        &self,
+        context: &OperationContext,
+    ) -> Result<Arc<ReconciliationOutcome>, ProviderError> {
+        let request = self.enqueue_reconciliation(None)?;
+        self.wait_for_reconciliation(request, context)
+    }
+
+    pub(crate) fn rescan_paths_observation<I, P>(
+        &self,
+        paths: I,
+    ) -> Result<Arc<ReconciliationOutcome>, WatchError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        let request = self.enqueue_reconciliation_paths(paths)?;
+        request
+            .receiver
+            .recv()
+            .map_err(|_| WatchError::Stopped)?
+            .map_err(reconciliation_failure)
+    }
+
+    pub(crate) fn rescan_paths_observation_with_context<I, P>(
+        &self,
+        paths: I,
+        context: &OperationContext,
+    ) -> Result<Arc<ReconciliationOutcome>, ProviderError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        let request = self.enqueue_reconciliation_paths(paths)?;
+        self.wait_for_reconciliation(request, context)
+    }
+
+    pub(crate) fn acknowledge_observation_with_context(
+        &self,
+        outcome: Arc<ReconciliationOutcome>,
+        context: &OperationContext,
+    ) -> Result<bool, ProviderError> {
+        if outcome.epoch.is_exhausted() {
+            return Err(WatchError::RevisionExhausted.into());
+        }
+        let (ready, receiver) = mpsc::channel();
+        let active = Arc::new(AtomicBool::new(true));
         self.commands
-            .send(WorkerInput::Command(Command::Rescan(ready)))
+            .send(WorkerInput::Command(Command::Acknowledge {
+                outcome,
+                active: active.clone(),
+                ready,
+            }))
             .map_err(|_| WatchError::Stopped)?;
-        receiver.recv().map_err(|_| WatchError::Stopped)
+        loop {
+            let wait = match context.next_wait() {
+                Ok(wait) => wait,
+                Err(error) => {
+                    active.store(false, Ordering::Release);
+                    return Err(error);
+                }
+            };
+            match receiver.recv_timeout(wait) {
+                Ok(Ok(result)) => return Ok(result),
+                Ok(Err(failure)) => return Err(reconciliation_failure(failure).into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(WatchError::Stopped.into());
+                }
+            }
+        }
+    }
+
+    fn enqueue_reconciliation_paths<I, P>(&self, paths: I) -> Result<PendingRequest, WatchError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        // Reserve before touching the iterator: a rejected 65th caller cannot
+        // force evaluation or allocation through a lazy/adversarial source.
+        let ticket = reserve_rescan_slot(self.pending_rescans.clone())?;
+        let mut bounded = BTreeSet::new();
+        let mut full = false;
+        for path in paths {
+            bounded.insert(path.into());
+            if bounded.len() > MAX_PENDING_PATHS {
+                bounded.clear();
+                full = true;
+                break;
+            }
+        }
+        self.enqueue_reserved((!full).then(|| bounded.into_iter().collect()), ticket)
+    }
+
+    fn enqueue_reconciliation(
+        &self,
+        paths: Option<Vec<PathBuf>>,
+    ) -> Result<PendingRequest, WatchError> {
+        let ticket = reserve_rescan_slot(self.pending_rescans.clone())?;
+        self.enqueue_reserved(paths, ticket)
+    }
+
+    fn enqueue_reserved(
+        &self,
+        paths: Option<Vec<PathBuf>>,
+        ticket: Arc<RescanTicket>,
+    ) -> Result<PendingRequest, WatchError> {
+        let id = claim_rescan_id(&self.next_rescan_id, &self.epoch, &self.commands)?;
+        let (ready, receiver) = mpsc::channel();
+        let pending = PendingRescan {
+            id,
+            ready,
+            ticket: ticket.clone(),
+        };
+        increment_revision(&self.invalidation_revision, &self.epoch, &self.commands)?;
+        let command = match paths {
+            Some(paths) => Command::RescanPaths(paths, pending),
+            None => Command::Rescan(pending),
+        };
+        if self.commands.send(WorkerInput::Command(command)).is_err() {
+            ticket.release();
+            return Err(WatchError::Stopped);
+        }
+        Ok(PendingRequest {
+            id,
+            receiver,
+            ticket,
+        })
+    }
+
+    fn wait_for_reconciliation(
+        &self,
+        request: PendingRequest,
+        context: &OperationContext,
+    ) -> Result<Arc<ReconciliationOutcome>, ProviderError> {
+        loop {
+            let wait = match context.next_wait() {
+                Ok(wait) => wait,
+                Err(error) => {
+                    request.ticket.cancel();
+                    if self
+                        .commands
+                        .send(WorkerInput::Command(Command::CancelRescan(request.id)))
+                        .is_err()
+                    {
+                        request.ticket.release();
+                    }
+                    return Err(error);
+                }
+            };
+            match request.receiver.recv_timeout(wait) {
+                Ok(Ok(outcome)) => return Ok(outcome),
+                Ok(Err(failure)) => return Err(reconciliation_failure(failure).into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    request.ticket.release();
+                    return Err(WatchError::Stopped.into());
+                }
+            }
+        }
     }
 
     /// Compare only the supplied record paths with the current snapshot.
@@ -133,17 +541,108 @@ impl CollectionWatcher {
     /// This is the preferred synchronization path after an in-process
     /// mutation. It preserves operation/event ordering without turning every
     /// write into an O(collection size) reload.
+    #[cfg(test)]
+    pub(crate) fn test_control(&self) -> WatcherTestControl {
+        WatcherTestControl {
+            commands: self.commands.clone(),
+            pending_rescans: self.pending_rescans.clone(),
+            invalidation_revision: self.invalidation_revision.clone(),
+            epoch: self.epoch.clone(),
+            filesystem_callback: self.filesystem_callback.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_rescan_count(&self) -> usize {
+        self.pending_rescans.load(Ordering::Acquire)
+    }
+
     pub fn rescan_paths<I, P>(&self, paths: I) -> Result<(), WatchError>
     where
         I: IntoIterator<Item = P>,
         P: Into<PathBuf>,
     {
-        let paths = paths.into_iter().map(Into::into).collect();
-        let (ready, receiver) = mpsc::sync_channel(0);
-        self.commands
-            .send(WorkerInput::Command(Command::RescanPaths(paths, ready)))
-            .map_err(|_| WatchError::Stopped)?;
-        receiver.recv().map_err(|_| WatchError::Stopped)
+        self.rescan_paths_observation(paths).map(|_| ())
+    }
+}
+
+struct PendingRequest {
+    id: u64,
+    receiver: mpsc::Receiver<ReconciliationResult>,
+    ticket: Arc<RescanTicket>,
+}
+
+fn reconciliation_failure(failure: ReconciliationFailure) -> WatchError {
+    match failure {
+        ReconciliationFailure::RevisionExhausted => WatchError::RevisionExhausted,
+    }
+}
+
+fn reserve_rescan_slot(pending: Arc<AtomicUsize>) -> Result<Arc<RescanTicket>, WatchError> {
+    pending
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < MAX_PENDING_RESCANS).then_some(current + 1)
+        })
+        .map_err(|_| WatchError::RescanBackpressure)?;
+    Ok(Arc::new(RescanTicket {
+        pending,
+        cancelled: AtomicBool::new(false),
+        released: AtomicBool::new(false),
+    }))
+}
+
+/// Advance without wrap. Exhaustion permanently poisons this worker; recovery
+/// requires dropping and recreating `CollectionWatcher`, which starts a fresh
+/// watcher-lifetime revision epoch.
+fn poison_watcher(epoch: &WatcherEpoch, sender: &mpsc::Sender<WorkerInput>) {
+    let _linearized = epoch.linearize();
+    if !epoch.exhausted.swap(true, Ordering::AcqRel) {
+        // Unbounded channel send is non-blocking. Keep notification inside the
+        // poison linearization point without making filesystem callbacks wait
+        // for the worker to receive it.
+        let _ = sender.send(WorkerInput::RevisionExhausted);
+    }
+}
+
+fn claim_rescan_id(
+    next: &AtomicU64,
+    epoch: &WatcherEpoch,
+    sender: &mpsc::Sender<WorkerInput>,
+) -> Result<u64, WatchError> {
+    let _linearized = epoch.linearize();
+    if epoch.is_exhausted() {
+        return Err(WatchError::RevisionExhausted);
+    }
+    match next.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_add(1)
+    }) {
+        Ok(previous) => Ok(previous),
+        Err(_) => {
+            drop(_linearized);
+            poison_watcher(epoch, sender);
+            Err(WatchError::RevisionExhausted)
+        }
+    }
+}
+
+fn increment_revision(
+    revision: &AtomicU64,
+    epoch: &WatcherEpoch,
+    sender: &mpsc::Sender<WorkerInput>,
+) -> Result<u64, WatchError> {
+    let _linearized = epoch.linearize();
+    if epoch.is_exhausted() {
+        return Err(WatchError::RevisionExhausted);
+    }
+    match revision.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_add(1)
+    }) {
+        Ok(previous) => Ok(previous + 1),
+        Err(_) => {
+            drop(_linearized);
+            poison_watcher(epoch, sender);
+            Err(WatchError::RevisionExhausted)
+        }
     }
 }
 
@@ -158,32 +657,42 @@ impl Drop for CollectionWatcher {
 
 struct WorkerChannels {
     inputs: mpsc::Receiver<WorkerInput>,
-    filesystem_tx: mpsc::Sender<WorkerInput>,
+    filesystem_callback: FilesystemCallback,
     events: mpsc::Sender<WatchEvent>,
     ready: mpsc::SyncSender<Result<(), notify::Error>>,
+    invalidation_revision: Arc<AtomicU64>,
+    epoch: Arc<WatcherEpoch>,
 }
 
 fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channels: WorkerChannels) {
     let WorkerChannels {
         inputs,
-        filesystem_tx,
+        filesystem_callback,
         events,
         ready,
+        invalidation_revision,
+        epoch,
     } = channels;
-    let mut watcher: RecommendedWatcher = match notify::recommended_watcher(move |event| {
-        let _ = filesystem_tx.send(WorkerInput::Filesystem(event));
-    }) {
-        Ok(watcher) => watcher,
-        Err(error) => {
-            let _ = ready.send(Err(error));
-            return;
-        }
-    };
+    // `RecommendedWatcher` and test control both invoke this exact shared
+    // callable instance. Tests never reconstruct the callback pipeline.
+    let installed_callback = filesystem_callback.clone();
+    let mut watcher: RecommendedWatcher =
+        match notify::recommended_watcher(move |event: Result<Event, notify::Error>| {
+            installed_callback(event);
+        }) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return;
+            }
+        };
     if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
         let _ = ready.send(Err(error));
         return;
     }
     let mut sequence = 0_u64;
+    let mut snapshot_revision = invalidation_revision.load(Ordering::Acquire);
+    let mut maintained_invalid_records = snapshot.invalid_records.clone();
     // Close the gap between the caller's initial snapshot and OS watch
     // registration before reporting readiness. Hosts can now treat `open` as
     // a stable boundary instead of triggering an additional full rescan.
@@ -243,25 +752,68 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
             .unwrap_or(tick);
         match inputs.recv_timeout(wait) {
             Ok(WorkerInput::Command(Command::Stop)) => return,
-            Ok(WorkerInput::Command(Command::Rescan(ready))) => {
-                schedule_relevant_refresh(
-                    &mut deadline,
-                    &mut retry_backoff,
-                    last_refresh_diagnostic.is_some(),
-                    Duration::ZERO,
-                );
-                full_rescan = true;
-                pending_rescans.push(ready);
+            Ok(WorkerInput::Command(Command::Rescan(pending))) => {
+                if pending.ticket.cancelled.load(Ordering::Acquire) {
+                    pending.ticket.release();
+                } else {
+                    schedule_relevant_refresh(
+                        &mut deadline,
+                        &mut retry_backoff,
+                        last_refresh_diagnostic.is_some(),
+                        Duration::ZERO,
+                    );
+                    full_rescan = true;
+                    pending_rescans.push(pending);
+                }
             }
-            Ok(WorkerInput::Command(Command::RescanPaths(paths, ready))) => {
-                schedule_relevant_refresh(
-                    &mut deadline,
-                    &mut retry_backoff,
-                    last_refresh_diagnostic.is_some(),
-                    Duration::ZERO,
-                );
-                pending_paths.extend(paths);
-                pending_rescans.push(ready);
+            Ok(WorkerInput::Command(Command::RescanPaths(paths, pending))) => {
+                if pending.ticket.cancelled.load(Ordering::Acquire) {
+                    pending.ticket.release();
+                } else {
+                    schedule_relevant_refresh(
+                        &mut deadline,
+                        &mut retry_backoff,
+                        last_refresh_diagnostic.is_some(),
+                        Duration::ZERO,
+                    );
+                    merge_pending_paths(&mut pending_paths, &mut full_rescan, paths);
+                    pending_rescans.push(pending);
+                }
+            }
+            Ok(WorkerInput::Command(Command::CancelRescan(id))) => {
+                if let Some(index) = pending_rescans.iter().position(|pending| pending.id == id) {
+                    pending_rescans.swap_remove(index).ticket.release();
+                }
+            }
+            Ok(WorkerInput::Command(Command::Acknowledge {
+                outcome,
+                active,
+                ready,
+            })) => {
+                let preliminarily_current = active.load(Ordering::Acquire)
+                    && !epoch.is_exhausted()
+                    && !outcome.epoch.is_exhausted()
+                    && outcome.revision == snapshot_revision
+                    && outcome.revision == invalidation_revision.load(Ordering::Acquire);
+                #[cfg(test)]
+                if preliminarily_current {
+                    epoch.run_hook(LinearizationPoint::Acknowledgement);
+                }
+                let _linearized = epoch.linearize();
+                let current = preliminarily_current
+                    && active.load(Ordering::Acquire)
+                    && !epoch.is_exhausted()
+                    && !outcome.epoch.is_exhausted()
+                    && outcome.revision == snapshot_revision
+                    && outcome.revision == invalidation_revision.load(Ordering::Acquire);
+                if current {
+                    maintained_invalid_records = outcome.invalid_records.clone();
+                    let _ = ready.send(Ok(true));
+                } else if epoch.is_exhausted() || outcome.epoch.is_exhausted() {
+                    let _ = ready.send(Err(ReconciliationFailure::RevisionExhausted));
+                } else {
+                    let _ = ready.send(Ok(false));
+                }
             }
             Ok(WorkerInput::Filesystem(Ok(event))) if invalidates_snapshot(&event) => {
                 let pathless = event.paths.is_empty();
@@ -281,8 +833,13 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
                         );
                     }
                     match invalidation {
-                        Some(paths) => pending_paths.extend(paths),
-                        None => full_rescan = true,
+                        Some(paths) => {
+                            merge_pending_paths(&mut pending_paths, &mut full_rescan, paths)
+                        }
+                        None => {
+                            pending_paths.clear();
+                            full_rescan = true;
+                        }
                     }
                     let refresh_is_failing = last_refresh_diagnostic.is_some();
                     if !(pathless && refresh_is_failing) {
@@ -290,7 +847,11 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
                             &mut deadline,
                             &mut retry_backoff,
                             refresh_is_failing,
-                            debounce,
+                            if pending_rescans.is_empty() {
+                                debounce
+                            } else {
+                                Duration::ZERO
+                            },
                         );
                     }
                 }
@@ -305,8 +866,21 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
                     return;
                 }
             }
+            Ok(WorkerInput::RevisionExhausted) => {
+                fail_pending_rescans(&mut pending_rescans);
+                pending_paths.clear();
+                full_rescan = false;
+                deadline = None;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        if epoch.is_exhausted() {
+            fail_pending_rescans(&mut pending_rescans);
+            pending_paths.clear();
+            full_rescan = false;
+            deadline = None;
         }
 
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -314,18 +888,30 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
             let refresh_started = Instant::now();
             let refresh_mode = if full_rescan { "full" } else { "incremental" };
             let refresh_path_count = pending_paths.len();
+            let refresh_revision = invalidation_revision.load(Ordering::Acquire);
+            let mut next = snapshot.clone();
             let refreshed = if full_rescan {
-                Snapshot::load(&root).map(|mut next| {
-                    next.retain_classified_invalid(&snapshot);
-                    let diff = snapshot.diff(&next);
-                    snapshot = next;
+                Snapshot::load(&root).map(|mut candidate| {
+                    candidate.retain_classified_invalid(&snapshot);
+                    let diff = snapshot.diff(&candidate);
+                    next = candidate;
                     diff
                 })
             } else {
-                snapshot.refresh_paths(&root, &pending_paths)
+                next.refresh_paths(&root, &pending_paths)
             };
+            if epoch.is_exhausted() {
+                fail_pending_rescans(&mut pending_rescans);
+                pending_paths.clear();
+                full_rescan = false;
+                deadline = None;
+                continue;
+            }
             match refreshed {
-                Ok(changes) => {
+                Ok(changes)
+                    if refresh_revision == invalidation_revision.load(Ordering::Acquire) =>
+                {
+                    snapshot = next;
                     for event in changes {
                         sequence += 1;
                         if events
@@ -344,9 +930,30 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
                     full_rescan = false;
                     retry_backoff = INITIAL_REFRESH_RETRY;
                     last_refresh_diagnostic = None;
-                    for ready in pending_rescans.drain(..) {
-                        let _ = ready.send(());
-                    }
+                    snapshot_revision = refresh_revision;
+                    let removed_invalid_records = maintained_invalid_records
+                        .iter()
+                        .filter(|path| {
+                            !snapshot.invalid_records.contains(*path)
+                                && !snapshot.records.contains_key(*path)
+                        })
+                        .cloned()
+                        .collect();
+                    let reconciliation = Arc::new(ReconciliationOutcome {
+                        invalid_records: snapshot.invalid_records.clone(),
+                        removed_invalid_records: Arc::new(removed_invalid_records),
+                        revision: snapshot_revision,
+                        epoch: epoch.clone(),
+                    });
+                    complete_pending_rescans(&mut pending_rescans, reconciliation, &epoch);
+                }
+                Ok(_) => {
+                    // An invalidation was enqueued while bytes were being
+                    // observed. Discard the candidate and reconcile a bounded
+                    // full snapshot before completing any waiter.
+                    pending_paths.clear();
+                    full_rescan = true;
+                    deadline = Some(Instant::now());
                 }
                 Err(error) => {
                     let failed_at = Instant::now();
@@ -376,6 +983,58 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
                 );
             }
         }
+    }
+}
+
+fn merge_pending_paths(
+    pending: &mut BTreeSet<PathBuf>,
+    full_rescan: &mut bool,
+    paths: impl IntoIterator<Item = PathBuf>,
+) {
+    if *full_rescan {
+        return;
+    }
+    for path in paths {
+        pending.insert(path);
+        if pending.len() > MAX_PENDING_PATHS {
+            pending.clear();
+            *full_rescan = true;
+            return;
+        }
+    }
+}
+
+fn fail_pending_rescans(pending: &mut Vec<PendingRescan>) {
+    for pending in pending.drain(..) {
+        if !pending.ticket.cancelled.load(Ordering::Acquire) {
+            let _ = pending
+                .ready
+                .send(Err(ReconciliationFailure::RevisionExhausted));
+        }
+        pending.ticket.release();
+    }
+}
+
+fn complete_pending_rescans(
+    pending: &mut Vec<PendingRescan>,
+    outcome: Arc<ReconciliationOutcome>,
+    epoch: &WatcherEpoch,
+) {
+    #[cfg(test)]
+    epoch.run_hook(LinearizationPoint::Waiter);
+    let _linearized = epoch.linearize();
+    let result = if epoch.is_exhausted() {
+        Err(ReconciliationFailure::RevisionExhausted)
+    } else {
+        Ok(outcome)
+    };
+    for pending in pending.drain(..) {
+        if !pending.ticket.cancelled.load(Ordering::Acquire) {
+            // Arc cloning is O(1), and unbounded send cannot block while the
+            // poison linearization gate is held.
+            let _ = pending.ready.send(result.clone());
+        }
+        pending.ticket.release();
     }
 }
 
@@ -413,6 +1072,37 @@ fn watch_profile_enabled() -> bool {
 /// Loading a snapshot opens every visible collection file. Some watcher
 /// backends report those reads as access events, so treating every event as an
 /// invalidation makes the snapshot loader continuously trigger itself.
+fn enqueue_filesystem_callback(
+    sender: &mpsc::Sender<WorkerInput>,
+    root: &Path,
+    revision: &AtomicU64,
+    epoch: &WatcherEpoch,
+    event: Result<Event, notify::Error>,
+) {
+    if event
+        .as_ref()
+        .is_ok_and(|event| enqueues_reconciliation(root, event))
+    {
+        let _ = increment_revision(revision, epoch, sender);
+    }
+    // Even after exhaustion, enqueue the backend event so the worker can
+    // release resources and consume callback traffic. It can no longer fence
+    // or complete reconciliation until the watcher is recreated.
+    let _ = sender.send(WorkerInput::Filesystem(event));
+}
+
+fn enqueues_reconciliation(root: &Path, event: &Event) -> bool {
+    invalidates_snapshot(event)
+        && (event.paths.is_empty()
+            || event.paths.iter().any(|path| {
+                let Ok(relative) = path.strip_prefix(root) else {
+                    return true;
+                };
+                let normalized = relative.to_string_lossy().replace('\\', "/");
+                normalized.is_empty() || !crate::record_path::has_hidden_component(&normalized)
+            }))
+}
+
 fn invalidates_snapshot(event: &Event) -> bool {
     !matches!(
         event.kind,
@@ -443,7 +1133,7 @@ fn now() -> String {
 struct Snapshot {
     resources: BTreeMap<String, ResourceState>,
     records: BTreeMap<String, RecordState>,
-    invalid_records: BTreeSet<String>,
+    invalid_records: Arc<BTreeSet<String>>,
     types_folder: String,
     contracts_folder: String,
     cache_folder: String,
@@ -475,7 +1165,7 @@ impl Snapshot {
         let observed = collection
             .snapshot_for_watcher()
             .map_err(|error| WatchError::Collection(error.to_string()))?;
-        let invalid_records = observed.invalid_records;
+        let invalid_records = Arc::new(observed.invalid_records);
         let canonical = observed.snapshot;
         let resources = canonical
             .resources
@@ -533,7 +1223,7 @@ impl Snapshot {
     }
 
     fn retain_classified_invalid(&mut self, previous: &Self) {
-        for path in &self.invalid_records {
+        for path in self.invalid_records.iter() {
             if let Some(record) = previous.records.get(path) {
                 self.records.insert(path.clone(), record.clone());
             }
@@ -652,14 +1342,14 @@ impl Snapshot {
         for (path, outcome) in replacements {
             match outcome {
                 WatchRecordLoad::Parsed(record) => {
-                    self.invalid_records.remove(&path);
+                    Arc::make_mut(&mut self.invalid_records).remove(&path);
                     self.records.insert(path, record);
                 }
                 WatchRecordLoad::Invalid => {
-                    self.invalid_records.insert(path);
+                    Arc::make_mut(&mut self.invalid_records).insert(path);
                 }
                 WatchRecordLoad::Absent => {
-                    self.invalid_records.remove(&path);
+                    Arc::make_mut(&mut self.invalid_records).remove(&path);
                     self.records.remove(&path);
                 }
             }
@@ -907,11 +1597,27 @@ mod tests {
     use notify::event::{AccessKind, AccessMode, DataChange, RenameMode};
     use std::fs;
 
+    fn test_pending_rescan(
+        watcher: &CollectionWatcher,
+        ready: ReconciliationSender,
+    ) -> PendingRescan {
+        let ticket = reserve_rescan_slot(watcher.pending_rescans.clone()).unwrap();
+        let id = watcher.next_rescan_id.fetch_add(1, Ordering::AcqRel);
+        increment_revision(
+            &watcher.invalidation_revision,
+            &watcher.epoch,
+            &watcher.commands,
+        )
+        .unwrap();
+        PendingRescan { id, ready, ticket }
+    }
+
     fn bounded_rescan(watcher: &CollectionWatcher, paths: Option<&[&str]>) {
-        let (ready, receiver) = mpsc::sync_channel(0);
+        let (ready, receiver) = mpsc::channel();
+        let pending = test_pending_rescan(watcher, ready);
         let command = match paths {
-            Some(paths) => Command::RescanPaths(paths.iter().map(PathBuf::from).collect(), ready),
-            None => Command::Rescan(ready),
+            Some(paths) => Command::RescanPaths(paths.iter().map(PathBuf::from).collect(), pending),
+            None => Command::Rescan(pending),
         };
         watcher
             .commands
@@ -919,7 +1625,8 @@ mod tests {
             .expect("watcher worker remains available");
         receiver
             .recv_timeout(Duration::from_secs(2))
-            .expect("reconciliation completes within its bounded test budget");
+            .expect("reconciliation completes within its bounded test budget")
+            .expect("reconciliation succeeds");
     }
 
     #[test]
@@ -952,7 +1659,7 @@ mod tests {
         let snapshot = Snapshot {
             resources: BTreeMap::new(),
             records: BTreeMap::new(),
-            invalid_records: BTreeSet::new(),
+            invalid_records: Arc::new(BTreeSet::new()),
             types_folder: "_types".to_string(),
             contracts_folder: "_contracts".to_string(),
             cache_folder: ".mdbase/cache".to_string(),
@@ -1515,12 +2222,13 @@ mod tests {
             "---\ntitle: After\n---\nupdated body\n",
         )
         .unwrap();
-        let (waiter, waiter_rx) = mpsc::sync_channel(0);
+        let (waiter, waiter_rx) = mpsc::channel();
+        let pending = test_pending_rescan(&watcher, waiter);
         watcher
             .commands
             .send(WorkerInput::Command(Command::RescanPaths(
                 vec![PathBuf::from("tracked.md")],
-                waiter,
+                pending,
             )))
             .unwrap();
 
@@ -1569,7 +2277,8 @@ mod tests {
         assert_eq!(modified.payload["after"]["title"], "After");
         waiter_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("retained waiter completes after retry");
+            .expect("retained waiter completes after retry")
+            .expect("retained reconciliation succeeds");
         assert!(watcher
             .recv_timeout(Duration::from_millis(100))
             .unwrap()
@@ -1611,10 +2320,11 @@ mod tests {
                 .and_then(Value::as_str),
             Some("collection_reload_failed")
         );
-        let (waiter, waiter_rx) = mpsc::sync_channel(0);
+        let (waiter, waiter_rx) = mpsc::channel();
+        let pending = test_pending_rescan(&watcher, waiter);
         watcher
             .commands
-            .send(WorkerInput::Command(Command::Rescan(waiter)))
+            .send(WorkerInput::Command(Command::Rescan(pending)))
             .unwrap();
         let churn_until = Instant::now() + Duration::from_millis(900);
         let mut index = 0;
@@ -1667,7 +2377,337 @@ mod tests {
         assert_eq!(diagnostics, 1);
         waiter_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("retained waiter completes after recovery");
+            .expect("retained waiter completes after recovery")
+            .expect("retained reconciliation succeeds");
+    }
+
+    #[test]
+    fn pending_rescan_slots_enforce_finite_boundary_and_recover_capacity() {
+        let pending = Arc::new(AtomicUsize::new(0));
+        let mut permits = (0..MAX_PENDING_RESCANS)
+            .map(|_| reserve_rescan_slot(pending.clone()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            reserve_rescan_slot(pending.clone()),
+            Err(WatchError::RescanBackpressure)
+        ));
+        permits.pop();
+        let replacement = reserve_rescan_slot(pending.clone()).unwrap();
+        assert_eq!(pending.load(Ordering::Acquire), MAX_PENDING_RESCANS);
+        drop(replacement);
+        drop(permits);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+
+        pending.store(MAX_PENDING_RESCANS, Ordering::Release);
+        let (_events_tx, events) = mpsc::channel();
+        let (commands, inputs) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            while !matches!(
+                inputs.recv(),
+                Ok(WorkerInput::Command(Command::Stop)) | Err(_)
+            ) {}
+        });
+        let watcher = CollectionWatcher {
+            events,
+            commands,
+            worker: Some(worker),
+            pending_rescans: pending,
+            next_rescan_id: Arc::new(AtomicU64::new(1)),
+            invalidation_revision: Arc::new(AtomicU64::new(0)),
+            epoch: Arc::new(WatcherEpoch::new()),
+            filesystem_callback: Arc::new(|_| {}),
+        };
+        assert!(matches!(
+            watcher.rescan(),
+            Err(WatchError::RescanBackpressure)
+        ));
+        let lazy = std::iter::from_fn(|| -> Option<PathBuf> {
+            panic!("rejected request must not enumerate")
+        });
+        assert!(matches!(
+            watcher.rescan_paths(lazy),
+            Err(WatchError::RescanBackpressure)
+        ));
+    }
+
+    #[test]
+    fn pending_path_union_overflow_coalesces_to_bounded_full_rescan() {
+        let mut pending = (0..MAX_PENDING_PATHS)
+            .map(|index| PathBuf::from(format!("pending-{index}.md")))
+            .collect::<BTreeSet<_>>();
+        let mut full = false;
+        merge_pending_paths(&mut pending, &mut full, [PathBuf::from("overflow.md")]);
+        assert!(full);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn over_limit_path_iterator_is_bounded_and_converges_via_full_rescan() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_secs(60)).unwrap();
+        fs::write(
+            directory.path().join("visible.md"),
+            "---\ntitle: Visible\n---\n",
+        )
+        .unwrap();
+        let enumerated = Arc::new(AtomicUsize::new(0));
+        let observed = enumerated.clone();
+        let paths = (0..(MAX_PENDING_PATHS * 2)).map(move |index| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            PathBuf::from(format!("irrelevant-{index}.md"))
+        });
+        watcher.rescan_paths(paths).unwrap();
+        assert_eq!(enumerated.load(Ordering::Relaxed), MAX_PENDING_PATHS + 1);
+        let event = watcher
+            .recv_timeout(Duration::ZERO)
+            .unwrap()
+            .expect("overflow must converge through one full rescan");
+        assert_eq!(event.event_type, "mdbase.record.created");
+        assert_eq!(event.payload["path"], "visible.md");
+    }
+
+    #[test]
+    fn coalesced_waiters_share_one_immutable_reconciliation_outcome() {
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+        let count = Arc::new(AtomicUsize::new(0));
+        let first_ticket = reserve_rescan_slot(count.clone()).unwrap();
+        let second_ticket = reserve_rescan_slot(count.clone()).unwrap();
+        let mut pending = vec![
+            PendingRescan {
+                id: 1,
+                ready: first_tx,
+                ticket: first_ticket,
+            },
+            PendingRescan {
+                id: 2,
+                ready: second_tx,
+                ticket: second_ticket,
+            },
+        ];
+        let epoch = Arc::new(WatcherEpoch::new());
+        let outcome = Arc::new(ReconciliationOutcome {
+            invalid_records: Arc::new(BTreeSet::from(["invalid.md".to_string()])),
+            removed_invalid_records: Arc::new(BTreeSet::new()),
+            revision: 1,
+            epoch: epoch.clone(),
+        });
+        complete_pending_rescans(&mut pending, outcome.clone(), &epoch);
+        let first = first_rx.recv().unwrap().unwrap();
+        let second = second_rx.recv().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&outcome, &first));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn waiter_success_and_poison_have_one_linearized_order() {
+        let epoch = Arc::new(WatcherEpoch::new());
+        let (commands, _inputs) = mpsc::channel();
+        let (ready, receiver) = mpsc::channel();
+        let count = Arc::new(AtomicUsize::new(0));
+        let ticket = reserve_rescan_slot(count.clone()).unwrap();
+        let pending = PendingRescan {
+            id: 1,
+            ready,
+            ticket,
+        };
+        let outcome = Arc::new(ReconciliationOutcome {
+            invalid_records: Arc::new(BTreeSet::new()),
+            removed_invalid_records: Arc::new(BTreeSet::new()),
+            revision: 1,
+            epoch: epoch.clone(),
+        });
+        let race = epoch.install_hook(LinearizationPoint::Waiter);
+        let worker_epoch = epoch.clone();
+        let completion = thread::spawn(move || {
+            let mut pending = vec![pending];
+            complete_pending_rescans(&mut pending, outcome, &worker_epoch);
+        });
+        race.wait_until_reached();
+        poison_watcher(&epoch, &commands);
+        race.resume();
+        completion.join().unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(ReconciliationFailure::RevisionExhausted))
+        ));
+        assert_eq!(count.load(Ordering::Acquire), 0);
+
+        // The opposite legal order remains possible: a send completed under
+        // the gate before poison is a valid pre-poison success.
+        let epoch = Arc::new(WatcherEpoch::new());
+        let (ready, receiver) = mpsc::channel();
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut pending = vec![PendingRescan {
+            id: 2,
+            ready,
+            ticket: reserve_rescan_slot(count).unwrap(),
+        }];
+        let outcome = Arc::new(ReconciliationOutcome {
+            invalid_records: Arc::new(BTreeSet::new()),
+            removed_invalid_records: Arc::new(BTreeSet::new()),
+            revision: 1,
+            epoch: epoch.clone(),
+        });
+        complete_pending_rescans(&mut pending, outcome, &epoch);
+        assert!(receiver.recv().unwrap().is_ok());
+        poison_watcher(&epoch, &commands);
+    }
+
+    #[test]
+    fn acknowledgement_cannot_succeed_after_poison_begins() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(5)).unwrap();
+        let outcome = watcher.rescan_observation().unwrap();
+        let control = watcher.test_control();
+        let race = control.install_acknowledgement_linearization_hook();
+        let (ready, receiver) = mpsc::channel();
+        watcher
+            .commands
+            .send(WorkerInput::Command(Command::Acknowledge {
+                outcome,
+                active: Arc::new(AtomicBool::new(true)),
+                ready,
+            }))
+            .unwrap();
+        race.wait_until_reached();
+        control.poison();
+        race.resume();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(ReconciliationFailure::RevisionExhausted))
+        ));
+    }
+
+    #[test]
+    fn rescan_id_exhaustion_poisons_and_fails_an_already_pending_waiter() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("tracked.md"),
+            "---\ntitle: Before\n---\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(5)).unwrap();
+        crate::operations::set_record_open_failure(
+            directory.path(),
+            "tracked.md",
+            Some(std::io::ErrorKind::Interrupted),
+        );
+        fs::write(
+            directory.path().join("tracked.md"),
+            "---\ntitle: After\n---\n",
+        )
+        .unwrap();
+        let pending = watcher.enqueue_reconciliation(None).unwrap();
+        watcher.next_rescan_id.store(u64::MAX, Ordering::Release);
+
+        assert!(matches!(
+            watcher.rescan(),
+            Err(WatchError::RevisionExhausted)
+        ));
+        assert!(matches!(
+            pending.receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(Err(ReconciliationFailure::RevisionExhausted))
+        ));
+        assert!(watcher.epoch.is_exhausted());
+        assert_eq!(watcher.next_rescan_id.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(watcher.pending_rescan_count(), 0);
+        crate::operations::set_record_open_failure(directory.path(), "tracked.md", None);
+    }
+
+    #[test]
+    fn callback_revision_exhaustion_fails_pending_and_future_reconciliation_without_wrap() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("tracked.md"),
+            "---\ntitle: Before\n---\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_millis(5)).unwrap();
+        let stale = watcher.rescan_observation().unwrap();
+
+        crate::operations::set_record_open_failure(
+            directory.path(),
+            "tracked.md",
+            Some(std::io::ErrorKind::Interrupted),
+        );
+        fs::write(
+            directory.path().join("tracked.md"),
+            "---\ntitle: After\n---\n",
+        )
+        .unwrap();
+        let pending = watcher.enqueue_reconciliation(None).unwrap();
+        watcher
+            .invalidation_revision
+            .store(u64::MAX, Ordering::Release);
+        (watcher.filesystem_callback)(Ok(Event {
+            kind: EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            paths: vec![directory.path().join("tracked.md")],
+            attrs: Default::default(),
+        }));
+
+        assert!(matches!(
+            pending.receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(Err(ReconciliationFailure::RevisionExhausted))
+        ));
+        assert_eq!(watcher.pending_rescan_count(), 0);
+        assert_eq!(
+            watcher.invalidation_revision.load(Ordering::Acquire),
+            u64::MAX
+        );
+        assert!(watcher.epoch.is_exhausted());
+        assert!(matches!(
+            watcher.acknowledge_observation_with_context(stale, &OperationContext::legacy()),
+            Err(ProviderError::Watch(WatchError::RevisionExhausted))
+        ));
+        assert!(matches!(
+            watcher.rescan(),
+            Err(WatchError::RevisionExhausted)
+        ));
+        crate::operations::set_record_open_failure(directory.path(), "tracked.md", None);
+    }
+
+    #[test]
+    fn invalidation_enqueued_after_observation_rejects_stale_acknowledgement() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("invalid.md"), b"bad\xffutf8\n").unwrap();
+        let watcher = CollectionWatcher::open(directory.path(), Duration::from_secs(60)).unwrap();
+        let outcome = watcher.rescan_observation().unwrap();
+        increment_revision(
+            &watcher.invalidation_revision,
+            &watcher.epoch,
+            &watcher.commands,
+        )
+        .unwrap();
+        assert!(!watcher
+            .acknowledge_observation_with_context(outcome, &OperationContext::legacy())
+            .unwrap());
     }
 
     #[test]

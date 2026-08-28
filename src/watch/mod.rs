@@ -7,7 +7,10 @@ mod portable;
 mod real;
 
 pub use portable::{PortableWatchEvent, WatchKind};
+pub(crate) use real::WatcherEpoch;
 pub use real::{CollectionWatcher, WatchError};
+#[cfg(test)]
+pub(crate) use real::{LinearizationPoint, LinearizationRace, WatcherTestControl};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

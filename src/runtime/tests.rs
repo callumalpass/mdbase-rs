@@ -34,6 +34,47 @@ fn collection() -> tempfile::TempDir {
     directory
 }
 
+fn runtime_query_paths(runtime: &FilesystemRuntime) -> BTreeSet<String> {
+    runtime
+        .read(
+            &OperationRequest::new(
+                OperationKind::Query,
+                json!({"frontmatter_mode": "persisted"}),
+            ),
+            &OperationContext::legacy(),
+        )
+        .unwrap()
+        .result
+        .result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|record| record["path"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn runtime_query_revision(runtime: &FilesystemRuntime, path: &str) -> String {
+    runtime
+        .read(
+            &OperationRequest::new(
+                OperationKind::Query,
+                json!({"frontmatter_mode": "persisted"}),
+            ),
+            &OperationContext::legacy(),
+        )
+        .unwrap()
+        .result
+        .result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["path"] == path)
+        .unwrap()["file"]["revision"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 #[test]
 fn provider_observes_external_changes_between_requests() {
     let directory = collection();
@@ -1906,6 +1947,380 @@ fn runtime_query_omits_unneeded_bodies_from_resident_records() {
         .unwrap();
     assert!(query.result.valid, "{:?}", query.result.diagnostics);
     assert!(query.result.result["results"][0].get("body").is_none());
+}
+
+#[test]
+fn runtime_reconciliation_keeps_all_classified_invalid_query_stubs() {
+    let directory = collection();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+    fs::write(
+        directory.path().join("sibling.md"),
+        "---\ntitle: Sibling\n---\nVisible\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("malformed.md"),
+        "---\ntitle: [broken\n---\nOpaque\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("non-mapping.md"),
+        "---\n- item\n---\nOpaque\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("invalid-utf8.md"),
+        b"---\ntitle: \xff\n---\nOpaque\n",
+    )
+    .unwrap();
+
+    runtime.synchronize().unwrap();
+    while runtime
+        .ingest_external_timeout(Duration::ZERO, &OperationContext::legacy())
+        .unwrap()
+        .is_some()
+    {}
+
+    let query = runtime
+        .read(
+            &OperationRequest::new(
+                OperationKind::Query,
+                json!({"frontmatter_mode": "persisted", "include_body": true}),
+            ),
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    assert!(query.result.valid, "{:?}", query.result.diagnostics);
+    let results = query.result.result["results"].as_array().unwrap();
+    let paths = results
+        .iter()
+        .filter_map(|record| record["path"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        paths,
+        std::collections::BTreeSet::from([
+            "invalid-utf8.md",
+            "malformed.md",
+            "non-mapping.md",
+            "sibling.md",
+        ])
+    );
+    for path in ["invalid-utf8.md", "malformed.md", "non-mapping.md"] {
+        let stub = results
+            .iter()
+            .find(|record| record["path"] == path)
+            .unwrap();
+        assert!(stub.get("frontmatter").is_none());
+        assert!(stub.get("body").is_none());
+        assert!(stub["file"]["revision"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+    }
+    let reasons = query
+        .result
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.path.as_deref().unwrap(),
+                diagnostic.details.as_ref().unwrap()["reason"]
+                    .as_str()
+                    .unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        reasons,
+        std::collections::BTreeMap::from([
+            ("invalid-utf8.md", "invalid_utf8"),
+            ("malformed.md", "invalid_yaml"),
+            ("non-mapping.md", "non_mapping_frontmatter"),
+        ])
+    );
+}
+
+fn assert_initial_invalid_deletion_disappears_from_query(full: bool) {
+    let directory = collection();
+    fs::write(directory.path().join("invalid.md"), b"bad\xffutf8\n").unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+    assert_eq!(
+        runtime_query_paths(&runtime),
+        BTreeSet::from(["invalid.md".to_string()])
+    );
+
+    fs::remove_file(directory.path().join("invalid.md")).unwrap();
+    if full {
+        runtime.synchronize().unwrap();
+    } else {
+        runtime.synchronize_paths_for_test(&["invalid.md"]).unwrap();
+    }
+
+    assert!(runtime_query_paths(&runtime).is_empty());
+    assert!(runtime
+        .ingest_external_timeout(Duration::ZERO, &OperationContext::legacy())
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn full_reconciliation_removes_initial_invalid_cache_stub_without_public_event() {
+    assert_initial_invalid_deletion_disappears_from_query(true);
+}
+
+#[test]
+fn incremental_reconciliation_removes_initial_invalid_cache_stub_without_public_event() {
+    assert_initial_invalid_deletion_disappears_from_query(false);
+}
+
+#[test]
+fn absence_recreation_before_cache_commit_rolls_back_and_reconciles_current_invalid_row() {
+    let directory = collection();
+    let original = b"original\xffinvalid\n";
+    let recreated = b"recreated\xffinvalid\n";
+    fs::write(directory.path().join("invalid.md"), original).unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+    assert_eq!(
+        runtime_query_revision(&runtime, "invalid.md"),
+        crate::v03::revision(original)
+    );
+
+    fs::remove_file(directory.path().join("invalid.md")).unwrap();
+    crate::cache::runtime::set_maintenance_revalidation_replacement(
+        directory.path(),
+        "invalid.md",
+        recreated.to_vec(),
+    );
+    runtime.synchronize().unwrap();
+
+    assert_eq!(
+        runtime_query_revision(&runtime, "invalid.md"),
+        crate::v03::revision(recreated)
+    );
+    assert!(runtime
+        .ingest_external_timeout(Duration::ZERO, &OperationContext::legacy())
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn invalid_replacement_before_cache_commit_rolls_back_and_indexes_final_revision() {
+    let directory = collection();
+    let original = b"original\xffinvalid\n";
+    let replacement = b"replacement\xffinvalid\n";
+    fs::write(directory.path().join("invalid.md"), original).unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+    crate::cache::runtime::set_maintenance_revalidation_replacement(
+        directory.path(),
+        "invalid.md",
+        replacement.to_vec(),
+    );
+
+    runtime.synchronize().unwrap();
+
+    assert_eq!(
+        runtime_query_revision(&runtime, "invalid.md"),
+        crate::v03::revision(replacement)
+    );
+    assert!(runtime
+        .ingest_external_timeout(Duration::ZERO, &OperationContext::legacy())
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn persistent_refresh_failure_honors_context_deadline_and_releases_waiter() {
+    let directory = collection();
+    fs::write(
+        directory.path().join("tracked.md"),
+        "---\ntitle: Before\n---\n",
+    )
+    .unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    crate::operations::set_record_open_failure(
+        directory.path(),
+        "tracked.md",
+        Some(std::io::ErrorKind::Interrupted),
+    );
+    fs::write(
+        directory.path().join("tracked.md"),
+        "---\ntitle: After\n---\n",
+    )
+    .unwrap();
+    let cancellation = crate::OperationCancellation::new();
+    let context = OperationContext::new(
+        &cancellation,
+        OperationDeadline::after(Duration::from_millis(50)),
+    );
+    let started = Instant::now();
+    assert!(matches!(
+        runtime.synchronize_with_context(&context),
+        Err(ProviderError::OperationDeadline)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    let wait_until = Instant::now() + Duration::from_secs(1);
+    while runtime.pending_rescan_count_for_test() != 0 && Instant::now() < wait_until {
+        thread::yield_now();
+    }
+    assert_eq!(runtime.pending_rescan_count_for_test(), 0);
+    crate::operations::set_record_open_failure(directory.path(), "tracked.md", None);
+    runtime.synchronize().unwrap();
+}
+
+#[test]
+fn poison_between_final_cache_check_and_commit_rolls_back_without_success() {
+    let directory = collection();
+    let original = b"original\xffinvalid\n";
+    let replacement = b"replacement\xffinvalid\n";
+    fs::write(directory.path().join("invalid.md"), original).unwrap();
+    let runtime =
+        Arc::new(FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap());
+    let generation = runtime.current_generation().unwrap();
+    let cached_revision = runtime_query_revision(&runtime, "invalid.md");
+    fs::write(directory.path().join("invalid.md"), replacement).unwrap();
+
+    let race = runtime.install_cache_commit_linearization_hook_for_test();
+    let synchronizing = runtime.clone();
+    let sync = thread::spawn(move || synchronizing.synchronize());
+    race.wait_until_reached();
+    runtime.poison_watcher_for_test();
+    race.resume();
+
+    assert!(matches!(
+        sync.join().unwrap(),
+        Err(ProviderError::Watch(
+            crate::watch::WatchError::RevisionExhausted
+        ))
+    ));
+    assert_eq!(runtime.current_generation().unwrap(), generation);
+    assert_eq!(
+        runtime_query_revision(&runtime, "invalid.md"),
+        cached_revision
+    );
+    assert_eq!(cached_revision, crate::v03::revision(original));
+}
+
+#[test]
+fn live_callback_revision_exhaustion_aborts_sync_without_cache_or_generation_mutation() {
+    let directory = collection();
+    let original = b"original\xffinvalid\n";
+    let replacement = b"replacement\xffinvalid\n";
+    fs::write(directory.path().join("invalid.md"), original).unwrap();
+    fs::write(
+        directory.path().join("tracked.md"),
+        "---\ntitle: Before\n---\n",
+    )
+    .unwrap();
+    let runtime =
+        Arc::new(FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap());
+    let generation = runtime.current_generation().unwrap();
+    let cached_revision = runtime_query_revision(&runtime, "invalid.md");
+    crate::operations::set_record_open_failure(
+        directory.path(),
+        "tracked.md",
+        Some(std::io::ErrorKind::Interrupted),
+    );
+    fs::write(
+        directory.path().join("tracked.md"),
+        "---\ntitle: After\n---\n",
+    )
+    .unwrap();
+
+    let synchronizing = runtime.clone();
+    let sync = thread::spawn(move || synchronizing.synchronize());
+    let wait_until = Instant::now() + Duration::from_secs(2);
+    while runtime.pending_rescan_count_for_test() == 0 && Instant::now() < wait_until {
+        thread::yield_now();
+    }
+    assert_eq!(runtime.pending_rescan_count_for_test(), 1);
+
+    runtime.set_watcher_revision_for_test(u64::MAX);
+    fs::write(directory.path().join("invalid.md"), replacement).unwrap();
+    // Inject through the exact installed-callback path while the synchronization
+    // waiter is retained; this avoids backend scheduling nondeterminism.
+    runtime.invoke_installed_watcher_modify_callback_for_test("invalid.md");
+    assert!(matches!(
+        sync.join().unwrap(),
+        Err(ProviderError::Watch(
+            crate::watch::WatchError::RevisionExhausted
+        ))
+    ));
+    crate::operations::set_record_open_failure(directory.path(), "tracked.md", None);
+
+    assert_eq!(runtime.pending_rescan_count_for_test(), 0);
+    assert_eq!(runtime.current_generation().unwrap(), generation);
+    assert_eq!(
+        runtime_query_revision(&runtime, "invalid.md"),
+        cached_revision
+    );
+    assert_eq!(cached_revision, crate::v03::revision(original));
+}
+
+#[test]
+fn stale_invalid_maintenance_cannot_rewind_or_contaminate_successor_cache() {
+    let directory = collection();
+    fs::write(directory.path().join("invalid.md"), b"first\xffrevision\n").unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+    let expected = runtime.current_generation().unwrap();
+    let successor = expected.successor().unwrap();
+    runtime
+        .provider()
+        .apply_runtime_cache_changes(&ChangeSet::None, &successor)
+        .unwrap();
+
+    let collection = Collection::open(directory.path()).unwrap();
+    let connection =
+        crate::cache::sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)
+            .unwrap();
+    let old_revision = connection
+        .query_row(
+            "SELECT source_revision FROM files WHERE path = 'invalid.md'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    drop(connection);
+    fs::write(directory.path().join("invalid.md"), b"second\xffrevision\n").unwrap();
+
+    let unpoisoned_epoch = crate::watch::WatcherEpoch::new();
+    let applied = runtime
+        .provider()
+        .apply_runtime_invalid_maintenance(
+            &BTreeSet::from(["invalid.md".to_string()]),
+            &BTreeSet::new(),
+            &unpoisoned_epoch,
+            &expected,
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    assert!(!applied, "stale sequence must be rejected under the gate");
+    let foreign_epoch = CollectionGeneration::initial();
+    assert_ne!(foreign_epoch.runtime_epoch(), successor.runtime_epoch());
+    assert!(!runtime
+        .provider()
+        .apply_runtime_invalid_maintenance(
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &unpoisoned_epoch,
+            &foreign_epoch,
+            &OperationContext::legacy(),
+        )
+        .unwrap());
+
+    assert!(crate::cache::runtime::matches_generation(&collection, &successor).unwrap());
+    assert!(!crate::cache::runtime::matches_generation(&collection, &expected).unwrap());
+    let connection =
+        crate::cache::sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)
+            .unwrap();
+    let revision = connection
+        .query_row(
+            "SELECT source_revision FROM files WHERE path = 'invalid.md'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    assert_eq!(revision, old_revision);
 }
 
 #[test]

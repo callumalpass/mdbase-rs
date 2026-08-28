@@ -22,6 +22,90 @@ pub(crate) fn reindex_file(
     rel_path: &str,
 ) -> Result<(), CacheError> {
     let outcome = crate::record_load::load_record(collection, abs_path, rel_path)?;
+    index_record_outcome(conn, collection, rel_path, outcome)
+}
+
+/// Revalidate a classified-invalid maintenance hint through the capability-
+/// relative no-follow boundary. A still-invalid record gets a bounded stub and
+/// an absent record is removed. A repaired record is left to its ordered public
+/// create/modify event, so a private hint cannot expose successor content in an
+/// earlier runtime generation. Transient failures roll back the transaction.
+pub(crate) fn refresh_invalid_file_no_follow(
+    conn: &Connection,
+    collection: &Collection,
+    rel_path: &str,
+) -> Result<Option<MaintenanceExpectation>, CacheError> {
+    match crate::record_load::load_record_no_follow(collection, rel_path)? {
+        Some(outcome @ crate::record_load::RecordLoadOutcome::Invalid { .. }) => {
+            let crate::record_load::RecordLoadOutcome::Invalid { facts, reason, .. } = &outcome
+            else {
+                unreachable!();
+            };
+            let expectation = MaintenanceExpectation::Invalid {
+                revision: facts.revision.clone(),
+                reason: *reason,
+            };
+            index_record_outcome(conn, collection, rel_path, outcome)?;
+            Ok(Some(expectation))
+        }
+        Some(crate::record_load::RecordLoadOutcome::Parsed { .. }) => Ok(None),
+        None => {
+            remove_file(conn, rel_path)?;
+            Ok(Some(MaintenanceExpectation::Absent))
+        }
+    }
+}
+
+/// Apply a private removal only when the capability-relative loader confirms
+/// that the record is genuinely absent. Recreated records are handled by a
+/// later observation or their ordered public event.
+pub(crate) fn remove_invalid_file_no_follow_if_absent(
+    conn: &Connection,
+    collection: &Collection,
+    rel_path: &str,
+) -> Result<Option<MaintenanceExpectation>, CacheError> {
+    if crate::record_load::load_record_no_follow(collection, rel_path)?.is_none() {
+        remove_file(conn, rel_path)?;
+        return Ok(Some(MaintenanceExpectation::Absent));
+    }
+    Ok(None)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MaintenanceExpectation {
+    Absent,
+    Invalid {
+        revision: String,
+        reason: crate::record_load::InvalidRecordReason,
+    },
+}
+
+pub(crate) fn maintenance_expectation_still_current(
+    collection: &Collection,
+    rel_path: &str,
+    expected: &MaintenanceExpectation,
+) -> Result<bool, CacheError> {
+    let current = crate::record_load::load_record_no_follow(collection, rel_path)?;
+    Ok(match (expected, current) {
+        (MaintenanceExpectation::Absent, None) => true,
+        (
+            MaintenanceExpectation::Invalid { revision, reason },
+            Some(crate::record_load::RecordLoadOutcome::Invalid {
+                facts,
+                reason: current_reason,
+                ..
+            }),
+        ) => facts.revision == *revision && current_reason == *reason,
+        _ => false,
+    })
+}
+
+fn index_record_outcome(
+    conn: &Connection,
+    collection: &Collection,
+    rel_path: &str,
+    outcome: crate::record_load::RecordLoadOutcome,
+) -> Result<(), CacheError> {
     let facts = outcome.facts().clone();
     // Keep UTF-8 availability explicit at this boundary; invalid source is not
     // indexed as a synthetic Markdown body.
