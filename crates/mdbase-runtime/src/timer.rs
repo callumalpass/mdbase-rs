@@ -37,6 +37,10 @@ pub enum TimerFireOutcome {
 }
 
 impl Runtime {
+    /// Unconditionally schedule one timer as a new generation.
+    ///
+    /// Use [`Runtime::reconcile_timer_exact`] when an identical non-cancelled
+    /// timer must retain its generation and lifecycle state.
     pub async fn upsert_timer(&self, request: TimerRequest) -> RuntimeResult<TimerRecord> {
         let now = self.clock.now();
         self.store
@@ -54,6 +58,19 @@ impl Runtime {
                 updated_at: now,
                 fired_at: None,
             })
+            .await
+    }
+
+    /// Reconcile exactly one timer without cancelling prefix-related siblings.
+    ///
+    /// This has the desired-member semantics of [`Runtime::reconcile_timers`]
+    /// without complete-set omission semantics: identical non-cancelled timers
+    /// preserve their generation and lifecycle state, while missing, changed,
+    /// or cancelled timers are scheduled at the next checked generation.
+    pub async fn reconcile_timer_exact(&self, request: TimerRequest) -> RuntimeResult<TimerRecord> {
+        let now = self.clock.now();
+        self.store
+            .reconcile_timer_exact(timer_record(request, now), now)
             .await
     }
 
@@ -92,20 +109,7 @@ impl Runtime {
                     format!("Timer {} appears more than once.", timer.id),
                 ));
             }
-            desired.push(TimerRecord {
-                id: timer.id,
-                generation: 0,
-                status: TimerStatus::Scheduled,
-                fire_at: timer.fire_at,
-                event_contract: timer.contract,
-                event_source: timer.source,
-                source_uri: timer.source_uri,
-                subject: timer.subject,
-                data: timer.data,
-                created_at: now,
-                updated_at: now,
-                fired_at: None,
-            });
+            desired.push(timer_record(timer, now));
         }
         self.store
             .reconcile_timers(&request.id_prefix, desired, now)
@@ -199,6 +203,23 @@ impl Runtime {
     }
 }
 
+fn timer_record(request: TimerRequest, now: DateTime<Utc>) -> TimerRecord {
+    TimerRecord {
+        id: request.id,
+        generation: 0,
+        status: TimerStatus::Scheduled,
+        fire_at: request.fire_at,
+        event_contract: request.contract,
+        event_source: request.source,
+        source_uri: request.source_uri,
+        subject: request.subject,
+        data: request.data,
+        created_at: now,
+        updated_at: now,
+        fired_at: None,
+    }
+}
+
 pub(crate) fn timer_matches(current: &TimerRecord, desired: &TimerRecord) -> bool {
     !matches!(current.status, TimerStatus::Cancelled)
         && current.fire_at == desired.fire_at
@@ -209,21 +230,32 @@ pub(crate) fn timer_matches(current: &TimerRecord, desired: &TimerRecord) -> boo
         && current.data == desired.data
 }
 
+/// Largest timer generation representable by every runtime store.
+///
+/// SQLite and PostgreSQL persist generations in signed 64-bit integer columns,
+/// so the in-memory store deliberately uses the same ceiling.
+pub const TIMER_GENERATION_MAX: u64 = i64::MAX as u64;
+
+pub(crate) fn next_timer_generation_value(
+    current: Option<&TimerRecord>,
+    id: &str,
+) -> RuntimeResult<u64> {
+    let generation = current.map(|timer| timer.generation).unwrap_or(0);
+    if generation >= TIMER_GENERATION_MAX {
+        return Err(RuntimeError::diagnostic(
+            "timer_generation_exhausted",
+            format!("Timer {id} exhausted its generation counter."),
+        ));
+    }
+    Ok(generation + 1)
+}
+
 pub(crate) fn next_timer_generation(
     current: Option<&TimerRecord>,
     mut desired: TimerRecord,
     now: DateTime<Utc>,
 ) -> RuntimeResult<TimerRecord> {
-    desired.generation = current
-        .map(|timer| timer.generation)
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| {
-            RuntimeError::diagnostic(
-                "timer_generation_exhausted",
-                format!("Timer {} exhausted its generation counter.", desired.id),
-            )
-        })?;
+    desired.generation = next_timer_generation_value(current, &desired.id)?;
     if let Some(current) = current {
         desired.created_at = current.created_at;
     }
@@ -231,4 +263,46 @@ pub(crate) fn next_timer_generation(
     desired.updated_at = now;
     desired.fired_at = None;
     Ok(desired)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn exact_timer_generation_exhaustion_fails_closed() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 29, 0, 0, 0).single().unwrap();
+        let current = TimerRecord {
+            id: "exact".to_string(),
+            generation: TIMER_GENERATION_MAX,
+            status: TimerStatus::Cancelled,
+            fire_at: now,
+            event_contract: ExactContractReference {
+                id: "timer.test".to_string(),
+                version: "1.0.0".to_string(),
+                digest: format!("sha256:{}", "0".repeat(64)),
+            },
+            event_source: ImplementationIdentity {
+                application: "test".to_string(),
+                implementation: "test".to_string(),
+                version: "1.0.0".to_string(),
+                instance_id: None,
+            },
+            source_uri: "urn:test".to_string(),
+            subject: None,
+            data: json!({}),
+            created_at: now,
+            updated_at: now,
+            fired_at: None,
+        };
+        let mut desired = current.clone();
+        desired.status = TimerStatus::Scheduled;
+
+        let error = next_timer_generation(Some(&current), desired, now).unwrap_err();
+
+        assert_eq!(error.code(), "timer_generation_exhausted");
+        assert_eq!(current.generation, TIMER_GENERATION_MAX);
+        assert_eq!(current.status, TimerStatus::Cancelled);
+    }
 }

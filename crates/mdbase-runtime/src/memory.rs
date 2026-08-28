@@ -14,7 +14,7 @@ use crate::store::{
     AdmitOutcome, Claim, EventPage, PreparedEvent, RuntimeStore, StoreSnapshot, TimerClaim,
     TimerReconcileOutcome,
 };
-use crate::timer::{next_timer_generation, timer_matches};
+use crate::timer::{next_timer_generation, next_timer_generation_value, timer_matches};
 
 #[derive(Debug, Clone)]
 struct Lease {
@@ -220,14 +220,31 @@ impl RuntimeStore for InMemoryRuntimeStore {
             .state
             .lock()
             .map_err(|_| RuntimeError::Store("in-memory store lock poisoned".to_string()))?;
-        timer.generation = state
-            .timers
-            .get(&timer.id)
-            .map_or(1, |current| current.generation + 1);
+        timer.generation = next_timer_generation_value(state.timers.get(&timer.id), &timer.id)?;
         timer.status = TimerStatus::Scheduled;
         state.timer_leases.remove(&timer.id);
         state.timers.insert(timer.id.clone(), timer.clone());
         Ok(timer)
+    }
+
+    async fn reconcile_timer_exact(
+        &self,
+        desired: TimerRecord,
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<TimerRecord> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeError::Store("in-memory store lock poisoned".to_string()))?;
+        if let Some(current) = state.timers.get(&desired.id) {
+            if timer_matches(current, &desired) {
+                return Ok(current.clone());
+            }
+        }
+        let next = next_timer_generation(state.timers.get(&desired.id), desired, now)?;
+        state.timer_leases.remove(&next.id);
+        state.timers.insert(next.id.clone(), next.clone());
+        Ok(next)
     }
 
     async fn cancel_timer(
@@ -268,6 +285,19 @@ impl RuntimeStore for InMemoryRuntimeStore {
             .iter()
             .map(|timer| timer.id.clone())
             .collect::<std::collections::BTreeSet<_>>();
+        // Build the complete desired result before changing omissions. This is
+        // what gives the non-transactional memory store SQL-style rollback when
+        // any member has exhausted its portable generation counter.
+        let mut planned = Vec::with_capacity(desired.len());
+        for desired in desired {
+            let current = state.timers.get(&desired.id);
+            if current.is_some_and(|current| timer_matches(current, &desired)) {
+                planned.push((current.expect("checked above").clone(), false));
+            } else {
+                planned.push((next_timer_generation(current, desired, now)?, true));
+            }
+        }
+
         let mut cancelled_ids = Vec::new();
         let cancel = state
             .timers
@@ -287,19 +317,12 @@ impl RuntimeStore for InMemoryRuntimeStore {
             state.timer_leases.remove(&id);
             cancelled_ids.push(id);
         }
-        let mut timers = Vec::with_capacity(desired.len());
-        for next in desired {
-            let unchanged = state
-                .timers
-                .get(&next.id)
-                .is_some_and(|current| timer_matches(current, &next));
-            if unchanged {
-                timers.push(state.timers[&next.id].clone());
-                continue;
+        let mut timers = Vec::with_capacity(planned.len());
+        for (next, changed) in planned {
+            if changed {
+                state.timer_leases.remove(&next.id);
+                state.timers.insert(next.id.clone(), next.clone());
             }
-            let next = next_timer_generation(state.timers.get(&next.id), next, now)?;
-            state.timer_leases.remove(&next.id);
-            state.timers.insert(next.id.clone(), next.clone());
             timers.push(next);
         }
         timers.sort_by(|left, right| left.id.cmp(&right.id));
@@ -574,4 +597,70 @@ fn add_std_duration(now: DateTime<Utc>, duration: Duration) -> RuntimeResult<Dat
     let delta = TimeDelta::from_std(duration)
         .map_err(|_| RuntimeError::Clock("lease duration is too large".to_string()))?;
     Ok(now + delta)
+}
+
+#[cfg(test)]
+mod timer_generation_tests {
+    use super::*;
+    use crate::timer::TIMER_GENERATION_MAX;
+    use mdbase_interop::{ExactContractReference, ImplementationIdentity};
+    use serde_json::json;
+
+    fn timer(id: &str, now: DateTime<Utc>) -> TimerRecord {
+        TimerRecord {
+            id: id.to_string(),
+            generation: 0,
+            status: TimerStatus::Scheduled,
+            fire_at: now,
+            event_contract: ExactContractReference {
+                id: "timer.test".to_string(),
+                version: "1.0.0".to_string(),
+                digest: format!("sha256:{}", "0".repeat(64)),
+            },
+            event_source: ImplementationIdentity {
+                application: "test".to_string(),
+                implementation: "memory".to_string(),
+                version: "1.0.0".to_string(),
+                instance_id: None,
+            },
+            source_uri: "urn:test".to_string(),
+            subject: None,
+            data: json!({}),
+            created_at: now,
+            updated_at: now,
+            fired_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_exhaustion_rolls_back_every_scheduling_path() {
+        let store = InMemoryRuntimeStore::new();
+        let now = Utc::now();
+        let mut exhausted = timer("max:timer", now);
+        exhausted.generation = TIMER_GENERATION_MAX;
+        let omitted = timer("max:omitted", now);
+        {
+            let mut state = store.state.lock().unwrap();
+            state.timers.insert(exhausted.id.clone(), exhausted.clone());
+            state.timers.insert(omitted.id.clone(), omitted);
+        }
+        let before = store.snapshot().await.unwrap().timers;
+        let mut changed = exhausted;
+        changed.data = json!({"changed": true});
+
+        for error in [
+            store.upsert_timer(changed.clone()).await.unwrap_err(),
+            store
+                .reconcile_timer_exact(changed.clone(), now)
+                .await
+                .unwrap_err(),
+            store
+                .reconcile_timers("max:", vec![changed], now)
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.code(), "timer_generation_exhausted");
+            assert_eq!(store.snapshot().await.unwrap().timers, before);
+        }
+    }
 }

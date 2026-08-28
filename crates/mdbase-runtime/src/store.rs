@@ -91,7 +91,21 @@ pub trait RuntimeStore: Send + Sync {
 
     async fn request_cancel(&self, id: &str, now: DateTime<Utc>) -> RuntimeResult<bool>;
 
+    /// Unconditionally schedule one timer as a new generation.
+    ///
+    /// Unlike [`RuntimeStore::reconcile_timer_exact`], this always replaces the
+    /// stored state and is retained for callers that require upsert semantics.
     async fn upsert_timer(&self, timer: TimerRecord) -> RuntimeResult<TimerRecord>;
+
+    /// Reconcile exactly one timer without treating prefix-related timers as omitted.
+    ///
+    /// An identical non-cancelled timer preserves all stored state. A missing,
+    /// changed, or cancelled timer is scheduled at its next checked generation.
+    async fn reconcile_timer_exact(
+        &self,
+        desired: TimerRecord,
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<TimerRecord>;
 
     async fn cancel_timer(
         &self,

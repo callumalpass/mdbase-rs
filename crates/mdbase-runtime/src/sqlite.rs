@@ -1,22 +1,32 @@
+mod recovery;
+mod schema;
+mod timers;
+mod utils;
+
+pub use recovery::{inspect_sqlite_recovery, SqliteRecoveryState};
+use schema::{migrate, validate_persisted_records};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
+use utils::{
+    add_duration, concurrency_policy, nonnegative_cursor, parse_timestamp, run_status, store_error,
+    timestamp,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::model::{
-    ConcurrencyPolicy, EventJournalEntry, RunRecord, RunStatus, TimerRecord, TimerStatus,
-};
+#[cfg(test)]
+use crate::model::TimerStatus;
+use crate::model::{ConcurrencyPolicy, EventJournalEntry, RunRecord, RunStatus, TimerRecord};
 use crate::store::{
     AdmitOutcome, Claim, EventPage, PreparedEvent, RuntimeStore, StoreSnapshot, TimerClaim,
     TimerReconcileOutcome,
 };
-use crate::timer::{next_timer_generation, timer_matches};
 
 /// Version of the SQLite tables and every Rust value serialized into them.
 ///
@@ -26,79 +36,6 @@ pub const SQLITE_SCHEMA_VERSION: u32 = 2;
 const SQLITE_WORK_QUEUE_CAPACITY: usize = 64;
 
 type SqliteCommand = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SqliteRecoveryState {
-    pub due_timers: bool,
-    pub pending_runs: bool,
-}
-
-impl SqliteRecoveryState {
-    pub fn has_work(self) -> bool {
-        self.due_timers || self.pending_runs
-    }
-}
-
-/// Inspect an existing runtime store without creating or migrating it.
-pub fn inspect_sqlite_recovery(
-    path: impl AsRef<Path>,
-    now: DateTime<Utc>,
-) -> RuntimeResult<SqliteRecoveryState> {
-    let path = path.as_ref();
-    if !path.is_file() {
-        return Ok(SqliteRecoveryState::default());
-    }
-    let connection =
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(store_error)?;
-    let installed = connection
-        .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-        .map_err(store_error)?;
-    if installed > SQLITE_SCHEMA_VERSION {
-        return Err(RuntimeError::diagnostic(
-            "runtime_schema_too_new",
-            format!(
-                "SQLite runtime schema version {installed} is newer than supported version {SQLITE_SCHEMA_VERSION}."
-            ),
-        ));
-    }
-    let table_exists = |name: &str| -> RuntimeResult<bool> {
-        connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-                [name],
-                |row| row.get(0),
-            )
-            .map_err(store_error)
-    };
-    let due_timers = table_exists("runtime_timers")?
-        && connection
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM runtime_timers
-                    WHERE status IN ('scheduled', 'firing') AND fire_at <= ?1
-                 )",
-                [timestamp(now)],
-                |row| row.get(0),
-            )
-            .map_err(store_error)?;
-    let pending_runs = table_exists("runtime_runs")?
-        && connection
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM runtime_runs
-                    WHERE status IN ('queued', 'running')
-                      AND not_before <= ?1
-                      AND (lease_token IS NULL OR lease_expires_at <= ?1)
-                 )",
-                [timestamp(now)],
-                |row| row.get(0),
-            )
-            .map_err(store_error)?;
-    Ok(SqliteRecoveryState {
-        due_timers,
-        pending_runs,
-    })
-}
 
 #[derive(Clone)]
 pub struct SqliteRuntimeStore {
@@ -170,165 +107,6 @@ impl SqliteRuntimeStore {
             .await
             .map_err(|_| RuntimeError::Store("SQLite worker stopped unexpectedly".to_string()))?
     }
-}
-
-fn migrate(connection: &mut Connection) -> RuntimeResult<()> {
-    let installed = connection
-        .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-        .map_err(store_error)?;
-    if installed > SQLITE_SCHEMA_VERSION {
-        return Err(RuntimeError::diagnostic(
-            "runtime_schema_too_new",
-            format!(
-                "SQLite runtime schema version {installed} is newer than supported version {SQLITE_SCHEMA_VERSION}."
-            ),
-        ));
-    }
-    let transaction = connection.transaction().map_err(store_error)?;
-    let mut version = installed;
-    if version == 0 {
-        transaction
-            .execute_batch(
-                "
-                CREATE TABLE IF NOT EXISTS runtime_events (
-                    cursor INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_runtime TEXT NOT NULL,
-                    event_id TEXT NOT NULL,
-                    envelope_json TEXT NOT NULL,
-                    received_at TEXT NOT NULL,
-                    UNIQUE(source_runtime, event_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS runtime_event_dedup (
-                    source_runtime TEXT NOT NULL,
-                    event_id TEXT NOT NULL,
-                    cursor INTEGER NOT NULL,
-                    PRIMARY KEY(source_runtime, event_id)
-                );
-
-                INSERT OR IGNORE INTO runtime_event_dedup(source_runtime, event_id, cursor)
-                    SELECT source_runtime, event_id, cursor FROM runtime_events;
-
-                CREATE TABLE IF NOT EXISTS runtime_meta (
-                    key TEXT PRIMARY KEY,
-                    value INTEGER NOT NULL
-                );
-
-                INSERT OR IGNORE INTO runtime_meta(key, value) VALUES ('retained_after', 0);
-
-                CREATE TABLE IF NOT EXISTS runtime_runs (
-                    id TEXT PRIMARY KEY,
-                    executor TEXT NOT NULL,
-                    workflow TEXT NOT NULL,
-                    trigger_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    not_before TEXT NOT NULL,
-                    idempotency_scope TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL,
-                    concurrency_group TEXT NOT NULL,
-                    concurrency_policy TEXT NOT NULL,
-                    lease_worker TEXT,
-                    lease_token TEXT,
-                    lease_expires_at TEXT,
-                    revision INTEGER NOT NULL,
-                    record_json TEXT NOT NULL,
-                    UNIQUE(idempotency_scope, idempotency_key)
-                );
-
-                CREATE INDEX IF NOT EXISTS runtime_runs_claim
-                    ON runtime_runs(executor, status, not_before, created_at);
-                CREATE INDEX IF NOT EXISTS runtime_runs_group
-                    ON runtime_runs(concurrency_group, status);
-                CREATE INDEX IF NOT EXISTS runtime_runs_trigger
-                    ON runtime_runs(workflow, trigger_id, created_at);
-
-                CREATE TABLE IF NOT EXISTS runtime_timers (
-                    id TEXT PRIMARY KEY,
-                    generation INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    fire_at TEXT NOT NULL,
-                    lease_worker TEXT,
-                    lease_token TEXT,
-                    lease_expires_at TEXT,
-                    record_json TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS runtime_timers_due
-                    ON runtime_timers(status, fire_at);
-                ",
-            )
-            .map_err(store_error)?;
-        version = 1;
-    }
-    if version == 1 {
-        // Runtime profile 0.2 made the persisted run and timer model
-        // incompatible with profile 0.1. The missing exact contract evidence
-        // cannot be reconstructed from old JSON, so this prerelease migration
-        // explicitly resets runtime-owned execution state.
-        transaction
-            .execute_batch(
-                "
-                DELETE FROM runtime_timers;
-                DELETE FROM runtime_runs;
-                DELETE FROM runtime_event_dedup;
-                DELETE FROM runtime_events;
-                DELETE FROM runtime_meta;
-                INSERT INTO runtime_meta(key, value) VALUES ('retained_after', 0);
-                ",
-            )
-            .map_err(store_error)?;
-        version = 2;
-    }
-    if version != SQLITE_SCHEMA_VERSION {
-        return Err(RuntimeError::Store(format!(
-            "SQLite runtime migration stopped at version {version}; expected {SQLITE_SCHEMA_VERSION}."
-        )));
-    }
-    transaction
-        .pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)
-        .map_err(store_error)?;
-    transaction.commit().map_err(store_error)
-}
-
-fn validate_persisted_records(connection: &Connection) -> RuntimeResult<()> {
-    let mut runs = connection
-        .prepare("SELECT id, record_json FROM runtime_runs ORDER BY id")
-        .map_err(store_error)?;
-    let rows = runs
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(store_error)?;
-    for row in rows {
-        let (id, json) = row.map_err(store_error)?;
-        serde_json::from_str::<RunRecord>(&json).map_err(|error| {
-            RuntimeError::diagnostic(
-                "invalid_persisted_runtime_record",
-                format!("Runtime run {id} is incompatible with this build: {error}"),
-            )
-        })?;
-    }
-    drop(runs);
-
-    let mut timers = connection
-        .prepare("SELECT id, record_json FROM runtime_timers ORDER BY id")
-        .map_err(store_error)?;
-    let rows = timers
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(store_error)?;
-    for row in rows {
-        let (id, json) = row.map_err(store_error)?;
-        serde_json::from_str::<TimerRecord>(&json).map_err(|error| {
-            RuntimeError::diagnostic(
-                "invalid_persisted_runtime_record",
-                format!("Runtime timer {id} is incompatible with this build: {error}"),
-            )
-        })?;
-    }
-    Ok(())
 }
 
 #[async_trait]
@@ -671,45 +449,16 @@ impl RuntimeStore for SqliteRuntimeStore {
         .await
     }
 
-    async fn upsert_timer(&self, mut timer: TimerRecord) -> RuntimeResult<TimerRecord> {
-        self.execute(move |connection| {
-            let generation = connection
-                .query_row(
-                    "SELECT generation FROM runtime_timers WHERE id = ?1",
-                    params![timer.id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(store_error)?
-                .and_then(|value| u64::try_from(value).ok())
-                .unwrap_or(0)
-                + 1;
-            timer.generation = generation;
-            timer.status = TimerStatus::Scheduled;
-            connection
-                .execute(
-                    "INSERT INTO runtime_timers
-                    (id, generation, status, fire_at, record_json)
-                 VALUES (?1, ?2, 'scheduled', ?3, ?4)
-                 ON CONFLICT(id) DO UPDATE SET
-                    generation = excluded.generation,
-                    status = 'scheduled',
-                    fire_at = excluded.fire_at,
-                    lease_worker = NULL,
-                    lease_token = NULL,
-                    lease_expires_at = NULL,
-                    record_json = excluded.record_json",
-                    params![
-                        timer.id,
-                        timer.generation,
-                        timestamp(timer.fire_at),
-                        serde_json::to_string(&timer)?
-                    ],
-                )
-                .map_err(store_error)?;
-            Ok(timer)
-        })
-        .await
+    async fn upsert_timer(&self, timer: TimerRecord) -> RuntimeResult<TimerRecord> {
+        self.upsert_timer_impl(timer).await
+    }
+
+    async fn reconcile_timer_exact(
+        &self,
+        desired: TimerRecord,
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<TimerRecord> {
+        self.reconcile_timer_exact_impl(desired, now).await
     }
 
     async fn cancel_timer(
@@ -718,41 +467,7 @@ impl RuntimeStore for SqliteRuntimeStore {
         generation: Option<u64>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<bool> {
-        let id = id.to_string();
-        self.execute(move |connection| {
-            let transaction = connection.transaction().map_err(store_error)?;
-            let json = transaction
-                .query_row(
-                    "SELECT record_json FROM runtime_timers WHERE id = ?1",
-                    params![id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(store_error)?;
-            let Some(json) = json else {
-                return Ok(false);
-            };
-            let mut timer: TimerRecord = serde_json::from_str(&json)?;
-            if generation.is_some_and(|expected| expected != timer.generation)
-                || !matches!(timer.status, TimerStatus::Scheduled | TimerStatus::Firing)
-            {
-                return Ok(false);
-            }
-            timer.status = TimerStatus::Cancelled;
-            timer.updated_at = now;
-            transaction
-                .execute(
-                    "UPDATE runtime_timers
-                 SET status = 'cancelled', lease_worker = NULL, lease_token = NULL,
-                     lease_expires_at = NULL, record_json = ?1
-                 WHERE id = ?2",
-                    params![serde_json::to_string(&timer)?, id],
-                )
-                .map_err(store_error)?;
-            transaction.commit().map_err(store_error)?;
-            Ok(true)
-        })
-        .await
+        self.cancel_timer_impl(id, generation, now).await
     }
 
     async fn reconcile_timers(
@@ -761,115 +476,11 @@ impl RuntimeStore for SqliteRuntimeStore {
         desired: Vec<TimerRecord>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<TimerReconcileOutcome> {
-        let id_prefix = id_prefix.to_string();
-        self.execute(move |connection| {
-            let transaction = connection.transaction().map_err(store_error)?;
-            let existing = {
-                let mut statement = transaction
-                    .prepare(
-                        "SELECT record_json FROM runtime_timers
-                     WHERE substr(id, 1, length(?1)) = ?1
-                     ORDER BY id",
-                    )
-                    .map_err(store_error)?;
-                let records = statement
-                    .query_map(params![id_prefix], |row| row.get::<_, String>(0))
-                    .map_err(store_error)?
-                    .map(|value| {
-                        let value = value.map_err(store_error)?;
-                        let timer = serde_json::from_str::<TimerRecord>(&value)?;
-                        Ok((timer.id.clone(), timer))
-                    })
-                    .collect::<RuntimeResult<std::collections::BTreeMap<_, _>>>()?;
-                records
-            };
-            let desired_ids = desired
-                .iter()
-                .map(|timer| timer.id.clone())
-                .collect::<std::collections::BTreeSet<_>>();
-            let mut cancelled_ids = Vec::new();
-            for timer in existing.values().filter(|timer| {
-                timer.id.starts_with(&id_prefix)
-                    && !desired_ids.contains(&timer.id)
-                    && matches!(timer.status, TimerStatus::Scheduled | TimerStatus::Firing)
-            }) {
-                let mut cancelled = timer.clone();
-                cancelled.status = TimerStatus::Cancelled;
-                cancelled.updated_at = now;
-                transaction
-                    .execute(
-                        "UPDATE runtime_timers
-                     SET status = 'cancelled', lease_worker = NULL, lease_token = NULL,
-                         lease_expires_at = NULL, record_json = ?1
-                     WHERE id = ?2",
-                        params![serde_json::to_string(&cancelled)?, cancelled.id],
-                    )
-                    .map_err(store_error)?;
-                cancelled_ids.push(timer.id.clone());
-            }
-            let mut timers = Vec::with_capacity(desired.len());
-            for desired in desired {
-                let current = existing.get(&desired.id);
-                if current.is_some_and(|current| timer_matches(current, &desired)) {
-                    timers.push(current.expect("checked above").clone());
-                    continue;
-                }
-                let next = next_timer_generation(current, desired, now)?;
-                transaction
-                    .execute(
-                        "INSERT INTO runtime_timers
-                        (id, generation, status, fire_at, record_json)
-                     VALUES (?1, ?2, 'scheduled', ?3, ?4)
-                     ON CONFLICT(id) DO UPDATE SET
-                        generation = excluded.generation,
-                        status = 'scheduled',
-                        fire_at = excluded.fire_at,
-                        lease_worker = NULL,
-                        lease_token = NULL,
-                        lease_expires_at = NULL,
-                        record_json = excluded.record_json",
-                        params![
-                            next.id,
-                            next.generation,
-                            timestamp(next.fire_at),
-                            serde_json::to_string(&next)?
-                        ],
-                    )
-                    .map_err(store_error)?;
-                timers.push(next);
-            }
-            transaction.commit().map_err(store_error)?;
-            timers.sort_by(|left, right| left.id.cmp(&right.id));
-            cancelled_ids.sort();
-            Ok(TimerReconcileOutcome {
-                timers,
-                cancelled_ids,
-            })
-        })
-        .await
+        self.reconcile_timers_impl(id_prefix, desired, now).await
     }
 
     async fn timers(&self, id_prefix: &str) -> RuntimeResult<Vec<TimerRecord>> {
-        let id_prefix = id_prefix.to_string();
-        self.execute(move |connection| {
-            let mut statement = connection
-                .prepare(
-                    "SELECT record_json FROM runtime_timers
-                     WHERE substr(id, 1, length(?1)) = ?1
-                     ORDER BY id",
-                )
-                .map_err(store_error)?;
-            let timers = statement
-                .query_map(params![id_prefix], |row| row.get::<_, String>(0))
-                .map_err(store_error)?
-                .map(|value| {
-                    let value = value.map_err(store_error)?;
-                    serde_json::from_str::<TimerRecord>(&value).map_err(Into::into)
-                })
-                .collect();
-            timers
-        })
-        .await
+        self.timers_impl(id_prefix).await
     }
 
     async fn claim_due_timer(
@@ -878,66 +489,7 @@ impl RuntimeStore for SqliteRuntimeStore {
         now: DateTime<Utc>,
         lease_for: Duration,
     ) -> RuntimeResult<Option<TimerClaim>> {
-        let worker = worker.to_string();
-        self.execute(move |connection| {
-            let transaction = connection.transaction().map_err(store_error)?;
-            transaction
-                .execute(
-                    "UPDATE runtime_timers
-                 SET lease_worker = NULL, lease_token = NULL, lease_expires_at = NULL
-                 WHERE lease_expires_at <= ?1",
-                    params![timestamp(now)],
-                )
-                .map_err(store_error)?;
-            let json = transaction
-                .query_row(
-                    "SELECT record_json FROM runtime_timers
-                 WHERE status IN ('scheduled', 'firing')
-                   AND fire_at <= ?1
-                   AND lease_token IS NULL
-                 ORDER BY fire_at, id LIMIT 1",
-                    params![timestamp(now)],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(store_error)?;
-            let Some(json) = json else {
-                transaction.commit().map_err(store_error)?;
-                return Ok(None);
-            };
-            let mut timer: TimerRecord = serde_json::from_str(&json)?;
-            timer.status = TimerStatus::Firing;
-            timer.updated_at = now;
-            let token = format!("timer_lease_{}", Ulid::new());
-            let expires_at = add_duration(now, lease_for)?;
-            let changed = transaction
-                .execute(
-                    "UPDATE runtime_timers
-                 SET status = 'firing', lease_worker = ?1, lease_token = ?2,
-                     lease_expires_at = ?3, record_json = ?4
-                 WHERE id = ?5 AND generation = ?6 AND lease_token IS NULL",
-                    params![
-                        worker,
-                        token,
-                        timestamp(expires_at),
-                        serde_json::to_string(&timer)?,
-                        timer.id,
-                        timer.generation
-                    ],
-                )
-                .map_err(store_error)?;
-            if changed != 1 {
-                return Ok(None);
-            }
-            transaction.commit().map_err(store_error)?;
-            Ok(Some(TimerClaim {
-                timer,
-                worker,
-                token,
-                expires_at,
-            }))
-        })
-        .await
+        self.claim_due_timer_impl(worker, now, lease_for).await
     }
 
     async fn fire_timer(
@@ -946,34 +498,7 @@ impl RuntimeStore for SqliteRuntimeStore {
         fired: TimerRecord,
         event: PreparedEvent,
     ) -> RuntimeResult<AdmitOutcome> {
-        self.execute(move |connection| {
-            let transaction = connection.transaction().map_err(store_error)?;
-            let changed = transaction
-                .execute(
-                    "UPDATE runtime_timers
-                 SET status = 'fired', lease_worker = NULL, lease_token = NULL,
-                     lease_expires_at = NULL, record_json = ?1
-                 WHERE id = ?2 AND generation = ?3 AND lease_worker = ?4 AND lease_token = ?5",
-                    params![
-                        serde_json::to_string(&fired)?,
-                        claim.timer.id,
-                        claim.timer.generation,
-                        claim.worker,
-                        claim.token
-                    ],
-                )
-                .map_err(store_error)?;
-            if changed != 1 {
-                return Err(RuntimeError::diagnostic(
-                    "stale_timer_generation",
-                    "Timer generation or lease changed before firing.",
-                ));
-            }
-            let outcome = admit_tx(&transaction, event)?;
-            transaction.commit().map_err(store_error)?;
-            Ok(outcome)
-        })
-        .await
+        self.fire_timer_impl(claim, fired, event).await
     }
 
     async fn snapshot(&self) -> RuntimeResult<StoreSnapshot> {
@@ -1278,49 +803,79 @@ fn read_json_column<T: serde::de::DeserializeOwned>(
     result
 }
 
-fn timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
+#[cfg(test)]
+mod timer_generation_tests {
+    use super::*;
+    use crate::timer::TIMER_GENERATION_MAX;
+    use mdbase_interop::{ExactContractReference, ImplementationIdentity};
+    use serde_json::json;
 
-fn parse_timestamp(value: &str) -> RuntimeResult<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|value| value.with_timezone(&Utc))
-        .map_err(|error| RuntimeError::Store(error.to_string()))
-}
-
-fn nonnegative_cursor(value: i64) -> RuntimeResult<u64> {
-    u64::try_from(value).map_err(|_| RuntimeError::Store("negative event cursor".to_string()))
-}
-
-fn add_duration(now: DateTime<Utc>, duration: Duration) -> RuntimeResult<DateTime<Utc>> {
-    TimeDelta::from_std(duration)
-        .map(|duration| now + duration)
-        .map_err(|_| RuntimeError::Clock("lease duration is too large".to_string()))
-}
-
-fn run_status(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Queued => "queued",
-        RunStatus::Running => "running",
-        RunStatus::Waiting => "waiting",
-        RunStatus::Succeeded => "succeeded",
-        RunStatus::Failed => "failed",
-        RunStatus::Cancelled => "cancelled",
-        RunStatus::Indeterminate => "indeterminate",
+    fn timer(id: &str, now: DateTime<Utc>) -> TimerRecord {
+        TimerRecord {
+            id: id.to_string(),
+            generation: 0,
+            status: TimerStatus::Scheduled,
+            fire_at: now,
+            event_contract: ExactContractReference {
+                id: "timer.test".to_string(),
+                version: "1.0.0".to_string(),
+                digest: format!("sha256:{}", "0".repeat(64)),
+            },
+            event_source: ImplementationIdentity {
+                application: "test".to_string(),
+                implementation: "sqlite".to_string(),
+                version: "1.0.0".to_string(),
+                instance_id: None,
+            },
+            source_uri: "urn:test".to_string(),
+            subject: None,
+            data: json!({}),
+            created_at: now,
+            updated_at: now,
+            fired_at: None,
+        }
     }
-}
 
-fn concurrency_policy(policy: ConcurrencyPolicy) -> &'static str {
-    match policy {
-        ConcurrencyPolicy::Skip => "skip",
-        ConcurrencyPolicy::Queue => "queue",
-        ConcurrencyPolicy::Replace => "replace",
-        ConcurrencyPolicy::Allow => "allow",
+    #[tokio::test]
+    async fn generation_exhaustion_rolls_back_every_scheduling_path() {
+        let store = SqliteRuntimeStore::in_memory().unwrap();
+        let now = Utc::now();
+        let exhausted = store.upsert_timer(timer("max:timer", now)).await.unwrap();
+        store.upsert_timer(timer("max:omitted", now)).await.unwrap();
+        let mut exhausted_at_max = exhausted;
+        exhausted_at_max.generation = TIMER_GENERATION_MAX;
+        let json = serde_json::to_string(&exhausted_at_max).unwrap();
+        store
+            .execute(move |connection| {
+                connection
+                    .execute(
+                        "UPDATE runtime_timers SET generation = ?1, record_json = ?2 WHERE id = ?3",
+                        params![i64::MAX, json, "max:timer"],
+                    )
+                    .map_err(store_error)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let before = store.snapshot().await.unwrap().timers;
+        let mut changed = exhausted_at_max;
+        changed.data = json!({"changed": true});
+
+        for error in [
+            store.upsert_timer(changed.clone()).await.unwrap_err(),
+            store
+                .reconcile_timer_exact(changed.clone(), now)
+                .await
+                .unwrap_err(),
+            store
+                .reconcile_timers("max:", vec![changed], now)
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.code(), "timer_generation_exhausted");
+            assert_eq!(store.snapshot().await.unwrap().timers, before);
+        }
     }
-}
-
-fn store_error(error: rusqlite::Error) -> RuntimeError {
-    RuntimeError::Store(error.to_string())
 }
 
 #[cfg(test)]
