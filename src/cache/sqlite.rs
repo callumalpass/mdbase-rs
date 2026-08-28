@@ -1,6 +1,6 @@
 //! SQLite setup and helpers.
 
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, OpenFlags, Result};
 use std::path::Path;
 
 /// Open (or create) the cache database at `<root>/<cache_folder>/cache.db`.
@@ -16,6 +16,22 @@ pub(crate) fn open_cache_db(root: &Path, cache_folder: &str) -> Result<Connectio
     )?;
     init_schema(&conn)?;
     Ok(conn)
+}
+
+/// Open an existing cache read-only without schema initialization, DDL, or
+/// logical cache writes. SQLite retains ownership of WAL shared-memory details.
+pub(crate) fn open_cache_db_read_only_existing(
+    root: &Path,
+    cache_folder: &str,
+) -> Result<Connection> {
+    let db_path = root.join(cache_folder).join("cache.db");
+    if !db_path.is_file() {
+        return Err(rusqlite::Error::InvalidPath(db_path));
+    }
+    Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
 }
 
 /// Open an in-memory cache database (for testing).
@@ -63,4 +79,126 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_existing_open_does_not_initialize_or_change_logical_tokens() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join(".mdbase/cache");
+        assert!(open_cache_db_read_only_existing(root.path(), ".mdbase/cache").is_err());
+        assert!(!cache.exists());
+
+        let connection = open_cache_db(root.path(), ".mdbase/cache").unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('query_snapshot', 'before')",
+                [],
+            )
+            .unwrap();
+        let schema_before: i64 = connection
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_unique_values_path'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(cache.join(format!("cache.db{suffix}")));
+        }
+        let read_only = open_cache_db_read_only_existing(root.path(), ".mdbase/cache").unwrap();
+        assert_eq!(
+            read_only
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'query_snapshot'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "before"
+        );
+        assert_eq!(
+            read_only
+                .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema_before
+        );
+        drop(read_only);
+        let verify = open_cache_db_read_only_existing(root.path(), ".mdbase/cache").unwrap();
+        assert_eq!(
+            verify
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'query_snapshot'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "before"
+        );
+        assert_eq!(
+            verify
+                .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema_before
+        );
+    }
+
+    #[test]
+    fn read_only_transaction_holds_one_logical_snapshot_across_live_wal_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let writer = open_cache_db(root.path(), ".mdbase/cache").unwrap();
+        writer
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('query_snapshot', 'first')",
+                [],
+            )
+            .unwrap();
+        let mut reader = open_cache_db_read_only_existing(root.path(), ".mdbase/cache").unwrap();
+        let read = reader
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .unwrap();
+        let first: String = read
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'query_snapshot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE meta SET value = 'second' WHERE key = 'query_snapshot'",
+                [],
+            )
+            .unwrap();
+        let coherent: String = read
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'query_snapshot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first, "first");
+        assert_eq!(coherent, "first");
+        drop(read);
+        assert_eq!(
+            reader
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'query_snapshot'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "second"
+        );
+    }
 }

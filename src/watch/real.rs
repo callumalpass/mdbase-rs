@@ -224,6 +224,36 @@ pub(crate) struct ReconciliationOutcome {
     pub(crate) epoch: Arc<WatcherEpoch>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ReconciliationToken {
+    epoch: Arc<WatcherEpoch>,
+    revision: u64,
+}
+
+impl ReconciliationToken {
+    pub(crate) fn is_later_in_same_epoch_than(&self, previous: &Self) -> bool {
+        Arc::ptr_eq(&self.epoch, &previous.epoch) && self.revision > previous.revision
+    }
+
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.epoch.is_exhausted()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(epoch: Arc<WatcherEpoch>, revision: u64) -> Self {
+        Self { epoch, revision }
+    }
+}
+
+impl ReconciliationOutcome {
+    pub(crate) fn token(&self) -> ReconciliationToken {
+        ReconciliationToken {
+            epoch: self.epoch.clone(),
+            revision: self.revision,
+        }
+    }
+}
+
 /// Rescan requests are synchronous, but concurrent callers can enqueue before
 /// the worker reaches them. Reserve a finite slot before sending so both the
 /// command queue and retained waiter vector remain bounded.

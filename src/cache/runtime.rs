@@ -1,8 +1,6 @@
 //! Runtime-owned incremental maintenance of the rebuildable SQLite index.
 
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::path::PathBuf;
 #[cfg(test)]
@@ -54,7 +52,7 @@ pub(crate) fn rebuild(
         indexer::reindex_file(&transaction, collection, &absolute, &relative)?;
     }
     indexer::resolve_all_links(&transaction, collection)?;
-    advance_generation(&transaction, generation)?;
+    let _ = advance_generation(&transaction, generation)?;
     transaction.commit()?;
     Ok(())
 }
@@ -129,7 +127,7 @@ pub(crate) fn apply_changes(
             .collect::<std::collections::HashSet<_>>();
         indexer::resolve_links_for_sources(&transaction, collection, &sources)?;
     }
-    advance_generation(&transaction, generation)?;
+    let _ = advance_generation(&transaction, generation)?;
     transaction.commit()?;
     Ok(())
 }
@@ -138,51 +136,181 @@ pub(crate) fn apply_changes(
 /// removals in one transaction without publishing a record event or advancing
 /// the runtime generation. Refresh rows contain only bounded path/file facts
 /// and the canonical closed failure reason.
+pub(crate) struct InvalidMaintenanceSeal {
+    refresh: BTreeSet<String>,
+    remove: BTreeSet<String>,
+    expectations: BTreeMap<String, indexer::MaintenanceExpectation>,
+    generation: CollectionGeneration,
+    observation: crate::watch::ReconciliationToken,
+    query_snapshot: String,
+    schema_version: i64,
+}
+
+impl InvalidMaintenanceSeal {
+    pub(crate) fn matches(
+        &self,
+        refresh: &BTreeSet<String>,
+        remove: &BTreeSet<String>,
+        generation: &CollectionGeneration,
+        observation: &crate::watch::ReconciliationToken,
+    ) -> bool {
+        self.refresh == *refresh
+            && self.remove == *remove
+            && self.generation == *generation
+            && observation.is_later_in_same_epoch_than(&self.observation)
+    }
+
+    pub(crate) fn filesystem_is_current(
+        &self,
+        collection: &Collection,
+    ) -> Result<bool, CacheError> {
+        for (path, expectation) in &self.expectations {
+            if !indexer::maintenance_expectation_still_current(collection, path, expectation)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn cache_is_current(&self, collection: &Collection) -> Result<bool, CacheError> {
+        let mut connection = sqlite::open_cache_db_read_only_existing(
+            &collection.root,
+            &collection.settings.cache_folder,
+        )?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let schema_version =
+            transaction.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))?;
+        if schema_version != self.schema_version {
+            return Ok(false);
+        }
+        let generation = transaction
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [GENERATION_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let query_snapshot = transaction
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'query_snapshot'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if generation.as_deref() != Some(generation_value(&self.generation)?.as_str())
+            || query_snapshot.as_deref() != Some(self.query_snapshot.as_str())
+        {
+            return Ok(false);
+        }
+        for (path, expectation) in &self.expectations {
+            if !indexer::maintenance_cache_expectation_is_exact(&transaction, path, expectation)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+pub(crate) enum InvalidMaintenanceOutcome {
+    Stale,
+    Current,
+    Applied(InvalidMaintenanceSeal),
+}
+
+impl std::fmt::Debug for InvalidMaintenanceOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Stale => "Stale",
+            Self::Current => "Current",
+            Self::Applied(_) => "Applied(..)",
+        })
+    }
+}
+
+impl PartialEq for InvalidMaintenanceOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Stale, Self::Stale) | (Self::Current, Self::Current)
+        )
+    }
+}
+
+impl Eq for InvalidMaintenanceOutcome {}
+
 pub(crate) fn apply_invalid_maintenance(
     collection: &Collection,
     refresh: &BTreeSet<String>,
     remove: &BTreeSet<String>,
     epoch: &crate::watch::WatcherEpoch,
     generation: &CollectionGeneration,
-) -> Result<bool, CacheError> {
+    observation: crate::watch::ReconciliationToken,
+) -> Result<InvalidMaintenanceOutcome, CacheError> {
     if epoch.is_exhausted() {
-        return Ok(false);
+        return Ok(InvalidMaintenanceOutcome::Stale);
+    }
+    if !refresh.is_disjoint(remove) {
+        return Ok(InvalidMaintenanceOutcome::Stale);
     }
     if refresh.is_empty() && remove.is_empty() {
         #[cfg(test)]
         epoch.run_hook(crate::watch::LinearizationPoint::CacheCommit);
         let _linearized = epoch.linearize();
-        return Ok(!epoch.is_exhausted());
+        return Ok(if epoch.is_exhausted() {
+            InvalidMaintenanceOutcome::Stale
+        } else {
+            InvalidMaintenanceOutcome::Current
+        });
+    }
+    let mut expected = BTreeMap::new();
+    for path in refresh {
+        let Some(expectation) = indexer::refresh_maintenance_expectation(collection, path)? else {
+            return Ok(InvalidMaintenanceOutcome::Stale);
+        };
+        expected.insert(path.clone(), expectation);
+    }
+    for path in remove {
+        if crate::record_load::load_record_no_follow(collection, path)?.is_some() {
+            return Ok(InvalidMaintenanceOutcome::Stale);
+        }
+        expected.insert(path.clone(), indexer::MaintenanceExpectation::Absent);
     }
     let mut connection =
         sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut expectations = Vec::new();
     for path in refresh {
-        if let Some(expectation) =
+        let Some(expectation) =
             indexer::refresh_invalid_file_no_follow(&transaction, collection, path)?
-        {
-            expectations.push((path.as_str(), expectation));
+        else {
+            return Ok(InvalidMaintenanceOutcome::Stale);
+        };
+        if expected.get(path) != Some(&expectation) {
+            return Ok(InvalidMaintenanceOutcome::Stale);
         }
     }
     for path in remove {
-        if let Some(expectation) =
+        let Some(expectation) =
             indexer::remove_invalid_file_no_follow_if_absent(&transaction, collection, path)?
-        {
-            expectations.push((path.as_str(), expectation));
+        else {
+            return Ok(InvalidMaintenanceOutcome::Stale);
+        };
+        if expected.get(path) != Some(&expectation) {
+            return Ok(InvalidMaintenanceOutcome::Stale);
         }
     }
     indexer::resolve_all_links(&transaction, collection)?;
     // Keep the same generation while rotating the derived query snapshot.
     // This write is also rolled back when final canonical revalidation fails.
-    advance_generation(&transaction, generation)?;
+    let query_snapshot = advance_generation(&transaction, generation)?;
+    let schema_version =
+        transaction.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))?;
     run_maintenance_revalidation_hook(collection);
     // External writers do not participate in SQLite locking. Re-open every
     // path whose row changed at the final pre-commit boundary and roll back if
     // absence, invalid classification, reason, or byte revision changed.
-    for (path, expectation) in expectations {
-        if !indexer::maintenance_expectation_still_current(collection, path, &expectation)? {
-            return Ok(false);
+    for (path, expectation) in &expected {
+        if !indexer::maintenance_expectation_still_current(collection, path, expectation)? {
+            return Ok(InvalidMaintenanceOutcome::Stale);
         }
     }
     // The hook is deliberately after the former atomic check and immediately
@@ -192,10 +320,18 @@ pub(crate) fn apply_invalid_maintenance(
     epoch.run_hook(crate::watch::LinearizationPoint::CacheCommit);
     let _linearized = epoch.linearize();
     if epoch.is_exhausted() {
-        return Ok(false);
+        return Ok(InvalidMaintenanceOutcome::Stale);
     }
     transaction.commit()?;
-    Ok(true)
+    Ok(InvalidMaintenanceOutcome::Applied(InvalidMaintenanceSeal {
+        refresh: refresh.clone(),
+        remove: remove.clone(),
+        expectations: expected,
+        generation: generation.clone(),
+        observation,
+        query_snapshot,
+        schema_version,
+    }))
 }
 
 #[cfg(test)]
@@ -329,16 +465,17 @@ pub(crate) fn uniqueness_conflicts(
 fn advance_generation(
     connection: &Connection,
     generation: &CollectionGeneration,
-) -> Result<(), CacheError> {
+) -> Result<String, CacheError> {
     connection.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
         rusqlite::params![GENERATION_KEY, generation_value(generation)?],
     )?;
+    let query_snapshot = uuid::Uuid::new_v4().simple().to_string();
     connection.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('query_snapshot', ?1)",
-        [uuid::Uuid::new_v4().simple().to_string()],
+        [&query_snapshot],
     )?;
-    Ok(())
+    Ok(query_snapshot)
 }
 
 fn generation_value(generation: &CollectionGeneration) -> Result<String, CacheError> {

@@ -1950,6 +1950,25 @@ fn runtime_query_omits_unneeded_bodies_from_resident_records() {
 }
 
 #[test]
+fn cache_write_notifications_do_not_exhaust_reconciliation_ownership_retries() {
+    let directory = collection();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+    fs::write(directory.path().join("invalid.md"), b"bad\xffutf8\n").unwrap();
+
+    // Each actual maintenance write injects the coarse watched-root callback
+    // emitted by macOS for hidden SQLite activity. Idempotent retries must not
+    // write again and manufacture an endless source of their own invalidation.
+    runtime.inject_cache_notifications_for_test(3);
+    runtime.synchronize().unwrap();
+
+    assert_eq!(runtime.maintenance_attempt_counts_for_test(), (1, 2));
+    assert_eq!(
+        runtime_query_paths(&runtime),
+        BTreeSet::from(["invalid.md".to_string()])
+    );
+}
+
+#[test]
 fn runtime_reconciliation_keeps_all_classified_invalid_query_stubs() {
     let directory = collection();
     let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
@@ -2258,6 +2277,264 @@ fn live_callback_revision_exhaustion_aborts_sync_without_cache_or_generation_mut
 }
 
 #[test]
+fn invalid_maintenance_rejects_ambiguous_hints_and_repairs_exact_cache_shape() {
+    use crate::cache::runtime::InvalidMaintenanceOutcome;
+
+    let directory = collection();
+    fs::write(directory.path().join("invalid.md"), b"bad\xffutf8\n").unwrap();
+    fs::write(
+        directory.path().join("parsed.md"),
+        "---\ntitle: Parsed\n---\n[[invalid]]\n",
+    )
+    .unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+    let generation = runtime.current_generation().unwrap();
+    let epoch = Arc::new(crate::watch::WatcherEpoch::new());
+    let apply = |refresh: BTreeSet<String>, remove: BTreeSet<String>| {
+        runtime
+            .provider()
+            .apply_runtime_invalid_maintenance(
+                &refresh,
+                &remove,
+                epoch.as_ref(),
+                &generation,
+                crate::watch::ReconciliationToken::for_test(epoch.clone(), 1),
+                &OperationContext::legacy(),
+            )
+            .unwrap()
+    };
+
+    assert_eq!(
+        apply(BTreeSet::from(["parsed.md".to_string()]), BTreeSet::new()),
+        InvalidMaintenanceOutcome::Stale
+    );
+    assert_eq!(
+        apply(BTreeSet::from(["absent.md".to_string()]), BTreeSet::new()),
+        InvalidMaintenanceOutcome::Stale
+    );
+    assert_eq!(
+        apply(BTreeSet::new(), BTreeSet::from(["parsed.md".to_string()])),
+        InvalidMaintenanceOutcome::Stale
+    );
+    assert_eq!(
+        apply(
+            BTreeSet::from(["invalid.md".to_string()]),
+            BTreeSet::from(["invalid.md".to_string()]),
+        ),
+        InvalidMaintenanceOutcome::Stale
+    );
+
+    let collection = Collection::open(directory.path()).unwrap();
+    let connection =
+        crate::cache::sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)
+            .unwrap();
+    connection
+        .execute(
+            "UPDATE files SET frontmatter_json = '{\"bad\":true}', body = 'leak', effective_json = '{\"bad\":true}' WHERE path = 'invalid.md'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute("INSERT INTO file_types VALUES ('invalid.md', 'bogus')", [])
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO links VALUES ('invalid.md', 'parsed.md', '', 0, 'body', NULL, 'parsed')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO unique_values VALUES ('bogus', 'id', 'value', 'invalid.md')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO identity_values VALUES ('value', 'invalid.md')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        apply(BTreeSet::from(["invalid.md".to_string()]), BTreeSet::new()),
+        InvalidMaintenanceOutcome::Applied(_)
+    ));
+    let connection =
+        crate::cache::sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)
+            .unwrap();
+    let canonical = connection
+        .query_row(
+            "SELECT frontmatter_json, body, effective_json, parse_error, failure_reason FROM files WHERE path = 'invalid.md'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?)),
+        )
+        .unwrap();
+    assert_eq!(canonical.0, "{}");
+    assert_eq!(canonical.1, "");
+    assert_eq!(canonical.2, None);
+    assert_eq!(canonical.3, 1);
+    assert_eq!(canonical.4, "invalid_utf8");
+    for table in ["file_types", "links", "unique_values", "identity_values"] {
+        let count: i64 = connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} WHERE {} = 'invalid.md'",
+                    if table == "links" {
+                        "source_path"
+                    } else {
+                        "path"
+                    }
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "source-owned {table} contamination remained");
+    }
+    let incoming: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM links WHERE source_path = 'parsed.md' AND raw_target = 'invalid'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(incoming, 1, "incoming backlinks must remain represented");
+}
+
+#[test]
+fn maintenance_seals_are_single_successor_epoch_and_cache_identity_bound() {
+    use crate::cache::runtime::InvalidMaintenanceOutcome;
+
+    let directory = collection();
+    fs::write(directory.path().join("invalid.md"), b"bad\xffutf8\n").unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+    let generation = runtime.current_generation().unwrap();
+    let epoch = Arc::new(crate::watch::WatcherEpoch::new());
+    let refresh = BTreeSet::from(["invalid.md".to_string()]);
+    let make_seal = |revision| match runtime
+        .provider()
+        .apply_runtime_invalid_maintenance(
+            &refresh,
+            &BTreeSet::new(),
+            epoch.as_ref(),
+            &generation,
+            crate::watch::ReconciliationToken::for_test(epoch.clone(), revision),
+            &OperationContext::legacy(),
+        )
+        .unwrap()
+    {
+        InvalidMaintenanceOutcome::Applied(seal) => seal,
+        other => panic!("expected committed seal at revision {revision}, got {other:?}"),
+    };
+    let validate = |seal, token, candidate: &BTreeSet<String>| {
+        runtime
+            .provider()
+            .validate_runtime_invalid_maintenance_seal(
+                seal,
+                candidate,
+                &BTreeSet::new(),
+                &generation,
+                &token,
+                &OperationContext::legacy(),
+            )
+            .unwrap()
+    };
+
+    let collection = Collection::open(directory.path()).unwrap();
+    let logical_state = || {
+        let connection = crate::cache::sqlite::open_cache_db_read_only_existing(
+            &collection.root,
+            &collection.settings.cache_folder,
+        )
+        .unwrap();
+        let snapshot: String = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'query_snapshot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let schema: i64 = connection
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        let row: (String, i64) = connection
+            .query_row(
+                "SELECT source_revision, parse_error FROM files WHERE path = 'invalid.md'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        (snapshot, schema, row)
+    };
+    let valid_seal = make_seal(0);
+    let before = logical_state();
+    assert!(validate(
+        valid_seal,
+        crate::watch::ReconciliationToken::for_test(epoch.clone(), 1),
+        &refresh,
+    ));
+    assert_eq!(logical_state(), before);
+
+    assert!(!validate(
+        make_seal(1),
+        crate::watch::ReconciliationToken::for_test(epoch.clone(), 1),
+        &refresh,
+    ));
+    let foreign = Arc::new(crate::watch::WatcherEpoch::new());
+    assert!(!validate(
+        make_seal(2),
+        crate::watch::ReconciliationToken::for_test(foreign, 3),
+        &refresh,
+    ));
+    assert!(!validate(
+        make_seal(3),
+        crate::watch::ReconciliationToken::for_test(epoch.clone(), 4),
+        &BTreeSet::new(),
+    ));
+
+    let schema_seal = make_seal(4);
+    let connection =
+        crate::cache::sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)
+            .unwrap();
+    connection
+        .execute_batch("ALTER TABLE files ADD COLUMN seal_schema_drift INTEGER;")
+        .unwrap();
+    drop(connection);
+    assert!(!validate(
+        schema_seal,
+        crate::watch::ReconciliationToken::for_test(epoch.clone(), 5),
+        &refresh,
+    ));
+
+    let second_runtime_seal = make_seal(5);
+    let rebuild_seal = make_seal(6);
+    let clear_seal = make_seal(7);
+    let second_runtime =
+        FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
+    assert!(!validate(
+        second_runtime_seal,
+        crate::watch::ReconciliationToken::for_test(epoch.clone(), 6),
+        &refresh,
+    ));
+    drop(second_runtime);
+    assert_eq!(collection.cache_rebuild()["success"], true);
+    assert!(!validate(
+        rebuild_seal,
+        crate::watch::ReconciliationToken::for_test(epoch.clone(), 7),
+        &refresh,
+    ));
+
+    assert_eq!(collection.cache_clear()["success"], true);
+    assert!(!validate(
+        clear_seal,
+        crate::watch::ReconciliationToken::for_test(epoch.clone(), 8),
+        &refresh,
+    ));
+}
+
+#[test]
 fn stale_invalid_maintenance_cannot_rewind_or_contaminate_successor_cache() {
     let directory = collection();
     fs::write(directory.path().join("invalid.md"), b"first\xffrevision\n").unwrap();
@@ -2283,30 +2560,39 @@ fn stale_invalid_maintenance_cannot_rewind_or_contaminate_successor_cache() {
     drop(connection);
     fs::write(directory.path().join("invalid.md"), b"second\xffrevision\n").unwrap();
 
-    let unpoisoned_epoch = crate::watch::WatcherEpoch::new();
+    let unpoisoned_epoch = Arc::new(crate::watch::WatcherEpoch::new());
     let applied = runtime
         .provider()
         .apply_runtime_invalid_maintenance(
             &BTreeSet::from(["invalid.md".to_string()]),
             &BTreeSet::new(),
-            &unpoisoned_epoch,
+            unpoisoned_epoch.as_ref(),
             &expected,
+            crate::watch::ReconciliationToken::for_test(unpoisoned_epoch.clone(), 1),
             &OperationContext::legacy(),
         )
         .unwrap();
-    assert!(!applied, "stale sequence must be rejected under the gate");
+    assert_eq!(
+        applied,
+        crate::cache::runtime::InvalidMaintenanceOutcome::Stale,
+        "stale sequence must be rejected under the gate"
+    );
     let foreign_epoch = CollectionGeneration::initial();
     assert_ne!(foreign_epoch.runtime_epoch(), successor.runtime_epoch());
-    assert!(!runtime
-        .provider()
-        .apply_runtime_invalid_maintenance(
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            &unpoisoned_epoch,
-            &foreign_epoch,
-            &OperationContext::legacy(),
-        )
-        .unwrap());
+    assert_eq!(
+        runtime
+            .provider()
+            .apply_runtime_invalid_maintenance(
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                unpoisoned_epoch.as_ref(),
+                &foreign_epoch,
+                crate::watch::ReconciliationToken::for_test(unpoisoned_epoch.clone(), 2),
+                &OperationContext::legacy(),
+            )
+            .unwrap(),
+        crate::cache::runtime::InvalidMaintenanceOutcome::Stale
+    );
 
     assert!(crate::cache::runtime::matches_generation(&collection, &successor).unwrap());
     assert!(!crate::cache::runtime::matches_generation(&collection, &expected).unwrap());

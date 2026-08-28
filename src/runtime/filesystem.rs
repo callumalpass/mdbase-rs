@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -33,6 +35,10 @@ pub struct FilesystemRuntime {
     cursors: Mutex<super::cursor::CursorStore>,
     #[cfg(test)]
     watcher_test_control: crate::watch::WatcherTestControl,
+    #[cfg(test)]
+    maintenance_notification_injections: AtomicUsize,
+    #[cfg(test)]
+    maintenance_transaction_commits: AtomicUsize,
 }
 
 struct RuntimeOrder {
@@ -97,6 +103,10 @@ impl FilesystemRuntime {
             cursors: Mutex::new(super::cursor::CursorStore::new(runtime_epoch)),
             #[cfg(test)]
             watcher_test_control,
+            #[cfg(test)]
+            maintenance_notification_injections: AtomicUsize::new(0),
+            #[cfg(test)]
+            maintenance_transaction_commits: AtomicUsize::new(0),
         })
     }
 
@@ -653,12 +663,46 @@ impl FilesystemRuntime {
         self.synchronize_reconciliation(Some(paths), &OperationContext::legacy())
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_cache_notifications_for_test(&self, count: usize) {
+        self.maintenance_notification_injections
+            .store(count, Ordering::Release);
+        self.maintenance_transaction_commits
+            .store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn maintenance_attempt_counts_for_test(&self) -> (usize, usize) {
+        (
+            self.maintenance_transaction_commits.load(Ordering::Acquire),
+            self.maintenance_notification_injections
+                .load(Ordering::Acquire),
+        )
+    }
+
+    #[cfg(test)]
+    fn inject_cache_notification_after_write_for_test(&self) {
+        if self
+            .maintenance_notification_injections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                (remaining > 0).then(|| remaining - 1)
+            })
+            .is_ok()
+        {
+            // macOS can report a recursive hidden-cache write at the watched
+            // root. Exercise that installed-callback path deterministically.
+            self.watcher_test_control
+                .invoke_installed_modify_callback(self.provider.root());
+        }
+    }
+
     fn synchronize_reconciliation(
         &self,
         paths: Option<&[&str]>,
         context: &OperationContext,
     ) -> Result<(), ProviderError> {
         const MAX_STALE_RETRIES: usize = 3;
+        let mut maintenance_seal = None;
         for _ in 0..MAX_STALE_RETRIES {
             context.check()?;
             // Capture ownership before observation. The provider compares this
@@ -673,14 +717,45 @@ impl FilesystemRuntime {
                 }
             };
             context.check()?;
-            if !self.provider.apply_runtime_invalid_maintenance(
-                observation.invalid_records.as_ref(),
-                observation.removed_invalid_records.as_ref(),
-                observation.epoch.as_ref(),
-                &expected_generation,
-                context,
-            )? {
-                continue;
+            let observation_token = observation.token();
+            // A seal is single-use and belongs only to the immediately next
+            // observation. Taking it before validation prevents a mismatched
+            // state from becoming valid again after any intervening retry.
+            let sealed_current = match maintenance_seal.take() {
+                Some(seal) => self.provider.validate_runtime_invalid_maintenance_seal(
+                    seal,
+                    observation.invalid_records.as_ref(),
+                    observation.removed_invalid_records.as_ref(),
+                    &expected_generation,
+                    &observation_token,
+                    context,
+                )?,
+                None => false,
+            };
+            let maintenance = if sealed_current {
+                crate::cache::runtime::InvalidMaintenanceOutcome::Current
+            } else {
+                self.provider.apply_runtime_invalid_maintenance(
+                    observation.invalid_records.as_ref(),
+                    observation.removed_invalid_records.as_ref(),
+                    observation.epoch.as_ref(),
+                    &expected_generation,
+                    observation_token,
+                    context,
+                )?
+            };
+            match maintenance {
+                crate::cache::runtime::InvalidMaintenanceOutcome::Stale => continue,
+                crate::cache::runtime::InvalidMaintenanceOutcome::Current => {}
+                crate::cache::runtime::InvalidMaintenanceOutcome::Applied(seal) => {
+                    maintenance_seal = Some(seal);
+                    #[cfg(test)]
+                    {
+                        self.maintenance_transaction_commits
+                            .fetch_add(1, Ordering::AcqRel);
+                        self.inject_cache_notification_after_write_for_test();
+                    }
+                }
             }
             let acknowledged = self
                 .watcher_lock(context)?

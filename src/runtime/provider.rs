@@ -512,21 +512,63 @@ impl FilesystemProvider {
     }
 
     /// Apply private watcher maintenance only if the expected generation still
-    /// owns both the provider and durable cache after acquiring the exclusive
-    /// gate. Equality includes the opaque runtime epoch. A stale caller is
-    /// rejected before any cache transaction or ownership-field update.
+    /// Validate a single-use maintenance seal against one coherent, read-only
+    /// SQLite snapshot. The path performs no logical cache write, DDL, or schema
+    /// initialization; query-snapshot and schema tokens fence every cache writer.
+    pub(crate) fn validate_runtime_invalid_maintenance_seal(
+        &self,
+        seal: crate::cache::runtime::InvalidMaintenanceSeal,
+        refresh: &std::collections::BTreeSet<String>,
+        remove: &std::collections::BTreeSet<String>,
+        expected_generation: &super::CollectionGeneration,
+        observation: &crate::watch::ReconciliationToken,
+        context: &OperationContext,
+    ) -> Result<bool, ProviderError> {
+        let _guard = self.write_lock(context)?;
+        context.check()?;
+        if observation.is_exhausted()
+            || !seal.matches(refresh, remove, expected_generation, observation)
+            || self
+                .runtime_cache_generation
+                .read()
+                .map_err(|_| ProviderError::LockPoisoned)?
+                .as_ref()
+                != Some(expected_generation)
+        {
+            return Ok(false);
+        }
+        let collection = self.current_collection()?;
+        if !seal.cache_is_current(collection.as_ref()).unwrap_or(false) {
+            return Ok(false);
+        }
+        context.check()?;
+        // Cooperative cache writers are fenced by the provider gate and the
+        // query-snapshot/schema tokens above. Revalidate handle-bound filesystem
+        // facts last. A callback delivered before acknowledgement advances the
+        // watcher revision and rejects that acknowledgement; a raw edit whose
+        // notification arrives later is a subsequent eventual watcher event.
+        let current = seal
+            .filesystem_is_current(collection.as_ref())
+            .unwrap_or(false);
+        context.check()?;
+        Ok(current)
+    }
+
     pub(crate) fn apply_runtime_invalid_maintenance(
         &self,
         refresh: &std::collections::BTreeSet<String>,
         remove: &std::collections::BTreeSet<String>,
         epoch: &crate::watch::WatcherEpoch,
         expected_generation: &super::CollectionGeneration,
+        observation: crate::watch::ReconciliationToken,
         context: &OperationContext,
-    ) -> Result<bool, ProviderError> {
+    ) -> Result<crate::cache::runtime::InvalidMaintenanceOutcome, ProviderError> {
+        use crate::cache::runtime::InvalidMaintenanceOutcome;
+
         let _guard = self.write_lock(context)?;
         context.check()?;
         if epoch.is_exhausted() {
-            return Ok(false);
+            return Ok(InvalidMaintenanceOutcome::Stale);
         }
         if self
             .runtime_cache_generation
@@ -535,13 +577,13 @@ impl FilesystemProvider {
             .as_ref()
             != Some(expected_generation)
         {
-            return Ok(false);
+            return Ok(InvalidMaintenanceOutcome::Stale);
         }
         let collection = self.current_collection()?;
         if !crate::cache::runtime::matches_generation(collection.as_ref(), expected_generation)
             .map_err(cache_error)?
         {
-            return Ok(false);
+            return Ok(InvalidMaintenanceOutcome::Stale);
         }
         crate::cache::runtime::apply_invalid_maintenance(
             collection.as_ref(),
@@ -549,6 +591,7 @@ impl FilesystemProvider {
             remove,
             epoch,
             expected_generation,
+            observation,
         )
         .map_err(cache_error)
     }
