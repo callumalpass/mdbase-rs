@@ -1260,6 +1260,14 @@ impl RuntimeStore for FailCommitStore {
         self.inner.upsert_timer(timer).await
     }
 
+    async fn reconcile_timer_exact(
+        &self,
+        desired: TimerRecord,
+        now: chrono::DateTime<Utc>,
+    ) -> RuntimeResult<TimerRecord> {
+        self.inner.reconcile_timer_exact(desired, now).await
+    }
+
     async fn cancel_timer(
         &self,
         id: &str,

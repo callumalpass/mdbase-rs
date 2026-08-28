@@ -1,3 +1,7 @@
+mod schema;
+mod timers;
+
+use schema::{migrate, validate_persisted_records};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -7,14 +11,11 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use ulid::Ulid;
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::model::{
-    ConcurrencyPolicy, EventJournalEntry, RunRecord, RunStatus, TimerRecord, TimerStatus,
-};
+use crate::model::{ConcurrencyPolicy, EventJournalEntry, RunRecord, RunStatus, TimerRecord};
 use crate::store::{
     AdmitOutcome, Claim, EventPage, PreparedEvent, RuntimeStore, StoreSnapshot, TimerClaim,
     TimerReconcileOutcome,
 };
-use crate::timer::{next_timer_generation, timer_matches};
 
 /// Version of the PostgreSQL tables and every Rust value serialized into them.
 ///
@@ -408,50 +409,16 @@ impl RuntimeStore for PostgresRuntimeStore {
         Ok(true)
     }
 
-    async fn upsert_timer(&self, mut timer: TimerRecord) -> RuntimeResult<TimerRecord> {
-        let mut transaction = self.pool.begin().await.map_err(store_error)?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || ':timer:' || $2, 0))")
-            .bind(&self.namespace)
-            .bind(&timer.id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(store_error)?;
-        let generation = sqlx::query(
-            "SELECT generation FROM mdbase_runtime_timers
-             WHERE namespace = $1 AND id = $2 FOR UPDATE",
-        )
-        .bind(&self.namespace)
-        .bind(&timer.id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(store_error)?
-        .map(|row| row.try_get::<i64, _>("generation").map_err(store_error))
-        .transpose()?
-        .map(as_u64)
-        .transpose()?
-        .unwrap_or(0)
-            + 1;
-        timer.generation = generation;
-        timer.status = TimerStatus::Scheduled;
-        sqlx::query(
-            "INSERT INTO mdbase_runtime_timers
-                (namespace, id, generation, status, fire_at, record_json)
-             VALUES ($1, $2, $3, 'scheduled', $4, $5)
-             ON CONFLICT(namespace, id) DO UPDATE SET
-                generation = excluded.generation, status = 'scheduled',
-                fire_at = excluded.fire_at, lease_worker = NULL, lease_token = NULL,
-                lease_expires_at = NULL, record_json = excluded.record_json",
-        )
-        .bind(&self.namespace)
-        .bind(&timer.id)
-        .bind(as_i64(timer.generation)?)
-        .bind(timer.fire_at)
-        .bind(serde_json::to_value(&timer)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(store_error)?;
-        transaction.commit().await.map_err(store_error)?;
-        Ok(timer)
+    async fn upsert_timer(&self, timer: TimerRecord) -> RuntimeResult<TimerRecord> {
+        self.upsert_timer_impl(timer).await
+    }
+
+    async fn reconcile_timer_exact(
+        &self,
+        desired: TimerRecord,
+        now: DateTime<Utc>,
+    ) -> RuntimeResult<TimerRecord> {
+        self.reconcile_timer_exact_impl(desired, now).await
     }
 
     async fn cancel_timer(
@@ -460,44 +427,7 @@ impl RuntimeStore for PostgresRuntimeStore {
         generation: Option<u64>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<bool> {
-        let mut transaction = self.pool.begin().await.map_err(store_error)?;
-        let row = sqlx::query(
-            "SELECT record_json FROM mdbase_runtime_timers
-             WHERE namespace = $1 AND id = $2 FOR UPDATE",
-        )
-        .bind(&self.namespace)
-        .bind(id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(store_error)?;
-        let Some(row) = row else {
-            transaction.commit().await.map_err(store_error)?;
-            return Ok(false);
-        };
-        let mut timer: TimerRecord =
-            serde_json::from_value(row.try_get("record_json").map_err(store_error)?)?;
-        if generation.is_some_and(|expected| expected != timer.generation)
-            || !matches!(timer.status, TimerStatus::Scheduled | TimerStatus::Firing)
-        {
-            transaction.commit().await.map_err(store_error)?;
-            return Ok(false);
-        }
-        timer.status = TimerStatus::Cancelled;
-        timer.updated_at = now;
-        sqlx::query(
-            "UPDATE mdbase_runtime_timers
-             SET status = 'cancelled', lease_worker = NULL, lease_token = NULL,
-                 lease_expires_at = NULL, record_json = $3
-             WHERE namespace = $1 AND id = $2",
-        )
-        .bind(&self.namespace)
-        .bind(id)
-        .bind(serde_json::to_value(&timer)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(store_error)?;
-        transaction.commit().await.map_err(store_error)?;
-        Ok(true)
+        self.cancel_timer_impl(id, generation, now).await
     }
 
     async fn reconcile_timers(
@@ -506,109 +436,11 @@ impl RuntimeStore for PostgresRuntimeStore {
         desired: Vec<TimerRecord>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<TimerReconcileOutcome> {
-        let mut transaction = self.pool.begin().await.map_err(store_error)?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || ':timers', 0))")
-            .bind(&self.namespace)
-            .execute(&mut *transaction)
-            .await
-            .map_err(store_error)?;
-        let existing = sqlx::query(
-            "SELECT record_json FROM mdbase_runtime_timers
-             WHERE namespace = $1 AND left(id, char_length($2)) = $2
-             ORDER BY id FOR UPDATE",
-        )
-        .bind(&self.namespace)
-        .bind(id_prefix)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(store_error)?
-        .into_iter()
-        .map(|row| {
-            let value: Value = row.try_get("record_json").map_err(store_error)?;
-            let timer = serde_json::from_value::<TimerRecord>(value)?;
-            Ok((timer.id.clone(), timer))
-        })
-        .collect::<RuntimeResult<std::collections::BTreeMap<_, _>>>()?;
-        let desired_ids = desired
-            .iter()
-            .map(|timer| timer.id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut cancelled_ids = Vec::new();
-        for timer in existing.values().filter(|timer| {
-            timer.id.starts_with(id_prefix)
-                && !desired_ids.contains(&timer.id)
-                && matches!(timer.status, TimerStatus::Scheduled | TimerStatus::Firing)
-        }) {
-            let mut cancelled = timer.clone();
-            cancelled.status = TimerStatus::Cancelled;
-            cancelled.updated_at = now;
-            sqlx::query(
-                "UPDATE mdbase_runtime_timers
-                 SET status = 'cancelled', lease_worker = NULL, lease_token = NULL,
-                     lease_expires_at = NULL, record_json = $3
-                 WHERE namespace = $1 AND id = $2",
-            )
-            .bind(&self.namespace)
-            .bind(&cancelled.id)
-            .bind(serde_json::to_value(&cancelled)?)
-            .execute(&mut *transaction)
-            .await
-            .map_err(store_error)?;
-            cancelled_ids.push(timer.id.clone());
-        }
-        let mut timers = Vec::with_capacity(desired.len());
-        for desired in desired {
-            let current = existing.get(&desired.id);
-            if current.is_some_and(|current| timer_matches(current, &desired)) {
-                timers.push(current.expect("checked above").clone());
-                continue;
-            }
-            let next = next_timer_generation(current, desired, now)?;
-            sqlx::query(
-                "INSERT INTO mdbase_runtime_timers
-                    (namespace, id, generation, status, fire_at, record_json)
-                 VALUES ($1, $2, $3, 'scheduled', $4, $5)
-                 ON CONFLICT(namespace, id) DO UPDATE SET
-                    generation = excluded.generation, status = 'scheduled',
-                    fire_at = excluded.fire_at, lease_worker = NULL, lease_token = NULL,
-                    lease_expires_at = NULL, record_json = excluded.record_json",
-            )
-            .bind(&self.namespace)
-            .bind(&next.id)
-            .bind(as_i64(next.generation)?)
-            .bind(next.fire_at)
-            .bind(serde_json::to_value(&next)?)
-            .execute(&mut *transaction)
-            .await
-            .map_err(store_error)?;
-            timers.push(next);
-        }
-        transaction.commit().await.map_err(store_error)?;
-        timers.sort_by(|left, right| left.id.cmp(&right.id));
-        cancelled_ids.sort();
-        Ok(TimerReconcileOutcome {
-            timers,
-            cancelled_ids,
-        })
+        self.reconcile_timers_impl(id_prefix, desired, now).await
     }
 
     async fn timers(&self, id_prefix: &str) -> RuntimeResult<Vec<TimerRecord>> {
-        sqlx::query(
-            "SELECT record_json FROM mdbase_runtime_timers
-             WHERE namespace = $1 AND left(id, char_length($2)) = $2
-             ORDER BY id",
-        )
-        .bind(&self.namespace)
-        .bind(id_prefix)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(store_error)?
-        .into_iter()
-        .map(|row| {
-            let value: Value = row.try_get("record_json").map_err(store_error)?;
-            serde_json::from_value::<TimerRecord>(value).map_err(Into::into)
-        })
-        .collect()
+        self.timers_impl(id_prefix).await
     }
 
     async fn claim_due_timer(
@@ -617,60 +449,7 @@ impl RuntimeStore for PostgresRuntimeStore {
         now: DateTime<Utc>,
         lease_for: Duration,
     ) -> RuntimeResult<Option<TimerClaim>> {
-        let mut transaction = self.pool.begin().await.map_err(store_error)?;
-        sqlx::query(
-            "UPDATE mdbase_runtime_timers
-             SET lease_worker = NULL, lease_token = NULL, lease_expires_at = NULL
-             WHERE namespace = $1 AND lease_expires_at <= $2",
-        )
-        .bind(&self.namespace)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(store_error)?;
-        let row = sqlx::query(
-            "SELECT record_json FROM mdbase_runtime_timers
-             WHERE namespace = $1 AND status IN ('scheduled', 'firing')
-               AND fire_at <= $2 AND lease_token IS NULL
-             ORDER BY fire_at, id LIMIT 1 FOR UPDATE SKIP LOCKED",
-        )
-        .bind(&self.namespace)
-        .bind(now)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(store_error)?;
-        let Some(row) = row else {
-            transaction.commit().await.map_err(store_error)?;
-            return Ok(None);
-        };
-        let mut timer: TimerRecord =
-            serde_json::from_value(row.try_get("record_json").map_err(store_error)?)?;
-        timer.status = TimerStatus::Firing;
-        timer.updated_at = now;
-        let token = format!("timer_lease_{}", Ulid::new());
-        let expires_at = add_duration(now, lease_for)?;
-        sqlx::query(
-            "UPDATE mdbase_runtime_timers
-             SET status = 'firing', lease_worker = $3, lease_token = $4,
-                 lease_expires_at = $5, record_json = $6
-             WHERE namespace = $1 AND id = $2 AND lease_token IS NULL",
-        )
-        .bind(&self.namespace)
-        .bind(&timer.id)
-        .bind(worker)
-        .bind(&token)
-        .bind(expires_at)
-        .bind(serde_json::to_value(&timer)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(store_error)?;
-        transaction.commit().await.map_err(store_error)?;
-        Ok(Some(TimerClaim {
-            timer,
-            worker: worker.to_string(),
-            token,
-            expires_at,
-        }))
+        self.claim_due_timer_impl(worker, now, lease_for).await
     }
 
     async fn fire_timer(
@@ -679,31 +458,7 @@ impl RuntimeStore for PostgresRuntimeStore {
         fired: TimerRecord,
         event: PreparedEvent,
     ) -> RuntimeResult<AdmitOutcome> {
-        let mut transaction = self.pool.begin().await.map_err(store_error)?;
-        let changed = sqlx::query(
-            "UPDATE mdbase_runtime_timers
-             SET status = 'fired', lease_worker = NULL, lease_token = NULL,
-                 lease_expires_at = NULL, record_json = $5
-             WHERE namespace = $1 AND id = $2 AND lease_worker = $3 AND lease_token = $4",
-        )
-        .bind(&self.namespace)
-        .bind(&claim.timer.id)
-        .bind(&claim.worker)
-        .bind(&claim.token)
-        .bind(serde_json::to_value(&fired)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(store_error)?
-        .rows_affected();
-        if changed != 1 {
-            return Err(RuntimeError::diagnostic(
-                "stale_timer_lease",
-                "Timer lease changed before firing.",
-            ));
-        }
-        let outcome = admit_tx(&mut transaction, &self.namespace, event).await?;
-        transaction.commit().await.map_err(store_error)?;
-        Ok(outcome)
+        self.fire_timer_impl(claim, fired, event).await
     }
 
     async fn snapshot(&self) -> RuntimeResult<StoreSnapshot> {
@@ -1043,187 +798,6 @@ async fn read_records<T: serde::de::DeserializeOwned>(
             serde_json::from_value(value).map_err(Into::into)
         })
         .collect()
-}
-
-async fn migrate(pool: &PgPool) -> RuntimeResult<()> {
-    let mut transaction = pool.begin().await.map_err(store_error)?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(POSTGRES_MIGRATION_LOCK)
-        .execute(&mut *transaction)
-        .await
-        .map_err(store_error)?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS mdbase_runtime_schema (
-            singleton boolean PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-            version integer NOT NULL CHECK (version >= 1)
-        )",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(store_error)?;
-    let installed = sqlx::query_scalar::<_, i32>(
-        "SELECT version FROM mdbase_runtime_schema WHERE singleton = TRUE",
-    )
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(store_error)?
-    .unwrap_or(0);
-    let installed = u32::try_from(installed)
-        .map_err(|_| RuntimeError::Store("negative PostgreSQL schema version".to_string()))?;
-    if installed > POSTGRES_SCHEMA_VERSION {
-        transaction.rollback().await.map_err(store_error)?;
-        return Err(RuntimeError::diagnostic(
-            "runtime_schema_too_new",
-            format!(
-                "PostgreSQL runtime schema version {installed} is newer than supported version {POSTGRES_SCHEMA_VERSION}."
-            ),
-        ));
-    }
-    let mut version = installed;
-    if version == 0 {
-        sqlx::raw_sql(
-            "
-        CREATE TABLE IF NOT EXISTS mdbase_runtime_meta (
-            namespace text PRIMARY KEY,
-            next_cursor bigint NOT NULL DEFAULT 0 CHECK (next_cursor >= 0),
-            retained_after bigint NOT NULL DEFAULT 0 CHECK (retained_after >= 0)
-        );
-        CREATE TABLE IF NOT EXISTS mdbase_runtime_events (
-            namespace text NOT NULL,
-            cursor bigint NOT NULL CHECK (cursor > 0),
-            source_runtime text NOT NULL,
-            event_id text NOT NULL,
-            envelope_json jsonb NOT NULL,
-            received_at timestamptz NOT NULL,
-            PRIMARY KEY(namespace, cursor)
-        );
-        CREATE TABLE IF NOT EXISTS mdbase_runtime_event_dedup (
-            namespace text NOT NULL,
-            source_runtime text NOT NULL,
-            event_id text NOT NULL,
-            cursor bigint NOT NULL CHECK (cursor > 0),
-            PRIMARY KEY(namespace, source_runtime, event_id)
-        );
-        CREATE TABLE IF NOT EXISTS mdbase_runtime_runs (
-            namespace text NOT NULL,
-            id text NOT NULL,
-            executor text NOT NULL,
-            workflow text NOT NULL,
-            trigger_id text NOT NULL,
-            status text NOT NULL,
-            created_at timestamptz NOT NULL,
-            not_before timestamptz NOT NULL,
-            idempotency_scope text NOT NULL,
-            idempotency_key text NOT NULL,
-            concurrency_group text NOT NULL,
-            concurrency_policy text NOT NULL,
-            lease_worker text,
-            lease_token text,
-            lease_expires_at timestamptz,
-            revision bigint NOT NULL,
-            record_json jsonb NOT NULL,
-            PRIMARY KEY(namespace, id),
-            UNIQUE(namespace, idempotency_scope, idempotency_key)
-        );
-        CREATE INDEX IF NOT EXISTS mdbase_runtime_runs_claim
-            ON mdbase_runtime_runs(namespace, executor, status, not_before, created_at);
-        CREATE INDEX IF NOT EXISTS mdbase_runtime_runs_group
-            ON mdbase_runtime_runs(namespace, concurrency_group, status);
-        CREATE INDEX IF NOT EXISTS mdbase_runtime_runs_trigger
-            ON mdbase_runtime_runs(namespace, workflow, trigger_id, created_at);
-        CREATE TABLE IF NOT EXISTS mdbase_runtime_timers (
-            namespace text NOT NULL,
-            id text NOT NULL,
-            generation bigint NOT NULL,
-            status text NOT NULL,
-            fire_at timestamptz NOT NULL,
-            lease_worker text,
-            lease_token text,
-            lease_expires_at timestamptz,
-            record_json jsonb NOT NULL,
-            PRIMARY KEY(namespace, id)
-        );
-        CREATE INDEX IF NOT EXISTS mdbase_runtime_timers_due
-            ON mdbase_runtime_timers(namespace, status, fire_at);
-        ",
-        )
-        .execute(&mut *transaction)
-        .await
-        .map_err(store_error)?;
-        version = 1;
-    }
-    if version == 1 {
-        // Runtime profile 0.2 made the persisted run and timer model
-        // incompatible with profile 0.1 (including exact string versions and
-        // implementation identities). Those values cannot be reconstructed
-        // safely from the old JSON. This prerelease boundary deliberately
-        // discards the runtime-owned execution journal; embedding-host source
-        // outboxes remain authoritative and can replay work that was not
-        // marked processed.
-        sqlx::raw_sql(
-            "
-            DELETE FROM mdbase_runtime_timers;
-            DELETE FROM mdbase_runtime_runs;
-            DELETE FROM mdbase_runtime_event_dedup;
-            DELETE FROM mdbase_runtime_events;
-            DELETE FROM mdbase_runtime_meta;
-            ",
-        )
-        .execute(&mut *transaction)
-        .await
-        .map_err(store_error)?;
-        version = 2;
-    }
-    if version != POSTGRES_SCHEMA_VERSION {
-        transaction.rollback().await.map_err(store_error)?;
-        return Err(RuntimeError::Store(format!(
-            "PostgreSQL runtime migration stopped at version {version}; expected {POSTGRES_SCHEMA_VERSION}."
-        )));
-    }
-    sqlx::query(
-        "INSERT INTO mdbase_runtime_schema(singleton, version)
-         VALUES (TRUE, $1)
-         ON CONFLICT(singleton) DO UPDATE SET version = excluded.version",
-    )
-    .bind(i32::try_from(POSTGRES_SCHEMA_VERSION).expect("schema version fits PostgreSQL integer"))
-    .execute(&mut *transaction)
-    .await
-    .map_err(store_error)?;
-    transaction.commit().await.map_err(store_error)
-}
-
-async fn validate_persisted_records(pool: &PgPool) -> RuntimeResult<()> {
-    for row in sqlx::query("SELECT namespace, id, record_json FROM mdbase_runtime_runs")
-        .fetch_all(pool)
-        .await
-        .map_err(store_error)?
-    {
-        let namespace: String = row.try_get("namespace").map_err(store_error)?;
-        let id: String = row.try_get("id").map_err(store_error)?;
-        let value: Value = row.try_get("record_json").map_err(store_error)?;
-        serde_json::from_value::<RunRecord>(value).map_err(|error| {
-            RuntimeError::diagnostic(
-                "invalid_persisted_runtime_record",
-                format!("Runtime run {namespace}/{id} is incompatible with this build: {error}"),
-            )
-        })?;
-    }
-    for row in sqlx::query("SELECT namespace, id, record_json FROM mdbase_runtime_timers")
-        .fetch_all(pool)
-        .await
-        .map_err(store_error)?
-    {
-        let namespace: String = row.try_get("namespace").map_err(store_error)?;
-        let id: String = row.try_get("id").map_err(store_error)?;
-        let value: Value = row.try_get("record_json").map_err(store_error)?;
-        serde_json::from_value::<TimerRecord>(value).map_err(|error| {
-            RuntimeError::diagnostic(
-                "invalid_persisted_runtime_record",
-                format!("Runtime timer {namespace}/{id} is incompatible with this build: {error}"),
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn add_duration(now: DateTime<Utc>, duration: Duration) -> RuntimeResult<DateTime<Utc>> {

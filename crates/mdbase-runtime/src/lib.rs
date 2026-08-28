@@ -52,7 +52,7 @@ pub use store::{
     AdmitOutcome, Claim, EventPage, PreparedEvent, RuntimeStore, StoreSnapshot, TimerClaim,
     TimerReconcileOutcome,
 };
-pub use timer::{TimerFireOutcome, TimerReconcileRequest, TimerRequest};
+pub use timer::{TimerFireOutcome, TimerReconcileRequest, TimerRequest, TIMER_GENERATION_MAX};
 
 /// Independently versioned implementation package.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
