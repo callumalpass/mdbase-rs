@@ -185,6 +185,9 @@ mod tests {
 
     #[test]
     fn cache_lifecycle_exclusive_waits_for_retained_shared_guard() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{mpsc, Arc};
+
         let directory = tempfile::tempdir().unwrap();
         let shared = sqlite::lock_cache_lifecycle_shared(
             directory.path(),
@@ -192,14 +195,39 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap();
+        let contention_counter = Arc::new(AtomicUsize::new(0));
+        let waiter_counter = contention_counter.clone();
         let root = directory.path().to_path_buf();
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
-            sqlite::lock_cache_lifecycle_exclusive(&root, ".cache", Duration::from_millis(500))
+            let result = sqlite::lock_cache_lifecycle_exclusive_with_contention_counter(
+                &root,
+                ".cache",
+                Duration::from_millis(500),
+                waiter_counter,
+            );
+            result_sender.send(result).unwrap();
         });
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(!waiter.is_finished());
+
+        let evidence_deadline = Instant::now() + Duration::from_secs(2);
+        while contention_counter.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < evidence_deadline,
+                "exclusive acquisition never observed actual shared-lock contention"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            result_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
         drop(shared);
-        waiter.join().unwrap().unwrap();
+        result_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        waiter.join().unwrap();
         assert!(directory
             .path()
             .join(".cache/cache.lifecycle.lock")

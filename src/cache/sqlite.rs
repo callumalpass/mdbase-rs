@@ -6,8 +6,28 @@ use rusqlite::{Connection, Result};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+thread_local! {
+    static EXCLUSIVE_CONTENTION_COUNTER: std::cell::RefCell<Option<Arc<AtomicUsize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct ExclusiveContentionCounterGuard;
+
+#[cfg(test)]
+impl Drop for ExclusiveContentionCounterGuard {
+    fn drop(&mut self) {
+        EXCLUSIVE_CONTENTION_COUNTER.with(|slot| {
+            slot.replace(None);
+        });
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct CacheDbIdentity(same_file::Handle);
@@ -54,6 +74,23 @@ pub(crate) fn lock_cache_lifecycle_exclusive(
     lock_cache_lifecycle(root, cache_folder, timeout, true)
 }
 
+#[cfg(test)]
+pub(crate) fn lock_cache_lifecycle_exclusive_with_contention_counter(
+    root: &Path,
+    cache_folder: &str,
+    timeout: Duration,
+    contention_counter: Arc<AtomicUsize>,
+) -> std::io::Result<CacheLifecycleGuard> {
+    EXCLUSIVE_CONTENTION_COUNTER.with(|slot| {
+        assert!(
+            slot.replace(Some(contention_counter)).is_none(),
+            "exclusive contention counter already installed on this thread"
+        );
+    });
+    let _counter_guard = ExclusiveContentionCounterGuard;
+    lock_cache_lifecycle_exclusive(root, cache_folder, timeout)
+}
+
 fn lock_cache_lifecycle(
     root: &Path,
     cache_folder: &str,
@@ -79,6 +116,14 @@ fn lock_cache_lifecycle(
         match result {
             Ok(()) => return Ok(CacheLifecycleGuard { file }),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                #[cfg(test)]
+                if exclusive {
+                    EXCLUSIVE_CONTENTION_COUNTER.with(|slot| {
+                        if let Some(counter) = slot.borrow().as_ref() {
+                            counter.fetch_add(1, Ordering::AcqRel);
+                        }
+                    });
+                }
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
