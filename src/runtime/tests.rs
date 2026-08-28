@@ -2019,18 +2019,28 @@ fn validation_reuses_committing_connection_without_manufacturing_invalidation() 
     let runtime = FilesystemRuntime::open(directory.path(), Duration::from_secs(60)).unwrap();
 
     // Attempt 1 is Applied and its deterministic cache-write callback advances
-    // the watcher from observation 1 to revision 2. Attempt 2 observes revision
-    // 3 and must validate as Current without opening another SQLite connection.
+    // the watcher. The next attempt observes that callback and must validate as
+    // Current without opening another SQLite connection. Native backends may
+    // contribute additional root-scoped revisions around those milestones.
     // The armed open hook models the extra macOS root callback that an open
-    // against WAL/SHM used to produce; it must remain armed and acknowledgement
-    // of observation 3 must succeed.
+    // against WAL/SHM used to produce; it must remain armed when acknowledgement
+    // succeeds.
     runtime.inject_cache_notifications_for_test(1);
     runtime.inject_cache_notification_on_validation_open_for_test();
-    assert_eq!(runtime.watcher_revision_for_test(), 0);
+    let revision_before_synchronize = runtime.watcher_revision_for_test();
+    assert_eq!(revision_before_synchronize, 0);
     runtime.synchronize().unwrap();
 
     assert_eq!(runtime.maintenance_attempt_counts_for_test(), (1, 0));
-    assert_eq!(runtime.watcher_revision_for_test(), 3);
+    let revision_after_synchronize = runtime.watcher_revision_for_test();
+    let revision_advance = revision_after_synchronize
+        .checked_sub(revision_before_synchronize)
+        .expect("watcher revision advanced monotonically through validation");
+    // The deterministic create/write/ack path advances at least three times.
+    // Native backends may additionally report root-scoped SQLite lifecycle
+    // notifications; the still-armed hook below proves validation itself did
+    // not open another connection and manufacture one.
+    assert!(revision_advance >= 3);
     assert!(runtime.clear_validation_open_notification_for_test());
     assert_eq!(
         runtime_query_paths(&runtime),
