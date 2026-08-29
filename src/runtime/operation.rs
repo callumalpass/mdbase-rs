@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::ProviderError;
-use crate::v03::{Diagnostic, OperationResult};
+use crate::{diagnostic::Diagnostic, v03::OperationResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -49,8 +49,7 @@ impl<'a> Operations<'a> {
         ))
     }
 
-    /// Evaluate a provider-supplied exact record using this collection's
-    /// compiled catalog without reading or discovering filesystem records.
+    /// Evaluate one provider-supplied exact record without filesystem discovery.
     pub(crate) fn read_record(
         &self,
         input: &Value,
@@ -110,15 +109,19 @@ impl<'a> Operations<'a> {
                 None,
             )]);
         };
-        let read = self.read(&serde_json::json!({"path": path}));
+        let request = match self.parse_read_request(input) {
+            Ok(request) => request,
+            Err(result) => return result,
+        };
+        let read = typed_read_result(crate::operations::read::evaluate_typed_read(
+            self.collection,
+            &request,
+            crate::operations::read::TypedReadSource::Filesystem,
+        ));
         if !read.valid {
             return failed_result(read.diagnostics);
         }
-        let persisted = read
-            .result
-            .get("frontmatter")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
+        let persisted = read.result["frontmatter"].clone();
         let (types, failures) = self
             .collection
             .determine_types_for_path_checked(&persisted, Some(path));
@@ -192,25 +195,23 @@ impl<'a> Operations<'a> {
         crate::views::delete_source(self.collection, input)
     }
 
-    /// Execute a query and return payload-free phase timings for local
-    /// profiling and host observability.
+    /// Execute a query with payload-free phase timings.
     pub fn query_profiled(&self, input: &Value) -> (OperationResult, super::QueryPerformance) {
         super::query::execute_profiled(self.collection, input)
     }
 
-    /// Evaluate a portable expression against either a record or explicit
-    /// workflow bindings.
+    /// Evaluate a portable expression against a record or explicit bindings.
     pub fn evaluate_cel(&self, input: &Value) -> OperationResult {
         if input.get("path").is_some() {
-            super::cel::evaluate_record(self.collection, input)
+            crate::cel::evaluate_record(self.collection, input)
         } else {
-            super::cel::evaluate_bindings(input)
+            crate::cel::evaluate_bindings(input)
         }
     }
 
     /// Recursively evaluate only `{ "$expr": "..." }` workflow values.
     pub fn evaluate_workflow_input(&self, input: &Value) -> OperationResult {
-        super::cel::evaluate_workflow_template(input)
+        crate::cel::evaluate_workflow_template(input)
     }
 
     pub fn create(&self, input: &Value) -> OperationResult {
@@ -239,7 +240,6 @@ impl<'a> Operations<'a> {
     }
 
     /// Execute one mutation directly inside a disposable staging collection.
-    ///
     /// Unlike [`Self::create`], [`Self::update`], [`Self::delete`], and
     /// [`Self::rename`], this method does not create a second collection-wide
     /// shadow copy before writing. It is intended for storage providers that
@@ -810,7 +810,7 @@ fn classify_raw_candidate(
 
 fn match_failure_diagnostics(
     path: &str,
-    failures: Vec<(String, super::cel::CelFailure)>,
+    failures: Vec<(String, crate::cel::CelFailure)>,
 ) -> Vec<Diagnostic> {
     failures
         .into_iter()

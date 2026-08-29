@@ -7,8 +7,9 @@ use super::context::complete_file_value;
 use super::diagnostics;
 use super::model::{Candidate, Direction, FrontmatterMode, OrderBy, Query};
 use super::preflight::{self, CompiledQuery};
+use crate::cel;
+use crate::diagnostic::Diagnostic;
 use crate::expressions::evaluator::{EvalContext, EvaluationClock};
-use crate::v03::{cel, Diagnostic};
 
 pub(super) fn sort_candidates(candidates: &mut [Candidate], order_by: &[OrderBy]) {
     candidates.sort_by(|left, right| {

@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::diagnostic::Diagnostic;
 use crate::operations::read::RecordFileFacts;
 use crate::types::{inheritance, loader};
-use crate::v03::{Diagnostic, OperationResult, TypeFile};
+use crate::v03::{OperationResult, TypeFile};
 use crate::{Collection, Settings, SpecProfile};
 
 use super::record_structure::RecordStructure;

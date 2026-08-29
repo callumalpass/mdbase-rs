@@ -15,7 +15,6 @@ use sha2::{Digest, Sha256};
 
 use crate::expressions::evaluator::resolve_execution_timezone;
 use crate::links::parser::normalize_link_path;
-use crate::v03::{Diagnostic, OperationResult};
 use crate::views::{
     base_uses_backlinks, combined_filter_matches, evaluate_property, is_configured_obsidian_source,
     lower_hosted_candidate, serialize_bases_file, stable_named_view_ids, uses_file_ctime,
@@ -23,6 +22,7 @@ use crate::views::{
     BasesLink, BasesTimezone, ObsidianBaseDocument, ObsidianBaseView, ViewReferenceInput,
 };
 use crate::OperationCancellation;
+use crate::{diagnostic::Diagnostic, v03::OperationResult};
 
 use super::{
     CandidatePredicate, CanonicalRecordInput, CatalogError, CompiledCatalog, HostedQueryBudgets,

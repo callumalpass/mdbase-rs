@@ -770,25 +770,26 @@ impl Collection {
         version: &str,
         selected_type: Option<&str>,
     ) -> ContractViewResult {
-        let read = self.read(&json!({"path": path}));
-        if let Some(error) = read.get("error") {
-            return failed_view(
-                contract,
-                version,
-                selected_type.unwrap_or_default(),
-                error["code"].as_str().unwrap_or("operation_failed"),
-                error["message"]
-                    .as_str()
-                    .unwrap_or("Record could not be read"),
-                Some(path),
-            );
-        }
+        let requested_type = selected_type.unwrap_or_default();
+        let failure = |code: &str, message: String| {
+            failed_view(contract, version, requested_type, code, message, Some(path))
+        };
+        let request = match crate::api::ReadRequest::new(path) {
+            Ok(request) => request,
+            Err(error) => return failure("invalid_path", error.to_string()),
+        };
+        let read = match self.typed().and_then(|typed| typed.read(request)) {
+            Ok(read) => read.value,
+            Err(error) => match error.diagnostics().first() {
+                Some(value) => return failure(value.code.as_str(), value.message.clone()),
+                None => return failure("operation_failed", "Record could not be read".into()),
+            },
+        };
         let implementations = self.data_contracts.implementations(contract, version);
-        let candidates = read["types"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
+        let candidates = read
+            .types
+            .iter()
+            .map(String::as_str)
             .filter(|type_name| {
                 implementations
                     .iter()
@@ -833,10 +834,7 @@ impl Collection {
                 Some(path),
             );
         }
-        let effective = read
-            .get("effective_frontmatter")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let effective = read.effective_frontmatter;
         let mut projected = self
             .data_contracts
             .project(selected, contract, version, &effective);

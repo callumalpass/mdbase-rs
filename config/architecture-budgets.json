@@ -1,6 +1,6 @@
 {
-  "rustSourceFileCountMax": 158,
-  "rustSourceLineCountMax": 84729,
+  "rustSourceFileCountMax": 159,
+  "rustSourceLineCountMax": 84928,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-command/src/lib.rs": 1809,
@@ -32,7 +32,7 @@
     "src/matching/engine.rs": 1,
     "src/runtime/outcome.rs": 2,
     "src/runtime/provider.rs": 2,
-    "src/v03/cel.rs": 2
+    "src/cel.rs": 2
   },
   "transitionalReferenceBudgets": {
     "uncheckedCollectionScans": 0,

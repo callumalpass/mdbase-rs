@@ -4,10 +4,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde_json::{json, Map, Value};
 
-use super::{
-    cel::{enrich_record_bindings, evaluate_compiled, operation_clock},
-    Diagnostic,
-};
+use crate::cel::{enrich_record_bindings, evaluate_compiled, operation_clock};
+use crate::diagnostic::Diagnostic;
 use crate::expressions::ast::Expr;
 use crate::expressions::evaluator::{EvalContext, EvaluationClock, NoteNamespaceSource};
 use crate::field_references;
@@ -289,7 +287,7 @@ mod tests {
         let old = serde_json::from_value::<Map<String, Value>>(json!({"status": "open"})).unwrap();
         let known = BTreeSet::from(["status".to_string(), "missing".to_string()]);
         let clock = EvaluationClock::capture(Some("UTC")).unwrap();
-        let expression = super::super::cel::compile(
+        let expression = crate::cel::compile(
             "note.status == 'done' && record.status == 'done' && !present.raw.missing && old.status == 'open' && operation.name == 'update'",
         )
         .unwrap();

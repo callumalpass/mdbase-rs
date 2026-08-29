@@ -1,4 +1,4 @@
-//! Query execution engine (§10).
+//! Legacy v0.2 compatibility query engine (§10); canonical queries use `query::canonical`.
 
 use crate::expressions::ast::Expr;
 use crate::expressions::evaluator::{evaluate as eval_expr, EvalContext, ResolvedFileData};
@@ -1031,7 +1031,7 @@ impl Collection {
                 .collect::<std::collections::BTreeSet<_>>();
             // Build the v0.3 record/raw/presence namespaces while retaining
             // top-level effective field access.
-            crate::v03::cel::enrich_record_bindings(
+            crate::cel::enrich_record_bindings(
                 ctx.frontmatter,
                 ctx.raw_frontmatter,
                 known_fields.iter(),

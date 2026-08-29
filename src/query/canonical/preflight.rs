@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::expressions::ast::Expr;
 
 use super::model::{Query, Selection};
-use crate::v03::{cel, Diagnostic};
+use crate::cel;
+use crate::diagnostic::Diagnostic;
 
 pub(crate) struct CompiledQuery {
     pub query: Query,

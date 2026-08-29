@@ -6,6 +6,7 @@ use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 use super::{CollectionPath, CollectionPathError, QueryRequest, QueryResult};
+use crate::diagnostic::Diagnostic as CanonicalDiagnostic;
 use crate::v03;
 use crate::{Collection, SpecProfile};
 
@@ -133,8 +134,8 @@ pub struct Diagnostic {
     pub details: Option<Value>,
 }
 
-impl From<v03::Diagnostic> for Diagnostic {
-    fn from(value: v03::Diagnostic) -> Self {
+impl From<CanonicalDiagnostic> for Diagnostic {
+    fn from(value: CanonicalDiagnostic) -> Self {
         let severity = match value.severity.as_str() {
             "warning" => Severity::Warning,
             "info" => Severity::Info,
@@ -804,7 +805,7 @@ impl<'a> TypedCollection<'a> {
         if self.collection.spec_profile == SpecProfile::V02 {
             return crate::compat::v02::query(self.collection, request);
         }
-        let schema_diagnostics = crate::v03::query::model::validate_typed(&request);
+        let schema_diagnostics = crate::query::canonical::model::validate_typed(&request);
         if !schema_diagnostics.is_empty() {
             return Err(MdbaseError::Operation {
                 diagnostics: schema_diagnostics
@@ -813,8 +814,8 @@ impl<'a> TypedCollection<'a> {
                     .collect(),
             });
         }
-        let query = crate::v03::query::model::Query::from_typed(&request);
-        match crate::v03::query::execute_typed(self.collection, query) {
+        let query = crate::query::canonical::model::Query::from_typed(&request);
+        match crate::query::canonical::execute_typed(self.collection, query) {
             Ok(execution) => Ok(OperationOutcome {
                 value: QueryResult {
                     records: execution.records,

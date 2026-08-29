@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::v03::Diagnostic;
+use crate::diagnostic::Diagnostic;
 
 use super::{
     CanonicalRecordInput, CatalogError, CompiledCatalog, RecordStructure, ResolutionCandidate,

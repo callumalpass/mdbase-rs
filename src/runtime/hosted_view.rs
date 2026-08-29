@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::v03::{Diagnostic, OperationResult};
+use crate::{diagnostic::Diagnostic, v03::OperationResult};
 
 use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, HostedQueryPlan};
 

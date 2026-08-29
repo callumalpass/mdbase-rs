@@ -22,7 +22,7 @@ pub(crate) fn matches_rules_checked(
     rel_path: &str,
     frontmatter: &serde_json::Value,
     timezone: Option<&str>,
-) -> Result<bool, crate::v03::cel::CelFailure> {
+) -> Result<bool, crate::cel::CelFailure> {
     matches_rules_checked_compiled(rules, None, rel_path, frontmatter, timezone)
 }
 
@@ -32,8 +32,8 @@ pub(crate) fn matches_rules_checked_compiled(
     rel_path: &str,
     frontmatter: &serde_json::Value,
     timezone: Option<&str>,
-) -> Result<bool, crate::v03::cel::CelFailure> {
-    let clock = crate::v03::cel::operation_clock(timezone)?;
+) -> Result<bool, crate::cel::CelFailure> {
+    let clock = crate::cel::operation_clock(timezone)?;
     matches_rules_checked_compiled_with_clock(
         rules,
         match_expression,
@@ -49,7 +49,7 @@ pub(crate) fn matches_rules_checked_compiled_with_clock(
     rel_path: &str,
     frontmatter: &serde_json::Value,
     clock: &crate::expressions::evaluator::EvaluationClock,
-) -> Result<bool, crate::v03::cel::CelFailure> {
+) -> Result<bool, crate::cel::CelFailure> {
     // All conditions in a match rule are AND'd together
     if let Some(ref path_glob) = rules.path_glob {
         if !matches_path_glob(rel_path, path_glob) {
@@ -78,15 +78,15 @@ pub(crate) fn matches_rules_checked_compiled_with_clock(
     }
     if let Some(ref expression) = rules.match_expr {
         let matched = match match_expression {
-            Some(expression) => crate::v03::cel::evaluate_match_expression_compiled_with_clock(
+            Some(expression) => crate::cel::evaluate_match_expression_compiled_with_clock(
                 expression,
                 frontmatter,
                 rel_path,
                 clock,
             )?,
             None => {
-                let parsed = crate::v03::cel::compile(expression)?;
-                crate::v03::cel::evaluate_match_expression_compiled_with_clock(
+                let parsed = crate::cel::compile(expression)?;
+                crate::cel::evaluate_match_expression_compiled_with_clock(
                     &parsed,
                     frontmatter,
                     rel_path,
@@ -591,8 +591,8 @@ impl Collection {
         &self,
         frontmatter: &serde_json::Value,
         rel_path: Option<&str>,
-    ) -> (Vec<String>, Vec<(String, crate::v03::cel::CelFailure)>) {
-        let clock = match crate::v03::cel::operation_clock(self.settings.timezone.as_deref()) {
+    ) -> (Vec<String>, Vec<(String, crate::cel::CelFailure)>) {
+        let clock = match crate::cel::operation_clock(self.settings.timezone.as_deref()) {
             Ok(clock) => clock,
             Err(error) => return (Vec::new(), vec![(String::new(), error)]),
         };
@@ -604,7 +604,7 @@ impl Collection {
         frontmatter: &serde_json::Value,
         rel_path: Option<&str>,
         clock: &crate::expressions::evaluator::EvaluationClock,
-    ) -> (Vec<String>, Vec<(String, crate::v03::cel::CelFailure)>) {
+    ) -> (Vec<String>, Vec<(String, crate::cel::CelFailure)>) {
         let mut types = Vec::new();
         let mut has_explicit = false;
 

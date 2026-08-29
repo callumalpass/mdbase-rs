@@ -15,12 +15,12 @@ use sha2::{Digest, Sha256};
 use crate::expressions::ast::{BinOp, Expr, UnaryOp};
 use crate::expressions::evaluator::{path_is_in_folder, resolve_execution_timezone};
 use crate::query::cache_source::FileRecord;
-use crate::v03::query::context::{candidate_context, file_value, namespace_value};
-use crate::v03::query::diagnostics;
-use crate::v03::query::model::{Candidate, Query};
-use crate::v03::query::preflight::{self, CompiledSelection};
-use crate::v03::query::result::serialize_candidate;
-use crate::v03::{cel, validate_query, Diagnostic};
+use crate::query::canonical::context::{candidate_context, file_value, namespace_value};
+use crate::query::canonical::diagnostics;
+use crate::query::canonical::model::{Candidate, Query};
+use crate::query::canonical::preflight::{self, CompiledSelection};
+use crate::query::canonical::result::serialize_candidate;
+use crate::{cel, diagnostic::Diagnostic, v03::validate_query};
 
 use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
 

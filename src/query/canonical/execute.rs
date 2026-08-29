@@ -9,9 +9,10 @@ use super::diagnostics;
 use super::model::{Candidate, Query};
 use super::preflight::{self, CompiledSelection};
 use super::result::{build_groups, compare_values, serialize_candidate, sort_candidates};
+use crate::cel;
+use crate::diagnostic::Diagnostic;
 use crate::expressions::evaluator::resolve_execution_timezone;
 use crate::query::cache_source::{InvalidRecordStub, LocalRecord};
-use crate::v03::{cel, validate_query, Diagnostic, OperationResult};
 use crate::{Collection, OperationCancellation, OperationCancelled};
 
 /// Payload-free phase timings and counters for one canonical v0.3 query.
@@ -36,6 +37,12 @@ pub struct QueryPerformance {
     pub groups_us: u64,
     pub serialize_us: u64,
     pub records_loaded: usize,
+    /// Bulk snapshot/cache sources opened for candidate records.
+    pub record_source_loads: usize,
+    /// Point reads performed to hydrate `context.this`.
+    pub context_record_loads: usize,
+    /// All record sources opened (`record_source_loads + context_record_loads`).
+    pub total_source_loads: usize,
     pub candidates: usize,
     pub results: usize,
     pub cache_used: bool,
@@ -51,7 +58,12 @@ pub(crate) struct QueryPathProbes {
     pub typed_request_json_encodes: usize,
     pub operation_result_decodes: usize,
     pub core_executions: usize,
+    /// Bulk snapshot/cache sources opened for candidate records.
     pub record_source_loads: usize,
+    /// Point reads performed to hydrate `context.this`.
+    pub context_record_loads: usize,
+    /// All record sources opened (`record_source_loads + context_record_loads`).
+    pub total_source_loads: usize,
 }
 
 #[cfg(test)]
@@ -64,6 +76,8 @@ thread_local! {
             operation_result_decodes: 0,
             core_executions: 0,
             record_source_loads: 0,
+            context_record_loads: 0,
+            total_source_loads: 0,
         }) };
 }
 
@@ -91,6 +105,16 @@ pub(crate) fn record_typed_request_json_encode() {
     bump_probe(|probes| probes.typed_request_json_encodes += 1);
 }
 
+#[cfg(test)]
+pub(crate) fn record_wire_schema_validation() {
+    bump_probe(|probes| probes.wire_schema_validations += 1);
+}
+
+#[cfg(test)]
+pub(crate) fn record_wire_query_decode() {
+    bump_probe(|probes| probes.wire_query_decodes += 1);
+}
+
 /// Dynamic rows and metadata produced by the already-parsed query core.
 pub(crate) struct QueryExecution {
     pub records: Vec<Value>,
@@ -101,59 +125,6 @@ pub(crate) struct QueryExecution {
 }
 
 pub(crate) type QueryEvaluation = Result<QueryExecution, Vec<Diagnostic>>;
-
-impl QueryExecution {
-    fn into_wire(self) -> OperationResult {
-        let inner_diagnostics =
-            serde_json::to_value(&self.diagnostics).unwrap_or_else(|_| json!([]));
-        OperationResult {
-            valid: true,
-            result: json!({
-                "results": self.records,
-                "meta": self.meta,
-                "diagnostics": inner_diagnostics,
-            }),
-            diagnostics: self.diagnostics,
-        }
-    }
-}
-
-fn evaluation_into_wire(evaluation: QueryEvaluation) -> OperationResult {
-    match evaluation {
-        Ok(execution) => execution.into_wire(),
-        Err(diagnostics) => diagnostics::failed(diagnostics),
-    }
-}
-
-pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult {
-    execute_profiled(collection, input).0
-}
-
-pub(crate) fn execute_profiled(
-    collection: &Collection,
-    input: &Value,
-) -> (OperationResult, QueryPerformance) {
-    execute_wire_profiled_cancellable(collection, input, &OperationCancellation::new(), false)
-        .expect("a fresh cancellation token cannot be cancelled")
-}
-
-pub(crate) fn execute_cancellable(
-    collection: &Collection,
-    input: &Value,
-    cancellation: &OperationCancellation,
-) -> Result<OperationResult, OperationCancelled> {
-    execute_wire_profiled_cancellable(collection, input, cancellation, false)
-        .map(|(result, _)| result)
-}
-
-pub(crate) fn execute_runtime_cancellable(
-    collection: &Collection,
-    input: &Value,
-    cancellation: &OperationCancellation,
-) -> Result<OperationResult, OperationCancelled> {
-    execute_wire_profiled_cancellable(collection, input, cancellation, true)
-        .map(|(result, _)| result)
-}
 
 pub(crate) fn execute_typed(collection: &Collection, query: Query) -> QueryEvaluation {
     execute_model_profiled_cancellable(
@@ -168,64 +139,7 @@ pub(crate) fn execute_typed(collection: &Collection, query: Query) -> QueryEvalu
     .0
 }
 
-fn execute_wire_profiled_cancellable(
-    collection: &Collection,
-    input: &Value,
-    cancellation: &OperationCancellation,
-    runtime_cache: bool,
-) -> Result<(OperationResult, QueryPerformance), OperationCancelled> {
-    let total_started = Instant::now();
-    cancellation.check()?;
-    let phase = Instant::now();
-    #[cfg(test)]
-    bump_probe(|probes| probes.wire_schema_validations += 1);
-    let schema_diagnostics = validate_query(input)
-        .into_iter()
-        .map(diagnostics::invalid_schema)
-        .collect::<Vec<_>>();
-    let schema_us = micros(phase.elapsed());
-    cancellation.check()?;
-    if !schema_diagnostics.is_empty() {
-        return Ok((
-            diagnostics::failed(schema_diagnostics),
-            QueryPerformance {
-                total_us: micros(total_started.elapsed()),
-                schema_us,
-                ..QueryPerformance::default()
-            },
-        ));
-    }
-    #[cfg(test)]
-    bump_probe(|probes| probes.wire_query_decodes += 1);
-    let query = match serde_json::from_value::<Query>(input.clone()) {
-        Ok(query) => query,
-        Err(error) => {
-            return Ok((
-                diagnostics::failed(vec![Diagnostic::error(
-                    "invalid_query",
-                    format!("Query could not be decoded: {error}"),
-                    None,
-                )]),
-                QueryPerformance {
-                    total_us: micros(total_started.elapsed()),
-                    schema_us,
-                    ..QueryPerformance::default()
-                },
-            ));
-        }
-    };
-    execute_model_profiled_cancellable(
-        collection,
-        query,
-        cancellation,
-        runtime_cache,
-        total_started,
-        schema_us,
-    )
-    .map(|(evaluation, performance)| (evaluation_into_wire(evaluation), performance))
-}
-
-fn execute_model_profiled_cancellable(
+pub(crate) fn execute_model_profiled_cancellable(
     collection: &Collection,
     query: Query,
     cancellation: &OperationCancellation,
@@ -354,8 +268,13 @@ fn execute_model_profiled_cancellable(
             .type_plans
             .values()
             .any(|plan| !plan.computed.is_empty());
+    performance.record_source_loads = 1;
+    performance.total_source_loads = 1;
     #[cfg(test)]
-    bump_probe(|probes| probes.record_source_loads += 1);
+    bump_probe(|probes| {
+        probes.record_source_loads += 1;
+        probes.total_source_loads += 1;
+    });
     let loaded = if runtime_cache {
         collection.load_runtime_query_data_profiled_cancellable(
             true,
@@ -476,7 +395,7 @@ fn execute_model_profiled_cancellable(
         .collect::<Vec<_>>();
     let type_definitions = Arc::new(collection.types.clone());
     let phase = Instant::now();
-    let context = match load_context(
+    let (context, context_record_loads) = match load_context(
         collection,
         &compiled.query,
         all_files.clone(),
@@ -487,6 +406,15 @@ fn execute_model_profiled_cancellable(
         Err(diagnostic) => finish!(Err(vec![*diagnostic])),
     };
     performance.context_us = micros(phase.elapsed());
+    performance.context_record_loads = context_record_loads;
+    performance.total_source_loads = performance
+        .record_source_loads
+        .saturating_add(context_record_loads);
+    #[cfg(test)]
+    bump_probe(|probes| {
+        probes.context_record_loads += context_record_loads;
+        probes.total_source_loads += context_record_loads;
+    });
     cancellation.check()?;
 
     let phase = Instant::now();
@@ -693,6 +621,10 @@ fn apply_load_performance(
     performance.all_files_us = millis_to_micros(load.build_all_files_ms);
     performance.link_graph_us = millis_to_micros(load.build_backlinks_ms);
     performance.records_loaded = load.file_records;
+    performance.record_source_loads = 1;
+    performance.total_source_loads = performance
+        .record_source_loads
+        .saturating_add(performance.context_record_loads);
     performance.cache_used = load.cache_used;
     performance.cache_fallback = load.cache_fallback;
     performance.link_graph_built = load.built_link_graph;
@@ -829,7 +761,7 @@ fn record_metadata_value(record: &LocalRecord, field: &str) -> Value {
 mod tests {
     use std::fs;
 
-    use crate::api::QueryRequest;
+    use crate::api::{CollectionPath, QueryRequest};
     use crate::Collection;
 
     use super::{query_path_probes, reset_query_path_probes};
@@ -844,7 +776,10 @@ mod tests {
         .unwrap();
         fs::write(root.path().join("one.md"), "---\ntitle: One\n---\nBody\n").unwrap();
         let collection = Collection::open(root.path()).unwrap();
-        let request = QueryRequest::builder().where_expression("true");
+        let request = QueryRequest {
+            context: Some(CollectionPath::new("one.md").unwrap()),
+            ..QueryRequest::builder().where_expression("true")
+        };
 
         let invalid = QueryRequest {
             timezone: Some(String::new()),
@@ -862,12 +797,14 @@ mod tests {
             super::QueryPathProbes {
                 core_executions: 1,
                 record_source_loads: 1,
+                context_record_loads: 1,
+                total_source_loads: 2,
                 ..super::QueryPathProbes::default()
             }
         );
 
         reset_query_path_probes();
-        let wire = super::execute(&collection, &request.to_wire());
+        let wire = crate::v03::query::execute(&collection, &request.to_wire());
         assert!(wire.valid, "{wire:#?}");
         assert_eq!(
             query_path_probes(),
@@ -877,8 +814,53 @@ mod tests {
                 typed_request_json_encodes: 1,
                 core_executions: 1,
                 record_source_loads: 1,
+                context_record_loads: 1,
+                total_source_loads: 2,
                 ..super::QueryPathProbes::default()
             }
         );
+
+        let missing = QueryRequest {
+            context: Some(CollectionPath::new("missing.md").unwrap()),
+            ..QueryRequest::builder().where_expression("true")
+        };
+        reset_query_path_probes();
+        assert!(collection.typed().unwrap().query(missing.clone()).is_err());
+        assert_eq!(
+            query_path_probes(),
+            super::QueryPathProbes {
+                core_executions: 1,
+                record_source_loads: 1,
+                total_source_loads: 1,
+                ..super::QueryPathProbes::default()
+            }
+        );
+
+        reset_query_path_probes();
+        let (wire, performance) =
+            crate::v03::query::execute_profiled(&collection, &missing.to_wire());
+        assert!(!wire.valid, "{wire:#?}");
+        assert_eq!(performance.context_record_loads, 0);
+        assert_eq!(performance.total_source_loads, 1);
+        assert_eq!(
+            query_path_probes(),
+            super::QueryPathProbes {
+                wire_schema_validations: 1,
+                wire_query_decodes: 1,
+                typed_request_json_encodes: 1,
+                core_executions: 1,
+                record_source_loads: 1,
+                total_source_loads: 1,
+                ..super::QueryPathProbes::default()
+            }
+        );
+
+        let (invalid_path, performance) = crate::v03::query::execute_profiled(
+            &collection,
+            &serde_json::json!({"context": {"this": {"path": "../outside.md"}}}),
+        );
+        assert!(!invalid_path.valid, "{invalid_path:#?}");
+        assert_eq!(performance.context_record_loads, 0);
+        assert_eq!(performance.total_source_loads, 1);
     }
 }

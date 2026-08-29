@@ -33,13 +33,15 @@ pub(crate) struct Query {
     pub _extensions: BTreeMap<String, Value>,
 }
 
-const QUERY_SCHEMA_ID: &str = "https://mdbase.dev/schemas/v0.3/query.schema.json";
-const TYPE_NAME_PATTERN: &str = "^[A-Za-z][A-Za-z0-9_-]{0,127}$";
-const FIELD_NAME_PATTERN: &str = "^[A-Za-z_][A-Za-z0-9_:-]*$";
+use contract::{
+    valid_field_name, valid_type_name, FIELD_NAME_PATTERN, QUERY_SCHEMA_ID, TYPE_NAME_PATTERN,
+};
 
 /// Validate every query-schema constraint that the closed typed request can
 /// express, without serializing it or invoking JSON Schema.
-pub(crate) fn validate_typed(request: &crate::api::QueryRequest) -> Vec<crate::v03::Diagnostic> {
+pub(crate) fn validate_typed(
+    request: &crate::api::QueryRequest,
+) -> Vec<crate::diagnostic::Diagnostic> {
     let mut failures = Vec::new();
     // serde_json objects and the schema validator visit known properties
     // lexically. Preserve that observable diagnostic order on the direct path.
@@ -139,7 +141,7 @@ pub(crate) fn validate_typed(request: &crate::api::QueryRequest) -> Vec<crate::v
 fn validate_order(
     order: &[crate::api::QueryOrder],
     property: &str,
-    failures: &mut Vec<crate::v03::Diagnostic>,
+    failures: &mut Vec<crate::diagnostic::Diagnostic>,
 ) {
     for (index, item) in order.iter().enumerate() {
         if item.field.is_empty() {
@@ -152,7 +154,11 @@ fn validate_order(
     }
 }
 
-fn min_length(field: &str, instance_path: &str, schema_path: &str) -> crate::v03::Diagnostic {
+fn min_length(
+    field: &str,
+    instance_path: &str,
+    schema_path: &str,
+) -> crate::diagnostic::Diagnostic {
     schema_failure(
         "schema_min_length",
         "\"\" is shorter than 1 character".to_string(),
@@ -168,8 +174,8 @@ fn schema_failure(
     field: &str,
     instance_path: &str,
     schema_path: &str,
-) -> crate::v03::Diagnostic {
-    super::diagnostics::invalid_schema(crate::v03::Diagnostic {
+) -> crate::diagnostic::Diagnostic {
+    super::diagnostics::invalid_schema(crate::diagnostic::Diagnostic {
         severity: "error".to_string(),
         code: code.to_string(),
         message,
@@ -182,31 +188,6 @@ fn schema_failure(
             "schema_path": schema_path,
         })),
     })
-}
-
-fn valid_type_name(value: &str) -> bool {
-    value.len() <= 128
-        && value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphabetic)
-        && value
-            .as_bytes()
-            .iter()
-            .skip(1)
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-}
-
-fn valid_field_name(value: &str) -> bool {
-    value
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-        && value
-            .as_bytes()
-            .iter()
-            .skip(1)
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-'))
 }
 
 fn pointer_segment(value: &str) -> String {
@@ -369,4 +350,102 @@ pub(crate) enum FrontmatterMode {
     Effective,
     Persisted,
     Both,
+}
+
+/// Constraints mirrored by the closed typed query API. This is the sole
+/// non-schema source for direct typed preflight.
+mod contract {
+    pub(super) const QUERY_SCHEMA_ID: &str = "https://mdbase.dev/schemas/v0.3/query.schema.json";
+    pub(super) const TYPE_NAME_PATTERN: &str = "^[A-Za-z][A-Za-z0-9_-]{0,127}$";
+    pub(super) const TYPE_NAME_MAX_LENGTH: usize = 128;
+    pub(super) const FIELD_NAME_PATTERN: &str = "^[A-Za-z_][A-Za-z0-9_:-]*$";
+
+    pub(super) fn valid_type_name(value: &str) -> bool {
+        value.len() <= TYPE_NAME_MAX_LENGTH
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+            && value
+                .as_bytes()
+                .iter()
+                .skip(1)
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }
+
+    pub(super) fn valid_field_name(value: &str) -> bool {
+        value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+            && value
+                .as_bytes()
+                .iter()
+                .skip(1)
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-'))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use serde_json::{json, Value};
+
+        use super::*;
+        use crate::api::QueryRequest;
+
+        fn schema() -> Value {
+            serde_json::from_str(include_str!("../../../schemas/v0.3/query.schema.json")).unwrap()
+        }
+
+        #[test]
+        fn typed_constraint_mirror_stays_in_sync_with_embedded_schema() {
+            let schema = schema();
+            assert_eq!(schema["$id"], QUERY_SCHEMA_ID);
+            assert_eq!(schema["$defs"]["typeName"]["pattern"], TYPE_NAME_PATTERN);
+            assert_eq!(schema["$defs"]["fieldName"]["pattern"], FIELD_NAME_PATTERN);
+            assert_eq!(schema["$defs"]["typeList"]["minItems"], 1);
+            assert_eq!(schema["$defs"]["typeList"]["uniqueItems"], true);
+            assert_eq!(schema["$defs"]["expression"]["minLength"], 1);
+            assert_eq!(schema["properties"]["timezone"]["minLength"], 1);
+            assert_eq!(
+                schema["$defs"]["queryContext"]["properties"]["this"]["properties"]["path"]
+                    ["minLength"],
+                1
+            );
+            assert_eq!(schema["$defs"]["select"]["minItems"], 1);
+            assert_eq!(
+                schema["$defs"]["select"]["items"]["oneOf"][0]["minLength"],
+                1
+            );
+            for name in ["orderBy", "groupBy"] {
+                assert_eq!(schema["$defs"][name]["minItems"], 1);
+                assert_eq!(
+                    schema["$defs"][name]["items"]["properties"]["field"]["minLength"],
+                    1
+                );
+                assert_eq!(
+                    schema["$defs"][name]["items"]["properties"]["direction"]["default"],
+                    "asc"
+                );
+            }
+            assert_eq!(schema["properties"]["include_body"]["default"], false);
+            assert_eq!(
+                schema["properties"]["frontmatter_mode"]["default"],
+                "effective"
+            );
+            assert!(TYPE_NAME_PATTERN.contains(&format!("{{0,{}}}", TYPE_NAME_MAX_LENGTH - 1)));
+        }
+
+        #[test]
+        fn typed_defaults_omit_schema_invalid_empty_arrays() {
+            assert_eq!(QueryRequest::default().to_wire(), json!({}));
+            assert_eq!(
+                QueryRequest {
+                    select: Some(Vec::new()),
+                    ..QueryRequest::default()
+                }
+                .to_wire(),
+                json!({"select": []})
+            );
+        }
+    }
 }

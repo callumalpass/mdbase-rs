@@ -16,13 +16,13 @@ use super::model::{
     NamedViewDescriptor, ObsidianBaseDocument, ObsidianBaseView, ViewDocumentDescriptor,
     ViewPresentation, ViewPropertyDescriptor, ViewReferenceInput, ViewSourceDescriptor,
 };
+use crate::diagnostic::Diagnostic;
 use crate::expressions::evaluator::{
     extract_embeds_from_body, extract_links_from_body, extract_tags_from_body,
 };
 use crate::query::cache_source::FileRecord;
-use crate::v03::{validate_view, Diagnostic, OperationResult};
+use crate::v03::{validate_view, OperationResult};
 use crate::Collection;
-
 pub(super) fn list_views(collection: &Collection, _input: &Value) -> OperationResult {
     let mut diagnostics = Vec::new();
     let mut documents = canonical_documents(collection, &mut diagnostics);
@@ -406,33 +406,33 @@ fn execute_canonical(collection: &Collection, request: &ViewReferenceInput) -> O
             Some(request.path.clone()),
         );
     }
-    let read = collection.read(&json!({"path": request.path}));
-    if read.get("error").is_some() {
-        return failed(
-            "view_not_found",
-            format!("View record '{}' was not found.", request.path),
-            Some(request.path.clone()),
-        );
-    }
-    let document = read
-        .get("frontmatter")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let read_record = |path: &str| {
+        let request = crate::api::ReadRequest::new(path).ok()?;
+        collection
+            .typed()
+            .ok()?
+            .read(request)
+            .ok()
+            .map(|read| read.value)
+    };
+    let read = match read_record(&request.path) {
+        Some(read) => read,
+        None => {
+            return failed(
+                "view_not_found",
+                format!("View record '{}' was not found.", request.path),
+                Some(request.path.clone()),
+            )
+        }
+    };
+    let document = read.frontmatter;
     let prepared = match prepare_canonical_view_query(&document, request) {
         Ok(prepared) => prepared,
         Err(result) => return result,
     };
-    let context_types = prepared.context_path.as_deref().map(|context_path| {
-        collection
-            .read(&json!({"path": context_path}))
-            .get("types")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(String::from)
-            .collect::<Vec<_>>()
-    });
+    let context_path = prepared.context_path.as_deref();
+    let context_types =
+        context_path.map(|path| read_record(path).map(|read| read.types).unwrap_or_default());
     if let Err(result) = verify_canonical_view_context(&prepared, context_types.as_deref()) {
         return result;
     }

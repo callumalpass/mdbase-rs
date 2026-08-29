@@ -424,7 +424,7 @@ fn capture_clock(collection: &Collection, path: &str) -> Result<EvaluationClock,
         TEST_CLOCK_CAPTURES.with(|captures| captures.set(captures.get() + 1));
         return Ok(clock);
     }
-    super::cel::operation_clock(collection.settings.timezone.as_deref()).map_err(|failure| {
+    crate::cel::operation_clock(collection.settings.timezone.as_deref()).map_err(|failure| {
         vec![diagnostic(
             failure.code,
             failure.message,

@@ -4,13 +4,14 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use super::model::Query;
+use crate::cel;
+use crate::diagnostic::Diagnostic;
 use crate::expressions::evaluator::{
     extract_embeds_from_body, extract_links_from_body, extract_tags_from_body, EvalContext,
     NoteNamespaceSource, ResolvedFileData,
 };
 use crate::query::cache_source::FileRecord;
 use crate::types::schema::TypeDef;
-use crate::v03::{cel, Diagnostic};
 use crate::Collection;
 
 pub(super) type LinkGraph = Option<Arc<HashMap<String, Vec<String>>>>;
@@ -21,9 +22,9 @@ pub(super) fn load_context(
     all_files: Option<Arc<Vec<ResolvedFileData>>>,
     backlinks: LinkGraph,
     type_definitions: Arc<HashMap<String, TypeDef>>,
-) -> Result<Option<Box<EvalContext>>, Box<Diagnostic>> {
+) -> Result<(Option<Box<EvalContext>>, usize), Box<Diagnostic>> {
     let Some(context) = &query.context else {
-        return Ok(None);
+        return Ok((None, 0));
     };
     let path = &context.this.path;
     let request = crate::api::ReadRequest::new(path).map_err(|_| {
@@ -61,23 +62,26 @@ pub(super) fn load_context(
             Value::Array(types.iter().cloned().map(Value::String).collect()),
         );
     }
-    Ok(Some(Box::new(EvalContext {
-        frontmatter: bindings,
-        raw_frontmatter: Some(persisted),
-        file_path: Some(path.clone()),
-        body: Some(read.body),
-        file_size: Some(read.file.size),
-        file_mtime: Some(read.file.mtime),
-        file_ctime: None,
-        this_context: None,
-        all_files,
-        traversal_depth: std::cell::Cell::new(0),
-        backlinks_index: backlinks,
-        type_names: Some(types),
-        types: Some(type_definitions),
-        note_namespace_source: NoteNamespaceSource::Effective,
-        string_concat: false,
-    })))
+    Ok((
+        Some(Box::new(EvalContext {
+            frontmatter: bindings,
+            raw_frontmatter: Some(persisted),
+            file_path: Some(path.clone()),
+            body: Some(read.body),
+            file_size: Some(read.file.size),
+            file_mtime: Some(read.file.mtime),
+            file_ctime: None,
+            this_context: None,
+            all_files,
+            traversal_depth: std::cell::Cell::new(0),
+            backlinks_index: backlinks,
+            type_names: Some(types),
+            types: Some(type_definitions),
+            note_namespace_source: NoteNamespaceSource::Effective,
+            string_concat: false,
+        })),
+        1,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -248,7 +248,7 @@ impl CompiledCatalog {
                 .into_iter()
                 .find(|diagnostic| diagnostic.severity == "error")
                 .unwrap_or_else(|| {
-                    crate::v03::Diagnostic::error(
+                    crate::diagnostic::Diagnostic::error(
                         "invalid_type_definition",
                         "The mutated hosted type registry is invalid.",
                         None,
@@ -455,7 +455,7 @@ fn resolve_definition_catalog(
             .into_iter()
             .find(|diagnostic| diagnostic.severity == "error")
             .unwrap_or_else(|| {
-                crate::v03::Diagnostic::error(
+                crate::diagnostic::Diagnostic::error(
                     "invalid_type_definition",
                     "The mutated hosted definition registry is invalid.",
                     None,

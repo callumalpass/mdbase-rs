@@ -211,6 +211,15 @@ fn context_projections_selection_and_record_errors_follow_portable_semantics() {
             |diagnostic| diagnostic.path.as_deref() == Some("tasks/bad.md")
                 && diagnostic.field.as_deref() == Some("projections.adjusted")
         ));
+    let (_, performance) = collection.v03_operations().unwrap().query_profiled(&json!({
+        "types": ["task"],
+        "context": {"this": {"path": "projects/alpha.md"}},
+        "where": "this.project == project"
+    }));
+    assert_eq!(performance.record_source_loads, 1);
+    assert_eq!(performance.context_record_loads, 1);
+    assert_eq!(performance.total_source_loads, 2);
+
     let result_shape = v03::validate_query_result(&result.result);
     assert!(result_shape.is_empty(), "{result_shape:#?}\n{result:#?}");
 }

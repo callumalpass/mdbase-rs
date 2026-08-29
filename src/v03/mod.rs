@@ -5,7 +5,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use jsonschema::{Draft, JSONSchema};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
@@ -15,7 +14,6 @@ use crate::{Collection, SpecProfile};
 use schema_diagnostics::validation_diagnostic;
 
 pub(crate) mod batch;
-pub(crate) mod cel;
 mod collection_setup;
 mod lifecycle;
 mod operations;
@@ -24,10 +22,11 @@ mod schema_diagnostics;
 mod type_pack;
 pub(crate) mod write_membership;
 
-pub use cel::{
+pub use crate::cel::{
     evaluate_runtime_expression, evaluate_runtime_template, validate_runtime_expression,
     WorkflowCelError,
 };
+pub use crate::diagnostic::Diagnostic;
 pub use collection_setup::{
     CollectionSetup, CollectionSetupApplyOptions, CollectionSetupAssessment,
     CollectionSetupProvisions, CollectionSetupReceipt, CollectionSetupRequirements,
@@ -71,42 +70,6 @@ const TYPE_FILE_SCHEMA: &str = include_str!("../../schemas/v0.3/type-file.schema
 const TYPE_PACK_SCHEMA: &str = include_str!("../../schemas/v0.3/type-pack.schema.json");
 const TYPE_PACK_LOCK_SCHEMA: &str = include_str!("../../schemas/v0.3/type-pack-lock.schema.json");
 const VIEW_SCHEMA: &str = include_str!("../../schemas/v0.3/view.schema.json");
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Diagnostic {
-    pub severity: String,
-    pub code: String,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub field: Option<String>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub type_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema_location: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<Value>,
-}
-
-impl Diagnostic {
-    pub fn error(
-        code: impl Into<String>,
-        message: impl Into<String>,
-        path: Option<String>,
-    ) -> Self {
-        Self {
-            severity: "error".to_string(),
-            code: code.into(),
-            message: message.into(),
-            path,
-            field: None,
-            type_name: None,
-            schema_location: None,
-            details: None,
-        }
-    }
-}
 
 pub(super) fn collection_validation_errors(collection: &Collection) -> Vec<Diagnostic> {
     let validation = collection.validate_op(&serde_json::json!({}));

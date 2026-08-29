@@ -1,4 +1,4 @@
-//! Portable v0.3 expression host bindings built on the shared evaluator.
+//! Version-neutral portable expression host bindings built on the shared evaluator.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -6,12 +6,13 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
-use super::{Diagnostic, OperationResult};
+use crate::diagnostic::Diagnostic;
 use crate::expressions::ast::Expr;
 use crate::expressions::evaluator::{
     evaluate_with_limits, EvalContext, EvaluationClock, NoteNamespaceSource,
 };
 use crate::expressions::parser::Parser;
+use crate::v03::OperationResult;
 use crate::Collection;
 
 pub(crate) const MAX_SOURCE_BYTES: usize = 64 * 1024;

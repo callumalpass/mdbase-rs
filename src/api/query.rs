@@ -128,7 +128,7 @@ impl QueryRequest {
     /// transports, omitting unset defaults that are invalid on the wire.
     pub fn to_wire(&self) -> Value {
         #[cfg(test)]
-        crate::v03::query::record_typed_request_json_encode();
+        crate::query::canonical::record_typed_request_json_encode();
         let mut value = Map::new();
         if !self.types.is_empty() {
             value.insert("types".to_string(), json!(self.types));
