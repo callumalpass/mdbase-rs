@@ -372,19 +372,19 @@ fn resolution_keys(
         },
         RecordResolutionKey {
             kind: RecordResolutionKeyKind::Basename,
-            value: file.basename.to_ascii_lowercase(),
+            value: file.basename.to_lowercase(),
         },
     ];
     if let Some(id) = effective_frontmatter.get(id_field).and_then(Value::as_str) {
         keys.push(RecordResolutionKey {
             kind: RecordResolutionKeyKind::Id,
-            value: id.to_ascii_lowercase(),
+            value: id.to_lowercase(),
         });
     }
     if let Some(title) = effective_frontmatter.get("title").and_then(Value::as_str) {
         keys.push(RecordResolutionKey {
             kind: RecordResolutionKeyKind::Title,
-            value: title.to_ascii_lowercase(),
+            value: title.to_lowercase(),
         });
     }
     keys.sort();

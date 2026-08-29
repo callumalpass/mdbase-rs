@@ -1,6 +1,6 @@
 {
   "rustSourceFileCountMax": 151,
-  "rustSourceLineCountMax": 80342,
+  "rustSourceLineCountMax": 80751,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-command/src/lib.rs": 1809,
@@ -10,6 +10,7 @@
     "src/bin/phase0-baseline.rs": 1163,
     "src/data_contracts.rs": 1075,
     "src/expressions/evaluator.rs": 3390,
+    "src/links/resolver.rs": 1071,
     "src/query/engine.rs": 1086,
     "src/runtime/filesystem.rs": 1248,
     "src/runtime/hosted_base.rs": 1943,

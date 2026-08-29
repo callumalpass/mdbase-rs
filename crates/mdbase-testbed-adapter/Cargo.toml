@@ -11,7 +11,7 @@ description = "Black-box mdbase contract and runtime testbed adapter"
 async-trait = "0.1"
 chrono.workspace = true
 mdbase = { path = "../.." }
-mdbase-interop = { version = "0.1.0-rc.2", git = "https://github.com/mdbase-dev/mdbase-spec.git", rev = "362953e2644b07a7b61f92068a27ac6f917ee5c1" }
+mdbase-interop = { version = "0.1.0-rc.2", git = "https://github.com/mdbase-dev/mdbase-spec.git", rev = "68b9a97969bf9472f0d42b8faf8a2e349553f4ea" }
 mdbase-runtime = { path = "../mdbase-runtime" }
 serde.workspace = true
 serde_json.workspace = true

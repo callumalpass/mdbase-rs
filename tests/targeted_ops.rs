@@ -309,7 +309,35 @@ fn rename_preserves_opaque_frontmatter_when_only_the_body_changes() {
 }
 
 #[test]
-fn duplicate_simple_link_keys_are_ambiguous_instead_of_arbitrarily_resolved() {
+fn resolve_link_rejects_relative_syntax_that_crosses_the_root() {
+    let tmp = TempDir::new().expect("tempdir");
+    setup_minimal(tmp.path());
+    write_file(&tmp.path().join("inside.md"), "Inside.\n");
+    write_file(
+        &tmp.path().join("tasks/source.md"),
+        "---\nrelated: '[[../../inside]]'\n---\n",
+    );
+
+    let collection = open_collection(tmp.path());
+    let resolved = collection.resolve_link(&serde_json::json!({
+        "path": "tasks/source.md",
+        "field": "related"
+    }));
+    assert_eq!(resolved["error"]["code"], "path_traversal", "{resolved}");
+
+    write_file(
+        &tmp.path().join("source.md"),
+        "---\nrelated: '[Inside](a/../../inside)'\n---\n",
+    );
+    let resolved = collection.resolve_link(&serde_json::json!({
+        "path": "source.md",
+        "field": "related"
+    }));
+    assert_eq!(resolved["error"]["code"], "path_traversal", "{resolved}");
+}
+
+#[test]
+fn duplicate_filenames_resolve_deterministically_and_drive_backlinks() {
     let tmp = TempDir::new().expect("tempdir");
     setup_minimal(tmp.path());
     write_file(&tmp.path().join("one/duplicate.md"), "One.\n");
@@ -324,16 +352,38 @@ fn duplicate_simple_link_keys_are_ambiguous_instead_of_arbitrarily_resolved() {
         "path": "source.md",
         "field": "related"
     }));
-    assert!(resolved["resolved_path"].is_null(), "{resolved}");
+    assert_eq!(resolved["resolved_path"], "one/duplicate.md", "{resolved}");
     let deleted = collection.delete(&serde_json::json!({
         "path": "one/duplicate.md",
         "check_backlinks": true,
         "dry_run": true
     }));
     assert_eq!(deleted["would_delete"], true, "{deleted}");
-    assert!(deleted
-        .get("broken_links")
-        .is_none_or(|links| { links.as_array().is_some_and(Vec::is_empty) }));
+    assert!(
+        deleted["broken_links"]
+            .as_array()
+            .is_some_and(|links| !links.is_empty()),
+        "{deleted}"
+    );
+}
+
+#[test]
+fn duplicate_configured_ids_remain_ambiguous() {
+    let tmp = TempDir::new().expect("tempdir");
+    setup_minimal(tmp.path());
+    write_file(&tmp.path().join("one/a.md"), "---\nid: duplicate-id\n---\n");
+    write_file(&tmp.path().join("two/b.md"), "---\nid: duplicate-id\n---\n");
+    write_file(
+        &tmp.path().join("source.md"),
+        "---\nrelated: '[[duplicate-id]]'\n---\n",
+    );
+
+    let collection = open_collection(tmp.path());
+    let resolved = collection.resolve_link(&serde_json::json!({
+        "path": "source.md",
+        "field": "related"
+    }));
+    assert!(resolved["resolved_path"].is_null(), "{resolved}");
 }
 
 #[test]
