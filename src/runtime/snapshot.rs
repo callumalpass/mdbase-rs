@@ -1,6 +1,6 @@
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json, FrontmatterState};
 use crate::operations::{ensure_safe_relative_path, readable_record_path};
-use crate::record_load::{InvalidRecordReason, RecordLoadOutcome};
+use crate::record_load::RecordLoadOutcome;
 use crate::Collection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -325,28 +325,30 @@ fn load_snapshot_record(
             path,
             facts,
             document,
+            layout,
             raw_frontmatter,
-            body,
             type_names,
             ..
         } => Ok(SnapshotRecordLoad::Record(CollectionSnapshotRecord {
             path,
             revision: facts.revision,
             frontmatter: raw_frontmatter.as_object().cloned().unwrap_or_default(),
-            body,
+            body: layout.body(&document).to_string(),
             types: type_names,
             document,
             frontmatter_error: None,
         })),
         RecordLoadOutcome::Invalid {
-            reason: InvalidRecordReason::InvalidUtf8,
+            state: crate::record_load::InvalidRecordState::InvalidUtf8,
             ..
         } => Ok(SnapshotRecordLoad::InvalidUtf8),
         RecordLoadOutcome::Invalid {
             path,
             facts,
-            document: Some(document),
-            reason,
+            state:
+                crate::record_load::InvalidRecordState::Frontmatter {
+                    document, reason, ..
+                },
             ..
         } => {
             let mut record = materialize_snapshot_record(collection, &path, document);
@@ -354,16 +356,16 @@ fn load_snapshot_record(
             debug_assert_eq!(
                 record.frontmatter_error.as_deref(),
                 Some(match reason {
-                    InvalidRecordReason::InvalidYaml => "Failed to parse YAML frontmatter",
-                    InvalidRecordReason::NonMappingFrontmatter => {
+                    crate::record_load::InvalidFrontmatterReason::InvalidYaml => {
+                        "Failed to parse YAML frontmatter"
+                    }
+                    crate::record_load::InvalidFrontmatterReason::NonMappingFrontmatter => {
                         "Frontmatter must be a YAML mapping"
                     }
-                    InvalidRecordReason::InvalidUtf8 => unreachable!(),
                 })
             );
             Ok(SnapshotRecordLoad::Record(record))
         }
-        RecordLoadOutcome::Invalid { document: None, .. } => Ok(SnapshotRecordLoad::InvalidUtf8),
     }
 }
 

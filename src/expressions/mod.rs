@@ -81,6 +81,21 @@ use crate::types::compiled::CompiledComputed;
 use crate::Collection;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+#[cfg(test)]
+thread_local! {
+    static COMPUTED_FIELD_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_computed_field_evaluations_for_test() {
+    COMPUTED_FIELD_EVALUATIONS.with(|value| value.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn computed_field_evaluations_for_test() -> usize {
+    COMPUTED_FIELD_EVALUATIONS.with(std::cell::Cell::get)
+}
+
 impl Collection {
     /// Evaluate computed fields for a read result (§5.12).
     pub(crate) fn evaluate_computed_fields(
@@ -90,6 +105,8 @@ impl Collection {
         path: &str,
         body: Option<&str>,
     ) -> serde_json::Value {
+        #[cfg(test)]
+        COMPUTED_FIELD_EVALUATIONS.with(|value| value.set(value.get() + 1));
         let mut ordered_types = type_names.to_vec();
         ordered_types.sort();
         ordered_types.dedup();

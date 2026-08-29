@@ -49,7 +49,7 @@ impl Collection {
 
         // Canonical v0.3 callers freeze membership before lifecycle/default/generated behavior.
         // Legacy callers retain the historical inference path unchanged.
-        let type_names = if let Some(membership) = &membership {
+        let mut type_names = if let Some(membership) = &membership {
             membership.types().to_vec()
         } else {
             let mut names = Vec::new();
@@ -67,6 +67,17 @@ impl Collection {
             }
             names
         };
+        // An explicit final path participates in legacy type matching before
+        // generated values are evaluated, including path-only types.
+        if membership.is_none() {
+            if let Some(path) = path_input {
+                for name in self.determine_types_for_path(&frontmatter_input, Some(path)) {
+                    if !type_names.contains(&name) {
+                        type_names.push(name);
+                    }
+                }
+            }
+        }
 
         // Build frontmatter early so path_pattern can use generated/default values
         let mut fm_obj = match frontmatter_input.as_object() {
@@ -89,12 +100,44 @@ impl Collection {
             }
         }
 
-        // Generate values before path derivation so path_pattern can use them
-        self.apply_generated(&mut fm_obj, &type_names, true, path_input);
+        // Generate from one authoritative operation-local allocation context.
+        // This remains before the write lock because generated values may derive
+        // the destination path; concurrent creates retain the pre-Phase-3 race.
+        let has_generated = type_names.iter().any(|type_name| {
+            self.types.get(type_name).is_some_and(|definition| {
+                definition
+                    .fields
+                    .values()
+                    .any(|field| field.generated.is_some())
+            })
+        });
+        let operation_snapshot = if has_generated || self.settings.default_validation == "error" {
+            match self.capture_collection_snapshot(&crate::OperationCancellation::new()) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
+            }
+        } else {
+            None
+        };
+        if has_generated {
+            let mut generated = crate::generated::GeneratedValueContext::from_snapshot(
+                self,
+                operation_snapshot
+                    .as_ref()
+                    .expect("generated creates capture one snapshot"),
+            );
+            if let Err(error) =
+                generated.apply_generated(self, &mut fm_obj, &type_names, true, path_input)
+            {
+                return op_error(error.code(), &error.to_string());
+            }
+        }
 
         // Apply defaults to a temporary copy for path derivation
-        let fm_with_defaults =
-            self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
+        let fm_with_defaults = self.coerce_types(
+            &self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names),
+            &type_names,
+        );
 
         // Determine path
         let path = match path_input {
@@ -175,8 +218,10 @@ impl Collection {
         }
 
         // Apply defaults for effective frontmatter (for validation and output)
-        let effective =
-            self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names);
+        let effective = self.coerce_types(
+            &self.apply_defaults(&serde_json::Value::Object(fm_obj.clone()), &type_names),
+            &type_names,
+        );
 
         // Prepared v0.3 writes have already crossed the checked classification
         // boundary and are checked again above on the canonical path. Keep the
@@ -219,7 +264,20 @@ impl Collection {
             } else {
                 &effective
             };
-            let validation = self.validate(validation_frontmatter, &type_names, path.as_str());
+            let mut validation = self.validate(validation_frontmatter, &type_names, path.as_str());
+            let uniqueness = self.check_uniqueness(
+                &effective,
+                &type_names,
+                path.as_str(),
+                operation_snapshot
+                    .as_ref()
+                    .expect("validated creates capture one snapshot"),
+            );
+            validation.issues.extend(uniqueness);
+            validation.valid = !validation
+                .issues
+                .iter()
+                .any(|issue| issue.severity == Severity::Error);
             if !validation.valid {
                 return validation_failed_error(&validation.issues);
             }
@@ -277,8 +335,9 @@ impl Collection {
         }
 
         // Write file
-        let yaml_mapping =
-            frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
+        let canonical_mapping = frontmatter::parser::json_to_yaml_mapping(
+            &serde_json::Value::Object(write_obj.clone()),
+        );
         let content = match raw_document {
             Some((source, candidate, had_bom)) => {
                 let candidate_mapping = match candidate.frontmatter.as_ref() {
@@ -286,17 +345,27 @@ impl Collection {
                     None => None,
                     _ => unreachable!("prepared raw create has mapping frontmatter"),
                 };
+                let yaml_mapping = candidate_mapping.map_or_else(
+                    || canonical_mapping.clone(),
+                    |mapping| serializer::reconcile_json_object(mapping, &write_obj),
+                );
                 let mapping_unchanged = candidate_mapping.map_or_else(
                     || yaml_mapping.is_empty(),
                     |mapping| mapping == &yaml_mapping,
                 );
                 if mapping_unchanged && candidate.body == body {
-                    source
+                    Ok(source)
                 } else {
                     serializer::serialize_document_with_bom(had_bom, &yaml_mapping, body)
                 }
             }
-            None => serializer::serialize_document(&yaml_mapping, body),
+            None => serializer::serialize_document(&canonical_mapping, body),
+        };
+        let content = match content {
+            Ok(content) => content,
+            Err(error) => {
+                return op_error(FRONTMATTER_SERIALIZATION_FAILED, &error.to_string());
+            }
         };
 
         if let Err(error) =

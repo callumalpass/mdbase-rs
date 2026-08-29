@@ -15,7 +15,9 @@ impl Collection {
         from_no_ext: &str,
         to_no_ext: &str,
         source_dir: &str,
+        source_path: &str,
         source_id: Option<&str>,
+        resolution_index: &crate::links::resolver::LinkResolutionIndex,
     ) -> bool {
         let mut changed = false;
 
@@ -50,7 +52,9 @@ impl Collection {
                     from_no_ext,
                     to_no_ext,
                     source_dir,
+                    source_path,
                     source_id,
+                    resolution_index,
                 );
                 if new_line != line {
                     changed = true;
@@ -99,7 +103,9 @@ impl Collection {
         from_no_ext: &str,
         to_no_ext: &str,
         source_dir: &str,
+        source_path: &str,
         source_id: Option<&str>,
+        resolution_index: &crate::links::resolver::LinkResolutionIndex,
     ) -> String {
         let mut result = String::with_capacity(line.len());
         let chars: Vec<char> = line.chars().collect();
@@ -151,13 +157,15 @@ impl Collection {
                     if i < len {
                         let inner: String = chars[content_start..i].iter().collect();
                         i += 2; // skip ]]
-                        if self.link_resolves_to(
+                        if self.body_link_resolves_to(
                             &format!("[[{}]]", inner),
                             _from,
                             from_stem,
                             from_no_ext,
                             source_dir,
+                            source_path,
                             source_id,
+                            resolution_index,
                         ) {
                             let new_inner = self.rewrite_wikilink_inner(
                                 &inner,
@@ -208,13 +216,15 @@ impl Collection {
                         let href: String = chars[paren_start..i - 1].iter().collect();
                         if !href.starts_with("http://")
                             && !href.starts_with("https://")
-                            && self.link_resolves_to(
+                            && self.body_link_resolves_to(
                                 &href,
                                 _from,
                                 from_stem,
                                 from_no_ext,
                                 source_dir,
+                                source_path,
                                 source_id,
+                                resolution_index,
                             )
                         {
                             let text_part: String =
@@ -252,13 +262,15 @@ impl Collection {
                 if i < len {
                     let inner: String = chars[content_start..i].iter().collect();
                     i += 2;
-                    if self.link_resolves_to(
+                    if self.body_link_resolves_to(
                         &format!("[[{}]]", inner),
                         _from,
                         from_stem,
                         from_no_ext,
                         source_dir,
+                        source_path,
                         source_id,
+                        resolution_index,
                     ) {
                         let new_inner = self.rewrite_wikilink_inner(
                             &inner,
@@ -311,13 +323,15 @@ impl Collection {
                     let href: String = chars[paren_start..i - 1].iter().collect();
                     if !href.starts_with("http://")
                         && !href.starts_with("https://")
-                        && self.link_resolves_to(
+                        && self.body_link_resolves_to(
                             &href,
                             _from,
                             from_stem,
                             from_no_ext,
                             source_dir,
+                            source_path,
                             source_id,
+                            resolution_index,
                         )
                     {
                         let text_part: String = chars[link_start..paren_start - 1].iter().collect();
@@ -347,5 +361,33 @@ impl Collection {
         }
 
         result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn body_link_resolves_to(
+        &self,
+        link: &str,
+        from: &str,
+        from_stem: &str,
+        from_no_ext: &str,
+        source_dir: &str,
+        source_path: &str,
+        source_id: Option<&str>,
+        resolution_index: &crate::links::resolver::LinkResolutionIndex,
+    ) -> bool {
+        if self.is_stable_configured_id_wikilink(link, source_id) {
+            return false;
+        }
+        if !self.link_resolves_to(link, from, from_stem, from_no_ext, source_dir) {
+            return false;
+        }
+        match self.simple_wikilink_resolution(link, source_path, &[], resolution_index) {
+            None => true,
+            Some(crate::links::resolver::LinkResolution::Resolved(path)) => path == from,
+            Some(
+                crate::links::resolver::LinkResolution::Missing
+                | crate::links::resolver::LinkResolution::Ambiguous(_),
+            ) => false,
+        }
     }
 }

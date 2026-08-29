@@ -111,17 +111,62 @@ pub(crate) fn mutation_record_path(
         .map_err(|error| path_boundary_error(collection.spec_profile, &error.to_string()))
 }
 
+/// Prepare a record's parent below the held collection-root capability.
+///
+/// Every existing component is reopened without following links. Missing
+/// components are created relative to the currently held directory and then
+/// reopened no-follow, so a competing symlink, non-directory, or replacement
+/// race fails instead of redirecting an ambient path operation.
+pub(crate) fn prepare_record_parent_no_follow(
+    collection: &Collection,
+    path: &crate::api::CollectionPath,
+) -> std::io::Result<()> {
+    use cap_fs_ext::DirExt;
+
+    let path = path.to_path_buf();
+    let components = path.components().collect::<Vec<_>>();
+    let Some((_, parents)) = components.split_last() else {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    };
+    let mut directory = collection.root_capability()?;
+    let mut prepared = std::path::PathBuf::new();
+    for component in parents {
+        let Component::Normal(name) = component else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        };
+        prepared.push(name);
+        match directory.open_dir_nofollow(name) {
+            Ok(next) => directory = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match directory.create_dir(name) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+                #[cfg(test)]
+                crate::operations::rename::hooks::apply_injected_parent_swap(
+                    collection.root(),
+                    &prepared,
+                );
+                directory = directory.open_dir_nofollow(name)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Open one regular record relative to an already-authorized root without
 /// following symbolic links in any path component.
 ///
 /// Capability-relative handles bind every component to the opened root on
 /// Unix and Windows, eliminating pathname replacement races before reads.
 pub(crate) fn open_regular_record_no_follow(
-    collection_root: &Path,
+    collection: &Collection,
     relative_path: &str,
 ) -> std::io::Result<Option<std::fs::File>> {
     use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
-    use cap_std::fs::{Dir, OpenOptions};
+    use cap_std::fs::OpenOptions;
 
     let components = Path::new(relative_path)
         .components()
@@ -135,11 +180,14 @@ pub(crate) fn open_regular_record_no_follow(
     };
 
     #[cfg(test)]
-    if let Some(error) = injected_record_open_failure(collection_root, relative_path) {
-        return open_result_or_unavailable(Err(error));
+    {
+        if let Some(error) = injected_record_open_failure(collection.root(), relative_path) {
+            return open_result_or_unavailable(Err(error));
+        }
+        replace_record_with_symlink_for_test(collection.root(), relative_path);
     }
 
-    let mut directory = Dir::open_ambient_dir(collection_root, cap_std::ambient_authority())?;
+    let mut directory = collection.root_capability()?;
     for component in parents {
         let Some(next) = open_result_or_unavailable(directory.open_dir_nofollow(component))? else {
             return Ok(None);
@@ -250,6 +298,49 @@ fn injected_record_open_failure(
         .map(std::io::Error::from)
 }
 
+#[cfg(all(test, unix))]
+fn record_symlink_replacements() -> &'static std::sync::Mutex<
+    std::collections::BTreeMap<(std::path::PathBuf, String), std::path::PathBuf>,
+> {
+    static REPLACEMENTS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::BTreeMap<(std::path::PathBuf, String), std::path::PathBuf>,
+        >,
+    > = std::sync::OnceLock::new();
+    REPLACEMENTS.get_or_init(Default::default)
+}
+
+#[cfg(all(test, unix))]
+fn replace_record_with_symlink_for_test(collection_root: &Path, relative_path: &str) {
+    let target = record_symlink_replacements()
+        .lock()
+        .expect("record replacement lock")
+        .remove(&(collection_root.to_path_buf(), relative_path.to_string()));
+    if let Some(target) = target {
+        let record = collection_root.join(relative_path);
+        std::fs::remove_file(&record).expect("remove record before test replacement");
+        std::os::unix::fs::symlink(target, record).expect("install test symlink replacement");
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+fn replace_record_with_symlink_for_test(_collection_root: &Path, _relative_path: &str) {}
+
+#[cfg(all(test, unix))]
+pub(crate) fn replace_record_with_symlink_on_open_for_test(
+    collection_root: &Path,
+    relative_path: &str,
+    target: &Path,
+) {
+    record_symlink_replacements()
+        .lock()
+        .expect("record replacement lock")
+        .insert(
+            (collection_root.to_path_buf(), relative_path.to_string()),
+            target.to_path_buf(),
+        );
+}
+
 #[cfg(test)]
 pub(crate) fn set_record_open_failure(
     collection_root: &Path,
@@ -345,22 +436,34 @@ pub(crate) fn ensure_revision(
 /// The temporary file lives beside the destination so persistence remains on
 /// the same filesystem. Existing permissions are retained on replacement.
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    atomic_write_mode(path, contents, false)
+    atomic_write_mode(path, contents, false, true)
 }
 
 /// Atomically create a new file without replacing a concurrent creator.
 pub(crate) fn atomic_create(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    atomic_write_mode(path, contents, true)
+    atomic_write_mode(path, contents, true, true)
 }
 
-fn atomic_write_mode(path: &Path, contents: &[u8], no_clobber: bool) -> std::io::Result<()> {
+/// Atomically replace a file whose parent was already prepared and fenced.
+pub(crate) fn atomic_write_in_prepared_parent(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    atomic_write_mode(path, contents, false, false)
+}
+
+fn atomic_write_mode(
+    path: &Path,
+    contents: &[u8],
+    no_clobber: bool,
+    create_parent: bool,
+) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "destination has no parent directory",
         )
     })?;
-    std::fs::create_dir_all(parent)?;
+    if create_parent {
+        std::fs::create_dir_all(parent)?;
+    }
     let permissions = std::fs::metadata(path)
         .ok()
         .map(|metadata| metadata.permissions());
@@ -428,8 +531,13 @@ mod tests {
     use super::{
         ensure_safe_relative_path, open_regular_record_no_follow, open_result_or_unavailable,
     };
-    use crate::SpecProfile;
+    use crate::{Collection, SpecProfile};
     use std::io::ErrorKind;
+
+    fn collection(root: &std::path::Path) -> Collection {
+        std::fs::write(root.join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        Collection::open(root).unwrap()
+    }
 
     #[test]
     fn durability_primitives_cover_create_replace_cross_directory_rename_and_delete() {
@@ -530,18 +638,19 @@ mod tests {
     #[test]
     fn nofollow_open_preserves_missing_non_directory_and_non_regular_outcomes() {
         let root = tempfile::tempdir().expect("tempdir");
+        let collection = collection(root.path());
         std::fs::write(root.path().join("parent-file"), b"not a directory").unwrap();
         std::fs::create_dir(root.path().join("directory.md")).unwrap();
 
-        assert!(open_regular_record_no_follow(root.path(), "missing.md")
+        assert!(open_regular_record_no_follow(&collection, "missing.md")
             .unwrap()
             .is_none());
         assert!(
-            open_regular_record_no_follow(root.path(), "parent-file/record.md")
+            open_regular_record_no_follow(&collection, "parent-file/record.md")
                 .unwrap()
                 .is_none()
         );
-        assert!(open_regular_record_no_follow(root.path(), "directory.md")
+        assert!(open_regular_record_no_follow(&collection, "directory.md")
             .unwrap()
             .is_none());
     }
@@ -552,6 +661,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().expect("tempdir");
+        let collection = collection(root.path());
         let outside = tempfile::tempdir().expect("outside tempdir");
         std::fs::write(outside.path().join("record.md"), b"outside").unwrap();
         symlink(outside.path(), root.path().join("linked-parent")).unwrap();
@@ -562,11 +672,11 @@ mod tests {
         .unwrap();
 
         assert!(
-            open_regular_record_no_follow(root.path(), "linked-parent/record.md")
+            open_regular_record_no_follow(&collection, "linked-parent/record.md")
                 .unwrap()
                 .is_none()
         );
-        assert!(open_regular_record_no_follow(root.path(), "linked-leaf.md")
+        assert!(open_regular_record_no_follow(&collection, "linked-leaf.md")
             .unwrap()
             .is_none());
     }

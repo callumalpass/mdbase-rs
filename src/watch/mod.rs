@@ -505,7 +505,17 @@ fn process_type_change(
     let new_definition = val.get("new_definition")?.as_str()?;
 
     // Find affected files (files of this type) before applying change
-    let all_files = collection.build_all_files_data();
+    let all_files = match collection.build_all_files_data() {
+        Ok(files) => files,
+        Err(error) => {
+            return Some(vec![json!({
+                "event": "operation_failed",
+                "timestamp": now_timestamp(),
+                "code": "collection_snapshot_failed",
+                "message": error.to_string(),
+            })]);
+        }
+    };
     let mut affected_files: Vec<String> = Vec::new();
     for file_data in &all_files {
         let file_types =

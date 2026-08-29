@@ -221,6 +221,8 @@ impl CompiledCatalog {
             type_plans: self.collection.type_plans.clone(),
             type_warnings: self.collection.type_warnings.clone(),
             data_contracts,
+            root_capability: Collection::capability_for_root(directory.path())
+                .map_err(validation_stage_error)?,
         };
         Ok(collection
             .v03_operations()

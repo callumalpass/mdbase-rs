@@ -727,7 +727,8 @@ fn write_markdown_file(
             .map_err(|e| format!("Failed to create parent folder {}: {e}", parent.display()))?;
     }
     let yaml_mapping = json_to_yaml_mapping(frontmatter);
-    let content = serialize_document(&yaml_mapping, body);
+    let content = serialize_document(&yaml_mapping, body)
+        .map_err(|error| format!("Failed to serialize {}: {error}", path.display()))?;
     fs::write(path, content).map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 

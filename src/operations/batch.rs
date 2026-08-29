@@ -1,10 +1,72 @@
 //! Batch operations (§12.7).
 
 use crate::errors::*;
-use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
+use crate::frontmatter::parser::yaml_mapping_to_json;
 use crate::frontmatter::serializer;
 use crate::query::engine::QueryEvalContext;
 use crate::Collection;
+
+fn invalid_record_batch_detail(
+    path: &str,
+    invalid: crate::record_load::InvalidRecordView<'_>,
+) -> serde_json::Value {
+    let reason = match invalid {
+        crate::record_load::InvalidRecordView::Frontmatter { reason, .. } => reason,
+        crate::record_load::InvalidRecordView::InvalidUtf8 { .. } => {
+            crate::record_load::InvalidRecordReason::InvalidUtf8
+        }
+    };
+    let (code, message) = match reason {
+        crate::record_load::InvalidRecordReason::InvalidUtf8 => (
+            "file_read_failed",
+            "Collection record could not be read".to_string(),
+        ),
+        _ => (
+            INVALID_FRONTMATTER,
+            format!("Invalid frontmatter: {}", reason.as_str()),
+        ),
+    };
+    serde_json::json!({
+        "path": path,
+        "status": "failed",
+        "error": {"code": code, "message": message},
+    })
+}
+
+fn preflight_serialization(
+    record: crate::record_load::ParsedRecordView<'_>,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), serializer::FrontmatterSerializationError> {
+    let authored_mapping = crate::frontmatter::parser::parse_document(record.document)
+        .frontmatter
+        .and_then(|value| value.as_mapping().cloned())
+        .unwrap_or_default();
+    let mapping = serializer::reconcile_json_object(&authored_mapping, fields);
+    serializer::serialize_document_with_bom(
+        record.layout.had_bom(),
+        &mapping,
+        record.layout.body(record.document),
+    )?;
+    Ok(())
+}
+
+fn serialization_failure_detail(path: &str, error: &impl std::fmt::Display) -> serde_json::Value {
+    serde_json::json!({
+        "path": path,
+        "status": "failed",
+        "error": {
+            "code": FRONTMATTER_SERIALIZATION_FAILED,
+            "message": error.to_string(),
+        },
+    })
+}
+
+fn timestamp_from_ns(value: i64) -> Option<String> {
+    let seconds = value.div_euclid(1_000_000_000);
+    let nanoseconds = value.rem_euclid(1_000_000_000) as u32;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanoseconds)
+        .map(|time| time.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
 
 impl Collection {
     pub fn batch_update(
@@ -50,8 +112,17 @@ impl Collection {
             );
         }
 
-        // Find matching files using query logic
-        let matching_paths = self.query_matching_paths_with_types(where_clause, &filter_types);
+        // Select and preflight from one authoritative generation.
+        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
+        };
+        let matching_paths =
+            match self.query_matching_paths_with_types(&snapshot, where_clause, &filter_types) {
+                Ok(paths) => paths,
+                Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
+            };
 
         let total = matching_paths.len();
         if total == 0 {
@@ -65,60 +136,135 @@ impl Collection {
             });
         }
 
-        // Validate-all-then-execute: validate all files first
-        if self.settings.default_validation == "error" {
-            for path in &matching_paths {
-                let full_path = self.root.join(path);
-                let content = match std::fs::read_to_string(&full_path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let doc = parse_document(&content);
-                let existing_mapping = match &doc.frontmatter {
-                    Some(serde_yaml::Value::Mapping(m)) => m.clone(),
-                    _ => serde_yaml::Mapping::new(),
-                };
-                let merged = serializer::merge_fields(
-                    &existing_mapping,
-                    &fields,
-                    &self.settings.write_nulls,
+        let mut ineligible_paths = std::collections::HashSet::new();
+        let mut details = Vec::new();
+        for path in &matching_paths {
+            let Some(entry) = snapshot.entry(path) else {
+                return op_error(
+                    "collection_snapshot_failed",
+                    "selected record is absent from its snapshot",
                 );
-                let merged_json = yaml_mapping_to_json(&merged);
-                let type_names = self.determine_types(&merged_json);
-                let effective = self.apply_defaults(&merged_json, &type_names);
+            };
+            if let Some(invalid) = entry.invalid() {
+                ineligible_paths.insert(path.clone());
+                details.push(invalid_record_batch_detail(path, invalid));
+            }
+        }
+
+        // Finalize generated values and validate the complete proposed state
+        // once. Reservations advance only after an item passes local preflight.
+        let mut generated = crate::generated::GeneratedValueContext::from_snapshot(self, &snapshot);
+        let mut proposals = Vec::new();
+        let mut prepared_updates = std::collections::HashMap::new();
+        let mut corpus = snapshot
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .effective_frontmatter()
+                    .map(|frontmatter| (entry.relative_path().to_string(), frontmatter.clone()))
+            })
+            .collect::<Vec<_>>();
+        for path in &matching_paths {
+            if ineligible_paths.contains(path) {
+                continue;
+            }
+            let entry = snapshot.entry(path).expect("selected snapshot entry");
+            let Some(parsed) = entry.parsed() else {
+                continue;
+            };
+            let existing_mapping =
+                crate::frontmatter::parser::json_to_yaml_mapping(parsed.raw_frontmatter);
+            let merged =
+                serializer::merge_fields(&existing_mapping, &fields, &self.settings.write_nulls);
+            let merged_json = yaml_mapping_to_json(&merged);
+            let type_names = self.determine_types_for_path(&merged_json, Some(path));
+            let mut proposed_raw = merged_json.as_object().cloned().unwrap_or_default();
+            let mut candidate_generated = generated.clone();
+            if let Err(error) = candidate_generated.apply_generated(
+                self,
+                &mut proposed_raw,
+                &type_names,
+                false,
+                Some(path),
+            ) {
+                return op_error(error.code(), &error.to_string());
+            }
+            let raw_value = serde_json::Value::Object(proposed_raw.clone());
+            let effective =
+                self.coerce_types(&self.apply_defaults(&raw_value, &type_names), &type_names);
+            if let Err(error) = preflight_serialization(parsed, &proposed_raw) {
+                ineligible_paths.insert(path.clone());
+                details.push(serialization_failure_detail(path, &error));
+                continue;
+            }
+            if self.settings.default_validation == "error" {
                 let validation = self.validate(&effective, &type_names, path);
                 if !validation.valid {
                     return validation_failed_error(&validation.issues);
                 }
             }
+            generated = candidate_generated;
+            if let Some((_, frontmatter)) =
+                corpus.iter_mut().find(|(candidate, _)| candidate == path)
+            {
+                *frontmatter = effective.clone();
+            }
+            proposals.push((path.clone(), effective, type_names));
+            prepared_updates.insert(
+                path.clone(),
+                crate::operations::update::PrevalidatedUpdate {
+                    expected_revision: entry.facts().revision.clone(),
+                    raw_frontmatter: proposed_raw,
+                },
+            );
+        }
+        if self.settings.default_validation == "error" {
+            for (path, effective, type_names) in &proposals {
+                let issues = self.check_uniqueness_in_corpus(effective, type_names, path, &corpus);
+                if !issues.is_empty() {
+                    return validation_failed_error(&issues);
+                }
+            }
         }
 
         if dry_run {
+            if details.is_empty() {
+                return serde_json::json!({
+                    "batch_result": {
+                        "total": total,
+                        "succeeded": total,
+                        "failed": 0,
+                    }
+                });
+            }
             return serde_json::json!({
                 "batch_result": {
                     "total": total,
-                    "succeeded": total,
-                    "failed": 0,
+                    "succeeded": total - details.len(),
+                    "failed": details.len(),
+                    "details": details,
                 }
             });
         }
 
-        // Execute updates
+        // Execute only records proven parsed by the captured generation.
         let mut succeeded = 0usize;
-        let mut failed = 0usize;
+        let mut failed = details.len();
         let mut skipped = 0usize;
-        let mut details: Vec<serde_json::Value> = Vec::new();
         let mut failed_paths: Vec<String> = Vec::new();
 
         // Build backlinks index for skip_dependents checking
         let bl_index_for_skip = if skip_dependents {
-            let all_files = self.build_all_files_data();
-            Some(self.build_backlinks_index(&all_files))
+            Some(self.build_backlinks_index_for_snapshot(&snapshot))
         } else {
             None
         };
 
         for path in &matching_paths {
+            if ineligible_paths.contains(path) {
+                continue;
+            }
             // Check skip_dependents: if this file has a link TO a failed file, skip it
             // Use backlinks index: if a failed file has this file as a backlink source,
             // then this file links to the failed file and should be skipped
@@ -154,10 +300,16 @@ impl Collection {
                 }
             }
 
-            let update_result = self.update(&serde_json::json!({
-                "path": path,
-                "fields": fields,
-            }));
+            let prepared = prepared_updates
+                .remove(path)
+                .expect("eligible batch update was finalized");
+            let update_result = self.update_prevalidated(
+                &serde_json::json!({
+                    "path": path,
+                    "fields": fields,
+                }),
+                prepared,
+            );
 
             if update_result.get("error").is_some() {
                 failed += 1;
@@ -212,62 +364,151 @@ impl Collection {
             }
         }
 
-        // Validate all first
-        if self.settings.default_validation == "error" {
-            for update in updates {
-                let path = match update.get("path").and_then(|v| v.as_str()) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let fields = update
-                    .get("fields")
-                    .cloned()
-                    .unwrap_or(serde_json::json!({}));
-                let full_path = self.root.join(path);
-                let content = match std::fs::read_to_string(&full_path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let doc = parse_document(&content);
-                let existing_mapping = match &doc.frontmatter {
-                    Some(serde_yaml::Value::Mapping(m)) => m.clone(),
-                    _ => serde_yaml::Mapping::new(),
-                };
-                let merged = serializer::merge_fields(
-                    &existing_mapping,
-                    &fields,
-                    &self.settings.write_nulls,
-                );
-                let merged_json = yaml_mapping_to_json(&merged);
-                let type_names = self.determine_types(&merged_json);
-                let effective = self.apply_defaults(&merged_json, &type_names);
+        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
+        };
+
+        let mut ineligible_paths = std::collections::HashSet::new();
+        let mut details = Vec::new();
+        for update in updates {
+            let path = update
+                .get("path")
+                .and_then(|value| value.as_str())
+                .expect("explicit update paths were validated");
+            let Some(entry) = snapshot.entry(path) else {
+                return op_error(FILE_NOT_FOUND, &format!("File not found: {path}"));
+            };
+            if let Some(invalid) = entry.invalid() {
+                ineligible_paths.insert(path.to_string());
+                details.push(invalid_record_batch_detail(path, invalid));
+            }
+        }
+
+        let mut generated = crate::generated::GeneratedValueContext::from_snapshot(self, &snapshot);
+        let mut working_raw = snapshot
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .raw_frontmatter()
+                    .map(|frontmatter| (entry.relative_path().to_string(), frontmatter.clone()))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut effective_corpus = snapshot
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .effective_frontmatter()
+                    .map(|frontmatter| (entry.relative_path().to_string(), frontmatter.clone()))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut final_proposals = std::collections::HashMap::new();
+        let mut prepared_updates = Vec::with_capacity(updates.len());
+        for update in updates {
+            let path = update
+                .get("path")
+                .and_then(|value| value.as_str())
+                .expect("explicit update paths were validated");
+            if ineligible_paths.contains(path) {
+                prepared_updates.push(None);
+                continue;
+            }
+            let fields = update
+                .get("fields")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            let existing = working_raw.get(path).expect("eligible snapshot record");
+            let existing_mapping = crate::frontmatter::parser::json_to_yaml_mapping(existing);
+            let merged =
+                serializer::merge_fields(&existing_mapping, &fields, &self.settings.write_nulls);
+            let merged_json = yaml_mapping_to_json(&merged);
+            let type_names = self.determine_types_for_path(&merged_json, Some(path));
+            let mut proposed_raw = merged_json.as_object().cloned().unwrap_or_default();
+            let mut candidate_generated = generated.clone();
+            if let Err(error) = candidate_generated.apply_generated(
+                self,
+                &mut proposed_raw,
+                &type_names,
+                false,
+                Some(path),
+            ) {
+                return op_error(error.code(), &error.to_string());
+            }
+            let raw_value = serde_json::Value::Object(proposed_raw.clone());
+            let effective =
+                self.coerce_types(&self.apply_defaults(&raw_value, &type_names), &type_names);
+            let entry = snapshot.entry(path).expect("explicit snapshot entry");
+            let Some(parsed) = entry.parsed() else {
+                prepared_updates.push(None);
+                continue;
+            };
+            if let Err(error) = preflight_serialization(parsed, &proposed_raw) {
+                ineligible_paths.insert(path.to_string());
+                details.push(serialization_failure_detail(path, &error));
+                prepared_updates.push(None);
+                continue;
+            }
+            if self.settings.default_validation == "error" {
                 let validation = self.validate(&effective, &type_names, path);
                 if !validation.valid {
                     return validation_failed_error(&validation.issues);
+                }
+            }
+            generated = candidate_generated;
+            working_raw.insert(path.to_string(), raw_value);
+            effective_corpus.insert(path.to_string(), effective.clone());
+            final_proposals.insert(path.to_string(), (effective, type_names));
+            prepared_updates.push(Some(crate::operations::update::PrevalidatedUpdate {
+                expected_revision: entry.facts().revision.clone(),
+                raw_frontmatter: proposed_raw,
+            }));
+        }
+        if self.settings.default_validation == "error" {
+            let corpus = effective_corpus.into_iter().collect::<Vec<_>>();
+            for (path, (effective, type_names)) in final_proposals {
+                let issues =
+                    self.check_uniqueness_in_corpus(&effective, &type_names, &path, &corpus);
+                if !issues.is_empty() {
+                    return validation_failed_error(&issues);
                 }
             }
         }
 
         let total = updates.len();
         if dry_run {
+            if details.is_empty() {
+                return serde_json::json!({
+                    "batch_result": {
+                        "total": total,
+                        "succeeded": total,
+                        "failed": 0,
+                    }
+                });
+            }
             return serde_json::json!({
                 "batch_result": {
                     "total": total,
-                    "succeeded": total,
-                    "failed": 0,
+                    "succeeded": total - details.len(),
+                    "failed": details.len(),
+                    "details": details,
                 }
             });
         }
 
         let mut succeeded = 0usize;
-        let mut failed = 0usize;
-        let mut details: Vec<serde_json::Value> = Vec::new();
+        let mut failed = details.len();
 
-        for update in updates {
-            let path = match update.get("path").and_then(|v| v.as_str()) {
-                Some(p) => p,
-                None => continue,
-            };
+        for (index, update) in updates.iter().enumerate() {
+            let path = update
+                .get("path")
+                .and_then(|value| value.as_str())
+                .expect("explicit update paths were validated");
+            if ineligible_paths.contains(path) {
+                continue;
+            }
             let fields = update
                 .get("fields")
                 .cloned()
@@ -281,7 +522,13 @@ impl Collection {
                 }
             }
 
-            let result = self.update(&serde_json::json!({ "path": path, "fields": fields }));
+            let prepared = prepared_updates[index]
+                .take()
+                .expect("eligible explicit update was finalized");
+            let result = self.update_prevalidated(
+                &serde_json::json!({ "path": path, "fields": fields }),
+                prepared,
+            );
             if result.get("error").is_some() {
                 failed += 1;
                 details.push(serde_json::json!({ "path": path, "status": "failed" }));
@@ -336,7 +583,16 @@ impl Collection {
             return op_error("invalid_input", "batch_delete requires 'where'");
         }
 
-        let matching_paths = self.query_matching_paths_with_types(where_clause, &filter_types);
+        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
+        };
+        let matching_paths =
+            match self.query_matching_paths_with_types(&snapshot, where_clause, &filter_types) {
+                Ok(paths) => paths,
+                Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
+            };
 
         let total = matching_paths.len();
         if total == 0 {
@@ -353,8 +609,7 @@ impl Collection {
         // Check backlinks before deletion
         let mut broken_links: Vec<serde_json::Value> = Vec::new();
         if check_backlinks {
-            let all_files = self.build_all_files_data();
-            let bl_index = self.build_backlinks_index(&all_files);
+            let bl_index = self.build_backlinks_index_for_snapshot(&snapshot);
             for path in &matching_paths {
                 if let Some(sources) = bl_index.get(path) {
                     for source in sources {
@@ -396,16 +651,13 @@ impl Collection {
                 }
             }
 
-            let full_path = self.root.join(path);
-            match std::fs::remove_file(&full_path) {
-                Ok(_) => {
-                    succeeded += 1;
-                    details.push(serde_json::json!({ "path": path, "status": "success" }));
-                }
-                Err(_) => {
-                    failed += 1;
-                    details.push(serde_json::json!({ "path": path, "status": "failed" }));
-                }
+            let deleted = self.delete(&serde_json::json!({"path": path}));
+            if deleted.get("error").is_some() {
+                failed += 1;
+                details.push(serde_json::json!({ "path": path, "status": "failed" }));
+            } else {
+                succeeded += 1;
+                details.push(serde_json::json!({ "path": path, "status": "success" }));
             }
         }
 
@@ -423,131 +675,170 @@ impl Collection {
         result
     }
 
-    /// Query matching file paths (reuses query logic but only returns paths).
-    #[allow(dead_code)]
-    pub(crate) fn query_matching_paths(&self, where_clause: &serde_json::Value) -> Vec<String> {
-        self.query_matching_paths_with_types(Some(where_clause), &[])
-    }
-
-    /// Query matching file paths with optional type filtering.
+    /// Query matching paths from one already captured authoritative generation.
     pub(crate) fn query_matching_paths_with_types(
         &self,
+        snapshot: &crate::snapshot::AuthoritativeCollectionSnapshot,
         where_clause: Option<&serde_json::Value>,
         filter_types: &[String],
-    ) -> Vec<String> {
-        let files = self.scan_collection_files();
-        let mut matching: Vec<String> = Vec::new();
-
-        // Build all_files data for asFile() traversal in where clauses
-        let all_files_data: Vec<crate::expressions::evaluator::ResolvedFileData> = files
-            .iter()
-            .filter_map(|fp| {
-                let rp = fp
-                    .strip_prefix(&self.root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default()
-                    .replace('\\', "/");
-                let content = std::fs::read_to_string(fp).ok()?;
-                let doc = parse_document(&content);
-                let fm = match &doc.frontmatter {
-                    Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
-                    _ => serde_json::json!({}),
-                };
-                let type_names = self.determine_types_for_path(&fm, Some(&rp));
-                let effective = self.apply_defaults(&fm, &type_names);
-                let effective = self.coerce_types(&effective, &type_names);
-                Some(crate::expressions::evaluator::ResolvedFileData {
-                    path: rp,
-                    frontmatter: effective,
-                    body: doc.body,
+    ) -> Result<Vec<String>, crate::CollectionSnapshotError> {
+        let Some(where_value) = where_clause else {
+            let mut matching = snapshot
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    filter_types.is_empty()
+                        || entry
+                            .type_names()
+                            .iter()
+                            .any(|name| filter_types.contains(name))
                 })
-            })
-            .collect();
-        let all_files_arc = std::sync::Arc::new(all_files_data);
-        let backlinks_index = self.build_backlinks_index(&all_files_arc);
-        let backlinks_arc = std::sync::Arc::new(backlinks_index);
+                .map(|entry| entry.relative_path().to_string())
+                .collect::<Vec<_>>();
+            matching.sort();
+            return Ok(matching);
+        };
 
-        for file_path in &files {
-            let rel_path = file_path
-                .strip_prefix(&self.root)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default()
-                .replace('\\', "/");
-
-            let content = match std::fs::read_to_string(file_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let doc = parse_document(&content);
-
-            let raw_frontmatter = match &doc.frontmatter {
-                Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
-                _ => serde_json::json!({}),
-            };
-
-            let type_names = self.determine_types_for_path(&raw_frontmatter, Some(&rel_path));
-
-            // Apply type filter if provided
-            if !filter_types.is_empty() {
-                let matches = type_names.iter().any(|tn| filter_types.contains(tn));
-                if !matches {
-                    continue;
-                }
-            }
-
-            let effective = self.apply_defaults(&raw_frontmatter, &type_names);
-            let effective = self.coerce_types(&effective, &type_names);
-            let effective = self.evaluate_computed_fields(
-                effective,
-                &type_names,
-                &rel_path,
-                Some(doc.body.as_str()),
+        let needs_link_graph = self.where_clause_uses_link_graph(where_value);
+        let (all_files_arc, backlinks_arc) = if needs_link_graph {
+            let resolved_files = std::sync::Arc::new(snapshot.resolved_files_data());
+            let backlinks = std::sync::Arc::new(
+                self.build_backlinks_index_for_snapshot_files(snapshot, &resolved_files),
             );
+            (Some(resolved_files), Some(backlinks))
+        } else {
+            (None, None)
+        };
+        let mut matching = Vec::new();
 
-            // If no where clause, match all (type-filtered) files
-            let matches = if let Some(where_val) = where_clause {
-                let file_metadata = std::fs::metadata(file_path).ok();
-                let file_size = file_metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-                let file_mtime = file_metadata
-                    .as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .map(|t| {
-                        let dt: chrono::DateTime<chrono::Utc> = t.into();
-                        dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-                    });
-                let file_ctime = file_metadata
-                    .as_ref()
-                    .and_then(|m| m.created().ok())
-                    .map(|t| {
-                        let dt: chrono::DateTime<chrono::Utc> = t.into();
-                        dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-                    });
-
-                let eval_ctx = QueryEvalContext {
-                    frontmatter: &effective,
-                    raw_frontmatter: &raw_frontmatter,
-                    file_path: &rel_path,
-                    body: &doc.body,
-                    type_names: &type_names,
-                    formulas: &serde_json::Map::new(),
-                    file_size,
-                    file_mtime: file_mtime.as_deref(),
-                    file_ctime: file_ctime.as_deref(),
-                    this_context: None,
-                    all_files: Some(all_files_arc.clone()),
-                    backlinks_index: Some(backlinks_arc.clone()),
-                };
-                self.evaluate_where(&eval_ctx, where_val)
-            } else {
-                true
+        for entry in snapshot.entries() {
+            let rel_path = entry.relative_path();
+            let type_names = entry.type_names();
+            if !filter_types.is_empty()
+                && !type_names.iter().any(|name| filter_types.contains(name))
+            {
+                continue;
+            }
+            let (Some(body), Some(base_effective)) = (entry.body(), entry.effective_frontmatter())
+            else {
+                continue;
             };
-
+            let raw_frontmatter = entry
+                .raw_frontmatter()
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let effective = self.evaluate_computed_fields(
+                base_effective.clone(),
+                type_names,
+                rel_path,
+                Some(body),
+            );
+            let facts = entry.facts();
+            let file_mtime = timestamp_from_ns(facts.mtime_ns);
+            let file_ctime = facts.ctime_ns.and_then(timestamp_from_ns);
+            let eval_ctx = QueryEvalContext {
+                frontmatter: &effective,
+                raw_frontmatter: &raw_frontmatter,
+                file_path: rel_path,
+                body,
+                type_names,
+                formulas: &serde_json::Map::new(),
+                file_size: facts.size,
+                file_mtime: file_mtime.as_deref(),
+                file_ctime: file_ctime.as_deref(),
+                this_context: None,
+                all_files: all_files_arc.clone(),
+                backlinks_index: backlinks_arc.clone(),
+            };
+            let matches = self.evaluate_where(&eval_ctx, where_value);
             if matches {
-                matching.push(rel_path);
+                matching.push(rel_path.to_string());
             }
         }
-
         matching.sort();
-        matching
+        Ok(matching)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_batch_tests {
+    use super::*;
+
+    #[test]
+    fn type_only_selection_at_two_thousand_records_uses_indexed_lookups_and_no_link_projection() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        for index in 0..2_048 {
+            std::fs::write(
+                root.path().join(format!("{index:04}.md")),
+                "---\ntype: note\n---\nbody\n",
+            )
+            .unwrap();
+        }
+        let collection = Collection::open(root.path()).unwrap();
+        let snapshot = collection
+            .capture_collection_snapshot(&crate::OperationCancellation::new())
+            .unwrap();
+        crate::snapshot::reset_snapshot_projection_counters_for_test();
+        crate::expressions::reset_computed_field_evaluations_for_test();
+
+        for index in (0..2_048).rev() {
+            assert!(snapshot.entry(&format!("{index:04}.md")).is_some());
+        }
+        let paths = collection
+            .query_matching_paths_with_types(&snapshot, None, &["note".to_string()])
+            .unwrap();
+
+        assert_eq!(paths.len(), 2_048);
+        assert_eq!(crate::snapshot::snapshot_entry_lookups_for_test(), 2_048);
+        assert_eq!(crate::snapshot::snapshot_resolved_projections_for_test(), 0);
+        assert_eq!(crate::expressions::computed_field_evaluations_for_test(), 0);
+    }
+
+    #[test]
+    fn n_updates_use_one_capture_plus_two_mutation_boundary_loads_each() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: error\n",
+        )
+        .unwrap();
+        for index in 0..4 {
+            std::fs::write(root.path().join(format!("{index}.md")), "body\n").unwrap();
+        }
+        let collection = Collection::open(root.path()).unwrap();
+        crate::reset_snapshot_scan_calls_for_test();
+        crate::record_load::reset_snapshot_record_loads_for_test();
+
+        let result = collection.batch_update(
+            &serde_json::json!({"where": "true", "fields": {"title": "updated"}}),
+            None,
+            false,
+        );
+        assert_eq!(result["batch_result"]["succeeded"], 4, "{result:#}");
+        assert_eq!(crate::snapshot_scan_calls_for_test(), 1);
+        assert_eq!(crate::record_load::snapshot_record_loads_for_test(), 12);
+    }
+
+    #[test]
+    fn external_edit_after_prevalidation_is_not_adopted() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        let record = root.path().join("record.md");
+        std::fs::write(&record, "---\ntitle: original\n---\n").unwrap();
+        let replacement = root.path().join("replacement.tmp");
+        std::fs::write(&replacement, "---\ntitle: external\n---\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        crate::operations::update::inject_prevalidated_replacement(&record, replacement);
+
+        let result = collection.batch_update(
+            &serde_json::json!({"where": "true", "fields": {"title": "batch"}}),
+            None,
+            false,
+        );
+        assert_eq!(result["batch_result"]["failed"], 1, "{result:#}");
+        assert!(std::fs::read_to_string(record)
+            .unwrap()
+            .contains("title: external"));
     }
 }

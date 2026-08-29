@@ -1,12 +1,32 @@
 //! Frontmatter serialization (§3.4).
 
 use serde_yaml::Value as YamlValue;
+use thiserror::Error;
+
+/// An error returned when YAML frontmatter cannot be emitted.
+#[derive(Debug, Error)]
+#[error("failed to serialize YAML frontmatter: {source}")]
+pub struct FrontmatterSerializationError {
+    #[source]
+    source: serde_yaml::Error,
+}
+
+impl From<serde_yaml::Error> for FrontmatterSerializationError {
+    fn from(source: serde_yaml::Error) -> Self {
+        Self { source }
+    }
+}
 
 /// Serialize a record document.
 ///
 /// Records with no persisted fields are ordinary body-only Markdown files.
 /// Frontmatter delimiters are only emitted when the mapping contains fields.
-pub fn serialize_document(frontmatter: &serde_yaml::Mapping, body: &str) -> String {
+/// Returns [`FrontmatterSerializationError`] when `serde_yaml` cannot emit an
+/// authored YAML value.
+pub fn serialize_document(
+    frontmatter: &serde_yaml::Mapping,
+    body: &str,
+) -> Result<String, FrontmatterSerializationError> {
     serialize_document_with_bom(false, frontmatter, body)
 }
 
@@ -20,29 +40,33 @@ pub fn serialize_document(frontmatter: &serde_yaml::Mapping, body: &str) -> Stri
 ///
 /// Records with no persisted fields remain body-only files; with `had_bom`
 /// the BOM is still restored so body-only documents round-trip unchanged too.
+/// Returns [`FrontmatterSerializationError`] rather than panicking or
+/// substituting empty frontmatter when the YAML emitter rejects a value.
 pub fn serialize_document_with_bom(
     had_bom: bool,
     frontmatter: &serde_yaml::Mapping,
     body: &str,
-) -> String {
-    let doc = serialize_inner(frontmatter, body);
+) -> Result<String, FrontmatterSerializationError> {
+    let doc = serialize_inner(frontmatter, body)?;
     if had_bom {
         let mut out = String::with_capacity('\u{FEFF}'.len_utf8() + doc.len());
         out.push('\u{FEFF}');
         out.push_str(&doc);
-        out
+        Ok(out)
     } else {
-        doc
+        Ok(doc)
     }
 }
 
-fn serialize_inner(frontmatter: &serde_yaml::Mapping, body: &str) -> String {
+fn serialize_inner(
+    frontmatter: &serde_yaml::Mapping,
+    body: &str,
+) -> Result<String, FrontmatterSerializationError> {
     if frontmatter.is_empty() {
-        return body.to_string();
+        return Ok(body.to_string());
     }
 
-    let yaml_str =
-        serde_yaml::to_string(&YamlValue::Mapping(frontmatter.clone())).unwrap_or_default();
+    let yaml_str = serde_yaml::to_string(&YamlValue::Mapping(frontmatter.clone()))?;
     let mut result = String::from("---\n");
     result.push_str(&yaml_str);
     if !yaml_str.ends_with('\n') {
@@ -53,6 +77,32 @@ fn serialize_inner(frontmatter: &serde_yaml::Mapping, body: &str) -> String {
         result.push_str(body);
         if !body.ends_with('\n') {
             result.push('\n');
+        }
+    }
+    Ok(result)
+}
+
+/// Reconcile JSON object fields into an authored YAML mapping.
+///
+/// Non-string keys and unchanged tagged values are retained so a rewrite never
+/// silently normalizes away authored YAML that the JSON projection cannot
+/// represent. Changed string fields use the canonical JSON-to-YAML conversion.
+pub(crate) fn reconcile_json_object(
+    authored: &serde_yaml::Mapping,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> serde_yaml::Mapping {
+    let mut result = authored.clone();
+    result.retain(|key, _| match key {
+        YamlValue::String(key) => fields.contains_key(key),
+        _ => true,
+    });
+    for (key, value) in fields {
+        let yaml_key = YamlValue::String(key.clone());
+        let unchanged = result
+            .get(&yaml_key)
+            .is_some_and(|authored| super::parser::yaml_to_json(authored) == *value);
+        if !unchanged {
+            result.insert(yaml_key, super::parser::json_to_yaml(value));
         }
     }
     result
@@ -94,7 +144,7 @@ mod tests {
             "# Note\n",
             "---\nA horizontal rule without a closing fence",
         ] {
-            assert_eq!(serialize_document(&Mapping::new(), body), body);
+            assert_eq!(serialize_document(&Mapping::new(), body).unwrap(), body);
         }
     }
 
@@ -104,9 +154,24 @@ mod tests {
         frontmatter.insert(Value::String("title".into()), Value::String("Note".into()));
 
         assert_eq!(
-            serialize_document(&frontmatter, "# Body"),
+            serialize_document(&frontmatter, "# Body").unwrap(),
             "---\ntitle: Note\n---\n# Body\n"
         );
+    }
+
+    pub(crate) const UNEMITTABLE_TAGGED_COMPLEX_MAPPING: &str =
+        "? !key\n  nested: key\n: !value\n  nested: value\n";
+
+    #[test]
+    fn tagged_complex_mapping_key_and_value_returns_emitter_error() {
+        let Value::Mapping(frontmatter) =
+            serde_yaml::from_str::<Value>(UNEMITTABLE_TAGGED_COMPLEX_MAPPING).unwrap()
+        else {
+            panic!("fixture must be a mapping");
+        };
+
+        assert!(serialize_document(&frontmatter, "Body\n").is_err());
+        assert!(serialize_document_with_bom(true, &frontmatter, "Body\n").is_err());
     }
 
     #[test]
@@ -117,16 +182,16 @@ mod tests {
         frontmatter.insert(Value::String("title".into()), Value::String("Note".into()));
 
         assert_eq!(
-            serialize_document_with_bom(true, &frontmatter, "# Body\n"),
+            serialize_document_with_bom(true, &frontmatter, "# Body\n").unwrap(),
             "\u{feff}---\ntitle: Note\n---\n# Body\n"
         );
         assert_eq!(
-            serialize_document_with_bom(false, &frontmatter, "# Body\n"),
+            serialize_document_with_bom(false, &frontmatter, "# Body\n").unwrap(),
             "---\ntitle: Note\n---\n# Body\n"
         );
         // Body-only records restore the marker without inventing frontmatter.
         assert_eq!(
-            serialize_document_with_bom(true, &Mapping::new(), "# Body\n"),
+            serialize_document_with_bom(true, &Mapping::new(), "# Body\n").unwrap(),
             "\u{feff}# Body\n"
         );
     }

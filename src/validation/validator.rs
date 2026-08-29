@@ -179,7 +179,6 @@ pub fn validate_frontmatter_full_multi(
 
 // --- impl Collection methods for validation ---
 
-use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::generated::derive_path;
 use crate::validation::merge::detect_type_conflicts;
 use crate::Collection;
@@ -200,8 +199,16 @@ fn invalid_record_issue(path: &str, reason: &str) -> Issue {
     }
 }
 
-fn file_read_issue(path: &str) -> Issue {
-    Issue {
+fn invalid_record_validation(path: &str, reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "valid": false,
+        "path": path,
+        "issues": [crate::errors::issue_to_json(&invalid_record_issue(path, reason))],
+    })
+}
+
+fn file_read_validation(path: &str) -> serde_json::Value {
+    let issue = Issue {
         code: "file_read_failed".to_string(),
         message: "Collection record could not be read".to_string(),
         path: Some(path.to_string()),
@@ -212,22 +219,11 @@ fn file_read_issue(path: &str) -> Issue {
         type_name: None,
         line: None,
         column: None,
-    }
-}
-
-fn invalid_record_validation(path: &str, reason: &str) -> serde_json::Value {
+    };
     serde_json::json!({
         "valid": false,
         "path": path,
-        "issues": [crate::errors::issue_to_json(&invalid_record_issue(path, reason))],
-    })
-}
-
-fn file_read_validation(path: &str) -> serde_json::Value {
-    serde_json::json!({
-        "valid": false,
-        "path": path,
-        "issues": [crate::errors::issue_to_json(&file_read_issue(path))],
+        "issues": [crate::errors::issue_to_json(&issue)],
     })
 }
 
@@ -300,28 +296,29 @@ impl Collection {
         frontmatter: &serde_json::Value,
         type_names: &[String],
         exclude_path: &str,
+        snapshot: &crate::snapshot::AuthoritativeCollectionSnapshot,
+    ) -> Vec<Issue> {
+        let corpus = snapshot
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .effective_frontmatter()
+                    .map(|frontmatter| (entry.relative_path().to_string(), frontmatter.clone()))
+            })
+            .collect::<Vec<_>>();
+        self.check_uniqueness_in_corpus(frontmatter, type_names, exclude_path, &corpus)
+    }
+
+    pub(crate) fn check_uniqueness_in_corpus(
+        &self,
+        frontmatter: &serde_json::Value,
+        type_names: &[String],
+        exclude_path: &str,
+        corpus: &[(String, serde_json::Value)],
     ) -> Vec<Issue> {
         let mut issues = Vec::new();
         let exclude_normalized = exclude_path.replace('\\', "/");
-
-        // Preload frontmatter for every file once to avoid repeated full rescans.
-        let scanned_frontmatters: Vec<(String, serde_json::Value)> = self
-            .scan_collection_files()
-            .into_iter()
-            .filter_map(|file_path| {
-                let rel_path = file_path
-                    .strip_prefix(&self.root)
-                    .map(|p| p.to_string_lossy().to_string().replace('\\', "/"))
-                    .ok()?;
-                let content = std::fs::read_to_string(&file_path).ok()?;
-                let doc = parse_document(&content);
-                let other_fm = match &doc.frontmatter {
-                    Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
-                    _ => return None,
-                };
-                Some((rel_path, other_fm))
-            })
-            .collect();
 
         for type_name in type_names {
             let type_def = match self.types.get(type_name) {
@@ -361,7 +358,7 @@ impl Collection {
             });
 
             // Check against all other files using the preloaded frontmatter snapshot.
-            for (rel_path, other_fm) in &scanned_frontmatters {
+            for (rel_path, other_fm) in corpus {
                 if rel_path == &exclude_normalized {
                     continue;
                 }
@@ -511,6 +508,47 @@ impl Collection {
             {
                 return error;
             }
+            if input.get("frontmatter").is_none() {
+                let root = match self.root_capability() {
+                    Ok(root) => root,
+                    Err(error) => {
+                        return crate::errors::op_error(
+                            "collection_snapshot_failed",
+                            &error.to_string(),
+                        )
+                    }
+                };
+                match root.symlink_metadata(path) {
+                    Ok(metadata) if !metadata.is_file() => return file_read_validation(path),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return crate::errors::op_error(
+                            FILE_NOT_FOUND,
+                            &format!("File not found: {path}"),
+                        )
+                    }
+                    Err(_) => return file_read_validation(path),
+                }
+            }
+        }
+
+        let collection_snapshot = match self
+            .capture_collection_snapshot(&crate::OperationCancellation::new())
+        {
+            Ok(snapshot) => snapshot,
+            Err(error)
+                if path
+                    .is_some_and(|target| error.is_record_load_failure_for(&self.root, target)) =>
+            {
+                return file_read_validation(path.expect("matched targeted path"))
+            }
+            Err(error) => {
+                return crate::errors::op_error("collection_snapshot_failed", &error.to_string())
+            }
+        };
+        let resolution_index = collection_snapshot.link_resolution_index(self);
+
+        if let Some(path) = path {
             // Check if inline frontmatter is provided in input
             let inline_fm = input.get("frontmatter");
 
@@ -521,23 +559,21 @@ impl Collection {
                     _ => serde_json::json!({}),
                 }
             } else {
-                // Check if file exists
-                let full_path = self.root.join(path);
-                if !full_path.exists() {
-                    return crate::errors::op_error(
-                        FILE_NOT_FOUND,
-                        &format!("File not found: {}", path),
-                    );
-                }
-
-                match crate::record_load::load_record(self, &full_path, path) {
-                    Ok(crate::record_load::RecordLoadOutcome::Parsed {
-                        raw_frontmatter, ..
-                    }) => raw_frontmatter,
-                    Ok(crate::record_load::RecordLoadOutcome::Invalid { reason, .. }) => {
-                        return invalid_record_validation(path, reason.as_str());
+                match collection_snapshot.entry(path) {
+                    Some(entry) => match entry.outcome() {
+                        crate::record_load::RecordLoadOutcome::Parsed {
+                            raw_frontmatter, ..
+                        } => raw_frontmatter.clone(),
+                        crate::record_load::RecordLoadOutcome::Invalid { state, .. } => {
+                            return invalid_record_validation(path, state.reason().as_str());
+                        }
+                    },
+                    None => {
+                        return crate::errors::op_error(
+                            FILE_NOT_FOUND,
+                            &format!("File not found: {}", path),
+                        )
                     }
-                    Err(_) => return file_read_validation(path),
                 }
             };
 
@@ -638,11 +674,13 @@ impl Collection {
             all_issues.extend(self.data_contract_issues(&type_names, &effective, path));
 
             // Cross-file uniqueness checking
-            let uniqueness_issues = self.check_uniqueness(&effective, &type_names, path);
+            let uniqueness_issues =
+                self.check_uniqueness(&effective, &type_names, path, &collection_snapshot);
             all_issues.extend(uniqueness_issues);
 
             // Link validate_exists checking
-            let link_issues = self.check_link_exists(&effective, &type_names, path);
+            let link_issues =
+                self.check_link_exists(&effective, &type_names, path, &resolution_index);
             all_issues.extend(link_issues);
 
             let has_errors = all_issues.iter().any(|i| i.severity == Severity::Error);
@@ -659,37 +697,24 @@ impl Collection {
             });
         }
 
-        // Validate all files in collection
+        // Validate all files from the operation's authoritative capture.
         let mut all_issues = Vec::new();
-        let files = self.scan_collection_files();
 
         // Track unique values per (type, field) and id values per type
         let mut unique_values: HashMap<(String, String), HashMap<String, Vec<String>>> =
             HashMap::new();
         let mut id_values: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
 
-        for file_path in &files {
-            let rel_path = file_path
-                .strip_prefix(&self.root)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let outcome = match crate::record_load::load_record(self, file_path, &rel_path) {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    all_issues.push(file_read_issue(&rel_path));
-                    continue;
-                }
-            };
-            let (_raw_fm, effective, type_names) = match outcome {
+        for entry in collection_snapshot.entries() {
+            let rel_path = entry.relative_path().to_string();
+            let (effective, type_names) = match entry.outcome() {
                 crate::record_load::RecordLoadOutcome::Parsed {
-                    raw_frontmatter,
                     effective_frontmatter,
                     type_names,
                     ..
-                } => (raw_frontmatter, effective_frontmatter, type_names),
-                crate::record_load::RecordLoadOutcome::Invalid { reason, .. } => {
-                    all_issues.push(invalid_record_issue(&rel_path, reason.as_str()));
+                } => (effective_frontmatter.clone(), type_names.clone()),
+                crate::record_load::RecordLoadOutcome::Invalid { state, .. } => {
+                    all_issues.push(invalid_record_issue(&rel_path, state.reason().as_str()));
                     continue;
                 }
             };
@@ -858,4 +883,54 @@ pub(crate) fn unique_field_references(type_def: &TypeDef) -> Vec<String> {
     let mut references = references.into_iter().collect::<Vec<_>>();
     references.sort();
     references
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn targeted_links_and_uniqueness_share_one_capture() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        std::fs::write(root.path().join("target.md"), "target\n").unwrap();
+        std::fs::write(
+            root.path().join("source.md"),
+            "---\nrelated: '[[target]]'\n---\n",
+        )
+        .unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        crate::reset_snapshot_scan_calls_for_test();
+        crate::record_load::reset_snapshot_record_loads_for_test();
+
+        let validated = collection.validate_op(&serde_json::json!({"path": "source.md"}));
+        assert_eq!(validated["valid"], true, "{validated:#}");
+        assert_eq!(crate::snapshot_scan_calls_for_test(), 1);
+        assert_eq!(crate::record_load::snapshot_record_loads_for_test(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn targeted_disappearance_is_file_read_failed_without_a_second_read() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        std::fs::write(root.path().join("target.md"), "target\n").unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        crate::operations::replace_record_with_symlink_on_open_for_test(
+            root.path(),
+            "target.md",
+            outside.path(),
+        );
+        crate::record_load::reset_snapshot_record_loads_for_test();
+
+        let result = collection.validate_op(&serde_json::json!({"path": "target.md"}));
+        assert_eq!(result["valid"], false, "{result:#}");
+        assert_eq!(result["path"], "target.md", "{result:#}");
+        assert_eq!(
+            result["issues"][0]["code"], "file_read_failed",
+            "{result:#}"
+        );
+        assert_eq!(crate::record_load::snapshot_record_loads_for_test(), 1);
+    }
 }

@@ -65,8 +65,10 @@ impl Collection {
         // Check backlinks before deletion
         let mut broken_links: Vec<serde_json::Value> = Vec::new();
         if check_backlinks {
-            let all_files = self.build_all_files_data();
-            let bl_index = self.build_backlinks_index(&all_files);
+            let bl_index = match self.build_authoritative_backlinks_index() {
+                Ok(index) => index,
+                Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
+            };
             if let Some(sources) = bl_index.get(path.as_str()) {
                 for source in sources {
                     broken_links.push(serde_json::json!({

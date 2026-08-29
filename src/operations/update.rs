@@ -9,6 +9,11 @@ use crate::operations::{
 };
 use crate::Collection;
 
+pub(crate) struct PrevalidatedUpdate {
+    pub expected_revision: String,
+    pub raw_frontmatter: serde_json::Map<String, serde_json::Value>,
+}
+
 #[cfg(test)]
 fn injected_publication_replacements(
 ) -> &'static std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>> {
@@ -16,6 +21,37 @@ fn injected_publication_replacements(
         std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>>,
     > = std::sync::OnceLock::new();
     REPLACEMENTS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn injected_prevalidated_replacements(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>> {
+    static REPLACEMENTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>>,
+    > = std::sync::OnceLock::new();
+    REPLACEMENTS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn inject_prevalidated_replacement(
+    path: &std::path::Path,
+    replacement: std::path::PathBuf,
+) {
+    injected_prevalidated_replacements()
+        .lock()
+        .expect("prevalidated replacement lock")
+        .insert(path.to_path_buf(), replacement);
+}
+
+#[cfg(test)]
+fn apply_injected_prevalidated_replacement(path: &std::path::Path) {
+    let replacement = injected_prevalidated_replacements()
+        .lock()
+        .expect("prevalidated replacement lock")
+        .remove(path);
+    if let Some(replacement) = replacement {
+        std::fs::rename(replacement, path).expect("injected prevalidated replacement");
+    }
 }
 
 #[cfg(test)]
@@ -40,7 +76,15 @@ fn apply_injected_publication_replacement(path: &std::path::Path) {
 impl Collection {
     /// Update a file (§12.3).
     pub fn update(&self, input: &serde_json::Value) -> serde_json::Value {
-        self.update_prepared(input, None)
+        self.update_prepared(input, None, true, None)
+    }
+
+    pub(crate) fn update_prevalidated(
+        &self,
+        input: &serde_json::Value,
+        prepared: PrevalidatedUpdate,
+    ) -> serde_json::Value {
+        self.update_prepared(input, None, false, Some(prepared))
     }
 
     pub(crate) fn update_v03_prepared(
@@ -48,13 +92,15 @@ impl Collection {
         input: &serde_json::Value,
         membership: crate::v03::write_membership::ResolvedWriteMembership,
     ) -> serde_json::Value {
-        self.update_prepared(input, Some(membership))
+        self.update_prepared(input, Some(membership), true, None)
     }
 
     fn update_prepared(
         &self,
         input: &serde_json::Value,
         membership: Option<crate::v03::write_membership::ResolvedWriteMembership>,
+        validate_collection: bool,
+        prevalidated: Option<PrevalidatedUpdate>,
     ) -> serde_json::Value {
         let input = match UpdateInput::parse(input) {
             Ok(parsed) => parsed,
@@ -91,7 +137,11 @@ impl Collection {
         // Load bytes, metadata, and revision from one open handle. The loaded
         // revision is also the mandatory publication precondition, including
         // when a legacy caller omitted `if_revision`.
-        let loaded = match crate::record_load::load_record(self, &full_path, path.as_str()) {
+        #[cfg(test)]
+        if prevalidated.is_some() {
+            apply_injected_prevalidated_replacement(&full_path);
+        }
+        let loaded = match crate::record_load::load_record(self, path.as_str()) {
             Ok(loaded) => loaded,
             Err(error) => return op_error(FILE_NOT_FOUND, &format!("Failed to read: {error}")),
         };
@@ -105,32 +155,39 @@ impl Collection {
                 );
             }
         }
-        if if_revision
-            .as_deref()
-            .is_some_and(|expected| expected != loaded_facts.revision)
+        if prevalidated
+            .as_ref()
+            .is_some_and(|prepared| prepared.expected_revision != loaded_facts.revision)
+            || if_revision
+                .as_deref()
+                .is_some_and(|expected| expected != loaded_facts.revision)
         {
             return op_error(
                 CONCURRENT_MODIFICATION,
                 &format!("File '{}' was modified externally", path.as_str()),
             );
         }
-        let existing = match loaded {
-            crate::record_load::RecordLoadOutcome::Parsed { document, .. } => {
-                Some(parse_document_for_rewrite(&document))
-            }
-            crate::record_load::RecordLoadOutcome::Invalid { document: raw, .. }
-                if document.is_some() =>
-            {
-                raw.map(|raw| parse_document_for_rewrite(&raw))
-            }
-            crate::record_load::RecordLoadOutcome::Invalid { reason, .. } => {
-                return op_error(
-                    INVALID_FRONTMATTER,
-                    &format!("Invalid frontmatter: {}", reason.as_str()),
-                )
-            }
-        };
         let replacement = document.as_deref().map(parse_document_for_rewrite);
+        let existing = match loaded {
+            crate::record_load::RecordLoadOutcome::Parsed {
+                document, layout, ..
+            } => {
+                let had_bom = layout.had_bom();
+                Some((layout.into_parsed_document(&document), had_bom))
+            }
+            crate::record_load::RecordLoadOutcome::Invalid {
+                state: crate::record_load::InvalidRecordState::Frontmatter { document: raw, .. },
+                ..
+            } => Some(parse_document_for_rewrite(&raw)),
+            crate::record_load::RecordLoadOutcome::Invalid {
+                state: crate::record_load::InvalidRecordState::InvalidUtf8,
+                ..
+            } if replacement.is_some() => None,
+            crate::record_load::RecordLoadOutcome::Invalid {
+                state: crate::record_load::InvalidRecordState::InvalidUtf8,
+                ..
+            } => return op_error(INVALID_FRONTMATTER, "Invalid frontmatter: invalid_utf8"),
+        };
         let replacement_doc = replacement.as_ref().map(|(doc, _)| doc);
         let replacement_mapping = match replacement_doc
             .as_ref()
@@ -166,35 +223,75 @@ impl Collection {
         };
         let merged_json = yaml_mapping_to_json(&merged);
 
+        let proposed_raw = prevalidated
+            .as_ref()
+            .map(|prepared| serde_json::Value::Object(prepared.raw_frontmatter.clone()))
+            .unwrap_or_else(|| merged_json.clone());
         // Canonical v0.3 callers carry the membership frozen before lifecycle.
         // Legacy callers retain historical inference unchanged.
         let type_names = membership.as_ref().map_or_else(
-            || self.determine_types(&merged_json),
+            || self.determine_types_for_path(&proposed_raw, Some(path.as_str())),
             |membership| membership.types().to_vec(),
         );
-
-        // Apply generated (now_on_write)
-        let mut merged_obj = match merged_json.as_object() {
-            Some(o) => o.clone(),
-            None => serde_json::Map::new(),
+        let mut merged_obj = proposed_raw.as_object().cloned().unwrap_or_default();
+        let has_generated = type_names.iter().any(|type_name| {
+            self.types.get(type_name).is_some_and(|definition| {
+                definition
+                    .fields
+                    .values()
+                    .any(|field| field.generated.is_some())
+            })
+        });
+        let operation_snapshot = if prevalidated.is_none()
+            && (has_generated
+                || (validate_collection && self.settings.default_validation == "error"))
+        {
+            match self.capture_collection_snapshot(&crate::OperationCancellation::new()) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
+            }
+        } else {
+            None
         };
-        self.apply_generated(&mut merged_obj, &type_names, false, Some(path.as_str()));
+        if prevalidated.is_none() && has_generated {
+            let mut generated = crate::generated::GeneratedValueContext::from_snapshot(
+                self,
+                operation_snapshot
+                    .as_ref()
+                    .expect("generated updates capture one snapshot"),
+            );
+            if let Err(error) = generated.apply_generated(
+                self,
+                &mut merged_obj,
+                &type_names,
+                false,
+                Some(path.as_str()),
+            ) {
+                return op_error(error.code(), &error.to_string());
+            }
+        }
 
         // Apply defaults for effective frontmatter
-        let effective =
-            self.apply_defaults(&serde_json::Value::Object(merged_obj.clone()), &type_names);
+        let effective = self.coerce_types(
+            &self.apply_defaults(&serde_json::Value::Object(merged_obj.clone()), &type_names),
+            &type_names,
+        );
 
         // Validate
-        if self.settings.default_validation == "error" {
+        if validate_collection && self.settings.default_validation == "error" {
             let validation_frontmatter = if self.spec_profile == crate::SpecProfile::V03 {
                 &serde_json::Value::Object(merged_obj.clone())
             } else {
                 &effective
             };
             let mut validation = self.validate(validation_frontmatter, &type_names, path.as_str());
+            let collection_snapshot = operation_snapshot
+                .as_ref()
+                .expect("validated updates capture one snapshot");
 
             // Cross-file uniqueness checks for update
-            let uniqueness_issues = self.check_uniqueness(&effective, &type_names, path.as_str());
+            let uniqueness_issues =
+                self.check_uniqueness(&effective, &type_names, path.as_str(), collection_snapshot);
             validation.issues.extend(uniqueness_issues.iter().cloned());
             if !uniqueness_issues.is_empty() {
                 validation.valid = false;
@@ -226,8 +323,7 @@ impl Collection {
         }
 
         // Write file
-        let write_mapping =
-            crate::frontmatter::parser::json_to_yaml_mapping(&serde_json::Value::Object(write_obj));
+        let write_mapping = serializer::reconcile_json_object(&existing_mapping, &write_obj);
         let body = match replacement_doc.as_ref() {
             Some(candidate) => candidate.body.as_str(),
             None => new_body
@@ -239,7 +335,7 @@ impl Collection {
                 .unwrap_or_default(),
         };
         let output = if document.is_some() && replacement_mapping.as_ref() == Some(&write_mapping) {
-            document.as_deref().unwrap_or_default().to_string()
+            Ok(document.as_deref().unwrap_or_default().to_string())
         } else {
             // Restore the original UTF-8 BOM so round-trips stay byte-stable.
             let existing_had_bom = existing.as_ref().is_some_and(|(_, had_bom)| *had_bom);
@@ -247,6 +343,12 @@ impl Collection {
                 .as_ref()
                 .map_or(existing_had_bom, |(_, had_bom)| *had_bom);
             serializer::serialize_document_with_bom(had_bom, &write_mapping, body)
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                return op_error(FRONTMATTER_SERIALIZATION_FAILED, &error.to_string());
+            }
         };
 
         if let Err(error) =
@@ -261,7 +363,7 @@ impl Collection {
         // not only path metadata. This catches atomic replacements (including
         // forged same-mtime and invalid-UTF-8 files) without weakening the
         // existing cross-platform atomic replace and crash-safety semantics.
-        let current_facts = match crate::record_load::load_record(self, &full_path, path.as_str()) {
+        let current_facts = match crate::record_load::load_record(self, path.as_str()) {
             Ok(current) => current.facts().clone(),
             Err(error) => {
                 return op_error("io_error", &format!("Failed to revalidate record: {error}"));

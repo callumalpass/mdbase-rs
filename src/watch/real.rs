@@ -1578,12 +1578,14 @@ fn load_record(collection: &Collection, path: &str) -> Result<WatchRecordLoad, W
     else {
         return Ok(WatchRecordLoad::Absent);
     };
+    let invalid_reason = outcome.reason();
     match outcome {
         RecordLoadOutcome::Parsed {
             facts,
             raw_frontmatter,
             effective_frontmatter,
-            body,
+            document,
+            layout,
             type_names,
             ..
         } => Ok(WatchRecordLoad::Parsed(RecordState {
@@ -1591,12 +1593,15 @@ fn load_record(collection: &Collection, path: &str) -> Result<WatchRecordLoad, W
             raw_frontmatter: raw_frontmatter.as_object().cloned().unwrap_or_default(),
             effective_frontmatter,
             types: json!(type_names),
-            body,
+            body: layout.body(&document).to_string(),
         })),
         // Watch events have no invalid-record representation. Keep classified
         // invalidity distinct from absence so an existing parsed state is not
         // converted into a synthetic deletion/checkpoint advancement.
-        RecordLoadOutcome::Invalid { .. } => Ok(WatchRecordLoad::Invalid),
+        RecordLoadOutcome::Invalid { .. } => {
+            debug_assert!(invalid_reason.is_some());
+            Ok(WatchRecordLoad::Invalid)
+        }
     }
 }
 

@@ -432,6 +432,13 @@ pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    // A path may participate in at most one explicit batch item. Reject this
+    // before creating a shadow or evaluating generated values so dry-run,
+    // atomic, and best-effort execution reserve exactly the same inputs.
+    if let Some(diagnostic) = duplicate_batch_path(items) {
+        return failed(vec![diagnostic]);
+    }
+
     if dry_run || !allow_partial {
         let shadow = match shadow_collection(collection) {
             Ok(shadow) => shadow,
@@ -485,6 +492,36 @@ pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult
         false,
         false,
     )
+}
+
+fn duplicate_batch_path(items: &[Value]) -> Option<Diagnostic> {
+    let mut seen = std::collections::BTreeSet::new();
+    for item in items {
+        let kind = item.get("kind").and_then(Value::as_str);
+        let input = item.get("input").and_then(Value::as_object);
+        let keys: &[&str] = if kind == Some("rename") {
+            &["from", "to"]
+        } else {
+            &["path"]
+        };
+        for key in keys {
+            let Some(path) = input
+                .and_then(|value| value.get(*key))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let canonical = path.replace('\\', "/");
+            if !seen.insert(canonical.clone()) {
+                return Some(Diagnostic::error(
+                    "duplicate_batch_path",
+                    format!("Batch path '{canonical}' is used more than once."),
+                    Some(canonical),
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn adapt_mtime_precondition(
@@ -914,6 +951,60 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn duplicate_batch_paths_are_rejected_before_any_mode_can_write_or_reserve() {
+        for adjacent in [true, false] {
+            for allow_partial in [true, false] {
+                for dry_run in [true, false] {
+                    let source = tempfile::tempdir().unwrap();
+                    write(
+                        &source.path().join("mdbase.yaml"),
+                        "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+                    );
+                    write(
+                        &source.path().join("_types/item.md"),
+                        "---\nname: item\nfields:\n  sequence: { type: integer, generated: sequence }\n---\n",
+                    );
+                    let original = "---\ntype: item\ntitle: Before\n---\n";
+                    write(&source.path().join("same.md"), original);
+                    write(&source.path().join("other.md"), "---\ntitle: Other\n---\n");
+                    let collection = Collection::open(source.path()).unwrap();
+                    let duplicate = json!({
+                        "kind": "update",
+                        "input": {"path": "same.md", "fields": {"title": "Would reserve"}}
+                    });
+                    let middle = json!({
+                        "kind": "update",
+                        "input": {"path": "other.md", "fields": {"title": "Changed"}}
+                    });
+                    let operations = if adjacent {
+                        vec![duplicate.clone(), duplicate]
+                    } else {
+                        vec![duplicate.clone(), middle, duplicate]
+                    };
+                    let result = execute(
+                        &collection,
+                        &json!({
+                            "operations": operations,
+                            "allow_partial": allow_partial,
+                            "dry_run": dry_run
+                        }),
+                    );
+                    assert!(!result.valid);
+                    assert_eq!(result.diagnostics[0].code, "duplicate_batch_path");
+                    assert_eq!(result.diagnostics[0].path.as_deref(), Some("same.md"));
+                    assert_eq!(
+                        fs::read_to_string(source.path().join("same.md")).unwrap(),
+                        original
+                    );
+                    assert!(fs::read_to_string(source.path().join("other.md"))
+                        .unwrap()
+                        .contains("Other"));
+                }
+            }
+        }
     }
 
     #[test]

@@ -3,9 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::errors::*;
-use crate::frontmatter::parser::{parse_document_for_rewrite, yaml_mapping_to_json};
+
 use crate::frontmatter::serializer;
-use crate::types::schema::GeneratedStrategy;
 use crate::Collection;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,12 +13,68 @@ enum ChangeKind {
     Generated,
 }
 
+fn invalid_record_detail(
+    path: &str,
+    invalid: crate::record_load::InvalidRecordView<'_>,
+) -> serde_json::Value {
+    let reason = match invalid {
+        crate::record_load::InvalidRecordView::Frontmatter { reason, .. } => reason,
+        crate::record_load::InvalidRecordView::InvalidUtf8 { .. } => {
+            crate::record_load::InvalidRecordReason::InvalidUtf8
+        }
+    };
+    let (code, message) = match reason {
+        crate::record_load::InvalidRecordReason::InvalidUtf8 => (
+            "file_read_failed",
+            "Collection record could not be read".to_string(),
+        ),
+        _ => (
+            INVALID_FRONTMATTER,
+            format!("Invalid frontmatter: {}", reason.as_str()),
+        ),
+    };
+    serde_json::json!({
+        "path": path,
+        "status": "failed",
+        "error": {"code": code, "message": message},
+    })
+}
+
 struct BackfillPlan {
     path: String,
-    body: String,
-    had_bom: bool,
-    write_obj: serde_json::Map<String, serde_json::Value>,
+    expected_revision: String,
+    output: String,
+    effective: serde_json::Value,
+    type_names: Vec<String>,
     changed_fields: Vec<String>,
+}
+
+#[cfg(test)]
+fn injected_backfill_replacements(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>> {
+    static REPLACEMENTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>>,
+    > = std::sync::OnceLock::new();
+    REPLACEMENTS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn inject_backfill_replacement(path: &std::path::Path, replacement: std::path::PathBuf) {
+    injected_backfill_replacements()
+        .lock()
+        .expect("backfill replacement lock")
+        .insert(path.to_path_buf(), replacement);
+}
+
+#[cfg(test)]
+fn apply_injected_backfill_replacement(path: &std::path::Path) {
+    if let Some(replacement) = injected_backfill_replacements()
+        .lock()
+        .expect("backfill replacement lock")
+        .remove(path)
+    {
+        std::fs::rename(replacement, path).expect("injected backfill replacement");
+    }
 }
 
 impl Collection {
@@ -58,7 +113,16 @@ impl Collection {
             .map(|t| vec![t.to_lowercase()])
             .unwrap_or_default();
 
-        let matching_paths = self.query_matching_paths_with_types(where_clause, &filter_types);
+        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
+        };
+        let matching_paths =
+            match self.query_matching_paths_with_types(&snapshot, where_clause, &filter_types) {
+                Ok(paths) => paths,
+                Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
+            };
         let total = matching_paths.len();
         if total == 0 {
             return serde_json::json!({
@@ -75,93 +139,68 @@ impl Collection {
         let mut plans: Vec<BackfillPlan> = Vec::new();
         let mut skipped = 0usize;
         let mut noop_success = 0usize;
+        let mut planning_failed = 0usize;
         let mut details: Vec<serde_json::Value> = Vec::new();
+        let mut generated = crate::generated::GeneratedValueContext::from_snapshot(self, &snapshot);
 
         for path in &matching_paths {
-            let full_path = self.root.join(path);
-            let content = match std::fs::read_to_string(&full_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    details.push(serde_json::json!({
-                        "path": path,
-                        "status": "failed",
-                        "error": { "code": "io_error", "message": e.to_string() }
-                    }));
-                    continue;
-                }
+            let Some(entry) = snapshot.entry(path) else {
+                return op_error(
+                    "collection_snapshot_failed",
+                    "selected backfill record is absent from its snapshot",
+                );
             };
-            let (doc, had_bom) = parse_document_for_rewrite(&content);
-            let raw_frontmatter = match &doc.frontmatter {
-                Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
-                _ => serde_json::json!({}),
+            let Some(raw_frontmatter) = entry.raw_frontmatter().cloned() else {
+                planning_failed += 1;
+                if let Some(invalid) = entry.invalid() {
+                    details.push(invalid_record_detail(entry.relative_path(), invalid));
+                }
+                continue;
             };
             let raw_obj = raw_frontmatter.as_object().cloned().unwrap_or_default();
-
-            let type_names = self.determine_types_for_path(&raw_frontmatter, Some(path));
+            let type_names = entry.type_names().to_vec();
+            let body = entry.body().unwrap_or_default();
+            let had_bom = entry.had_bom().unwrap_or(false);
 
             let mut working = raw_obj.clone();
+            let mut candidate_generated = generated.clone();
             let mut changes: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
             let mut change_kinds: HashMap<String, ChangeKind> = HashMap::new();
 
             if apply_generated {
-                let mut generated_fields: Vec<(String, GeneratedStrategy)> = Vec::new();
-                let mut seen = HashSet::new();
+                let mut missing_generated = HashSet::new();
                 for type_name in &type_names {
                     if let Some(type_def) = self.types.get(type_name) {
                         for (field_name, field_def) in &type_def.fields {
-                            if field_def.generated.is_none() {
-                                continue;
-                            }
-                            if let Some(ref filter) = fields_filter {
-                                if !filter.contains(field_name) {
-                                    continue;
-                                }
-                            }
-                            if raw_obj.contains_key(field_name) {
-                                continue;
-                            }
-                            if seen.insert(field_name.clone()) {
-                                generated_fields.push((
-                                    field_name.clone(),
-                                    field_def.generated.clone().unwrap(),
-                                ));
+                            if field_def.generated.is_some()
+                                && !raw_obj.contains_key(field_name)
+                                && fields_filter
+                                    .as_ref()
+                                    .is_none_or(|filter| filter.contains(field_name))
+                            {
+                                missing_generated.insert(field_name.clone());
                             }
                         }
                     }
                 }
-
-                generated_fields.sort_by(|a, b| {
-                    let a_dep = match &a.1 {
-                        GeneratedStrategy::Derived { from, .. } => Some(from.clone()),
-                        _ => None,
-                    };
-                    let b_dep = match &b.1 {
-                        GeneratedStrategy::Derived { from, .. } => Some(from.clone()),
-                        _ => None,
-                    };
-                    match (&a_dep, &b_dep) {
-                        (None, Some(_)) => std::cmp::Ordering::Less,
-                        (Some(_), None) => std::cmp::Ordering::Greater,
-                        (Some(a_from), _) if *a_from == b.0 => std::cmp::Ordering::Greater,
-                        (_, Some(b_from)) if *b_from == a.0 => std::cmp::Ordering::Less,
-                        _ => std::cmp::Ordering::Equal,
-                    }
-                });
-
-                for (field_name, strategy) in generated_fields {
-                    if working.contains_key(&field_name) {
-                        continue;
-                    }
-                    let value = self.generate_value(
-                        &strategy,
-                        &field_name,
-                        &type_names,
-                        &working,
-                        Some(path),
-                    );
-                    working.insert(field_name.clone(), value.clone());
+                let generated_fields = match candidate_generated.apply_generated_filtered(
+                    self,
+                    &mut working,
+                    &type_names,
+                    true,
+                    Some(path),
+                    Some(&missing_generated),
+                ) {
+                    Ok(fields) => fields,
+                    Err(error) => return op_error(error.code(), &error.to_string()),
+                };
+                for field_name in generated_fields {
+                    let value = working
+                        .get(&field_name)
+                        .cloned()
+                        .expect("generated field was inserted");
                     changes.insert(field_name.clone(), value);
-                    change_kinds.insert(field_name.clone(), ChangeKind::Generated);
+                    change_kinds.insert(field_name, ChangeKind::Generated);
                 }
             }
 
@@ -208,16 +247,6 @@ impl Collection {
                 continue;
             }
 
-            // Validation (abort all on first failure)
-            if self.settings.default_validation == "error" {
-                let effective =
-                    self.apply_defaults(&serde_json::Value::Object(working.clone()), &type_names);
-                let validation = self.validate(&effective, &type_names, path);
-                if !validation.valid {
-                    return validation_failed_error(&validation.issues);
-                }
-            }
-
             // Build write map honoring write_defaults/write_nulls
             let mut write_obj = raw_obj.clone();
             for (field, value) in &changes {
@@ -232,13 +261,95 @@ impl Collection {
                 write_obj.insert(field.clone(), value.clone());
             }
 
+            let effective = self.coerce_types(
+                &self.apply_defaults(&serde_json::Value::Object(write_obj.clone()), &type_names),
+                &type_names,
+            );
+            let authored_mapping = entry
+                .outcome()
+                .document()
+                .and_then(|document| {
+                    crate::frontmatter::parser::parse_document(document)
+                        .frontmatter
+                        .and_then(|value| value.as_mapping().cloned())
+                })
+                .unwrap_or_default();
+            let yaml_mapping = serializer::reconcile_json_object(&authored_mapping, &write_obj);
+            let output = match serializer::serialize_document_with_bom(had_bom, &yaml_mapping, body)
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    planning_failed += 1;
+                    details.push(serde_json::json!({
+                        "path": path,
+                        "status": "failed",
+                        "error": {
+                            "code": FRONTMATTER_SERIALIZATION_FAILED,
+                            "message": error.to_string()
+                        }
+                    }));
+                    continue;
+                }
+            };
+            generated = candidate_generated;
             plans.push(BackfillPlan {
                 path: path.to_string(),
-                body: doc.body.clone(),
-                had_bom,
-                write_obj,
+                expected_revision: entry.facts().revision.clone(),
+                output,
+                effective,
+                type_names,
                 changed_fields: changes.keys().cloned().collect(),
             });
+        }
+
+        // Validate the complete final effective corpus before the first write.
+        if self.settings.default_validation == "error" {
+            let mut corpus = snapshot
+                .entries()
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .effective_frontmatter()
+                        .map(|frontmatter| (entry.relative_path().to_string(), frontmatter.clone()))
+                })
+                .collect::<HashMap<_, _>>();
+            for plan in &plans {
+                corpus.insert(plan.path.clone(), plan.effective.clone());
+            }
+            let corpus = corpus.into_iter().collect::<Vec<_>>();
+            let mut resolved_files = snapshot.resolved_files_data();
+            for plan in &plans {
+                if let Some(file) = resolved_files
+                    .iter_mut()
+                    .find(|file| file.path == plan.path)
+                {
+                    file.frontmatter = plan.effective.clone();
+                }
+            }
+            let resolution_index = self.build_link_resolution_index(&resolved_files);
+            let mut issues = Vec::new();
+            for plan in &plans {
+                let validation = self.validate(&plan.effective, &plan.type_names, &plan.path);
+                issues.extend(validation.issues);
+                issues.extend(self.check_uniqueness_in_corpus(
+                    &plan.effective,
+                    &plan.type_names,
+                    &plan.path,
+                    &corpus,
+                ));
+                issues.extend(self.check_link_exists(
+                    &plan.effective,
+                    &plan.type_names,
+                    &plan.path,
+                    &resolution_index,
+                ));
+            }
+            if issues
+                .iter()
+                .any(|issue| issue.severity == crate::errors::Severity::Error)
+            {
+                return validation_failed_error(&issues);
+            }
         }
 
         if dry_run {
@@ -246,7 +357,7 @@ impl Collection {
                 "batch_result": {
                     "total": total,
                     "succeeded": plans.len() + noop_success,
-                    "failed": 0,
+                    "failed": planning_failed,
                     "skipped": skipped,
                     "details": details,
                 }
@@ -254,16 +365,40 @@ impl Collection {
         }
 
         let mut succeeded = noop_success;
-        let mut failed = 0usize;
+        let mut failed = planning_failed;
 
         for plan in plans {
             let full_path = self.root.join(&plan.path);
-            let yaml_mapping = crate::frontmatter::parser::json_to_yaml_mapping(
-                &serde_json::Value::Object(plan.write_obj),
-            );
-            let output =
-                serializer::serialize_document_with_bom(plan.had_bom, &yaml_mapping, &plan.body);
-            if let Err(e) = crate::operations::atomic_write(&full_path, output.as_bytes()) {
+            #[cfg(test)]
+            apply_injected_backfill_replacement(&full_path);
+            let current = match crate::record_load::load_record(self, &plan.path) {
+                Ok(current) => current,
+                Err(error) => {
+                    failed += 1;
+                    details.push(serde_json::json!({
+                        "path": plan.path,
+                        "status": "failed",
+                        "error": {
+                            "code": "file_read_failed",
+                            "message": format!("Failed to revalidate record: {error}")
+                        }
+                    }));
+                    continue;
+                }
+            };
+            if current.facts().revision != plan.expected_revision {
+                failed += 1;
+                details.push(serde_json::json!({
+                    "path": plan.path,
+                    "status": "failed",
+                    "error": {
+                        "code": CONCURRENT_MODIFICATION,
+                        "message": "File was modified externally"
+                    }
+                }));
+                continue;
+            }
+            if let Err(e) = crate::operations::atomic_write(&full_path, plan.output.as_bytes()) {
                 failed += 1;
                 details.push(serde_json::json!({
                     "path": plan.path,
@@ -289,5 +424,49 @@ impl Collection {
                 "details": details,
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inject_backfill_replacement;
+    use crate::Collection;
+    use serde_json::json;
+    use std::fs;
+
+    #[test]
+    fn external_edit_after_planning_is_never_overwritten_and_dry_run_does_not_reload() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("mdbase.yaml"),
+            "spec_version: 0.2.0\nsettings:\n  validation: error\n  write_defaults: true\n",
+        )
+        .unwrap();
+        fs::create_dir(root.path().join("_types")).unwrap();
+        fs::write(
+            root.path().join("_types/item.md"),
+            "---\nname: item\nfields:\n  value: { type: string, default: filled }\n---\n",
+        )
+        .unwrap();
+        let record = root.path().join("record.md");
+        fs::write(&record, "---\ntype: item\n---\noriginal\n").unwrap();
+        let replacement = root.path().join("replacement.tmp");
+        fs::write(&replacement, "---\ntype: item\n---\nexternal\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        inject_backfill_replacement(&record, replacement);
+
+        let dry_run = collection.backfill(&json!({"type": "item", "dry_run": true}));
+        assert_eq!(dry_run["batch_result"]["succeeded"], 1, "{dry_run:#}");
+        assert!(fs::read_to_string(&record).unwrap().contains("original"));
+
+        let result = collection.backfill(&json!({"type": "item"}));
+        assert_eq!(result["batch_result"]["failed"], 1, "{result:#}");
+        assert_eq!(
+            result["batch_result"]["details"][0]["error"]["code"], "concurrent_modification",
+            "{result:#}"
+        );
+        let persisted = fs::read_to_string(record).unwrap();
+        assert!(persisted.contains("external"), "{persisted}");
+        assert!(!persisted.contains("value:"), "{persisted}");
     }
 }

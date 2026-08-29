@@ -139,6 +139,8 @@ impl CompiledCatalog {
         .map_err(|error| mutation_error(error.code, error.message))?;
         let collection = Collection {
             root: directory.path().to_path_buf(),
+            root_capability: Collection::capability_for_root(directory.path())
+                .map_err(stage_io_error)?,
             spec_profile: SpecProfile::V03,
             settings: self.collection.settings.clone(),
             config_extensions: self.collection.config_extensions.clone(),

@@ -469,7 +469,8 @@ fn write_markdown(path: &Path, fields: &Value) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let map = mdbase::frontmatter::parser::json_to_yaml_mapping(fields);
-    let content = mdbase::frontmatter::serializer::serialize_document(&map, "Synthetic body.\n");
+    let content = mdbase::frontmatter::serializer::serialize_document(&map, "Synthetic body.\n")
+        .map_err(|error| format!("serialize {}: {error}", path.display()))?;
     fs::write(path, content).map_err(|error| format!("write {}: {error}", path.display()))
 }
 

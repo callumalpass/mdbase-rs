@@ -73,6 +73,60 @@ fn normalized(result: &mdbase::v03::OperationResult) -> Value {
 }
 
 #[test]
+fn legacy_batch_and_backfill_never_rewrite_opaque_records() {
+    let (batch_root, batch_collection) = scoped_collection();
+    let broken_before = fs::read(batch_root.path().join("records/broken.md")).unwrap();
+    let preview = batch_collection.batch_update(
+        &json!({"query": {"types": ["path-scope"]}, "fields": {"updated": true}, "dry_run": true}),
+        None,
+        false,
+    );
+    assert_eq!(preview["batch_result"]["failed"], 1, "{preview:#}");
+    assert_eq!(
+        fs::read(batch_root.path().join("records/broken.md")).unwrap(),
+        broken_before
+    );
+    let batch = batch_collection.batch_update(
+        &json!({"query": {"types": ["path-scope"]}, "fields": {"updated": true}}),
+        None,
+        false,
+    );
+    assert_eq!(batch["batch_result"]["total"], 2, "{batch:#}");
+    assert_eq!(batch["batch_result"]["succeeded"], 1, "{batch:#}");
+    assert_eq!(batch["batch_result"]["failed"], 1, "{batch:#}");
+    assert_eq!(
+        fs::read(batch_root.path().join("records/broken.md")).unwrap(),
+        broken_before
+    );
+    assert!(
+        fs::read_to_string(batch_root.path().join("records/healthy.md"))
+            .unwrap()
+            .contains("updated: true")
+    );
+
+    let (backfill_root, backfill_collection) = scoped_collection();
+    let broken_before = fs::read(backfill_root.path().join("records/broken.md")).unwrap();
+    let preview = backfill_collection.backfill(&json!({"type": "path-scope", "dry_run": true}));
+    assert_eq!(preview["batch_result"]["failed"], 1, "{preview:#}");
+    assert_eq!(
+        fs::read(backfill_root.path().join("records/broken.md")).unwrap(),
+        broken_before
+    );
+    let backfill = backfill_collection.backfill(&json!({"type": "path-scope"}));
+    assert_eq!(backfill["batch_result"]["total"], 2, "{backfill:#}");
+    assert_eq!(backfill["batch_result"]["failed"], 1, "{backfill:#}");
+    assert_eq!(
+        fs::read(backfill_root.path().join("records/broken.md")).unwrap(),
+        broken_before
+    );
+    assert!(backfill["batch_result"]["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|detail| detail["path"] == "records/healthy.md" && detail["status"] == "success"));
+}
+
+#[test]
 fn cached_and_forced_disk_queries_keep_siblings_and_invalid_stubs_in_parity() {
     let (_root, collection) = collection();
     let disk = query(&collection);

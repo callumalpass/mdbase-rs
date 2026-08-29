@@ -2,7 +2,6 @@
 
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use crate::cache::CacheError;
 use crate::expressions::evaluator::{
@@ -12,17 +11,18 @@ use crate::Collection;
 
 /// Parse and index a single file into the cache database.
 ///
-/// `abs_path` is the absolute path on disk; `rel_path` is the forward-slash
-/// separated path relative to the collection root.
+/// `rel_path` is the forward-slash separated path relative to the collection root.
 #[allow(dead_code)]
 pub(crate) fn reindex_file(
     conn: &Connection,
     collection: &Collection,
-    abs_path: &Path,
     rel_path: &str,
 ) -> Result<(), CacheError> {
-    let outcome = crate::record_load::load_record(collection, abs_path, rel_path)?;
-    index_record_outcome(conn, collection, rel_path, outcome)
+    match crate::record_load::load_record(collection, rel_path) {
+        Ok(outcome) => index_record_outcome(conn, collection, rel_path, outcome),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => remove_file(conn, rel_path),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Revalidate a classified-invalid maintenance hint through the capability-
@@ -36,25 +36,24 @@ pub(crate) fn refresh_invalid_file_no_follow(
     rel_path: &str,
 ) -> Result<Option<MaintenanceExpectation>, CacheError> {
     match crate::record_load::load_record_no_follow(collection, rel_path)? {
-        Some(outcome @ crate::record_load::RecordLoadOutcome::Invalid { .. }) => {
-            let crate::record_load::RecordLoadOutcome::Invalid {
-                facts,
-                reason,
-                type_names,
+        Some(
+            ref outcome @ crate::record_load::RecordLoadOutcome::Invalid {
+                ref facts,
+                ref type_names,
+                ref state,
                 ..
-            } = &outcome
-            else {
-                unreachable!();
-            };
+            },
+        ) => {
+            let reason = state.reason();
             let expectation = MaintenanceExpectation::Invalid {
                 revision: facts.revision.clone(),
-                reason: *reason,
+                reason,
                 size: facts.size,
                 mtime_ns: facts.mtime_ns,
                 ctime_ns: facts.ctime_ns,
                 type_names: type_names.iter().cloned().collect(),
             };
-            index_record_outcome(conn, collection, rel_path, outcome)?;
+            index_record_outcome(conn, collection, rel_path, outcome.clone())?;
             Ok(Some(expectation))
         }
         Some(crate::record_load::RecordLoadOutcome::Parsed { .. }) => Ok(None),
@@ -100,17 +99,20 @@ pub(crate) fn refresh_maintenance_expectation(
     match crate::record_load::load_record_no_follow(collection, rel_path)? {
         Some(crate::record_load::RecordLoadOutcome::Invalid {
             facts,
-            reason,
             type_names,
+            state,
             ..
-        }) => Ok(Some(MaintenanceExpectation::Invalid {
-            revision: facts.revision,
-            reason,
-            size: facts.size,
-            mtime_ns: facts.mtime_ns,
-            ctime_ns: facts.ctime_ns,
-            type_names: type_names.into_iter().collect(),
-        })),
+        }) => {
+            let reason = state.reason();
+            Ok(Some(MaintenanceExpectation::Invalid {
+                revision: facts.revision,
+                reason,
+                size: facts.size,
+                mtime_ns: facts.mtime_ns,
+                ctime_ns: facts.ctime_ns,
+                type_names: type_names.into_iter().collect(),
+            }))
+        }
         Some(crate::record_load::RecordLoadOutcome::Parsed { .. }) | None => Ok(None),
     }
 }
@@ -214,13 +216,13 @@ pub(crate) fn maintenance_expectation_still_current(
             },
             Some(crate::record_load::RecordLoadOutcome::Invalid {
                 facts,
-                reason: current_reason,
                 type_names: current_types,
+                state,
                 ..
             }),
         ) => {
             facts.revision == *revision
-                && current_reason == *reason
+                && state.reason() == *reason
                 && facts.size == *size
                 && facts.mtime_ns == *mtime_ns
                 && facts.ctime_ns == *ctime_ns
@@ -250,9 +252,10 @@ fn index_record_outcome(
         crate::record_load::RecordLoadOutcome::Invalid {
             path,
             type_names,
-            reason,
+            state,
             ..
         } => {
+            let reason = state.reason();
             conn.execute(
                 "INSERT INTO files (path, mtime_ns, ctime_ns, size, frontmatter_json, body, effective_json, parse_error, source_revision, failure_reason) \
                  VALUES (?1, ?2, ?3, ?4, '{}', '', NULL, 1, ?5, ?6)",
@@ -276,10 +279,12 @@ fn index_record_outcome(
             path,
             raw_frontmatter,
             effective_frontmatter,
-            body,
+            document,
+            layout,
             type_names,
             ..
         } => {
+            let body = layout.body(&document);
             let fm_str = serde_json::to_string(&raw_frontmatter)?;
             let eff_str = serde_json::to_string(&effective_frontmatter)?;
             conn.execute(
@@ -307,7 +312,7 @@ fn index_record_outcome(
                 rel_path,
                 &facts.revision,
                 &effective_frontmatter,
-                &body,
+                body,
             )?;
             insert_unique_values(
                 conn,
@@ -587,7 +592,7 @@ pub(crate) fn reindex_all(
             .map_err(|_| CacheError::OutsideRoot(abs_path.display().to_string()))?
             .to_string_lossy()
             .replace('\\', "/");
-        reindex_file(&transaction, collection, abs_path, &rel_path)?;
+        reindex_file(&transaction, collection, &rel_path)?;
     }
 
     resolve_all_links(&transaction, collection)?;

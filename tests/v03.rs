@@ -136,6 +136,23 @@ views:
 }
 
 #[test]
+fn targeted_validation_distinguishes_non_regular_from_missing_records() {
+    let directory = v03_collection();
+    fs::create_dir(directory.path().join("blocked.md")).unwrap();
+    let collection = Collection::open(directory.path()).unwrap();
+
+    let blocked = collection.validate_op(&serde_json::json!({"path": "blocked.md"}));
+    assert_eq!(blocked["valid"], false, "{blocked:#}");
+    assert_eq!(
+        blocked["issues"][0]["code"], "file_read_failed",
+        "{blocked:#}"
+    );
+
+    let missing = collection.validate_op(&serde_json::json!({"path": "missing.md"}));
+    assert_eq!(missing["error"]["code"], "file_not_found", "{missing:#}");
+}
+
+#[test]
 fn v03_allows_disabling_explicit_type_keys() {
     let directory = tempfile::tempdir().expect("temp collection");
     write(

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::Collection;
 
 impl Collection {
@@ -17,11 +15,21 @@ impl Collection {
         source_dir: &str,
         rel_path: &str,
         source_id: &Option<String>,
-        ambiguous_stem_counts: &HashMap<String, usize>,
+        type_names: &[String],
+        resolution_index: &crate::links::resolver::LinkResolutionIndex,
         changed: &mut bool,
         refs_updated: &mut Vec<serde_json::Value>,
         warnings: &mut Vec<serde_json::Value>,
     ) {
+        let typed_target_fields = type_names
+            .iter()
+            .filter_map(|type_name| self.types.get(type_name))
+            .flat_map(|type_def| type_def.fields.iter())
+            .filter_map(|(name, field)| {
+                let target_types = crate::links::resolver::allowed_target_types(field);
+                (!target_types.is_empty()).then(|| (name.clone(), target_types))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
         FrontmatterRewriteContext {
             collection: self,
             from,
@@ -33,131 +41,13 @@ impl Collection {
             source_dir,
             rel_path,
             source_id,
-            ambiguous_stem_counts,
+            typed_target_fields: &typed_target_fields,
+            resolution_index,
             changed,
             refs_updated,
             warnings,
         }
         .visit(fm, "");
-    }
-
-    /// Check if a wikilink resolves via id_field and the id didn't change (id-stability).
-    /// Per spec §12.5: implementations SHOULD NOT rewrite the link when the id_field
-    /// value hasn't changed, to avoid unnecessary churn.
-    /// We apply this only when the link target matches the id AND the id differs
-    /// from the old filename stem (so the link was genuinely id-based, not filename-based).
-    pub(crate) fn should_skip_id_stable_link(
-        &self,
-        link_val: &str,
-        source_id: &Option<String>,
-        _from_stem: &str,
-        source_file_path: &str,
-        field_name: &str,
-    ) -> bool {
-        if !self.settings.id_field_explicit {
-            return false;
-        }
-        if let Some(id) = source_id {
-            // Only wikilinks can resolve via id_field. Markdown links and bare paths
-            // resolve by path and always need updating.
-            if link_val.starts_with("[[") && link_val.ends_with("]]") {
-                let inner = &link_val[2..link_val.len() - 2];
-                let target = inner
-                    .split('|')
-                    .next()
-                    .unwrap_or(inner)
-                    .split('#')
-                    .next()
-                    .unwrap_or(inner)
-                    .trim();
-                // Simple name (no path separators or extensions) that matches the
-                // renamed file's id_field value -> potentially id-stable
-                if !target.contains('/') && !target.contains('.') && target.eq_ignore_ascii_case(id)
-                {
-                    // Only skip if the link field has a typed target constraint,
-                    // meaning it resolves via id lookup rather than filename.
-                    // Generic link fields (no target type) resolve by filename
-                    // and must be updated.
-                    if !self
-                        .get_field_target_types(source_file_path, field_name)
-                        .is_empty()
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-
-    /// Check if a link was ambiguous before the rename (matched multiple files).
-    /// Executed renames account for the old path, while dry runs still see it on disk.
-    pub(crate) fn collect_wikilink_stem_counts(
-        &self,
-        from_path: &str,
-        source_already_renamed: bool,
-    ) -> HashMap<String, usize> {
-        let mut stem_counts: HashMap<String, usize> = HashMap::new();
-        for file_path in self.scan_collection_files() {
-            let rel_path = match file_path.strip_prefix(&self.root) {
-                Ok(p) => p.to_string_lossy().to_string().replace('\\', "/"),
-                Err(_) => continue,
-            };
-            let stem = std::path::Path::new(&rel_path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            if !stem.is_empty() {
-                *stem_counts.entry(stem.to_ascii_lowercase()).or_insert(0) += 1;
-            }
-        }
-
-        if source_already_renamed {
-            // The source no longer exists on disk, but its old stem participated
-            // in resolution immediately before the rename.
-            let from_stem = std::path::Path::new(from_path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            if !from_stem.is_empty() {
-                *stem_counts
-                    .entry(from_stem.to_ascii_lowercase())
-                    .or_insert(0) += 1;
-            }
-        }
-
-        stem_counts
-    }
-
-    pub(crate) fn is_ambiguous_link_with_counts(
-        &self,
-        link_val: &str,
-        stem_counts: &HashMap<String, usize>,
-    ) -> bool {
-        let target = if link_val.starts_with("[[") && link_val.ends_with("]]") {
-            let inner = &link_val[2..link_val.len() - 2];
-            inner
-                .split('|')
-                .next()
-                .unwrap_or(inner)
-                .split('#')
-                .next()
-                .unwrap_or(inner)
-                .trim()
-                .to_string()
-        } else {
-            return false; // Only wikilinks can be ambiguous
-        };
-
-        if target.is_empty() || target.contains('/') || target.contains('.') {
-            return false; // Path-based links are not ambiguous
-        }
-
-        stem_counts
-            .get(&target.to_ascii_lowercase())
-            .copied()
-            .unwrap_or(0)
-            > 1
     }
 }
 
@@ -172,7 +62,8 @@ struct FrontmatterRewriteContext<'a> {
     source_dir: &'a str,
     rel_path: &'a str,
     source_id: &'a Option<String>,
-    ambiguous_stem_counts: &'a HashMap<String, usize>,
+    typed_target_fields: &'a std::collections::HashMap<String, Vec<String>>,
+    resolution_index: &'a crate::links::resolver::LinkResolutionIndex,
     changed: &'a mut bool,
     refs_updated: &'a mut Vec<serde_json::Value>,
     warnings: &'a mut Vec<serde_json::Value>,
@@ -201,38 +92,51 @@ impl FrontmatterRewriteContext<'_> {
                     self.visit(item, &format!("{field}[{index}]"));
                 }
             }
+            serde_yaml::Value::Tagged(tagged) => self.visit(&mut tagged.value, field),
             serde_yaml::Value::String(link) => self.rewrite_string(link, field),
             _ => {}
         }
     }
 
     fn rewrite_string(&mut self, link: &mut String, field: &str) {
+        let target_types = self
+            .typed_target_fields
+            .get(field)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if self
+            .collection
+            .is_stable_configured_id_wikilink(link, self.source_id.as_deref())
+        {
+            return;
+        }
         if self.collection.link_resolves_to(
             link,
             self.from,
             self.from_stem,
             self.from_no_ext,
             self.source_dir,
-            self.source_id.as_deref(),
         ) {
-            if self.collection.should_skip_id_stable_link(
+            match self.collection.simple_wikilink_resolution(
                 link,
-                self.source_id,
-                self.from_stem,
                 self.rel_path,
-                field,
+                target_types,
+                self.resolution_index,
             ) {
-                return;
-            }
-            if self
-                .collection
-                .is_ambiguous_link_with_counts(link, self.ambiguous_stem_counts)
-            {
-                self.warnings.push(serde_json::json!({
-                    "path": self.rel_path,
-                    "message": format!("Ambiguous link '{}' not updated", link),
-                }));
-                return;
+                None => {}
+                Some(crate::links::resolver::LinkResolution::Resolved(path))
+                    if path == self.from => {}
+                Some(crate::links::resolver::LinkResolution::Ambiguous(_)) => {
+                    self.warnings.push(serde_json::json!({
+                        "path": self.rel_path,
+                        "message": format!("Ambiguous link '{}' not updated", link),
+                    }));
+                    return;
+                }
+                Some(
+                    crate::links::resolver::LinkResolution::Missing
+                    | crate::links::resolver::LinkResolution::Resolved(_),
+                ) => return,
             }
             *link = self.collection.rewrite_link_value(
                 link,
@@ -259,7 +163,9 @@ impl FrontmatterRewriteContext<'_> {
             self.from_no_ext,
             self.to_no_ext,
             self.source_dir,
+            self.rel_path,
             self.source_id.as_deref(),
+            self.resolution_index,
         );
         if rewritten != *link {
             *link = rewritten;

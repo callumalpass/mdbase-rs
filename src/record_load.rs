@@ -1,13 +1,14 @@
 //! Canonical byte-first record loading boundary.
 
 use std::io::Read;
-use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use serde_json::{json, Value};
 
-use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json, FrontmatterState};
-use crate::Collection;
+use crate::frontmatter::parser::{
+    parse_document_layout, yaml_mapping_to_json, FrontmatterState, ParsedDocumentLayout,
+};
+use crate::{Collection, OperationCancellation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvalidRecordReason {
@@ -34,47 +35,244 @@ pub(crate) struct RecordFileFacts {
     pub ctime_ns: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvalidFrontmatterReason {
+    InvalidYaml,
+    NonMappingFrontmatter,
+}
+
+impl From<InvalidFrontmatterReason> for InvalidRecordReason {
+    fn from(reason: InvalidFrontmatterReason) -> Self {
+        match reason {
+            InvalidFrontmatterReason::InvalidYaml => Self::InvalidYaml,
+            InvalidFrontmatterReason::NonMappingFrontmatter => Self::NonMappingFrontmatter,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum InvalidRecordState {
+    Frontmatter {
+        document: String,
+        layout: ParsedDocumentLayout,
+        effective_frontmatter: Value,
+        reason: InvalidFrontmatterReason,
+    },
+    InvalidUtf8,
+}
+
+impl InvalidRecordState {
+    pub(crate) fn reason(&self) -> InvalidRecordReason {
+        match self {
+            Self::Frontmatter { reason, .. } => (*reason).into(),
+            Self::InvalidUtf8 => InvalidRecordReason::InvalidUtf8,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum RecordLoadOutcome {
     Parsed {
         path: String,
         facts: RecordFileFacts,
         document: String,
+        layout: ParsedDocumentLayout,
         raw_frontmatter: Value,
         effective_frontmatter: Value,
-        body: String,
         type_names: Vec<String>,
     },
     Invalid {
         path: String,
         facts: RecordFileFacts,
-        document: Option<String>,
         type_names: Vec<String>,
+        state: InvalidRecordState,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ParsedRecordView<'a> {
+    pub path: &'a str,
+    pub facts: &'a RecordFileFacts,
+    pub document: &'a str,
+    pub layout: &'a ParsedDocumentLayout,
+    pub raw_frontmatter: &'a Value,
+    pub effective_frontmatter: &'a Value,
+    pub type_names: &'a [String],
+}
+
+pub(crate) enum RecordLoadView<'a> {
+    Parsed(ParsedRecordView<'a>),
+    Invalid(InvalidRecordView<'a>),
+}
+
+pub(crate) enum InvalidRecordView<'a> {
+    Frontmatter {
+        path: &'a str,
+        facts: &'a RecordFileFacts,
+        document: &'a str,
+        layout: &'a ParsedDocumentLayout,
+        effective_frontmatter: &'a Value,
+        type_names: &'a [String],
         reason: InvalidRecordReason,
+    },
+    InvalidUtf8 {
+        path: &'a str,
+        facts: &'a RecordFileFacts,
+        type_names: &'a [String],
     },
 }
 
 impl RecordLoadOutcome {
-    pub(crate) fn facts(&self) -> &RecordFileFacts {
+    pub(crate) fn view(&self) -> RecordLoadView<'_> {
         match self {
-            Self::Parsed { facts, .. } | Self::Invalid { facts, .. } => facts,
+            Self::Parsed {
+                path,
+                facts,
+                document,
+                layout,
+                raw_frontmatter,
+                effective_frontmatter,
+                type_names,
+            } => RecordLoadView::Parsed(ParsedRecordView {
+                path,
+                facts,
+                document,
+                layout,
+                raw_frontmatter,
+                effective_frontmatter,
+                type_names,
+            }),
+            Self::Invalid {
+                path,
+                facts,
+                type_names,
+                state:
+                    InvalidRecordState::Frontmatter {
+                        document,
+                        layout,
+                        effective_frontmatter,
+                        reason,
+                    },
+            } => RecordLoadView::Invalid(InvalidRecordView::Frontmatter {
+                path,
+                facts,
+                document,
+                layout,
+                effective_frontmatter,
+                type_names,
+                reason: (*reason).into(),
+            }),
+            Self::Invalid {
+                path,
+                facts,
+                type_names,
+                state: InvalidRecordState::InvalidUtf8,
+            } => RecordLoadView::Invalid(InvalidRecordView::InvalidUtf8 {
+                path,
+                facts,
+                type_names,
+            }),
+        }
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        match self.view() {
+            RecordLoadView::Parsed(record) => record.path,
+            RecordLoadView::Invalid(InvalidRecordView::Frontmatter { path, .. })
+            | RecordLoadView::Invalid(InvalidRecordView::InvalidUtf8 { path, .. }) => path,
+        }
+    }
+
+    pub(crate) fn parsed(&self) -> Option<ParsedRecordView<'_>> {
+        match self.view() {
+            RecordLoadView::Parsed(record) => Some(record),
+            RecordLoadView::Invalid(_) => None,
+        }
+    }
+
+    pub(crate) fn invalid(&self) -> Option<InvalidRecordView<'_>> {
+        match self.view() {
+            RecordLoadView::Parsed(_) => None,
+            RecordLoadView::Invalid(record) => Some(record),
+        }
+    }
+
+    pub(crate) fn reason(&self) -> Option<InvalidRecordReason> {
+        match self.view() {
+            RecordLoadView::Parsed(_) => None,
+            RecordLoadView::Invalid(InvalidRecordView::Frontmatter { reason, .. }) => Some(reason),
+            RecordLoadView::Invalid(InvalidRecordView::InvalidUtf8 { .. }) => {
+                Some(InvalidRecordReason::InvalidUtf8)
+            }
+        }
+    }
+
+    pub(crate) fn facts(&self) -> &RecordFileFacts {
+        match self.view() {
+            RecordLoadView::Parsed(record) => record.facts,
+            RecordLoadView::Invalid(InvalidRecordView::Frontmatter { facts, .. })
+            | RecordLoadView::Invalid(InvalidRecordView::InvalidUtf8 { facts, .. }) => facts,
+        }
+    }
+
+    pub(crate) fn type_names(&self) -> &[String] {
+        match self.view() {
+            RecordLoadView::Parsed(record) => record.type_names,
+            RecordLoadView::Invalid(InvalidRecordView::Frontmatter { type_names, .. })
+            | RecordLoadView::Invalid(InvalidRecordView::InvalidUtf8 { type_names, .. }) => {
+                type_names
+            }
+        }
+    }
+
+    pub(crate) fn effective_frontmatter(&self) -> Option<&Value> {
+        match self.view() {
+            RecordLoadView::Parsed(record) => Some(record.effective_frontmatter),
+            RecordLoadView::Invalid(InvalidRecordView::Frontmatter {
+                effective_frontmatter,
+                ..
+            }) => Some(effective_frontmatter),
+            RecordLoadView::Invalid(InvalidRecordView::InvalidUtf8 { .. }) => None,
         }
     }
 
     pub(crate) fn document(&self) -> Option<&str> {
-        match self {
-            Self::Parsed { document, .. } => Some(document),
-            Self::Invalid { document, .. } => document.as_deref(),
+        match self.view() {
+            RecordLoadView::Parsed(record) => Some(record.document),
+            RecordLoadView::Invalid(InvalidRecordView::Frontmatter { document, .. }) => {
+                Some(document)
+            }
+            RecordLoadView::Invalid(InvalidRecordView::InvalidUtf8 { .. }) => None,
+        }
+    }
+
+    pub(crate) fn body(&self) -> Option<&str> {
+        match self.view() {
+            RecordLoadView::Parsed(record) => Some(record.layout.body(record.document)),
+            RecordLoadView::Invalid(InvalidRecordView::Frontmatter {
+                document, layout, ..
+            }) => Some(layout.body(document)),
+            RecordLoadView::Invalid(InvalidRecordView::InvalidUtf8 { .. }) => None,
+        }
+    }
+
+    pub(crate) fn had_bom(&self) -> Option<bool> {
+        match self.view() {
+            RecordLoadView::Parsed(record) => Some(record.layout.had_bom()),
+            RecordLoadView::Invalid(InvalidRecordView::Frontmatter { layout, .. }) => {
+                Some(layout.had_bom())
+            }
+            RecordLoadView::Invalid(InvalidRecordView::InvalidUtf8 { .. }) => None,
         }
     }
 }
 
 pub(crate) fn load_record(
     collection: &Collection,
-    abs_path: &Path,
     rel_path: &str,
 ) -> std::io::Result<RecordLoadOutcome> {
-    load_open_record(collection, std::fs::File::open(abs_path)?, rel_path)
+    load_record_no_follow(collection, rel_path)?
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
 }
 
 /// Load a record through the collection's capability-relative, no-follow
@@ -84,8 +282,18 @@ pub(crate) fn load_record_no_follow(
     collection: &Collection,
     rel_path: &str,
 ) -> std::io::Result<Option<RecordLoadOutcome>> {
-    crate::operations::open_regular_record_no_follow(collection.root(), rel_path)?
-        .map(|file| load_open_record(collection, file, rel_path))
+    load_record_no_follow_cancellable(collection, rel_path, &OperationCancellation::new())
+}
+
+pub(crate) fn load_record_no_follow_cancellable(
+    collection: &Collection,
+    rel_path: &str,
+    cancellation: &OperationCancellation,
+) -> std::io::Result<Option<RecordLoadOutcome>> {
+    #[cfg(test)]
+    SNAPSHOT_RECORD_LOADS.with(|loads| loads.set(loads.get() + 1));
+    crate::operations::open_regular_record_no_follow(collection, rel_path)?
+        .map(|file| load_open_record(collection, file, rel_path, cancellation))
         .transpose()
 }
 
@@ -93,10 +301,22 @@ fn load_open_record(
     collection: &Collection,
     mut file: std::fs::File,
     rel_path: &str,
+    cancellation: &OperationCancellation,
 ) -> std::io::Result<RecordLoadOutcome> {
     let before = file.metadata()?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        cancellation.check().map_err(|_| cancelled_io())?;
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        #[cfg(test)]
+        maybe_cancel_read_for_test(cancellation);
+    }
+    cancellation.check().map_err(|_| cancelled_io())?;
     let after = file.metadata()?;
     if before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
@@ -109,6 +329,45 @@ fn load_open_record(
     }
     let facts = facts(&bytes, &after);
     Ok(classify_bytes(collection, rel_path, bytes, facts))
+}
+
+fn cancelled_io() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "record load cancelled")
+}
+
+#[cfg(test)]
+thread_local! {
+    static CANCEL_AFTER_READ_CHUNKS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static SNAPSHOT_RECORD_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_snapshot_record_loads_for_test() {
+    SNAPSHOT_RECORD_LOADS.with(|loads| loads.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn snapshot_record_loads_for_test() -> usize {
+    SNAPSHOT_RECORD_LOADS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_after_read_chunks_for_test(chunks: Option<usize>) {
+    CANCEL_AFTER_READ_CHUNKS.with(|remaining| remaining.set(chunks));
+}
+
+#[cfg(test)]
+fn maybe_cancel_read_for_test(cancellation: &OperationCancellation) {
+    CANCEL_AFTER_READ_CHUNKS.with(|remaining| {
+        if let Some(value) = remaining.get() {
+            if value <= 1 {
+                remaining.set(None);
+                cancellation.cancel();
+            } else {
+                remaining.set(Some(value - 1));
+            }
+        }
+    });
 }
 
 fn facts(bytes: &[u8], metadata: &std::fs::Metadata) -> RecordFileFacts {
@@ -141,32 +400,37 @@ fn classify_bytes(
             return RecordLoadOutcome::Invalid {
                 path: rel_path.to_string(),
                 facts,
-                document: None,
                 type_names: collection.determine_types_for_path_only(rel_path),
-                reason: InvalidRecordReason::InvalidUtf8,
+                state: InvalidRecordState::InvalidUtf8,
             };
         }
     };
-    let parsed = parse_document(&document);
-    let raw_frontmatter = match parsed.frontmatter_state() {
+    let layout = parse_document_layout(&document);
+    let raw_frontmatter = match layout.frontmatter_state() {
         FrontmatterState::Absent => json!({}),
         FrontmatterState::Mapping(mapping) => yaml_mapping_to_json(mapping),
-        FrontmatterState::InvalidYaml => {
-            return RecordLoadOutcome::Invalid {
-                path: rel_path.to_string(),
-                facts,
-                document: Some(document),
-                type_names: collection.determine_types_for_path_only(rel_path),
-                reason: InvalidRecordReason::InvalidYaml,
+        FrontmatterState::InvalidYaml
+        | FrontmatterState::Null
+        | FrontmatterState::NonMapping(_) => {
+            let reason = if matches!(layout.frontmatter_state(), FrontmatterState::InvalidYaml) {
+                InvalidFrontmatterReason::InvalidYaml
+            } else {
+                InvalidFrontmatterReason::NonMappingFrontmatter
             };
-        }
-        FrontmatterState::Null | FrontmatterState::NonMapping(_) => {
+            let type_names = collection.determine_types_for_path_only(rel_path);
+            let empty = json!({});
+            let effective_frontmatter = collection
+                .coerce_types(&collection.apply_defaults(&empty, &type_names), &type_names);
             return RecordLoadOutcome::Invalid {
                 path: rel_path.to_string(),
                 facts,
-                document: Some(document),
-                type_names: collection.determine_types_for_path_only(rel_path),
-                reason: InvalidRecordReason::NonMappingFrontmatter,
+                type_names,
+                state: InvalidRecordState::Frontmatter {
+                    document,
+                    layout,
+                    effective_frontmatter,
+                    reason,
+                },
             };
         }
     };
@@ -179,9 +443,9 @@ fn classify_bytes(
         path: rel_path.to_string(),
         facts,
         document,
+        layout,
         raw_frontmatter,
         effective_frontmatter,
-        body: parsed.body,
         type_names,
     }
 }
@@ -205,6 +469,56 @@ mod tests {
             ctime_ns: None,
         };
         classify_bytes(&fixture(), "note.md", source.to_vec(), facts)
+    }
+
+    #[test]
+    fn parsed_outcome_retains_rewrite_parse_and_bom() {
+        let outcome = classify(b"\xef\xbb\xbf---\ntitle: retained\n---\nBody\n");
+        let RecordLoadOutcome::Parsed {
+            document, layout, ..
+        } = outcome
+        else {
+            panic!("expected parsed record");
+        };
+        assert!(layout.had_bom());
+        assert!(document.starts_with('\u{feff}'));
+        assert_eq!(layout.body(&document), "Body\n");
+    }
+
+    #[test]
+    fn invalid_owned_states_have_closed_borrowed_views() {
+        let frontmatter = classify(b"\xef\xbb\xbf---\na: [broken\n---\nBody\n");
+        match frontmatter.invalid() {
+            Some(InvalidRecordView::Frontmatter {
+                document,
+                layout,
+                reason,
+                ..
+            }) => {
+                assert_eq!(reason, InvalidRecordReason::InvalidYaml);
+                assert!(layout.had_bom());
+                assert_eq!(layout.body(document), "Body\n");
+                assert_eq!(frontmatter.document(), Some(document));
+                assert_eq!(frontmatter.body(), Some("Body\n"));
+                assert_eq!(frontmatter.had_bom(), Some(true));
+            }
+            Some(InvalidRecordView::InvalidUtf8 { .. }) | None => {
+                panic!("expected authored invalid state")
+            }
+        }
+
+        let invalid_utf8 = classify(b"bad\xffutf8");
+        assert!(matches!(
+            invalid_utf8.invalid(),
+            Some(InvalidRecordView::InvalidUtf8 { .. })
+        ));
+        assert_eq!(
+            invalid_utf8.reason(),
+            Some(InvalidRecordReason::InvalidUtf8)
+        );
+        assert_eq!(invalid_utf8.document(), None);
+        assert_eq!(invalid_utf8.body(), None);
+        assert_eq!(invalid_utf8.had_bom(), None);
     }
 
     #[test]
@@ -254,10 +568,7 @@ mod tests {
         ];
         for (source, expected) in invalid {
             let outcome = classify(source);
-            match &outcome {
-                RecordLoadOutcome::Invalid { reason, .. } => assert_eq!(*reason, expected),
-                _ => panic!("expected invalid record"),
-            }
+            assert_eq!(outcome.reason(), Some(expected));
             assert_eq!(outcome.facts().revision, crate::v03::revision(source));
         }
     }
@@ -314,7 +625,7 @@ mod tests {
             }
         });
         for _ in 0..500 {
-            let outcome = load_record(&collection, &path, "note.md").unwrap();
+            let outcome = load_record(&collection, "note.md").unwrap();
             let facts = outcome.facts();
             let index = versions
                 .iter()

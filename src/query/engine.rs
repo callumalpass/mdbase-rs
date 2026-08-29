@@ -724,7 +724,7 @@ impl Collection {
         result
     }
 
-    fn where_clause_uses_link_graph(&self, where_val: &serde_json::Value) -> bool {
+    pub(crate) fn where_clause_uses_link_graph(&self, where_val: &serde_json::Value) -> bool {
         match where_val {
             serde_json::Value::String(expr_str) => self.where_expr_uses_link_graph(expr_str),
             serde_json::Value::Object(map) => {
