@@ -7,7 +7,9 @@ pub(crate) mod model;
 pub(crate) mod preflight;
 pub(crate) mod result;
 
+#[cfg(test)]
+pub(crate) use execute::record_typed_request_json_encode;
 pub use execute::QueryPerformance;
 pub(crate) use execute::{
-    execute, execute_cancellable, execute_profiled, execute_runtime_cancellable,
+    execute, execute_cancellable, execute_profiled, execute_runtime_cancellable, execute_typed,
 };

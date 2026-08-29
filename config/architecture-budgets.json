@@ -1,12 +1,11 @@
 {
-  "rustSourceFileCountMax": 156,
-  "rustSourceLineCountMax": 84293,
+  "rustSourceFileCountMax": 158,
+  "rustSourceLineCountMax": 84729,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-command/src/lib.rs": 1809,
     "crates/mdbase-command/src/profile.rs": 1348,
     "crates/mdbase-runtime/src/engine.rs": 1270,
-    "src/api/typed.rs": 1113,
     "src/bin/phase0-baseline.rs": 1164,
     "src/data_contracts.rs": 1075,
     "src/expressions/evaluator.rs": 3390,
@@ -19,7 +18,6 @@
     "src/transactions/runtime.rs": 1078,
     "src/v03/batch.rs": 1146,
     "src/v03/collection_setup.rs": 1478,
-    "src/v03/mod.rs": 1067,
     "src/v03/operations.rs": 1029,
     "src/v03/type_pack.rs": 2110,
     "src/views/execute.rs": 1376,

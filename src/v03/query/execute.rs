@@ -43,6 +43,88 @@ pub struct QueryPerformance {
     pub link_graph_built: bool,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct QueryPathProbes {
+    pub wire_schema_validations: usize,
+    pub wire_query_decodes: usize,
+    pub typed_request_json_encodes: usize,
+    pub operation_result_decodes: usize,
+    pub core_executions: usize,
+    pub record_source_loads: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static QUERY_PATH_PROBES: std::cell::Cell<QueryPathProbes> =
+        const { std::cell::Cell::new(QueryPathProbes {
+            wire_schema_validations: 0,
+            wire_query_decodes: 0,
+            typed_request_json_encodes: 0,
+            operation_result_decodes: 0,
+            core_executions: 0,
+            record_source_loads: 0,
+        }) };
+}
+
+#[cfg(test)]
+fn bump_probe(update: impl FnOnce(&mut QueryPathProbes)) {
+    QUERY_PATH_PROBES.with(|probes| {
+        let mut value = probes.get();
+        update(&mut value);
+        probes.set(value);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_query_path_probes() {
+    QUERY_PATH_PROBES.with(|probes| probes.set(QueryPathProbes::default()));
+}
+
+#[cfg(test)]
+pub(crate) fn query_path_probes() -> QueryPathProbes {
+    QUERY_PATH_PROBES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn record_typed_request_json_encode() {
+    bump_probe(|probes| probes.typed_request_json_encodes += 1);
+}
+
+/// Dynamic rows and metadata produced by the already-parsed query core.
+pub(crate) struct QueryExecution {
+    pub records: Vec<Value>,
+    pub total_count: usize,
+    pub has_more: bool,
+    pub meta: Value,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+pub(crate) type QueryEvaluation = Result<QueryExecution, Vec<Diagnostic>>;
+
+impl QueryExecution {
+    fn into_wire(self) -> OperationResult {
+        let inner_diagnostics =
+            serde_json::to_value(&self.diagnostics).unwrap_or_else(|_| json!([]));
+        OperationResult {
+            valid: true,
+            result: json!({
+                "results": self.records,
+                "meta": self.meta,
+                "diagnostics": inner_diagnostics,
+            }),
+            diagnostics: self.diagnostics,
+        }
+    }
+}
+
+fn evaluation_into_wire(evaluation: QueryEvaluation) -> OperationResult {
+    match evaluation {
+        Ok(execution) => execution.into_wire(),
+        Err(diagnostics) => diagnostics::failed(diagnostics),
+    }
+}
+
 pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult {
     execute_profiled(collection, input).0
 }
@@ -51,7 +133,7 @@ pub(crate) fn execute_profiled(
     collection: &Collection,
     input: &Value,
 ) -> (OperationResult, QueryPerformance) {
-    execute_profiled_cancellable(collection, input, &OperationCancellation::new(), false)
+    execute_wire_profiled_cancellable(collection, input, &OperationCancellation::new(), false)
         .expect("a fresh cancellation token cannot be cancelled")
 }
 
@@ -60,7 +142,8 @@ pub(crate) fn execute_cancellable(
     input: &Value,
     cancellation: &OperationCancellation,
 ) -> Result<OperationResult, OperationCancelled> {
-    execute_profiled_cancellable(collection, input, cancellation, false).map(|(result, _)| result)
+    execute_wire_profiled_cancellable(collection, input, cancellation, false)
+        .map(|(result, _)| result)
 }
 
 pub(crate) fn execute_runtime_cancellable(
@@ -68,17 +151,92 @@ pub(crate) fn execute_runtime_cancellable(
     input: &Value,
     cancellation: &OperationCancellation,
 ) -> Result<OperationResult, OperationCancelled> {
-    execute_profiled_cancellable(collection, input, cancellation, true).map(|(result, _)| result)
+    execute_wire_profiled_cancellable(collection, input, cancellation, true)
+        .map(|(result, _)| result)
 }
 
-fn execute_profiled_cancellable(
+pub(crate) fn execute_typed(collection: &Collection, query: Query) -> QueryEvaluation {
+    execute_model_profiled_cancellable(
+        collection,
+        query,
+        &OperationCancellation::new(),
+        false,
+        Instant::now(),
+        0,
+    )
+    .expect("a fresh cancellation token cannot be cancelled")
+    .0
+}
+
+fn execute_wire_profiled_cancellable(
     collection: &Collection,
     input: &Value,
     cancellation: &OperationCancellation,
     runtime_cache: bool,
 ) -> Result<(OperationResult, QueryPerformance), OperationCancelled> {
     let total_started = Instant::now();
-    let mut performance = QueryPerformance::default();
+    cancellation.check()?;
+    let phase = Instant::now();
+    #[cfg(test)]
+    bump_probe(|probes| probes.wire_schema_validations += 1);
+    let schema_diagnostics = validate_query(input)
+        .into_iter()
+        .map(diagnostics::invalid_schema)
+        .collect::<Vec<_>>();
+    let schema_us = micros(phase.elapsed());
+    cancellation.check()?;
+    if !schema_diagnostics.is_empty() {
+        return Ok((
+            diagnostics::failed(schema_diagnostics),
+            QueryPerformance {
+                total_us: micros(total_started.elapsed()),
+                schema_us,
+                ..QueryPerformance::default()
+            },
+        ));
+    }
+    #[cfg(test)]
+    bump_probe(|probes| probes.wire_query_decodes += 1);
+    let query = match serde_json::from_value::<Query>(input.clone()) {
+        Ok(query) => query,
+        Err(error) => {
+            return Ok((
+                diagnostics::failed(vec![Diagnostic::error(
+                    "invalid_query",
+                    format!("Query could not be decoded: {error}"),
+                    None,
+                )]),
+                QueryPerformance {
+                    total_us: micros(total_started.elapsed()),
+                    schema_us,
+                    ..QueryPerformance::default()
+                },
+            ));
+        }
+    };
+    execute_model_profiled_cancellable(
+        collection,
+        query,
+        cancellation,
+        runtime_cache,
+        total_started,
+        schema_us,
+    )
+    .map(|(evaluation, performance)| (evaluation_into_wire(evaluation), performance))
+}
+
+fn execute_model_profiled_cancellable(
+    collection: &Collection,
+    query: Query,
+    cancellation: &OperationCancellation,
+    runtime_cache: bool,
+    total_started: Instant,
+    schema_us: u64,
+) -> Result<(QueryEvaluation, QueryPerformance), OperationCancelled> {
+    let mut performance = QueryPerformance {
+        schema_us,
+        ..QueryPerformance::default()
+    };
     macro_rules! finish {
         ($result:expr) => {{
             performance.total_us = micros(total_started.elapsed());
@@ -87,32 +245,12 @@ fn execute_profiled_cancellable(
     }
 
     cancellation.check()?;
-
+    #[cfg(test)]
+    bump_probe(|probes| probes.core_executions += 1);
     let phase = Instant::now();
-    let schema_diagnostics = validate_query(input)
-        .into_iter()
-        .map(diagnostics::invalid_schema)
-        .collect::<Vec<_>>();
-    performance.schema_us = micros(phase.elapsed());
-    cancellation.check()?;
-    if !schema_diagnostics.is_empty() {
-        finish!(diagnostics::failed(schema_diagnostics));
-    }
-
-    let phase = Instant::now();
-    let query = match serde_json::from_value::<Query>(input.clone()) {
-        Ok(query) => query,
-        Err(error) => {
-            finish!(diagnostics::failed(vec![Diagnostic::error(
-                "invalid_query",
-                format!("Query could not be decoded: {error}"),
-                None,
-            )]));
-        }
-    };
     let compiled = match preflight::compile(query) {
         Ok(compiled) => compiled,
-        Err(diagnostics) => finish!(diagnostics::failed(diagnostics)),
+        Err(diagnostics) => finish!(Err(diagnostics)),
     };
     performance.preflight_us = micros(phase.elapsed());
     cancellation.check()?;
@@ -124,7 +262,7 @@ fn execute_profiled_cancellable(
     ) {
         Ok(timezone) => timezone,
         Err(message) => {
-            finish!(diagnostics::failed(vec![Diagnostic::error(
+            finish!(Err(vec![Diagnostic::error(
                 "invalid_timezone",
                 message,
                 None,
@@ -134,7 +272,7 @@ fn execute_profiled_cancellable(
     let clock = match cel::operation_clock(timezone) {
         Ok(clock) => clock,
         Err(error) => {
-            finish!(diagnostics::failed(vec![Diagnostic::error(
+            finish!(Err(vec![Diagnostic::error(
                 error.code,
                 error.message,
                 None,
@@ -216,6 +354,8 @@ fn execute_profiled_cancellable(
             .type_plans
             .values()
             .any(|plan| !plan.computed.is_empty());
+    #[cfg(test)]
+    bump_probe(|probes| probes.record_source_loads += 1);
     let loaded = if runtime_cache {
         collection.load_runtime_query_data_profiled_cancellable(
             true,
@@ -241,7 +381,7 @@ fn execute_profiled_cancellable(
                     .to_string_lossy()
                     .replace('\\', "/")
             });
-            finish!(diagnostics::failed(vec![Diagnostic::error(
+            finish!(Err(vec![Diagnostic::error(
                 "collection_snapshot_failed",
                 error.to_string(),
                 path,
@@ -344,7 +484,7 @@ fn execute_profiled_cancellable(
         type_definitions.clone(),
     ) {
         Ok(context) => context,
-        Err(diagnostic) => finish!(diagnostics::failed(vec![*diagnostic])),
+        Err(diagnostic) => finish!(Err(vec![*diagnostic])),
     };
     performance.context_us = micros(phase.elapsed());
     cancellation.check()?;
@@ -528,17 +668,13 @@ fn execute_profiled_cancellable(
     if let Some(groups) = groups {
         meta["groups"] = Value::Array(groups);
     }
-    let serialized_diagnostics =
-        serde_json::to_value(&query_diagnostics).unwrap_or_else(|_| json!([]));
-    let result = OperationResult {
-        valid: true,
-        result: json!({
-            "results": results,
-            "meta": meta,
-            "diagnostics": serialized_diagnostics,
-        }),
+    let result = Ok(QueryExecution {
+        records: results,
+        total_count,
+        has_more,
+        meta,
         diagnostics: query_diagnostics,
-    };
+    });
     performance.total_us = micros(total_started.elapsed());
     Ok((result, performance))
 }
@@ -569,7 +705,7 @@ fn build_metadata_page_result(
     total_count: usize,
     has_more: bool,
     performance: &mut QueryPerformance,
-) -> OperationResult {
+) -> QueryEvaluation {
     let phase = Instant::now();
     let mut query_diagnostics = Vec::new();
     let results = records
@@ -616,21 +752,17 @@ fn build_metadata_page_result(
         .collect::<Vec<_>>();
     performance.evaluate_us = micros(phase.elapsed());
     performance.results = results.len();
-    let serialized_diagnostics =
-        serde_json::to_value(&query_diagnostics).unwrap_or_else(|_| json!([]));
     let meta = json!({
         "total_count": total_count,
         "has_more": has_more,
     });
-    OperationResult {
-        valid: true,
-        result: json!({
-            "results": results,
-            "meta": meta,
-            "diagnostics": serialized_diagnostics,
-        }),
+    Ok(QueryExecution {
+        records: results,
+        total_count,
+        has_more,
+        meta,
         diagnostics: query_diagnostics,
-    }
+    })
 }
 
 fn millis_to_micros(milliseconds: f64) -> u64 {
@@ -690,5 +822,63 @@ fn record_metadata_value(record: &LocalRecord, field: &str) -> Value {
         .as_ref()
         .map_or(Value::Null, |value| Value::String(value.clone())),
         _ => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use crate::api::QueryRequest;
+    use crate::Collection;
+
+    use super::{query_path_probes, reset_query_path_probes};
+
+    #[test]
+    fn typed_query_skips_wire_and_envelope_paths_and_loads_once() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  timezone: UTC\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("one.md"), "---\ntitle: One\n---\nBody\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        let request = QueryRequest::builder().where_expression("true");
+
+        let invalid = QueryRequest {
+            timezone: Some(String::new()),
+            ..QueryRequest::default()
+        };
+        reset_query_path_probes();
+        assert!(collection.typed().unwrap().query(invalid).is_err());
+        assert_eq!(query_path_probes(), super::QueryPathProbes::default());
+
+        reset_query_path_probes();
+        let typed = collection.typed().unwrap().query(request.clone()).unwrap();
+        assert_eq!(typed.value.total_count, 1);
+        assert_eq!(
+            query_path_probes(),
+            super::QueryPathProbes {
+                core_executions: 1,
+                record_source_loads: 1,
+                ..super::QueryPathProbes::default()
+            }
+        );
+
+        reset_query_path_probes();
+        let wire = super::execute(&collection, &request.to_wire());
+        assert!(wire.valid, "{wire:#?}");
+        assert_eq!(
+            query_path_probes(),
+            super::QueryPathProbes {
+                wire_schema_validations: 1,
+                wire_query_decodes: 1,
+                typed_request_json_encodes: 1,
+                core_executions: 1,
+                record_source_loads: 1,
+                ..super::QueryPathProbes::default()
+            }
+        );
     }
 }

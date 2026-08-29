@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::de::DeserializeOwned;
@@ -6,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-use super::{CollectionPath, CollectionPathError};
+use super::{CollectionPath, CollectionPathError, QueryRequest, QueryResult};
 use crate::v03;
 use crate::{Collection, SpecProfile};
 
@@ -597,203 +596,6 @@ impl BatchRequest {
     }
 }
 
-/// Sort direction for query ordering and grouping.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum QueryDirection {
-    /// Ascending order.
-    #[default]
-    Asc,
-    /// Descending order.
-    Desc,
-}
-
-/// One ordered query field.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct QueryOrder {
-    /// Field or projection name.
-    pub field: String,
-    /// Ordering direction.
-    pub direction: QueryDirection,
-}
-
-/// Frontmatter representation included in query records.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FrontmatterMode {
-    /// Include effective frontmatter after defaults and computed fields.
-    #[default]
-    Effective,
-    /// Include only persisted frontmatter.
-    Persisted,
-    /// Include both persisted and effective frontmatter.
-    Both,
-}
-
-/// Typed builder for the common canonical query surface.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct QueryRequest {
-    /// Type names used to restrict candidate records.
-    #[serde(default)]
-    pub types: Vec<String>,
-    /// IANA timezone used for calendar semantics in this invocation.
-    #[serde(default)]
-    pub timezone: Option<String>,
-    /// Record used to bind the query `this` context.
-    #[serde(default)]
-    pub context: Option<CollectionPath>,
-    /// Named CEL expressions evaluated before filtering and selection.
-    #[serde(default)]
-    pub projections: BTreeMap<String, String>,
-    /// CEL predicate used to filter candidates.
-    #[serde(default, rename = "where")]
-    pub where_expression: Option<String>,
-    /// Fields retained in each returned record.
-    #[serde(default)]
-    pub select: Option<Vec<String>>,
-    /// Deterministic record ordering.
-    #[serde(default)]
-    pub order_by: Vec<QueryOrder>,
-    /// Ordered grouping fields.
-    #[serde(default)]
-    pub group_by: Vec<QueryOrder>,
-    /// Maximum returned records.
-    #[serde(default)]
-    pub limit: Option<u64>,
-    /// Number of ordered records skipped before returning results.
-    #[serde(default)]
-    pub offset: u64,
-    /// Whether returned records include their Markdown body.
-    #[serde(default)]
-    pub include_body: bool,
-    /// Frontmatter representation to return.
-    #[serde(default)]
-    pub frontmatter_mode: FrontmatterMode,
-}
-
-impl QueryRequest {
-    /// Start a query with canonical defaults.
-    pub fn builder() -> Self {
-        Self::default()
-    }
-
-    /// Add a type filter.
-    pub fn type_name(mut self, type_name: impl Into<String>) -> Self {
-        self.types.push(type_name.into());
-        self
-    }
-
-    /// Override the collection timezone for this query invocation.
-    pub fn timezone(mut self, timezone: impl Into<String>) -> Self {
-        self.timezone = Some(timezone.into());
-        self
-    }
-
-    /// Set the CEL filter expression.
-    pub fn where_expression(mut self, expression: impl Into<String>) -> Self {
-        self.where_expression = Some(expression.into());
-        self
-    }
-
-    /// Append an ordering field.
-    pub fn order_by(mut self, field: impl Into<String>, direction: QueryDirection) -> Self {
-        self.order_by.push(QueryOrder {
-            field: field.into(),
-            direction,
-        });
-        self
-    }
-
-    /// Set the maximum returned record count.
-    pub fn limit(mut self, limit: u64) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    /// Set the ordered record offset.
-    pub fn offset(mut self, offset: u64) -> Self {
-        self.offset = offset;
-        self
-    }
-
-    /// Encode the canonical portable query object used by providers and local
-    /// transports, omitting unset defaults that are invalid on the wire.
-    pub fn to_wire(&self) -> Value {
-        let mut value = Map::new();
-        if !self.types.is_empty() {
-            value.insert("types".to_string(), json!(self.types));
-        }
-        if let Some(timezone) = &self.timezone {
-            value.insert("timezone".to_string(), json!(timezone));
-        }
-        if let Some(context) = &self.context {
-            value.insert("context".to_string(), json!({"this": {"path": context}}));
-        }
-        if !self.projections.is_empty() {
-            value.insert(
-                "projections".to_string(),
-                Value::Object(
-                    self.projections
-                        .iter()
-                        .map(|(name, expression)| (name.clone(), json!({"expr": expression})))
-                        .collect(),
-                ),
-            );
-        }
-        if let Some(expression) = &self.where_expression {
-            value.insert("where".to_string(), Value::String(expression.clone()));
-        }
-        if let Some(select) = &self.select {
-            value.insert("select".to_string(), json!(select));
-        }
-        insert_order(&mut value, "order_by", &self.order_by);
-        insert_order(&mut value, "group_by", &self.group_by);
-        if let Some(limit) = self.limit {
-            value.insert("limit".to_string(), json!(limit));
-        }
-        if self.offset != 0 {
-            value.insert("offset".to_string(), json!(self.offset));
-        }
-        if self.include_body {
-            value.insert("include_body".to_string(), Value::Bool(true));
-        }
-        let frontmatter_mode = match self.frontmatter_mode {
-            FrontmatterMode::Effective => None,
-            FrontmatterMode::Persisted => Some("persisted"),
-            FrontmatterMode::Both => Some("both"),
-        };
-        if let Some(frontmatter_mode) = frontmatter_mode {
-            value.insert(
-                "frontmatter_mode".to_string(),
-                Value::String(frontmatter_mode.to_string()),
-            );
-        }
-        Value::Object(value)
-    }
-}
-
-fn insert_order(target: &mut Map<String, Value>, name: &str, order: &[QueryOrder]) {
-    if !order.is_empty() {
-        target.insert(
-            name.to_string(),
-            Value::Array(
-                order
-                    .iter()
-                    .map(|item| {
-                        json!({
-                            "field": item.field,
-                            "direction": match item.direction {
-                                QueryDirection::Asc => "asc",
-                                QueryDirection::Desc => "desc",
-                            }
-                        })
-                    })
-                    .collect(),
-            ),
-        );
-    }
-}
-
 /// Filesystem metadata attached to a record read.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecordFile {
@@ -917,22 +719,6 @@ pub struct BatchResult {
     pub dry_run: bool,
 }
 
-/// Paginated canonical query result.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct QueryResult {
-    /// Returned records.
-    #[serde(rename = "results")]
-    pub records: Vec<Value>,
-    /// Total matching records before pagination.
-    #[serde(skip_serializing)]
-    pub total_count: usize,
-    /// Whether another page is available.
-    #[serde(skip_serializing)]
-    pub has_more: bool,
-    /// Canonical query metadata.
-    pub meta: Value,
-}
-
 /// Borrowed typed operation service for one loaded collection.
 pub struct TypedCollection<'a> {
     collection: &'a Collection,
@@ -1018,48 +804,34 @@ impl<'a> TypedCollection<'a> {
         if self.collection.spec_profile == SpecProfile::V02 {
             return crate::compat::v02::query(self.collection, request);
         }
-        let result = self.operations()?.query(&request.to_wire());
-        let diagnostics = result
-            .diagnostics
-            .into_iter()
-            .map(Diagnostic::from)
-            .collect::<Vec<_>>();
-        if !result.valid {
-            return Err(MdbaseError::Operation { diagnostics });
+        let schema_diagnostics = crate::v03::query::model::validate_typed(&request);
+        if !schema_diagnostics.is_empty() {
+            return Err(MdbaseError::Operation {
+                diagnostics: schema_diagnostics
+                    .into_iter()
+                    .map(Diagnostic::from)
+                    .collect(),
+            });
         }
-        let records = result
-            .result
-            .get("results")
-            .and_then(Value::as_array)
-            .cloned()
-            .ok_or_else(|| MdbaseError::InvalidResult {
-                message: "query result does not contain a results array".to_string(),
-            })?;
-        let meta = result
-            .result
-            .get("meta")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let total_count = meta
-            .get("total_count")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| MdbaseError::InvalidResult {
-                message: "query result does not contain a valid total_count".to_string(),
-            })?;
-        let has_more = meta
-            .get("has_more")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        Ok(OperationOutcome {
-            value: QueryResult {
-                records,
-                total_count,
-                has_more,
-                meta,
-            },
-            diagnostics,
-        })
+        let query = crate::v03::query::model::Query::from_typed(&request);
+        match crate::v03::query::execute_typed(self.collection, query) {
+            Ok(execution) => Ok(OperationOutcome {
+                value: QueryResult {
+                    records: execution.records,
+                    total_count: execution.total_count,
+                    has_more: execution.has_more,
+                    meta: execution.meta,
+                },
+                diagnostics: execution
+                    .diagnostics
+                    .into_iter()
+                    .map(Diagnostic::from)
+                    .collect(),
+            }),
+            Err(diagnostics) => Err(MdbaseError::Operation {
+                diagnostics: diagnostics.into_iter().map(Diagnostic::from).collect(),
+            }),
+        }
     }
 
     /// Plan or atomically apply the explicit v0.2-to-v0.3 migration.

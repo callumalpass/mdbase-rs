@@ -1,5 +1,6 @@
 use std::fs;
 
+use mdbase::api::{CollectionPath, FrontmatterMode, QueryDirection, QueryOrder, QueryRequest};
 use mdbase::{v03, Collection};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -212,6 +213,227 @@ fn context_projections_selection_and_record_errors_follow_portable_semantics() {
         ));
     let result_shape = v03::validate_query_result(&result.result);
     assert!(result_shape.is_empty(), "{result_shape:#?}\n{result:#?}");
+}
+
+fn diagnostic_signature(
+    diagnostic: &mdbase::api::Diagnostic,
+) -> (
+    &str,
+    Option<&str>,
+    Option<&str>,
+    Option<&str>,
+    Option<&Value>,
+) {
+    (
+        diagnostic.code.as_str(),
+        diagnostic.path.as_deref(),
+        diagnostic.field.as_deref(),
+        diagnostic.schema_location.as_deref(),
+        diagnostic.details.as_ref(),
+    )
+}
+
+#[test]
+fn hostile_typed_requests_match_wire_schema_failures_without_using_the_wire_path() {
+    let (_root, collection) = query_collection();
+    let long_type = format!("A{}", "a".repeat(128));
+    let mut cases = Vec::<(&str, QueryRequest, Value)>::new();
+
+    for (name, types) in [
+        ("duplicate types", vec!["task", "task"]),
+        ("empty type", vec![""]),
+        ("invalid type", vec!["1task"]),
+    ] {
+        let request = QueryRequest {
+            types: types.into_iter().map(str::to_string).collect(),
+            ..QueryRequest::default()
+        };
+        cases.push((name, request.clone(), request.to_wire()));
+    }
+    let request = QueryRequest {
+        types: vec![long_type.clone()],
+        ..QueryRequest::default()
+    };
+    cases.push(("long type", request, json!({"types": [long_type]})));
+
+    let timezone = QueryRequest {
+        timezone: Some(String::new()),
+        ..QueryRequest::default()
+    };
+    cases.push(("empty timezone", timezone, json!({"timezone": ""})));
+    let filter = QueryRequest {
+        where_expression: Some(String::new()),
+        ..QueryRequest::default()
+    };
+    cases.push(("empty filter", filter, json!({"where": ""})));
+
+    let mut projection_name = QueryRequest::default();
+    projection_name
+        .projections
+        .insert("bad.name".to_string(), "true".to_string());
+    cases.push((
+        "projection name",
+        projection_name,
+        json!({"projections": {"bad.name": {"expr": "true"}}}),
+    ));
+    let mut projection_expression = QueryRequest::default();
+    projection_expression
+        .projections
+        .insert("valid".to_string(), String::new());
+    cases.push((
+        "projection expression",
+        projection_expression,
+        json!({"projections": {"valid": {"expr": ""}}}),
+    ));
+
+    let empty_select = QueryRequest {
+        select: Some(Vec::new()),
+        ..QueryRequest::default()
+    };
+    cases.push(("empty select", empty_select, json!({"select": []})));
+    let empty_selection = QueryRequest {
+        select: Some(vec![String::new()]),
+        ..QueryRequest::default()
+    };
+    cases.push(("empty selection", empty_selection, json!({"select": [""]})));
+
+    for (name, property) in [
+        ("empty order field", "order_by"),
+        ("empty group field", "group_by"),
+    ] {
+        let order = QueryOrder {
+            field: String::new(),
+            direction: QueryDirection::Asc,
+        };
+        let mut request = QueryRequest::default();
+        if property == "order_by" {
+            request.order_by.push(order);
+        } else {
+            request.group_by.push(order);
+        }
+        let wire_input = request.to_wire();
+        cases.push((name, request, wire_input));
+    }
+
+    let mut combined = QueryRequest {
+        types: vec!["1bad".to_string(), "1bad".to_string()],
+        timezone: Some(String::new()),
+        where_expression: Some(String::new()),
+        select: Some(vec![String::new()]),
+        order_by: vec![QueryOrder {
+            field: String::new(),
+            direction: QueryDirection::Asc,
+        }],
+        group_by: vec![QueryOrder {
+            field: String::new(),
+            direction: QueryDirection::Desc,
+        }],
+        ..QueryRequest::default()
+    };
+    combined
+        .projections
+        .insert("bad.name".to_string(), String::new());
+    cases.push((
+        "combined diagnostic order",
+        combined.clone(),
+        combined.to_wire(),
+    ));
+
+    for (name, request, wire_input) in cases {
+        let typed = collection.typed().unwrap().query(request).unwrap_err();
+        let wire = query(&collection, wire_input);
+        assert!(!wire.valid, "{name}: {wire:#?}");
+        let wire_diagnostics = wire
+            .diagnostics
+            .into_iter()
+            .map(mdbase::api::Diagnostic::from)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            typed
+                .diagnostics()
+                .iter()
+                .map(diagnostic_signature)
+                .collect::<Vec<_>>(),
+            wire_diagnostics
+                .iter()
+                .map(diagnostic_signature)
+                .collect::<Vec<_>>(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn typed_query_projects_directly_to_the_unchanged_wire_result() {
+    let (_root, collection) = query_collection();
+    let mut request = QueryRequest::builder()
+        .type_name("task")
+        .where_expression("estimate != 'many'")
+        .order_by("projection.adjusted", QueryDirection::Desc)
+        .offset(1)
+        .limit(1);
+    request.context = Some(CollectionPath::new("projects/alpha.md").unwrap());
+    request
+        .projections
+        .insert("adjusted".to_string(), "estimate + 1".to_string());
+    request.select = Some(vec!["title".to_string(), "projection.adjusted".to_string()]);
+    request.group_by = vec![QueryOrder {
+        field: "project".to_string(),
+        direction: QueryDirection::Asc,
+    }];
+    // Typed requests intentionally have no summary or selection-expression
+    // fields; every supported field is projected here without serde defaults.
+    request.include_body = true;
+    request.frontmatter_mode = FrontmatterMode::Both;
+
+    let wire = query(&collection, request.to_wire());
+    let typed = collection.typed().unwrap().query(request).unwrap();
+    assert!(wire.valid, "{wire:#?}");
+    assert_eq!(json!(typed.value.records), wire.result["results"]);
+    assert_eq!(typed.value.meta, wire.result["meta"]);
+    let wire_diagnostics = wire
+        .diagnostics
+        .clone()
+        .into_iter()
+        .map(mdbase::api::Diagnostic::from)
+        .collect::<Vec<_>>();
+    assert_eq!(typed.diagnostics, wire_diagnostics);
+    assert!(v03::validate_query_result(&wire.result).is_empty());
+    let envelope = serde_json::to_value(&wire).unwrap();
+    let envelope_schema: Value =
+        serde_json::from_str(include_str!("../schemas/v0.3/operation-result.schema.json")).unwrap();
+    let diagnostic_schema =
+        serde_json::from_str(include_str!("../schemas/v0.3/diagnostic.schema.json")).unwrap();
+    let envelope_validator = jsonschema::JSONSchema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .with_document(
+            "https://mdbase.dev/schemas/v0.3/diagnostic.schema.json".to_string(),
+            diagnostic_schema,
+        )
+        .compile(&envelope_schema)
+        .unwrap();
+    let envelope_errors = envelope_validator
+        .validate(&envelope)
+        .err()
+        .into_iter()
+        .flatten()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    assert!(envelope_errors.is_empty(), "{envelope_errors:#?}");
+
+    let invalid_request = QueryRequest::builder().where_expression("(");
+    let invalid_wire = query(&collection, invalid_request.to_wire());
+    let invalid_typed = collection
+        .typed()
+        .unwrap()
+        .query(invalid_request)
+        .unwrap_err();
+    let invalid_wire_diagnostics = invalid_wire
+        .diagnostics
+        .into_iter()
+        .map(mdbase::api::Diagnostic::from)
+        .collect::<Vec<_>>();
+    assert_eq!(invalid_typed.diagnostics(), invalid_wire_diagnostics);
 }
 
 #[test]
