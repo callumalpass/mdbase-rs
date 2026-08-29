@@ -26,30 +26,30 @@ pub(super) fn load_context(
         return Ok(None);
     };
     let path = &context.this.path;
-    let read = collection.read(&json!({"path": path}));
-    if read.get("error").is_some() {
-        return Err(Box::new(Diagnostic::error(
+    let request = crate::api::ReadRequest::new(path).map_err(|_| {
+        Box::new(Diagnostic::error(
             "context_not_found",
             format!("Query context record '{path}' was not found."),
             Some(path.clone()),
-        )));
-    }
-    let effective = read
-        .get("effective_frontmatter")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let persisted = read
-        .get("frontmatter")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let types = read
-        .get("types")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(String::from)
-        .collect::<Vec<_>>();
+        ))
+    })?;
+    let read = crate::operations::read::evaluate_typed_read(
+        collection,
+        &request,
+        crate::operations::read::TypedReadSource::Filesystem,
+    )
+    .into_outcome()
+    .map_err(|_| {
+        Box::new(Diagnostic::error(
+            "context_not_found",
+            format!("Query context record '{path}' was not found."),
+            Some(path.clone()),
+        ))
+    })?
+    .value;
+    let effective = read.effective_frontmatter.clone();
+    let persisted = read.frontmatter.clone();
+    let types = read.types.clone();
     let mut bindings = cel::enrich_record_bindings(
         &effective,
         &persisted,
@@ -65,12 +65,9 @@ pub(super) fn load_context(
         frontmatter: bindings,
         raw_frontmatter: Some(persisted),
         file_path: Some(path.clone()),
-        body: read.get("body").and_then(Value::as_str).map(String::from),
-        file_size: read.pointer("/file/size").and_then(Value::as_u64),
-        file_mtime: read
-            .pointer("/file/mtime")
-            .and_then(Value::as_str)
-            .map(String::from),
+        body: Some(read.body),
+        file_size: Some(read.file.size),
+        file_mtime: Some(read.file.mtime),
         file_ctime: None,
         this_context: None,
         all_files,

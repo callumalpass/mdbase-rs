@@ -38,9 +38,15 @@ impl<'a> Operations<'a> {
     }
 
     pub fn read(&self, input: &Value) -> OperationResult {
-        let mut result = self.normalize("read", input, self.collection.read(input));
-        self.attach_match_diagnostics(&mut result);
-        result
+        let request = match self.parse_read_request(input) {
+            Ok(request) => request,
+            Err(result) => return result,
+        };
+        typed_read_result(crate::operations::read::evaluate_typed_read(
+            self.collection,
+            &request,
+            crate::operations::read::TypedReadSource::Filesystem,
+        ))
     }
 
     /// Evaluate a provider-supplied exact record using this collection's
@@ -52,61 +58,47 @@ impl<'a> Operations<'a> {
         document: &str,
         file_facts: &crate::operations::read::RecordFileFacts,
     ) -> OperationResult {
-        let parsed = match crate::api::operations::ReadInput::parse(input) {
-            Ok(parsed) => parsed,
-            Err(error) => return self.normalize_without_hydration("read", input, error),
+        let request = match self.parse_read_request(input) {
+            Ok(request) => request,
+            Err(result) => return result,
         };
-        if let Err(error) =
-            crate::operations::ensure_safe_relative_path(&parsed.path, self.collection.spec_profile)
-        {
-            return self.normalize_without_hydration("read", input, error);
-        }
-        let requested = match crate::operations::readable_record_path(self.collection, &parsed.path)
-        {
-            Ok(path) => path,
-            Err(error) => return self.normalize_without_hydration("read", input, error),
-        };
-        if requested.as_str() != path {
-            return failed_result(vec![Diagnostic::error(
-                "record_identity_mismatch",
-                "The supplied record does not match the requested canonical path.",
-                Some(parsed.path),
-            )]);
-        }
-        let evaluated = self.collection.read_document(
-            requested.as_str(),
-            document,
-            file_facts,
-            parsed.include_document,
-        );
-        let mut result = self.normalize_without_hydration("read", input, evaluated);
-        self.attach_match_diagnostics(&mut result);
-        result
+        typed_read_result(crate::operations::read::evaluate_typed_read(
+            self.collection,
+            &request,
+            crate::operations::read::TypedReadSource::Exact {
+                canonical_path: path,
+                document,
+                file_facts,
+            },
+        ))
     }
 
     pub(crate) fn read_record_not_found(&self, input: &Value) -> OperationResult {
-        let parsed = match crate::api::operations::ReadInput::parse(input) {
-            Ok(parsed) => parsed,
-            Err(error) => return self.normalize_without_hydration("read", input, error),
+        let request = match self.parse_read_request(input) {
+            Ok(request) => request,
+            Err(result) => return result,
         };
-        if let Err(error) =
-            crate::operations::ensure_safe_relative_path(&parsed.path, self.collection.spec_profile)
-        {
-            return self.normalize_without_hydration("read", input, error);
-        }
-        let requested = match crate::operations::readable_record_path(self.collection, &parsed.path)
-        {
-            Ok(path) => path,
-            Err(error) => return self.normalize_without_hydration("read", input, error),
-        };
-        self.normalize_without_hydration(
-            "read",
-            input,
-            crate::errors::op_error(
-                crate::errors::FILE_NOT_FOUND,
-                &format!("File not found: {}", requested.as_str()),
-            ),
-        )
+        typed_read_result(crate::operations::read::evaluate_typed_read(
+            self.collection,
+            &request,
+            crate::operations::read::TypedReadSource::Missing,
+        ))
+    }
+
+    fn parse_read_request(
+        &self,
+        input: &Value,
+    ) -> Result<crate::api::ReadRequest, OperationResult> {
+        let parsed = crate::api::operations::ReadInput::parse(input)
+            .map_err(|error| legacy_read_error(input, error))?;
+        crate::operations::ensure_safe_relative_path(&parsed.path, self.collection.spec_profile)
+            .map_err(|error| legacy_read_error(input, error))?;
+        let path = crate::operations::readable_record_path(self.collection, &parsed.path)
+            .map_err(|error| legacy_read_error(input, error))?;
+        Ok(crate::api::ReadRequest {
+            path,
+            include_document: parsed.include_document,
+        })
     }
 
     /// Resolve explicit or inferred type membership for one record.
@@ -118,21 +110,12 @@ impl<'a> Operations<'a> {
                 None,
             )]);
         };
-        let read = self.collection.read(&serde_json::json!({"path": path}));
-        if let Some(error) = read.get("error") {
-            return failed_result(vec![Diagnostic::error(
-                error
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("operation_failed"),
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Record could not be read."),
-                Some(path.to_string()),
-            )]);
+        let read = self.read(&serde_json::json!({"path": path}));
+        if !read.valid {
+            return failed_result(read.diagnostics);
         }
         let persisted = read
+            .result
             .get("frontmatter")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
@@ -476,36 +459,11 @@ impl<'a> Operations<'a> {
     }
 
     fn normalize(&self, operation: &str, input: &Value, legacy: Value) -> OperationResult {
-        self.normalize_inner(operation, input, legacy, true)
-    }
-
-    fn normalize_without_hydration(
-        &self,
-        operation: &str,
-        input: &Value,
-        legacy: Value,
-    ) -> OperationResult {
-        self.normalize_inner(operation, input, legacy, false)
-    }
-
-    fn normalize_inner(
-        &self,
-        operation: &str,
-        input: &Value,
-        legacy: Value,
-        hydrate_from_filesystem: bool,
-    ) -> OperationResult {
         let path = input
             .get("path")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let validation_severity =
-            if operation == "read" && self.collection.settings.default_validation == "warn" {
-                "warning"
-            } else {
-                "error"
-            };
-        let mut diagnostics = collect_diagnostics(&legacy, path.as_deref(), validation_severity);
+        let mut diagnostics = collect_diagnostics(&legacy, path.as_deref(), "error");
         let has_error = diagnostics
             .iter()
             .any(|diagnostic| diagnostic.severity == "error");
@@ -522,13 +480,12 @@ impl<'a> Operations<'a> {
             result.remove(envelope_key);
         }
 
-        if hydrate_from_filesystem
-            && valid
+        if valid
             && !input
                 .get("dry_run")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
-            && matches!(operation, "read" | "create" | "update" | "rename")
+            && matches!(operation, "create" | "update" | "rename")
         {
             let persisted_path = persisted_path(operation, input, &result);
             if let Some(persisted_path) = persisted_path {
@@ -797,21 +754,6 @@ impl<'a> Operations<'a> {
         }
         Ok((Value::Object(normalized), membership))
     }
-
-    fn attach_match_diagnostics(&self, result: &mut OperationResult) {
-        let Some(path) = result.result.get("path").and_then(Value::as_str) else {
-            return;
-        };
-        let Some(persisted) = result.result.get("frontmatter") else {
-            return;
-        };
-        let (_, failures) = self
-            .collection
-            .determine_types_for_path_checked(persisted, Some(path));
-        result
-            .diagnostics
-            .extend(match_failure_diagnostics(path, failures));
-    }
 }
 
 fn invalid_record_diagnostic(path: &str, reason: &str) -> Diagnostic {
@@ -914,6 +856,47 @@ fn diff_frontmatter(before: &Map<String, Value>, after: &Map<String, Value>) -> 
         }
     }
     fields
+}
+
+fn typed_read_result(evaluation: crate::operations::read::TypedReadEvaluation) -> OperationResult {
+    OperationResult {
+        valid: evaluation.valid,
+        result: evaluation
+            .value
+            .map(|value| serde_json::to_value(value).expect("record documents serialize"))
+            .unwrap_or_else(|| serde_json::json!({})),
+        diagnostics: evaluation
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| Diagnostic {
+                severity: match diagnostic.severity {
+                    crate::api::Severity::Error => "error",
+                    crate::api::Severity::Warning => "warning",
+                    crate::api::Severity::Info => "info",
+                }
+                .to_string(),
+                code: diagnostic.code.to_string(),
+                message: diagnostic.message,
+                path: diagnostic.path,
+                field: diagnostic.field,
+                type_name: diagnostic.type_name,
+                schema_location: diagnostic.schema_location,
+                details: diagnostic.details,
+            })
+            .collect(),
+    }
+}
+
+fn legacy_read_error(input: &Value, error: Value) -> OperationResult {
+    OperationResult {
+        valid: false,
+        result: serde_json::json!({}),
+        diagnostics: collect_diagnostics(
+            &error,
+            input.get("path").and_then(Value::as_str),
+            "error",
+        ),
+    }
 }
 
 fn failed_result(diagnostics: Vec<Diagnostic>) -> OperationResult {

@@ -463,6 +463,7 @@ mod tests {
     #[test]
     fn evaluates_one_exact_record_without_a_collection_root() {
         let catalog = catalog();
+        crate::record_load::reset_snapshot_record_loads_for_test();
         let result = catalog.read_record(
             &json!({"path": "tasks/one.md", "include_document": true}),
             &CanonicalRecordInput {
@@ -479,6 +480,7 @@ mod tests {
         assert_eq!(result.result["body"], "Body\n");
         assert_eq!(result.result["file"]["size"], 24);
         assert_eq!(result.result["document"], "---\nscore: 3\n---\nBody\n");
+        assert_eq!(crate::record_load::snapshot_record_loads_for_test(), 0);
     }
 
     #[test]

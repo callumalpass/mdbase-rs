@@ -948,10 +948,12 @@ impl<'a> TypedCollection<'a> {
         if self.collection.spec_profile == SpecProfile::V02 {
             return crate::compat::v02::read(self.collection, request);
         }
-        self.execute(self.operations()?.read(&json!({
-            "path": request.path,
-            "include_document": request.include_document,
-        })))
+        crate::operations::read::evaluate_typed_read(
+            self.collection,
+            &request,
+            crate::operations::read::TypedReadSource::Filesystem,
+        )
+        .into_outcome()
     }
 
     /// Create one canonical record.
