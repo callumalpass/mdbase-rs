@@ -1,0 +1,43 @@
+{
+  "rustSourceFileCountMax": 151,
+  "rustSourceLineCountMax": 80342,
+  "rustSourceFileMaxLines": 1000,
+  "legacyFileLineBudgets": {
+    "crates/mdbase-command/src/lib.rs": 1809,
+    "crates/mdbase-command/src/profile.rs": 1347,
+    "crates/mdbase-runtime/src/engine.rs": 1270,
+    "src/api/typed.rs": 1111,
+    "src/bin/phase0-baseline.rs": 1163,
+    "src/data_contracts.rs": 1075,
+    "src/expressions/evaluator.rs": 3390,
+    "src/query/engine.rs": 1086,
+    "src/runtime/filesystem.rs": 1248,
+    "src/runtime/hosted_base.rs": 1943,
+    "src/runtime/hosted_query.rs": 3296,
+    "src/runtime/tests.rs": 3050,
+    "src/transactions/runtime.rs": 1078,
+    "src/v03/batch.rs": 1055,
+    "src/v03/collection_setup.rs": 1478,
+    "src/v03/mod.rs": 1067,
+    "src/v03/operations.rs": 1031,
+    "src/v03/type_pack.rs": 2110,
+    "src/views/execute.rs": 1376,
+    "src/views/expression.rs": 2965,
+    "src/watch/real.rs": 3138
+  },
+  "deadCodeAllowancesByFile": {
+    "crates/mdbase-command/src/lib.rs": 1,
+    "src/cache/indexer.rs": 3,
+    "src/cache/sqlite.rs": 1,
+    "src/cache/staleness.rs": 2,
+    "src/matching/engine.rs": 1,
+    "src/operations/batch.rs": 1,
+    "src/runtime/outcome.rs": 2,
+    "src/runtime/provider.rs": 2,
+    "src/v03/cel.rs": 2
+  },
+  "transitionalReferenceBudgets": {
+    "uncheckedCollectionScans": 11,
+    "v03OperationFacade": 36
+  }
+}
