@@ -134,7 +134,7 @@ impl CompiledCatalog {
         }
 
         let classified = self.classify_record(record)?;
-        let read = self.read_record(&serde_json::json!({"path": record.path}), record);
+        let read = self.read_record_typed(&serde_json::json!({"path": record.path}), record)?;
         let structure = self.parse_record_structure(record)?;
         let mut semantic_complete = classified.frontmatter_error.is_none()
             && structure
@@ -146,13 +146,29 @@ impl CompiledCatalog {
         // defaults. Preserve those facts for queries and saved views while
         // retaining the validation diagnostics below.
         let mut effective_frontmatter = read
-            .result
-            .get("effective_frontmatter")
-            .and_then(Value::as_object)
+            .record()
+            .and_then(|record| record.effective_frontmatter.as_object())
             .cloned()
             .unwrap_or_default();
-        let mut diagnostics = read.diagnostics;
-        collect_result_diagnostics(&read.result, &mut diagnostics);
+        let mut diagnostics = read
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| Diagnostic {
+                severity: match diagnostic.severity {
+                    crate::api::Severity::Error => "error",
+                    crate::api::Severity::Warning => "warning",
+                    crate::api::Severity::Info => "info",
+                }
+                .to_string(),
+                code: diagnostic.code.to_string(),
+                message: diagnostic.message,
+                path: diagnostic.path,
+                field: diagnostic.field,
+                type_name: diagnostic.type_name,
+                schema_location: diagnostic.schema_location,
+                details: diagnostic.details,
+            })
+            .collect::<Vec<_>>();
         let body_dependent_fields = self.body_dependent_computed_fields(&classified.types);
         for field in body_dependent_fields {
             effective_frontmatter.remove(&field);
@@ -392,56 +408,6 @@ fn resolution_keys(
     keys
 }
 
-fn collect_result_diagnostics(result: &Value, diagnostics: &mut Vec<Diagnostic>) {
-    let values = result
-        .pointer("/validation/issues")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .chain(
-            result
-                .get("warnings")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten(),
-        );
-    for value in values {
-        let Some(code) = value.get("code").and_then(Value::as_str) else {
-            continue;
-        };
-        diagnostics.push(Diagnostic {
-            severity: value
-                .get("severity")
-                .and_then(Value::as_str)
-                .unwrap_or("warning")
-                .to_string(),
-            code: code.to_string(),
-            message: value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or(code)
-                .to_string(),
-            path: value
-                .get("path")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            field: value
-                .get("field")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            type_name: value
-                .get("type")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            schema_location: value
-                .get("schema_location")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            details: value.get("details").cloned(),
-        });
-    }
-}
-
 fn sort_diagnostics(diagnostics: &mut [Diagnostic]) {
     diagnostics.sort_by(|left, right| {
         left.code
@@ -456,6 +422,7 @@ fn sort_diagnostics(diagnostics: &mut [Diagnostic]) {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use serde_json::json;
 

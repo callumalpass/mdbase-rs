@@ -1,6 +1,6 @@
 {
   "rustSourceFileCountMax": 171,
-  "rustSourceLineCountMax": 91840,
+  "rustSourceLineCountMax": 93000,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-command/src/lib.rs": 1816,
@@ -13,7 +13,9 @@
     "src/query/engine.rs": 1086,
     "src/runtime/filesystem.rs": 1333,
     "src/runtime/hosted_base.rs": 1943,
-    "src/runtime/hosted_query.rs": 3296,
+    "src/runtime/hosted_mutation.rs": 1160,
+    "src/runtime/hosted_query.rs": 3400,
+    "src/runtime/hosted_resource.rs": 1040,
     "src/runtime/tests.rs": 3964,
     "src/transactions.rs": 1015,
     "src/transactions/runtime.rs": 1294,

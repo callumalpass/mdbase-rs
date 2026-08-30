@@ -237,7 +237,8 @@ impl CanonicalOperationOutcome {
 
     pub(crate) fn record(&self) -> Option<&RecordDocument> {
         match &self.value {
-            CanonicalOperationValue::Create(Some(record))
+            CanonicalOperationValue::Read(Some(record))
+            | CanonicalOperationValue::Create(Some(record))
             | CanonicalOperationValue::Update(Some(record)) => Some(record),
             _ => None,
         }
@@ -425,8 +426,20 @@ impl CanonicalOperationOutcome {
         })
     }
 
-    /// The single compatibility adapter from the typed runtime contract to the
-    /// exact portable v0.3 operation envelope.
+    /// Internal adapter for operation families whose canonical implementation
+    /// still returns the v0.3 envelope. Hosted typed seams call this adapter at
+    /// the implementation edge and never inspect `OperationResult.result`.
+    /// Validation and setup/resource value families remain explicitly
+    /// `WireOnlyOperationValue` until canonical value models exist.
+    pub(crate) fn hosted_wire_edge(
+        operation: OperationKind,
+        result: OperationResult,
+    ) -> Result<Self, ProviderError> {
+        Self::recover_v03(operation, result)
+    }
+
+    /// The single public compatibility adapter from the typed runtime contract
+    /// to the exact portable v0.3 operation envelope.
     pub fn to_v03(&self) -> OperationResult {
         let result = match &self.value {
             CanonicalOperationValue::Read(value)

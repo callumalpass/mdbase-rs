@@ -451,9 +451,10 @@ pub enum RebuildReason {
 }
 
 /// Exact or explicitly broad canonical effects of one observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum ChangeSet {
     /// No canonical resource changed.
+    #[default]
     None,
     /// Exact immutable canonical changes.
     Exact(ChangeBatch),
