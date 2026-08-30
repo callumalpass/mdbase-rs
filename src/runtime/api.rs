@@ -3,9 +3,10 @@ use std::num::NonZeroUsize;
 use super::{
     CancelOutcome, ChangeBatch, ChangeFeed, ChangeFeedBaseline, ChangeFeedOwnerId,
     ChangeFeedTransfer, ChangeFeedTransferId, ChangeFeedTransferIntent, ChangePage,
-    ChangePageCursor, ChangeWatermark, CommitAttempt, CommitId, DurableCommitState,
-    ExecutionOutcome, HostClaimId, OperationContext, OperationRequest, PreparationOutcome,
-    PreparedMutation, ProviderError, ReadCursor, ReadPage, RuntimeChangeEventPage,
+    ChangePageCursor, ChangeWatermark, CommitAttempt, CommitId, CursorReleaseOutcome,
+    DurableCommitState, ExecutionOutcome, HostClaimId, OperationContext, OperationRequest,
+    PreparationOutcome, PreparedMutation, ProviderError, ReadCursor, ReadPage,
+    RuntimeChangeEventPage,
 };
 
 /// Provider-neutral authority over one coordinated collection runtime.
@@ -32,7 +33,7 @@ pub trait CollectionRuntime: Send + Sync {
         &self,
         cursor: ReadCursor,
         context: &OperationContext,
-    ) -> Result<(), ProviderError>;
+    ) -> Result<CursorReleaseOutcome, ProviderError>;
 
     fn prepare(
         &self,
@@ -154,7 +155,7 @@ impl CollectionRuntime for super::FilesystemRuntime {
         &self,
         cursor: ReadCursor,
         context: &OperationContext,
-    ) -> Result<(), ProviderError> {
+    ) -> Result<CursorReleaseOutcome, ProviderError> {
         super::FilesystemRuntime::release_read(self, cursor, context)
     }
 

@@ -624,6 +624,14 @@ pub struct ReadPage {
     pub next: Option<ReadCursor>,
 }
 
+/// Typed result of explicitly releasing generation-pinned cursor state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CursorReleaseOutcome {
+    /// `true` when retained state existed and was released; `false` for an
+    /// authenticated cursor that had already been released.
+    pub released: bool,
+}
+
 /// Opaque process-local handle for one durable prepared mutation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedMutation {

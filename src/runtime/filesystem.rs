@@ -296,10 +296,11 @@ impl FilesystemRuntime {
         &self,
         cursor: ReadCursor,
         context: &OperationContext,
-    ) -> Result<(), ProviderError> {
+    ) -> Result<super::CursorReleaseOutcome, ProviderError> {
         context.check()?;
-        self.cursor_lock(context)?.release(cursor)?;
-        context.check()
+        let released = self.cursor_lock(context)?.release(cursor)?;
+        context.check()?;
+        Ok(super::CursorReleaseOutcome { released })
     }
 
     /// Validate and durably stage one exact mutation under an opaque host claim.

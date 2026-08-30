@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use super::{
-    CanonicalOperationOutcome, CanonicalOperationValue, ChangeSet, CollectionGeneration,
-    ExecutionOutcome, OperationContext, ProviderError, ReadCursor, ReadPage,
+    CanonicalOperationOutcome, ChangeSet, CollectionGeneration, ExecutionOutcome, OperationContext,
+    ProviderError, ReadCursor, ReadPage,
 };
 
 const MAX_ACTIVE_CURSORS: usize = 32;
@@ -53,7 +53,7 @@ impl CursorStore {
         let page_items = page_items
             .unwrap_or(DEFAULT_PAGE_ITEMS)
             .clamp(1, MAX_PAGE_ITEMS);
-        let CanonicalOperationValue::Query(Some(query)) = &mut outcome.operation.value else {
+        let Some(query) = outcome.operation.query_value_mut() else {
             return Ok(ReadPage {
                 outcome,
                 next: None,
@@ -135,7 +135,7 @@ impl CursorStore {
             .saturating_add(pinned.page_items)
             .min(pinned.results.len());
         let mut operation = pinned.template.clone();
-        let CanonicalOperationValue::Query(Some(query)) = &mut operation.value else {
+        let Some(query) = operation.query_value_mut() else {
             return Err(ProviderError::Transaction {
                 code: "cursor_state_invalid",
                 message: "pinned read no longer contains a typed query".to_string(),
@@ -154,12 +154,15 @@ impl CursorStore {
         })
     }
 
-    pub(crate) fn release(&mut self, cursor: ReadCursor) -> Result<(), ProviderError> {
+    pub(crate) fn release(&mut self, cursor: ReadCursor) -> Result<bool, ProviderError> {
         let (id, _) = self.authenticate(&cursor)?;
-        if let Some(removed) = self.entries.remove(&id) {
+        let released = if let Some(removed) = self.entries.remove(&id) {
             self.retained_bytes = self.retained_bytes.saturating_sub(removed.retained_bytes);
-        }
-        Ok(())
+            true
+        } else {
+            false
+        };
+        Ok(released)
     }
 
     pub(crate) fn measurements(&mut self) -> (usize, usize) {
@@ -315,7 +318,7 @@ fn set_has_more(meta: &mut serde_json::Value, has_more: bool) {
 mod tests {
     use super::*;
     use crate::api::{ProjectedValue, QueryMetadata};
-    use crate::runtime::{CanonicalQueryValue, OperationDeadline};
+    use crate::runtime::{CanonicalOperationValue, CanonicalQueryValue, OperationDeadline};
     use serde_json::json;
 
     #[test]
@@ -337,7 +340,7 @@ mod tests {
         };
         let outcome =
             ExecutionOutcome::new(operation, generation.clone(), ChangeSet::None, None, None);
-        let records = match &outcome.operation.value {
+        let records = match outcome.operation.value() {
             CanonicalOperationValue::Query(Some(query)) => &query.records,
             _ => unreachable!(),
         };

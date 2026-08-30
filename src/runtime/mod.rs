@@ -40,12 +40,13 @@ pub use benchmark::{
     BenchmarkDiagnostic, BenchmarkFileFacts, BenchmarkProjection, CandidateExpression,
     CandidateTruth, CompiledCandidate, ProjectionRelationship, QueryRequirements,
 };
+pub(crate) use canonical_operation::LegacyRecoveredV03Value;
 pub use canonical_operation::{
     CanonicalCollectionSetupAppliedValue, CanonicalCollectionSetupConflictValue,
-    CanonicalCollectionSetupValue, CanonicalDeleteValue, CanonicalOperationOutcome,
-    CanonicalOperationValue, CanonicalQueryValue, CanonicalRenamePreflightValue,
-    CanonicalRenameValue, CanonicalTypePackValue, DefinitionResultExtensions,
-    WireOnlyOperationValue,
+    CanonicalCollectionSetupValue, CanonicalDeleteValue, CanonicalOperationFamily,
+    CanonicalOperationOutcome, CanonicalOperationValue, CanonicalOutcomeState, CanonicalQueryValue,
+    CanonicalRenamePreflightValue, CanonicalRenameValue, CanonicalResourceOperationValue,
+    CanonicalTypePackValue, DefinitionResultExtensions,
 };
 pub use catalog::{
     CanonicalRecordInput, CatalogError, CatalogInput, CompiledCatalog, ResolvedTypeResource,
@@ -95,9 +96,10 @@ pub use outcome::{
     ChangeFeedOwnerId, ChangeFeedTransfer, ChangeFeedTransferId, ChangeFeedTransferIntent,
     ChangeFeedTransferReceipt, ChangeOrigin, ChangePage, ChangePageCursor, ChangeSet,
     ChangeWatermark, CollectionGeneration, CommitAttempt, CommitId, CommitRejection,
-    DurableCommitState, ExecutionOutcome, HostClaimId, PreparationOutcome, PreparedMutation,
-    ReadCursor, ReadPage, RebuildReason, RecordChange, RecordChangeKind, ResourceChange,
-    ResourceChangeKind, RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeMeasurements,
+    CursorReleaseOutcome, DurableCommitState, ExecutionOutcome, HostClaimId, PreparationOutcome,
+    PreparedMutation, ReadCursor, ReadPage, RebuildReason, RecordChange, RecordChangeKind,
+    ResourceChange, ResourceChangeKind, RuntimeChangeEvent, RuntimeChangeEventPage,
+    RuntimeMeasurements,
 };
 pub use projection::{
     PreparedSemanticProjection, RecordResolutionKey, RecordResolutionKeyKind, SemanticFileFacts,

@@ -9,7 +9,7 @@ use crate::api::{
 use crate::diagnostic::Diagnostic as WireDiagnostic;
 use crate::v03::OperationResult;
 
-use super::{OperationKind, ProviderError};
+use super::{CursorReleaseOutcome, OperationKind, ProviderError};
 
 /// Typed canonical query value retained by the runtime and read cursors.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -62,6 +62,24 @@ pub enum WireOnlyOperationValue {
     TypeResource(Value),
 }
 
+/// Typed mutation-resource envelope. The operation discriminator is retained
+/// so durable journals can validate the exact resource family.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalResourceOperationValue {
+    operation: OperationKind,
+    result: Value,
+}
+
+impl CanonicalResourceOperationValue {
+    pub fn operation(&self) -> OperationKind {
+        self.operation
+    }
+
+    pub fn result(&self) -> &Value {
+        &self.result
+    }
+}
+
 /// Explicitly named storage for forward-compatible definition-result fields.
 /// Core fields consumed by hosts remain closed and typed.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -100,6 +118,29 @@ pub enum CanonicalCollectionSetupValue {
     Assessment(crate::v03::CollectionSetupAssessment),
 }
 
+/// Opaque payload used only by version-2 transaction recovery. Its contents
+/// cannot be constructed or deserialized through the public API.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LegacyRecoveredV03Value(OperationResult);
+
+impl LegacyRecoveredV03Value {
+    pub(crate) fn from_transaction_recovery(result: OperationResult) -> Self {
+        Self(result)
+    }
+}
+
+impl<'de> Deserialize<'de> for LegacyRecoveredV03Value {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Err(serde::de::Error::custom(
+            "legacy-recovered values are restricted to transaction recovery",
+        ))
+    }
+}
+
 /// Closed semantic value returned by the filesystem runtime.
 ///
 /// `None` means the operation failed before producing a semantic value. It is
@@ -114,20 +155,92 @@ pub enum CanonicalOperationValue {
     Delete(Option<CanonicalDeleteValue>),
     Rename(Option<CanonicalRenameValue>),
     Batch(Option<BatchResult>),
-    TypePack(Option<CanonicalTypePackValue>),
-    CollectionSetup(Option<Box<CanonicalCollectionSetupValue>>),
+    AssessTypePack(Option<CanonicalTypePackValue>),
+    ApplyTypePack(Option<CanonicalTypePackValue>),
+    AssessCollectionSetup(Option<Box<CanonicalCollectionSetupValue>>),
+    ApplyCollectionSetup(Option<Box<CanonicalCollectionSetupValue>>),
+    ViewResourceMutation(CanonicalResourceOperationValue),
+    TypeResourceMutation(CanonicalResourceOperationValue),
+    CursorRelease(CursorReleaseOutcome),
     WireOnly(WireOnlyOperationValue),
     /// Exact non-semantic recovery of an ambiguous version-2 runtime journal.
-    LegacyRecoveredV03(OperationResult),
+    LegacyRecoveredV03(LegacyRecoveredV03Value),
+}
+
+/// Explicit in-memory state of a checked canonical operation outcome. This is
+/// derived and does not alter the durable journal shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalOutcomeState {
+    Completed,
+    Rejected,
+    WireCompatibilityCompleted,
+    WireCompatibilityRejected,
+    LegacyRecoveredV03,
+}
+
+/// Canonical family discriminator used where an operation context must be
+/// checked without conflating cursor lifecycle with query semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalOperationFamily {
+    Operation(OperationKind),
+    CursorLifecycle,
+    LegacyRecoveredV03,
 }
 
 /// Closed typed operation outcome shared by execution, durable transactions,
 /// recovery, claim resolution, and generation-pinned cursors.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// Its fields are deliberately private and serde is checked as well:
+///
+/// ```compile_fail
+/// use mdbase::runtime::{CanonicalOperationOutcome, CanonicalOperationValue};
+/// let _ = CanonicalOperationOutcome {
+///     valid: true,
+///     value: CanonicalOperationValue::Read(None),
+///     diagnostics: Vec::new(),
+/// };
+/// ```
+#[derive(Clone, Debug, PartialEq)]
 pub struct CanonicalOperationOutcome {
-    pub valid: bool,
-    pub value: CanonicalOperationValue,
-    pub diagnostics: Vec<Diagnostic>,
+    pub(crate) valid: bool,
+    pub(crate) value: CanonicalOperationValue,
+    pub(crate) diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CanonicalOperationOutcomeWire {
+    valid: bool,
+    value: CanonicalOperationValue,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl Serialize for CanonicalOperationOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if matches!(self.value, CanonicalOperationValue::LegacyRecoveredV03(_)) {
+            return Err(serde::ser::Error::custom(
+                "legacy-recovered v0.3 outcomes cannot be written to a v3 journal",
+            ));
+        }
+        CanonicalOperationOutcomeWire {
+            valid: self.valid,
+            value: self.value.clone(),
+            diagnostics: self.diagnostics.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalOperationOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = CanonicalOperationOutcomeWire::deserialize(deserializer)?;
+        Self::checked(wire.valid, wire.value, wire.diagnostics).map_err(serde::de::Error::custom)
+    }
 }
 
 impl CanonicalOperationValue {
@@ -140,8 +253,14 @@ impl CanonicalOperationValue {
             Self::Delete(_) => Some(OperationKind::Delete),
             Self::Rename(_) => Some(OperationKind::Rename),
             Self::Batch(_) => Some(OperationKind::Batch),
-            Self::TypePack(_) => Some(OperationKind::AssessTypePack),
-            Self::CollectionSetup(_) => Some(OperationKind::AssessCollectionSetup),
+            Self::AssessTypePack(_) => Some(OperationKind::AssessTypePack),
+            Self::ApplyTypePack(_) => Some(OperationKind::ApplyTypePack),
+            Self::AssessCollectionSetup(_) => Some(OperationKind::AssessCollectionSetup),
+            Self::ApplyCollectionSetup(_) => Some(OperationKind::ApplyCollectionSetup),
+            Self::ViewResourceMutation(value) | Self::TypeResourceMutation(value) => {
+                Some(value.operation)
+            }
+            Self::CursorRelease(_) => None,
             Self::WireOnly(WireOnlyOperationValue::Validation(_)) => Some(OperationKind::Validate),
             Self::WireOnly(WireOnlyOperationValue::ViewResource(_)) => {
                 Some(OperationKind::ExecuteView)
@@ -155,6 +274,143 @@ impl CanonicalOperationValue {
 }
 
 impl CanonicalOperationOutcome {
+    fn checked(
+        valid: bool,
+        value: CanonicalOperationValue,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Result<Self, &'static str> {
+        if matches!(value, CanonicalOperationValue::LegacyRecoveredV03(_)) {
+            return Err("legacy-recovered outcomes are accepted only by v0.3 transaction recovery");
+        }
+        let missing_semantic_value = matches!(
+            value,
+            CanonicalOperationValue::Read(None)
+                | CanonicalOperationValue::Query(None)
+                | CanonicalOperationValue::Create(None)
+                | CanonicalOperationValue::Update(None)
+                | CanonicalOperationValue::Delete(None)
+                | CanonicalOperationValue::Rename(None)
+                | CanonicalOperationValue::Batch(None)
+                | CanonicalOperationValue::AssessTypePack(None)
+                | CanonicalOperationValue::ApplyTypePack(None)
+                | CanonicalOperationValue::AssessCollectionSetup(None)
+                | CanonicalOperationValue::ApplyCollectionSetup(None)
+        );
+        if valid && missing_semantic_value {
+            return Err("a valid canonical operation outcome requires a semantic value");
+        }
+        if !valid && matches!(value, CanonicalOperationValue::CursorRelease(_)) {
+            return Err("cursor release outcomes can only be completed");
+        }
+        let resource_mismatch = matches!(
+            &value,
+            CanonicalOperationValue::ViewResourceMutation(value)
+                if !matches!(value.operation, OperationKind::CreateViewSource | OperationKind::UpdateViewSource | OperationKind::DeleteViewSource)
+        ) || matches!(
+            &value,
+            CanonicalOperationValue::TypeResourceMutation(value)
+                if !matches!(value.operation, OperationKind::CreateType | OperationKind::UpdateType)
+        );
+        if resource_mismatch {
+            return Err("resource outcome operation does not match its canonical family");
+        }
+        Ok(Self {
+            valid,
+            value,
+            diagnostics,
+        })
+    }
+
+    /// Construct a checked successful outcome. A semantic `None` and all
+    /// compatibility-only recovered values are rejected.
+    pub fn try_completed(
+        value: CanonicalOperationValue,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Result<Self, ProviderError> {
+        if matches!(value, CanonicalOperationValue::WireOnly(_)) {
+            return Err(invalid_outcome(
+                "wire-only outcomes require a named compatibility constructor",
+            ));
+        }
+        Self::checked(true, value, diagnostics).map_err(invalid_outcome)
+    }
+
+    /// Construct a checked rejected outcome. Partial or absent values and
+    /// diagnostics are retained; recovered legacy envelopes remain restricted.
+    pub fn try_rejected(
+        value: CanonicalOperationValue,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Result<Self, ProviderError> {
+        if matches!(value, CanonicalOperationValue::WireOnly(_)) {
+            return Err(invalid_outcome(
+                "wire-only outcomes require a named compatibility constructor",
+            ));
+        }
+        Self::checked(false, value, diagnostics).map_err(invalid_outcome)
+    }
+
+    /// Explicit derived runtime state without adding a persisted discriminator.
+    pub fn state(&self) -> CanonicalOutcomeState {
+        match (&self.value, self.valid) {
+            (CanonicalOperationValue::LegacyRecoveredV03(_), _) => {
+                CanonicalOutcomeState::LegacyRecoveredV03
+            }
+            (CanonicalOperationValue::WireOnly(_), true) => {
+                CanonicalOutcomeState::WireCompatibilityCompleted
+            }
+            (CanonicalOperationValue::WireOnly(_), false) => {
+                CanonicalOutcomeState::WireCompatibilityRejected
+            }
+            (_, true) => CanonicalOutcomeState::Completed,
+            (_, false) => CanonicalOutcomeState::Rejected,
+        }
+    }
+
+    /// Whether the operation completed semantically successfully.
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// The checked semantic value. Legacy v0.3 recovery is intentionally not
+    /// exposed as an ordinary semantic value.
+    pub fn value(&self) -> &CanonicalOperationValue {
+        &self.value
+    }
+
+    /// Diagnostics retained independently of validity and partial values.
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    /// Explicit canonical family, including non-operation lifecycle state.
+    pub fn family(&self) -> CanonicalOperationFamily {
+        match &self.value {
+            CanonicalOperationValue::CursorRelease(_) => CanonicalOperationFamily::CursorLifecycle,
+            CanonicalOperationValue::LegacyRecoveredV03(_) => {
+                CanonicalOperationFamily::LegacyRecoveredV03
+            }
+            value => CanonicalOperationFamily::Operation(
+                value
+                    .kind()
+                    .expect("all remaining canonical values have an operation"),
+            ),
+        }
+    }
+
+    /// Operation family represented by this outcome, when semantically known.
+    pub fn operation_kind(&self) -> Option<OperationKind> {
+        self.value.kind()
+    }
+
+    /// Mutably access an existing typed query without permitting callers to
+    /// replace the checked operation family or remove its semantic value.
+    pub fn query_value_mut(&mut self) -> Option<&mut CanonicalQueryValue> {
+        match &mut self.value {
+            CanonicalOperationValue::Query(Some(query)) => Some(query),
+            _ => None,
+        }
+    }
+
     pub(crate) fn read(outcome: crate::api::OperationOutcome<RecordDocument>) -> Self {
         Self {
             valid: true,
@@ -175,14 +431,6 @@ impl CanonicalOperationOutcome {
                 embedded_diagnostics,
             })),
             diagnostics: outcome.diagnostics,
-        }
-    }
-
-    pub(crate) fn legacy_recovered(result: OperationResult) -> Self {
-        Self {
-            valid: result.valid,
-            diagnostics: result.diagnostics.iter().cloned().map(Into::into).collect(),
-            value: CanonicalOperationValue::LegacyRecoveredV03(result),
         }
     }
 
@@ -237,6 +485,63 @@ impl CanonicalOperationOutcome {
         }
     }
 
+    /// Construct the typed result of releasing a query cursor. This replaces
+    /// the former validation-JSON lifecycle envelope while preserving its v0.3
+    /// projection.
+    pub fn cursor_release(outcome: CursorReleaseOutcome) -> Self {
+        Self {
+            valid: true,
+            value: CanonicalOperationValue::CursorRelease(outcome),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// Construct the validation compatibility family without exposing a raw
+    /// `WireOnlyOperationValue` constructor.
+    pub fn validation_wire(result: OperationResult) -> Self {
+        Self::wire_only(OperationKind::Validate, result)
+    }
+
+    /// Construct one checked view-resource compatibility outcome.
+    pub fn view_wire(
+        operation: OperationKind,
+        result: OperationResult,
+    ) -> Result<Self, ProviderError> {
+        if !matches!(
+            operation,
+            OperationKind::ListViews
+                | OperationKind::ExecuteView
+                | OperationKind::ReadViewSource
+                | OperationKind::CreateViewSource
+                | OperationKind::UpdateViewSource
+                | OperationKind::DeleteViewSource
+        ) {
+            return Err(ProviderError::UnsupportedOperation(
+                "view_wire requires a view-resource operation".to_string(),
+            ));
+        }
+        Ok(Self::wire_only(operation, result))
+    }
+
+    /// Construct one checked type-resource compatibility outcome.
+    pub fn type_wire(
+        operation: OperationKind,
+        result: OperationResult,
+    ) -> Result<Self, ProviderError> {
+        if !matches!(
+            operation,
+            OperationKind::ListTypes
+                | OperationKind::ReadType
+                | OperationKind::CreateType
+                | OperationKind::UpdateType
+        ) {
+            return Err(ProviderError::UnsupportedOperation(
+                "type_wire requires a type-resource operation".to_string(),
+            ));
+        }
+        Ok(Self::wire_only(operation, result))
+    }
+
     pub(crate) fn wire_only(operation: OperationKind, result: OperationResult) -> Self {
         if matches!(
             operation,
@@ -247,6 +552,17 @@ impl CanonicalOperationOutcome {
         ) {
             return Self::definition(operation, result)
                 .expect("definition APIs produce their closed typed result shape");
+        }
+        if matches!(
+            operation,
+            OperationKind::CreateViewSource
+                | OperationKind::UpdateViewSource
+                | OperationKind::DeleteViewSource
+                | OperationKind::CreateType
+                | OperationKind::UpdateType
+        ) {
+            return Self::recover_v03(operation, result)
+                .expect("resource mutation APIs produce their canonical resource shape");
         }
         let OperationResult {
             valid,
@@ -285,24 +601,32 @@ impl CanonicalOperationOutcome {
         } = result;
         let empty = result.as_object().is_some_and(serde_json::Map::is_empty);
         let value = match operation {
-            OperationKind::AssessTypePack | OperationKind::ApplyTypePack => {
-                CanonicalOperationValue::TypePack(
-                    (!empty).then(|| decode_value(result)).transpose()?,
-                )
-            }
-            OperationKind::AssessCollectionSetup | OperationKind::ApplyCollectionSetup => {
-                CanonicalOperationValue::CollectionSetup(
-                    (!empty)
-                        .then(|| decode_value(result).map(Box::new))
-                        .transpose()?,
-                )
-            }
+            OperationKind::AssessTypePack => CanonicalOperationValue::AssessTypePack(
+                (!empty).then(|| decode_value(result)).transpose()?,
+            ),
+            OperationKind::ApplyTypePack => CanonicalOperationValue::ApplyTypePack(
+                (!empty).then(|| decode_value(result)).transpose()?,
+            ),
+            OperationKind::AssessCollectionSetup => CanonicalOperationValue::AssessCollectionSetup(
+                (!empty)
+                    .then(|| decode_value(result).map(Box::new))
+                    .transpose()?,
+            ),
+            OperationKind::ApplyCollectionSetup => CanonicalOperationValue::ApplyCollectionSetup(
+                (!empty)
+                    .then(|| decode_value(result).map(Box::new))
+                    .transpose()?,
+            ),
             _ => unreachable!("definition constructor requires a definition operation"),
         };
-        Ok(Self {
+        Self::checked(
             valid,
             value,
-            diagnostics: diagnostics.into_iter().map(Into::into).collect(),
+            diagnostics.into_iter().map(Into::into).collect(),
+        )
+        .map_err(|message| ProviderError::Transaction {
+            code: "invalid_canonical_operation_outcome",
+            message: message.to_string(),
         })
     }
 
@@ -475,17 +799,25 @@ impl CanonicalOperationOutcome {
             }
             OperationKind::ListViews
             | OperationKind::ExecuteView
-            | OperationKind::ReadViewSource
-            | OperationKind::CreateViewSource
-            | OperationKind::UpdateViewSource
-            | OperationKind::DeleteViewSource => {
+            | OperationKind::ReadViewSource => {
                 CanonicalOperationValue::WireOnly(WireOnlyOperationValue::ViewResource(result))
             }
-            OperationKind::ListTypes
-            | OperationKind::ReadType
-            | OperationKind::CreateType
-            | OperationKind::UpdateType => {
+            OperationKind::CreateViewSource
+            | OperationKind::UpdateViewSource
+            | OperationKind::DeleteViewSource => {
+                CanonicalOperationValue::ViewResourceMutation(CanonicalResourceOperationValue {
+                    operation,
+                    result,
+                })
+            }
+            OperationKind::ListTypes | OperationKind::ReadType => {
                 CanonicalOperationValue::WireOnly(WireOnlyOperationValue::TypeResource(result))
+            }
+            OperationKind::CreateType | OperationKind::UpdateType => {
+                CanonicalOperationValue::TypeResourceMutation(CanonicalResourceOperationValue {
+                    operation,
+                    result,
+                })
             }
             OperationKind::AssessTypePack | OperationKind::ApplyTypePack => {
                 return Self::definition(
@@ -508,11 +840,20 @@ impl CanonicalOperationOutcome {
                 );
             }
         };
-        Ok(Self {
-            valid,
-            value,
-            diagnostics,
+        Self::checked(valid, value, diagnostics).map_err(|message| ProviderError::Transaction {
+            code: "invalid_canonical_operation_outcome",
+            message: message.to_string(),
         })
+    }
+
+    /// Checked public compatibility conversion with an explicit operation
+    /// discriminator. The discriminator selects the value decoder, so an
+    /// operation/value mismatch cannot be admitted.
+    pub fn try_from_v03(
+        operation: OperationKind,
+        result: OperationResult,
+    ) -> Result<Self, ProviderError> {
+        Self::recover_v03(operation, result)
     }
 
     /// Internal adapter for operation families whose canonical implementation
@@ -572,14 +913,23 @@ impl CanonicalOperationOutcome {
                     })
             }
             CanonicalOperationValue::Batch(value) => encode_optional(value),
-            CanonicalOperationValue::TypePack(value) => encode_optional(value),
-            CanonicalOperationValue::CollectionSetup(value) => encode_optional(value),
+            CanonicalOperationValue::AssessTypePack(value)
+            | CanonicalOperationValue::ApplyTypePack(value) => encode_optional(value),
+            CanonicalOperationValue::AssessCollectionSetup(value)
+            | CanonicalOperationValue::ApplyCollectionSetup(value) => encode_optional(value),
+            CanonicalOperationValue::ViewResourceMutation(value)
+            | CanonicalOperationValue::TypeResourceMutation(value) => value.result.clone(),
+            CanonicalOperationValue::CursorRelease(outcome) => serde_json::json!({
+                "released": outcome.released,
+                "results": [],
+                "meta": {"total_count": 0, "has_more": false}
+            }),
             CanonicalOperationValue::WireOnly(value) => match value {
                 WireOnlyOperationValue::Validation(value)
                 | WireOnlyOperationValue::ViewResource(value)
                 | WireOnlyOperationValue::TypeResource(value) => value.clone(),
             },
-            CanonicalOperationValue::LegacyRecoveredV03(result) => return result.clone(),
+            CanonicalOperationValue::LegacyRecoveredV03(result) => return result.0.clone(),
         };
         OperationResult {
             valid: self.valid,
@@ -627,11 +977,28 @@ impl CanonicalOperationOutcome {
     }
 }
 
+impl TryFrom<(OperationKind, OperationResult)> for CanonicalOperationOutcome {
+    type Error = ProviderError;
+
+    fn try_from(
+        (operation, result): (OperationKind, OperationResult),
+    ) -> Result<Self, Self::Error> {
+        Self::try_from_v03(operation, result)
+    }
+}
+
 fn decode_value<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ProviderError> {
     serde_json::from_value(value).map_err(|error| ProviderError::Transaction {
         code: "typed_outcome_decode_failed",
         message: error.to_string(),
     })
+}
+
+fn invalid_outcome(message: &'static str) -> ProviderError {
+    ProviderError::Transaction {
+        code: "invalid_canonical_operation_outcome",
+        message: message.to_string(),
+    }
 }
 
 fn invalid_shape(message: &str) -> ProviderError {
@@ -704,6 +1071,105 @@ mod tests {
         let typed = CanonicalOperationOutcome::recover_v03(kind, wire.clone()).unwrap();
         assert_eq!(typed.to_v03(), wire);
         typed
+    }
+
+    #[test]
+    fn serde_rejects_valid_outcomes_without_every_required_semantic_value() {
+        for operation in [
+            "read",
+            "query",
+            "create",
+            "update",
+            "delete",
+            "rename",
+            "batch",
+            "assess_type_pack",
+            "apply_type_pack",
+            "assess_collection_setup",
+            "apply_collection_setup",
+        ] {
+            let fixture = json!({
+                "valid": true,
+                "value": {"operation": operation, "value": null},
+                "diagnostics": []
+            });
+            let error =
+                serde_json::from_value::<CanonicalOperationOutcome>(fixture).expect_err(operation);
+            assert!(error.to_string().contains("requires a semantic value"));
+        }
+    }
+
+    #[test]
+    fn rejected_outcomes_retain_absent_or_partial_values_and_diagnostics() {
+        let absent = json!({
+            "valid": false,
+            "value": {"operation": "read", "value": null},
+            "diagnostics": []
+        });
+        assert!(!serde_json::from_value::<CanonicalOperationOutcome>(absent)
+            .unwrap()
+            .is_valid());
+
+        let partial = roundtrip(
+            OperationKind::Delete,
+            json!({"path": "a.md", "deleted": false}),
+        );
+        let rejected = CanonicalOperationOutcome::try_rejected(
+            partial.value().clone(),
+            vec![Diagnostic {
+                severity: Severity::Error,
+                code: crate::api::DiagnosticCode::new("partial_rejection"),
+                message: "partial evidence retained".to_string(),
+                path: Some("a.md".to_string()),
+                field: None,
+                type_name: None,
+                schema_location: None,
+                details: Some(json!({"partial": true})),
+            }],
+        )
+        .unwrap();
+        let replay: CanonicalOperationOutcome =
+            serde_json::from_value(serde_json::to_value(&rejected).unwrap()).unwrap();
+        assert_eq!(replay, rejected);
+        assert!(matches!(
+            replay.value(),
+            CanonicalOperationValue::Delete(Some(_))
+        ));
+    }
+
+    #[test]
+    fn explicit_operation_context_rejects_mismatched_wire_values() {
+        let wire = OperationResult {
+            valid: true,
+            result: record("a.md"),
+            diagnostics: Vec::new(),
+        };
+        assert!(CanonicalOperationOutcome::try_from_v03(OperationKind::Query, wire).is_err());
+    }
+
+    #[test]
+    fn legacy_state_cannot_enter_checked_serde_or_new_v3_writes() {
+        let wire = OperationResult {
+            valid: false,
+            result: json!({}),
+            diagnostics: Vec::new(),
+        };
+        let legacy = CanonicalOperationOutcome {
+            valid: wire.valid,
+            diagnostics: wire.diagnostics.iter().cloned().map(Into::into).collect(),
+            value: CanonicalOperationValue::LegacyRecoveredV03(
+                LegacyRecoveredV03Value::from_transaction_recovery(wire),
+            ),
+        };
+        assert!(serde_json::to_value(&legacy).is_err());
+        let fixture = json!({
+            "valid": false,
+            "value": {"operation": "legacy_recovered_v03", "value": {
+                "valid": false, "result": {}, "diagnostics": []
+            }},
+            "diagnostics": []
+        });
+        assert!(serde_json::from_value::<CanonicalOperationOutcome>(fixture).is_err());
     }
 
     #[test]
@@ -825,14 +1291,84 @@ mod tests {
     }
 
     #[test]
+    fn cursor_release_is_typed_and_preserves_the_v03_projection() {
+        let outcome =
+            CanonicalOperationOutcome::cursor_release(CursorReleaseOutcome { released: true });
+        assert_eq!(outcome.operation_kind(), None);
+        assert_eq!(outcome.family(), CanonicalOperationFamily::CursorLifecycle);
+        assert!(CanonicalOperationOutcome::try_rejected(
+            CanonicalOperationValue::CursorRelease(CursorReleaseOutcome { released: false }),
+            Vec::new()
+        )
+        .is_err());
+        let mut rejected = serde_json::to_value(&outcome).unwrap();
+        rejected["valid"] = json!(false);
+        assert!(serde_json::from_value::<CanonicalOperationOutcome>(rejected).is_err());
+        assert_eq!(
+            outcome.to_v03().result,
+            json!({
+                "released": true,
+                "results": [],
+                "meta": {"total_count": 0, "has_more": false}
+            })
+        );
+    }
+
+    #[test]
     fn wire_only_families_are_explicit_and_exact() {
+        let wire = |family: &str| OperationResult {
+            valid: true,
+            result: json!({"family": family}),
+            diagnostics: Vec::new(),
+        };
+        let outcomes = [
+            CanonicalOperationOutcome::validation_wire(wire("validation")),
+            CanonicalOperationOutcome::view_wire(OperationKind::ListViews, wire("view_resource"))
+                .unwrap(),
+            CanonicalOperationOutcome::type_wire(OperationKind::ReadType, wire("type_resource"))
+                .unwrap(),
+        ];
+        for typed in outcomes {
+            assert!(matches!(
+                typed.value(),
+                CanonicalOperationValue::WireOnly(_)
+            ));
+            let replay: CanonicalOperationOutcome =
+                serde_json::from_value(serde_json::to_value(&typed).unwrap()).unwrap();
+            assert_eq!(replay, typed);
+            assert_eq!(replay.to_v03(), typed.to_v03());
+        }
+    }
+
+    #[test]
+    fn definition_discriminators_are_exact_for_assess_and_apply() {
         for kind in [
-            OperationKind::Validate,
-            OperationKind::ListViews,
-            OperationKind::ReadType,
+            OperationKind::AssessTypePack,
+            OperationKind::ApplyTypePack,
+            OperationKind::AssessCollectionSetup,
+            OperationKind::ApplyCollectionSetup,
         ] {
-            let typed = roundtrip(kind, json!({"family": kind.as_str()}));
-            assert!(matches!(typed.value, CanonicalOperationValue::WireOnly(_)));
+            let wire = OperationResult {
+                valid: false,
+                result: json!({}),
+                diagnostics: Vec::new(),
+            };
+            let outcome = CanonicalOperationOutcome::try_from_v03(kind, wire.clone()).unwrap();
+            assert_eq!(outcome.operation_kind(), Some(kind));
+            assert_eq!(outcome.to_v03(), wire);
+            let serialized = serde_json::to_value(&outcome).unwrap();
+            assert_eq!(serialized["value"]["operation"], kind.as_str());
+            let replay: CanonicalOperationOutcome = serde_json::from_value(serialized).unwrap();
+            assert_eq!(replay.operation_kind(), Some(kind));
+            assert_eq!(replay.to_v03(), wire);
+        }
+        for legacy in ["type_pack", "collection_setup"] {
+            let fixture = json!({
+                "valid": false,
+                "value": {"operation": legacy, "value": null},
+                "diagnostics": []
+            });
+            assert!(serde_json::from_value::<CanonicalOperationOutcome>(fixture).is_err());
         }
     }
 
@@ -844,7 +1380,7 @@ mod tests {
         );
         assert!(matches!(
             pack.value,
-            CanonicalOperationValue::TypePack(Some(CanonicalTypePackValue {
+            CanonicalOperationValue::AssessTypePack(Some(CanonicalTypePackValue {
                 applicable: true,
                 ..
             }))
@@ -865,7 +1401,7 @@ mod tests {
         );
         assert!(matches!(
             setup.value,
-            CanonicalOperationValue::CollectionSetup(Some(value))
+            CanonicalOperationValue::AssessCollectionSetup(Some(value))
                 if matches!(*value, CanonicalCollectionSetupValue::Assessment(_))
         ));
     }

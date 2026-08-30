@@ -14,8 +14,10 @@ use super::{
     WriteLock, JOURNAL_FILE, TRANSACTIONS_DIR,
 };
 use crate::runtime::{
-    CanonicalChange, CanonicalOperationOutcome, ChangeBatch, ChangeBatchDescriptor, ChangeEventId,
-    ChangeWatermark, CollectionGeneration, CommitId, HostClaimId, OperationContext, OperationKind,
+    CanonicalChange, CanonicalOperationFamily, CanonicalOperationOutcome, CanonicalOperationValue,
+    ChangeBatch, ChangeBatchDescriptor, ChangeEventId, ChangeWatermark, CollectionGeneration,
+    CommitId, HostClaimId, LegacyRecoveredV03Value, OperationContext, OperationKind,
+    RecordChangeKind, ResourceChangeKind,
 };
 use crate::{v03::OperationResult, Collection};
 
@@ -258,6 +260,7 @@ pub(crate) fn prepare_runtime_transaction(
         resolution_acked: false,
         event_acked: false,
     };
+    validate_journal_operation_family(&journal)?;
     persist_runtime_journal(collection, &directory, &journal)?;
     staging.durable = true;
     Ok(RuntimePrepareOutcome::Prepared(CommitId::from_stored(id)))
@@ -434,8 +437,7 @@ pub(crate) fn list_unacked_runtime_events(
         if !runtime_journal_version(&value) {
             continue;
         }
-        let journal: RuntimeJournal = serde_json::from_value(value)
-            .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
+        let journal = decode_runtime_journal(value)?;
         validate_journal(collection, &directory, &journal)?;
         if journal.phase == RuntimePhase::Committed && !journal.event_acked {
             resolutions.push(resolution(&journal)?);
@@ -461,18 +463,15 @@ pub(crate) fn reset_runtime_support_for_fork(
             .held_root()
             .read(&journal_path)
             .map_err(|source| io_error(collection.root.join(&journal_path), source))?;
-        let version = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64));
-        if !matches!(version, Some(value) if value == u64::from(LEGACY_RUNTIME_JOURNAL_VERSION) || value == u64::from(RUNTIME_JOURNAL_VERSION))
-        {
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
+        if !runtime_journal_version(&value) {
             return Err(TransactionError::ManualRecovery(format!(
                 "non-runtime transaction '{}' remained after collection recovery",
                 directory.display()
             )));
         }
-        let mut journal: RuntimeJournal = serde_json::from_slice(&bytes)
-            .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
+        let mut journal = decode_runtime_journal(value)?;
         validate_journal(collection, &directory, &journal)?;
         if journal.phase == RuntimePhase::Committing {
             settle(collection, &directory, &mut journal)?;
@@ -531,8 +530,9 @@ pub(super) fn recover_runtime_one(
     directory: &Path,
     bytes: &[u8],
 ) -> Result<bool, TransactionError> {
-    let mut journal: RuntimeJournal = serde_json::from_slice(bytes)
+    let value = serde_json::from_slice(bytes)
         .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
+    let mut journal = decode_runtime_journal(value)?;
     validate_journal(collection, directory, &journal)?;
     match journal.phase {
         RuntimePhase::Prepared
@@ -681,8 +681,7 @@ fn first_unsettled_conflict(
         if !runtime_journal_version(&value) {
             continue;
         }
-        let other: RuntimeJournal = serde_json::from_value(value)
-            .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
+        let other = decode_runtime_journal(value)?;
         // Only a committed-but-unsettled transaction owns paths it has not yet
         // written. A prepared one has taken no commit point and loses the race
         // itself; a settled one is already visible in the working tree.
@@ -723,6 +722,7 @@ fn validate_journal(
             "runtime change batch does not match its descriptor".to_string(),
         ));
     }
+    validate_journal_operation_family(journal)?;
     for (index, entry) in journal.entries.iter().enumerate() {
         validate_entry_path(collection, &entry.path, journal.scope)?;
         let expected_stage = entry
@@ -770,6 +770,111 @@ fn validate_journal(
         }
     }
     Ok(())
+}
+
+fn validate_journal_operation_family(journal: &RuntimeJournal) -> Result<(), TransactionError> {
+    if journal.version == LEGACY_RUNTIME_JOURNAL_VERSION {
+        return Ok(());
+    }
+    if journal.changes.is_empty() {
+        return Err(TransactionError::InvalidJournal(
+            "v3 mutation journal has no canonical changes".to_string(),
+        ));
+    }
+    let operation = journal.operation_outcome.as_ref().ok_or_else(|| {
+        TransactionError::InvalidJournal("v3 canonical operation outcome missing".to_string())
+    })?;
+    let CanonicalOperationFamily::Operation(kind) = operation.family() else {
+        return Err(TransactionError::InvalidJournal(
+            "mutation journal contains a non-operation canonical family".to_string(),
+        ));
+    };
+    if matches!(operation.value(), CanonicalOperationValue::WireOnly(_)) {
+        return Err(TransactionError::InvalidJournal(
+            "mutation journal contains a wire-only outcome".to_string(),
+        ));
+    }
+    if let Some(rejection) = &journal.operation_rejection {
+        if rejection.family() != CanonicalOperationFamily::Operation(kind)
+            || matches!(rejection.value(), CanonicalOperationValue::WireOnly(_))
+        {
+            return Err(TransactionError::InvalidJournal(
+                "commit rejection operation does not match the transaction operation".to_string(),
+            ));
+        }
+    }
+
+    let exact = match journal.scope {
+        TransactionScope::Records => match kind {
+            OperationKind::Create => journal.changes.iter().all(|change| {
+                matches!(change, CanonicalChange::Record(record) if record.kind == RecordChangeKind::Created)
+            }),
+            OperationKind::Update => journal.changes.iter().all(|change| {
+                matches!(change, CanonicalChange::Record(record) if record.kind == RecordChangeKind::Updated)
+            }),
+            OperationKind::Delete => journal.changes.iter().all(|change| {
+                matches!(change, CanonicalChange::Record(record) if record.kind == RecordChangeKind::Deleted)
+            }),
+            OperationKind::Rename => {
+                let renamed = journal.changes.iter().filter(|change| {
+                    matches!(change, CanonicalChange::Record(record) if record.kind == RecordChangeKind::Renamed)
+                }).count();
+                renamed == 1 && journal.changes.iter().all(|change| {
+                    matches!(change, CanonicalChange::Record(record) if matches!(record.kind, RecordChangeKind::Renamed | RecordChangeKind::Updated))
+                })
+            }
+            OperationKind::Batch => journal
+                .changes
+                .iter()
+                .all(|change| matches!(change, CanonicalChange::Record(_))),
+            _ => false,
+        },
+        TransactionScope::Resources => validate_resource_operation(kind, &journal.changes),
+        TransactionScope::SystemMigration => false,
+    };
+    if !exact {
+        return Err(TransactionError::InvalidJournal(
+            "canonical operation does not match the transaction change family".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_resource_operation(kind: OperationKind, changes: &[CanonicalChange]) -> bool {
+    changes.iter().all(|change| {
+        let CanonicalChange::Resource(resource) = change else {
+            return false;
+        };
+        match kind {
+            OperationKind::CreateViewSource => {
+                resource.kind == ResourceChangeKind::ViewSource
+                    && resource.before_revision.is_none()
+                    && resource.after_revision.is_some()
+            }
+            OperationKind::UpdateViewSource => {
+                resource.kind == ResourceChangeKind::ViewSource
+                    && resource.before_revision.is_some()
+                    && resource.after_revision.is_some()
+            }
+            OperationKind::DeleteViewSource => {
+                resource.kind == ResourceChangeKind::ViewSource
+                    && resource.before_revision.is_some()
+                    && resource.after_revision.is_none()
+            }
+            OperationKind::CreateType => {
+                resource.kind == ResourceChangeKind::TypeDefinition
+                    && resource.before_revision.is_none()
+                    && resource.after_revision.is_some()
+            }
+            OperationKind::UpdateType => {
+                resource.kind == ResourceChangeKind::TypeDefinition
+                    && resource.before_revision.is_some()
+                    && resource.after_revision.is_some()
+            }
+            OperationKind::ApplyTypePack | OperationKind::ApplyCollectionSetup => true,
+            _ => false,
+        }
+    })
 }
 
 fn ensure_capacity(collection: &Collection, changes: &ChangeBatch) -> Result<(), TransactionError> {
@@ -826,8 +931,7 @@ fn find_by_claim(
         if !runtime_journal_version(&value) {
             continue;
         }
-        let journal: RuntimeJournal = serde_json::from_value(value)
-            .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
+        let journal = decode_runtime_journal(value)?;
         validate_journal(collection, &directory, &journal)?;
         if journal.host_claim == claim {
             return Ok(Some(journal));
@@ -872,11 +976,8 @@ fn release_payloads(collection: &Collection, directory: &Path, journal: &mut Run
     let _ = collection
         .held_root()
         .remove_dir_all(&directory.join("backup"));
-    journal.changes.clear();
-    journal.change_descriptor = ChangeBatch::new(Vec::new())
-        .expect("an empty change batch is valid")
-        .descriptor()
-        .clone();
+    // Canonical change evidence is retained after payload cleanup so recovery
+    // can continue to authenticate the operation family.
     for entry in &mut journal.entries {
         entry.stage_file = None;
         entry.backup_file = None;
@@ -887,16 +988,23 @@ fn release_payloads(collection: &Collection, directory: &Path, journal: &mut Run
 fn journal_operation(
     journal: &RuntimeJournal,
 ) -> Result<CanonicalOperationOutcome, TransactionError> {
-    if let Some(operation) = &journal.operation_outcome {
-        return Ok(operation.clone());
-    }
-    let result = journal.operation_result.clone().ok_or_else(|| {
-        TransactionError::InvalidJournal("runtime operation outcome missing".to_string())
-    })?;
-    match legacy_operation_kind(journal, &result) {
-        Some(kind) => CanonicalOperationOutcome::recover_v03(kind, result)
-            .map_err(|error| TransactionError::InvalidJournal(error.to_string())),
-        None => Ok(CanonicalOperationOutcome::legacy_recovered(result)),
+    match journal.version {
+        RUNTIME_JOURNAL_VERSION => journal.operation_outcome.clone().ok_or_else(|| {
+            TransactionError::InvalidJournal("v3 runtime operation outcome missing".to_string())
+        }),
+        LEGACY_RUNTIME_JOURNAL_VERSION => {
+            let result = journal.operation_result.clone().ok_or_else(|| {
+                TransactionError::InvalidJournal("v2 runtime operation result missing".to_string())
+            })?;
+            match legacy_operation_kind(journal, &result) {
+                Some(kind) => CanonicalOperationOutcome::recover_v03(kind, result)
+                    .map_err(|error| TransactionError::InvalidJournal(error.to_string())),
+                None => Ok(legacy_recovered_v03(result)),
+            }
+        }
+        _ => Err(TransactionError::InvalidJournal(
+            "unsupported runtime journal version".to_string(),
+        )),
     }
 }
 
@@ -916,17 +1024,35 @@ fn journal_operation_mut(
 fn journal_rejection(
     journal: &RuntimeJournal,
 ) -> Result<CanonicalOperationOutcome, TransactionError> {
-    if let Some(rejection) = &journal.operation_rejection {
-        return Ok(rejection.clone());
+    match journal.version {
+        RUNTIME_JOURNAL_VERSION => journal.operation_rejection.clone().ok_or_else(|| {
+            TransactionError::InvalidJournal("v3 commit rejection missing".to_string())
+        }),
+        LEGACY_RUNTIME_JOURNAL_VERSION => {
+            let rejection = journal.rejection.clone().ok_or_else(|| {
+                TransactionError::InvalidJournal("v2 commit rejection missing".to_string())
+            })?;
+            match journal_operation(journal)?.value.kind() {
+                Some(kind) => CanonicalOperationOutcome::recover_v03(kind, rejection)
+                    .map_err(|error| TransactionError::InvalidJournal(error.to_string())),
+                None => Ok(legacy_recovered_v03(rejection)),
+            }
+        }
+        _ => Err(TransactionError::InvalidJournal(
+            "unsupported runtime journal version".to_string(),
+        )),
     }
-    let rejection = journal
-        .rejection
-        .clone()
-        .ok_or_else(|| TransactionError::InvalidJournal("commit rejection missing".to_string()))?;
-    match journal_operation(journal)?.value.kind() {
-        Some(kind) => CanonicalOperationOutcome::recover_v03(kind, rejection)
-            .map_err(|error| TransactionError::InvalidJournal(error.to_string())),
-        None => Ok(CanonicalOperationOutcome::legacy_recovered(rejection)),
+}
+
+/// Construct an ambiguous v0.3 envelope only inside the transaction runtime's
+/// version-2 compatibility path. Checked serde and v3 persistence reject it.
+fn legacy_recovered_v03(result: OperationResult) -> CanonicalOperationOutcome {
+    CanonicalOperationOutcome {
+        valid: result.valid,
+        diagnostics: result.diagnostics.iter().cloned().map(Into::into).collect(),
+        value: CanonicalOperationValue::LegacyRecoveredV03(
+            LegacyRecoveredV03Value::from_transaction_recovery(result),
+        ),
     }
 }
 
@@ -970,6 +1096,82 @@ fn runtime_journal_version(value: &serde_json::Value) -> bool {
         Some(version) if version == u64::from(LEGACY_RUNTIME_JOURNAL_VERSION)
             || version == u64::from(RUNTIME_JOURNAL_VERSION)
     )
+}
+
+fn decode_runtime_journal(
+    mut value: serde_json::Value,
+) -> Result<RuntimeJournal, TransactionError> {
+    recover_phase4_definition_discriminators(&mut value);
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            TransactionError::InvalidJournal("runtime journal version missing".into())
+        })?;
+    let phase = value
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| TransactionError::InvalidJournal("runtime journal phase missing".into()))?;
+    let present = |field: &str| value.get(field).is_some_and(|item| !item.is_null());
+    let canonical = present("operation_outcome");
+    let legacy = present("operation_result");
+    let canonical_rejection = present("operation_rejection");
+    let legacy_rejection = present("rejection");
+    let rejected = phase == "rejected_before_commit";
+
+    let valid_shape = match u32::try_from(version).ok() {
+        Some(LEGACY_RUNTIME_JOURNAL_VERSION) => {
+            legacy && !canonical && !canonical_rejection && legacy_rejection == rejected
+        }
+        Some(RUNTIME_JOURNAL_VERSION) => {
+            canonical && !legacy && !legacy_rejection && canonical_rejection == rejected
+        }
+        _ => false,
+    };
+    if !valid_shape {
+        return Err(TransactionError::InvalidJournal(
+            "runtime journal outcome fields do not match its version and phase".to_string(),
+        ));
+    }
+    serde_json::from_value(value)
+        .map_err(|error| TransactionError::InvalidJournal(error.to_string()))
+}
+
+/// Phase 4 persisted definition families without their assess/apply
+/// discriminator. A durable resource mutation provides sufficient context to
+/// recover only the apply form; generic public outcome serde never guesses.
+fn recover_phase4_definition_discriminators(value: &mut serde_json::Value) {
+    if value.get("version").and_then(serde_json::Value::as_u64)
+        != Some(u64::from(RUNTIME_JOURNAL_VERSION))
+        || value.get("scope").and_then(serde_json::Value::as_str) != Some("resources")
+        || !value
+            .get("changes")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|changes| {
+                !changes.is_empty()
+                    && changes.iter().all(|change| {
+                        change.get("target").and_then(serde_json::Value::as_str) == Some("resource")
+                    })
+            })
+    {
+        return;
+    }
+    for field in ["operation_outcome", "operation_rejection"] {
+        let Some(discriminator) = value
+            .get_mut(field)
+            .and_then(|outcome| outcome.get_mut("value"))
+            .and_then(|outcome| outcome.get_mut("operation"))
+        else {
+            continue;
+        };
+        match discriminator.as_str() {
+            Some("type_pack") => *discriminator = serde_json::json!("apply_type_pack"),
+            Some("collection_setup") => {
+                *discriminator = serde_json::json!("apply_collection_setup")
+            }
+            _ => {}
+        }
+    }
 }
 
 fn conflict_result(
@@ -1020,8 +1222,11 @@ fn read_runtime_journal(
         .held_root()
         .read(&path)
         .map_err(|source| io_error(collection.root.join(&path), source))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| TransactionError::InvalidJournal(error.to_string()))
+    let value = serde_json::from_slice(&bytes)
+        .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
+    let journal = decode_runtime_journal(value)?;
+    validate_journal(collection, directory, &journal)?;
+    Ok(journal)
 }
 
 fn persist_runtime_journal(
@@ -1029,6 +1234,7 @@ fn persist_runtime_journal(
     directory: &Path,
     journal: &RuntimeJournal,
 ) -> Result<(), TransactionError> {
+    validate_journal(collection, directory, journal)?;
     let bytes = serde_json::to_vec_pretty(journal)
         .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
     let path = directory.join(JOURNAL_FILE);
@@ -1087,11 +1293,7 @@ mod tests {
         let claim = HostClaimId::generate();
         let event_id = ChangeEventId::generate();
         let changes = change(path, before, after);
-        let result = crate::v03::OperationResult {
-            valid: true,
-            result: serde_json::json!({}),
-            diagnostics: Vec::new(),
-        };
+        let operation = CanonicalOperationOutcome::invalid(OperationKind::Update, Vec::new());
         let outcome = prepare_runtime_transaction(
             collection,
             RuntimePrepareInput {
@@ -1099,11 +1301,7 @@ mod tests {
                 desired: &desired,
                 claim: &claim,
                 mutation_digest: claim.as_str(),
-                operation: &CanonicalOperationOutcome {
-                    valid: result.valid,
-                    value: crate::runtime::CanonicalOperationValue::Update(None),
-                    diagnostics: result.diagnostics.into_iter().map(Into::into).collect(),
-                },
+                operation: &operation,
                 changes: &changes,
                 event_id: &event_id,
             },
@@ -1125,6 +1323,156 @@ mod tests {
             &OperationContext::legacy(),
         )
         .unwrap()
+    }
+
+    fn journal_value(collection: &Collection, id: &CommitId) -> serde_json::Value {
+        let directory = transaction_directory(collection, id);
+        serde_json::from_slice(
+            &collection
+                .held_root()
+                .read(directory.join(JOURNAL_FILE))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn write_journal_value(collection: &Collection, id: &CommitId, value: &serde_json::Value) {
+        let directory = transaction_directory(collection, id);
+        collection
+            .held_root()
+            .atomic_write(
+                &directory.join(JOURNAL_FILE),
+                &serde_json::to_vec_pretty(value).unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn malicious_version_and_phase_outcome_field_combinations_fail_closed() {
+        let (_root, collection) = collection();
+        let id = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
+        let canonical = journal_value(&collection, &id);
+        let legacy_result = serde_json::to_value(
+            serde_json::from_value::<CanonicalOperationOutcome>(
+                canonical["operation_outcome"].clone(),
+            )
+            .unwrap()
+            .to_v03(),
+        )
+        .unwrap();
+
+        let mut fixtures = Vec::new();
+        let mut v3_with_legacy = canonical.clone();
+        v3_with_legacy["operation_result"] = legacy_result.clone();
+        fixtures.push(v3_with_legacy);
+        let mut v2_with_canonical = canonical.clone();
+        v2_with_canonical["version"] = serde_json::json!(LEGACY_RUNTIME_JOURNAL_VERSION);
+        v2_with_canonical["operation_result"] = legacy_result;
+        fixtures.push(v2_with_canonical);
+        let mut prepared_with_rejection = canonical.clone();
+        prepared_with_rejection["operation_rejection"] =
+            prepared_with_rejection["operation_outcome"].clone();
+        fixtures.push(prepared_with_rejection);
+        let mut rejected_without_rejection = canonical;
+        rejected_without_rejection["phase"] = serde_json::json!("rejected_before_commit");
+        fixtures.push(rejected_without_rejection);
+
+        for fixture in fixtures {
+            assert!(decode_runtime_journal(fixture).is_err());
+        }
+    }
+
+    #[test]
+    fn malicious_v3_operation_change_and_rejection_families_fail_closed() {
+        let (_root, collection) = collection();
+        let id = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
+        let original = journal_value(&collection, &id);
+        let directory = transaction_directory(&collection, &id);
+
+        let mut wrong_change_family = original.clone();
+        wrong_change_family["operation_outcome"]["value"]["operation"] =
+            serde_json::json!("delete");
+        write_journal_value(&collection, &id, &wrong_change_family);
+        assert!(read_runtime_journal(&collection, &directory).is_err());
+
+        let mut wire = original.clone();
+        wire["operation_outcome"] = serde_json::to_value(
+            CanonicalOperationOutcome::validation_wire(OperationResult {
+                valid: true,
+                result: serde_json::json!({"valid": true}),
+                diagnostics: Vec::new(),
+            }),
+        )
+        .unwrap();
+        write_journal_value(&collection, &id, &wire);
+        assert!(read_runtime_journal(&collection, &directory).is_err());
+
+        let mut cursor = original.clone();
+        cursor["operation_outcome"] =
+            serde_json::to_value(CanonicalOperationOutcome::cursor_release(
+                crate::runtime::CursorReleaseOutcome { released: true },
+            ))
+            .unwrap();
+        write_journal_value(&collection, &id, &cursor);
+        assert!(read_runtime_journal(&collection, &directory).is_err());
+
+        let mut rejection = original;
+        rejection["phase"] = serde_json::json!("rejected_before_commit");
+        rejection["operation_rejection"] = rejection["operation_outcome"].clone();
+        rejection["operation_rejection"]["value"]["operation"] = serde_json::json!("delete");
+        write_journal_value(&collection, &id, &rejection);
+        assert!(read_runtime_journal(&collection, &directory).is_err());
+    }
+
+    #[test]
+    fn definition_journals_preserve_apply_and_reject_assess_or_swapped_rejection() {
+        let (_root, collection) = collection();
+        let id = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
+        let directory = transaction_directory(&collection, &id);
+        let mut journal = read_runtime_journal(&collection, &directory).unwrap();
+        journal.scope = TransactionScope::Resources;
+        journal.changes = vec![CanonicalChange::Resource(crate::runtime::ResourceChange {
+            kind: ResourceChangeKind::Other,
+            path: crate::api::CollectionPath::new("resource.bin").unwrap(),
+            before_revision: None,
+            after_revision: crate::api::Revision::parse("sha256:after").ok(),
+        })];
+        let definition = |kind| {
+            CanonicalOperationOutcome::recover_v03(
+                kind,
+                OperationResult {
+                    valid: false,
+                    result: serde_json::json!({}),
+                    diagnostics: Vec::new(),
+                },
+            )
+            .unwrap()
+        };
+        journal.operation_outcome = Some(definition(OperationKind::ApplyTypePack));
+        assert!(validate_journal_operation_family(&journal).is_ok());
+        journal.operation_outcome = Some(definition(OperationKind::AssessTypePack));
+        assert!(validate_journal_operation_family(&journal).is_err());
+        journal.operation_outcome = Some(definition(OperationKind::ApplyTypePack));
+        journal.operation_rejection = Some(definition(OperationKind::AssessTypePack));
+        assert!(validate_journal_operation_family(&journal).is_err());
+
+        let mut phase4 = journal_value(&collection, &id);
+        phase4["scope"] = serde_json::json!("resources");
+        phase4["changes"] = serde_json::json!([{
+            "target": "resource",
+            "change": {
+                "kind": "other", "path": "resource.bin",
+                "before_revision": null, "after_revision": "sha256:after"
+            }
+        }]);
+        phase4["operation_outcome"] =
+            serde_json::to_value(definition(OperationKind::ApplyCollectionSetup)).unwrap();
+        phase4["operation_outcome"]["value"]["operation"] = serde_json::json!("collection_setup");
+        let recovered = decode_runtime_journal(phase4).unwrap();
+        assert_eq!(
+            recovered.operation_outcome.unwrap().operation_kind(),
+            Some(OperationKind::ApplyCollectionSetup)
+        );
     }
 
     #[test]
@@ -1187,8 +1535,36 @@ mod tests {
         journal.changes.clear();
         assert_eq!(legacy_operation_kind(&journal, &empty), None);
         assert!(matches!(
-            CanonicalOperationOutcome::legacy_recovered(empty).value,
+            legacy_recovered_v03(empty).value,
             crate::runtime::CanonicalOperationValue::LegacyRecoveredV03(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_version_three_outcome_fails_closed() {
+        let (_root, collection) = collection();
+        let id = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
+        let directory = transaction_directory(&collection, &id);
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &collection
+                .held_root()
+                .read(directory.join(JOURNAL_FILE))
+                .unwrap(),
+        )
+        .unwrap();
+        value["operation_outcome"]["valid"] = serde_json::json!(true);
+        collection
+            .held_root()
+            .atomic_write(
+                &directory.join(JOURNAL_FILE),
+                &serde_json::to_vec_pretty(&value).unwrap(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            resolve_runtime_commit(&collection, &id, &OperationContext::legacy()),
+            Err(TransactionError::InvalidJournal(message))
+                if message.contains("requires a semantic value")
         ));
     }
 
@@ -1206,8 +1582,10 @@ mod tests {
         .unwrap();
         assert!(value.get("operation_outcome").is_some());
         assert!(value.get("operation_result").is_none());
-        let typed: CanonicalOperationOutcome =
-            serde_json::from_value(value["operation_outcome"].take()).unwrap();
+        let v3_outcome = value["operation_outcome"].clone();
+        let typed: CanonicalOperationOutcome = serde_json::from_value(v3_outcome.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&typed).unwrap(), v3_outcome);
+        let expected_v03 = typed.to_v03();
         value["version"] = serde_json::json!(LEGACY_RUNTIME_JOURNAL_VERSION);
         value["operation_result"] = serde_json::to_value(typed.to_v03()).unwrap();
         value.as_object_mut().unwrap().remove("operation_outcome");
@@ -1229,6 +1607,7 @@ mod tests {
             recovered.value,
             crate::runtime::CanonicalOperationValue::Update(None)
         ));
+        assert_eq!(recovered.to_v03(), expected_v03);
     }
 
     /// Settlement runs after the commit lock is released, so for a window the
