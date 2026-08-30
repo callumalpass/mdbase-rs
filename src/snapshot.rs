@@ -2,10 +2,12 @@
 
 mod discovery;
 
+#[cfg(all(test, unix))]
+pub(crate) use discovery::replace_descendant_on_scan_for_test;
 #[cfg(test)]
 pub(crate) use discovery::{
-    cancel_scan_after_entries_for_test, replace_descendant_on_scan_for_test,
-    reset_snapshot_scan_calls_for_test, snapshot_scan_calls_for_test,
+    cancel_scan_after_entries_for_test, reset_snapshot_scan_calls_for_test,
+    snapshot_scan_calls_for_test,
 };
 
 use std::collections::HashMap;
@@ -731,7 +733,8 @@ mod tests {
         assert!(matches!(error, SnapshotError::Unavailable { .. }));
     }
 
-    #[cfg(unix)]
+    // Darwin filesystems reject this byte sequence before mdbase can observe it.
+    #[cfg(target_os = "linux")]
     #[test]
     fn invalid_utf8_record_path_is_explicit() {
         use std::ffi::OsString;

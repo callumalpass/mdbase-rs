@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 use std::path::Path;
 
 use crate::runtime::{OperationContext, ProviderError};

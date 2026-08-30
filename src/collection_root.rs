@@ -226,8 +226,8 @@ impl CollectionRoot {
         #[cfg(windows)]
         options
             .access_mode(
-                windows_sys::Win32::Storage::FileSystem::GENERIC_READ
-                    | windows_sys::Win32::Storage::FileSystem::GENERIC_WRITE
+                windows_sys::Win32::Foundation::GENERIC_READ
+                    | windows_sys::Win32::Foundation::GENERIC_WRITE
                     | windows_sys::Win32::Storage::FileSystem::DELETE,
             )
             .share_mode(
