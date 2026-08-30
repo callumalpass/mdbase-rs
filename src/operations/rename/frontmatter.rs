@@ -20,7 +20,7 @@ impl Collection {
         changed: &mut bool,
         refs_updated: &mut Vec<serde_json::Value>,
         warnings: &mut Vec<serde_json::Value>,
-    ) {
+    ) -> Result<(), crate::runtime::CatalogError> {
         let typed_target_fields = type_names
             .iter()
             .filter_map(|type_name| self.types.get(type_name))
@@ -47,7 +47,7 @@ impl Collection {
             refs_updated,
             warnings,
         }
-        .visit(fm, "");
+        .visit(fm, "")
     }
 }
 
@@ -70,7 +70,11 @@ struct FrontmatterRewriteContext<'a> {
 }
 
 impl FrontmatterRewriteContext<'_> {
-    fn visit(&mut self, value: &mut serde_yaml::Value, field: &str) {
+    fn visit(
+        &mut self,
+        value: &mut serde_yaml::Value,
+        field: &str,
+    ) -> Result<(), crate::runtime::CatalogError> {
         match value {
             serde_yaml::Value::Mapping(mapping) => {
                 let keys = mapping.keys().cloned().collect::<Vec<_>>();
@@ -84,21 +88,26 @@ impl FrontmatterRewriteContext<'_> {
                     } else {
                         format!("{field}.{key}")
                     };
-                    self.visit(child, &child_field);
+                    self.visit(child, &child_field)?;
                 }
             }
             serde_yaml::Value::Sequence(items) => {
                 for (index, item) in items.iter_mut().enumerate() {
-                    self.visit(item, &format!("{field}[{index}]"));
+                    self.visit(item, &format!("{field}[{index}]"))?;
                 }
             }
-            serde_yaml::Value::Tagged(tagged) => self.visit(&mut tagged.value, field),
-            serde_yaml::Value::String(link) => self.rewrite_string(link, field),
+            serde_yaml::Value::Tagged(tagged) => self.visit(&mut tagged.value, field)?,
+            serde_yaml::Value::String(link) => self.rewrite_string(link, field)?,
             _ => {}
         }
+        Ok(())
     }
 
-    fn rewrite_string(&mut self, link: &mut String, field: &str) {
+    fn rewrite_string(
+        &mut self,
+        link: &mut String,
+        field: &str,
+    ) -> Result<(), crate::runtime::CatalogError> {
         let target_types = self
             .typed_target_fields
             .get(field)
@@ -108,7 +117,7 @@ impl FrontmatterRewriteContext<'_> {
             .collection
             .is_stable_configured_id_wikilink(link, self.source_id.as_deref())
         {
-            return;
+            return Ok(());
         }
         if self.collection.link_resolves_to(
             link,
@@ -124,19 +133,20 @@ impl FrontmatterRewriteContext<'_> {
                 self.resolution_index,
             ) {
                 None => {}
-                Some(crate::links::resolver::LinkResolution::Resolved(path))
+                Some(Ok(crate::links::resolver::LinkResolution::Resolved { path, .. }))
                     if path == self.from => {}
-                Some(crate::links::resolver::LinkResolution::Ambiguous(_)) => {
+                Some(Ok(crate::links::resolver::LinkResolution::Ambiguous(_))) => {
                     self.warnings.push(serde_json::json!({
                         "path": self.rel_path,
                         "message": format!("Ambiguous link '{}' not updated", link),
                     }));
-                    return;
+                    return Ok(());
                 }
-                Some(
+                Some(Err(error)) => return Err(error),
+                Some(Ok(
                     crate::links::resolver::LinkResolution::Missing
-                    | crate::links::resolver::LinkResolution::Resolved(_),
-                ) => return,
+                    | crate::links::resolver::LinkResolution::Resolved { .. },
+                )) => return Ok(()),
             }
             *link = self.collection.rewrite_link_value(
                 link,
@@ -148,7 +158,7 @@ impl FrontmatterRewriteContext<'_> {
                 self.source_dir,
             );
             self.record_change(field);
-            return;
+            return Ok(());
         }
 
         // A frontmatter scalar may contain prose with multiple links. Reuse the
@@ -166,11 +176,12 @@ impl FrontmatterRewriteContext<'_> {
             self.rel_path,
             self.source_id.as_deref(),
             self.resolution_index,
-        );
+        )?;
         if rewritten != *link {
             *link = rewritten;
             self.record_change(field);
         }
+        Ok(())
     }
 
     fn record_change(&mut self, field: &str) {
@@ -179,5 +190,50 @@ impl FrontmatterRewriteContext<'_> {
             "path": self.rel_path,
             "field": field,
         }));
+    }
+}
+
+#[cfg(test)]
+mod selector_failure_tests {
+    use super::*;
+
+    #[test]
+    fn frontmatter_rewrite_propagates_selector_failure() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        let mut index = crate::links::resolver::LinkResolutionIndex::default();
+        index
+            .basename_lower_to_paths
+            .insert("target".to_string(), vec!["target.md".to_string()]);
+        let mut frontmatter = serde_yaml::from_str("ref: '[[target]]'\n").unwrap();
+        let mut changed = false;
+        let mut updates = Vec::new();
+        let mut warnings = Vec::new();
+
+        let error = collection
+            .update_fm_links(
+                &mut frontmatter,
+                "target.md",
+                "renamed.md",
+                "target",
+                "renamed",
+                "target",
+                "renamed",
+                "",
+                "../unsafe-source.md",
+                &None,
+                &[],
+                &index,
+                &mut changed,
+                &mut updates,
+                &mut warnings,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "invalid_resolution_candidate");
+        assert!(!changed);
+        assert!(updates.is_empty());
+        assert!(warnings.is_empty());
     }
 }

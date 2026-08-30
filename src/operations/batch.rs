@@ -255,7 +255,10 @@ impl Collection {
 
         // Build backlinks index for skip_dependents checking
         let bl_index_for_skip = if skip_dependents {
-            Some(self.build_backlinks_index_for_snapshot(&snapshot))
+            match self.build_backlinks_index_for_snapshot(&snapshot) {
+                Ok(index) => Some(index),
+                Err(error) => return op_error(&error.code, &error.message),
+            }
         } else {
             None
         };
@@ -606,7 +609,10 @@ impl Collection {
         // Check backlinks before deletion
         let mut broken_links: Vec<serde_json::Value> = Vec::new();
         if check_backlinks {
-            let bl_index = self.build_backlinks_index_for_snapshot(&snapshot);
+            let bl_index = match self.build_backlinks_index_for_snapshot(&snapshot) {
+                Ok(index) => index,
+                Err(error) => return op_error(&error.code, &error.message),
+            };
             for path in &matching_paths {
                 if let Some(sources) = bl_index.get(path) {
                     for source in sources {
@@ -700,7 +706,10 @@ impl Collection {
         let (all_files_arc, backlinks_arc) = if needs_link_graph {
             let resolved_files = std::sync::Arc::new(snapshot.resolved_files_data());
             let backlinks = std::sync::Arc::new(
-                self.build_backlinks_index_for_snapshot_files(snapshot, &resolved_files),
+                self.build_backlinks_index_for_snapshot_files(snapshot, &resolved_files)
+                    .map_err(|error| crate::CollectionSnapshotError::CacheUnavailable {
+                        reason: format!("{}: {}", error.code, error.message),
+                    })?,
             );
             (Some(resolved_files), Some(backlinks))
         } else {

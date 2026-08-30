@@ -84,6 +84,9 @@ impl Collection {
         // Wikilink: [[target]], [[target|alias]], [[target#anchor]], [[target#anchor|alias]]
         if value.starts_with("[[") && value.ends_with("]]") {
             let inner = &value[2..value.len() - 2];
+            if inner.contains('[') || inner.contains(']') {
+                return malformed_link(&raw, "Malformed wikilink delimiters");
+            }
             // Split on | for alias
             let (target_part, alias) = if let Some(pipe_idx) = inner.find('|') {
                 (&inner[..pipe_idx], Some(inner[pipe_idx + 1..].to_string()))
@@ -99,6 +102,9 @@ impl Collection {
             } else {
                 (target_part.to_string(), None)
             };
+            if target.trim().is_empty() || target.contains(['\n', '\r']) {
+                return malformed_link(&raw, "Wikilink target must be nonempty and single-line");
+            }
             let is_relative = target.starts_with("./") || target.starts_with("../");
             return serde_json::json!({
                 "link": {
@@ -112,11 +118,23 @@ impl Collection {
             });
         }
 
+        if value.starts_with("[[") {
+            return malformed_link(&raw, "Malformed or unterminated wikilink syntax");
+        }
+
         // Markdown link: [text](path) or [text](path#anchor)
         if value.starts_with('[') && value.contains("](") && value.ends_with(')') {
             let bracket_end = value.find("](").unwrap();
             let text = &value[1..bracket_end];
             let path_str = &value[bracket_end + 2..value.len() - 1];
+            if text.contains('[')
+                || text.contains(']')
+                || path_str.contains('(')
+                || path_str.contains(')')
+                || value[bracket_end + 2..].matches("](").count() > 0
+            {
+                return malformed_link(&raw, "Malformed Markdown link delimiters");
+            }
             let (path, anchor) = if let Some(hash_idx) = path_str.find('#') {
                 (
                     path_str[..hash_idx].to_string(),
@@ -125,6 +143,12 @@ impl Collection {
             } else {
                 (path_str.to_string(), None)
             };
+            if path.trim().is_empty() || path.contains(['\n', '\r']) {
+                return malformed_link(
+                    &raw,
+                    "Markdown link target must be nonempty and single-line",
+                );
+            }
             let is_relative = path.starts_with("./") || path.starts_with("../");
             let alias = Some(text.to_string());
             return serde_json::json!({
@@ -139,6 +163,12 @@ impl Collection {
             });
         }
 
+        // Only strings that clearly begin Markdown link syntax are rejected.
+        // Ordinary prose containing brackets remains a permissive bare value.
+        if value.starts_with('[') && value.contains("](") {
+            return malformed_link(&raw, "Malformed or unterminated Markdown link syntax");
+        }
+
         // Bare/path
         let is_relative = value.starts_with("./") || value.starts_with("../");
         serde_json::json!({
@@ -151,5 +181,68 @@ impl Collection {
                 "is_relative": is_relative,
             }
         })
+    }
+}
+
+fn malformed_link(raw: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": {"code": "malformed_link", "message": message},
+        "raw": raw,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collection() -> (tempfile::TempDir, Collection) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        (root, collection)
+    }
+
+    #[test]
+    fn malformed_link_intent_is_not_reclassified_as_a_bare_path() {
+        let (_root, collection) = collection();
+        for value in [
+            "[[unterminated",
+            "[[]]",
+            "[[   ]]",
+            "[[target\nline]]",
+            "[[|]]",
+            "[[#]]",
+            "[[target]]junk]]",
+            "[[[target]]]",
+            "[label](unterminated",
+            "[text]()",
+            "[text](   )",
+            "[text](#anchor)",
+            "[text](target\nline)",
+            "[label](target)junk)",
+            "[label](target)(extra)",
+        ] {
+            let parsed = collection.parse_link(&serde_json::json!({"value": value}));
+            assert_eq!(parsed["error"]["code"], "malformed_link", "{parsed}");
+            assert!(parsed.get("link").is_none(), "{parsed}");
+        }
+        for (value, target) in [
+            ("[[nested]]", "nested"),
+            ("[[nested#anchor|Alias]]", "nested"),
+            ("[Alias](nested.md#anchor)", "nested.md"),
+        ] {
+            let valid = collection.parse_link(&serde_json::json!({"value": value}));
+            assert_eq!(valid["link"]["target"], target, "{valid}");
+        }
+    }
+
+    #[test]
+    fn permissive_prose_remains_a_bare_path() {
+        let (_root, collection) = collection();
+        for value in ["prose [aside", "unmatched ]] prose"] {
+            let parsed = collection.parse_link(&serde_json::json!({"value": value}));
+            assert_eq!(parsed["link"]["format"], "path");
+            assert_eq!(parsed["link"]["target"], value);
+        }
     }
 }

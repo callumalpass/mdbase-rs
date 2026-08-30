@@ -751,7 +751,11 @@ impl Collection {
             });
             let (backlinks_index, backlinks_perf) = match cached_backlinks {
                 Some(Ok(backlinks)) => (backlinks, None),
-                _ => self.build_backlinks_index_profiled(&all_files_arc, profile),
+                _ => self
+                    .build_backlinks_index_profiled(&all_files_arc, profile)
+                    .map_err(|error| {
+                        SnapshotError::Cache(format!("{}: {}", error.code, error.message))
+                    })?,
             };
             cancellation.check().map_err(|_| SnapshotError::Cancelled)?;
             let backlinks_arc = Arc::new(backlinks_index);

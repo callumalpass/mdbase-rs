@@ -111,8 +111,9 @@ pub(crate) use record_resolution::{
     select_resolution_candidate, RankedResolution, RankedResolutionCandidate,
 };
 pub use record_resolution::{
-    OccurrenceResolutionLookup, RecordResolutionPlan, ResolutionCandidate, ResolutionLookupKey,
-    ResolvedRecordStructure, ResolvedStructuralOccurrence, MAX_RESOLUTION_CANDIDATES,
+    OccurrenceResolutionLookup, RecordResolutionPlan, ResolutionCandidate,
+    ResolutionCandidateIdentity, ResolutionLookupKey, ResolutionReason, ResolvedRecordStructure,
+    ResolvedStructuralOccurrence, MAX_RESOLUTION_ALTERNATIVES, MAX_RESOLUTION_CANDIDATES,
     MAX_RESOLUTION_LOOKUPS, MAX_STRUCTURAL_OCCURRENCES,
 };
 pub use record_structure::{

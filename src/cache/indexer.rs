@@ -536,8 +536,11 @@ fn resolve_links(
                 })
             })
             .unwrap_or_default();
-        let resolved =
-            collection.resolve_link_target(&raw, &source, &target_types, &resolution_index);
+        let resolved = collection
+            .resolve_link_target(&raw, &source, &target_types, &resolution_index)
+            .map_err(|error| {
+                CacheError::Resolution(format!("{}: {}", error.code, error.message))
+            })?;
         updates.push((rowid, raw, resolved));
     }
     drop(links);

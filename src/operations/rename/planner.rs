@@ -20,7 +20,7 @@ impl Collection {
         source_id: &Option<String>,
         warnings: &mut Vec<serde_json::Value>,
         failures: &mut Vec<serde_json::Value>,
-    ) -> Vec<ReferenceRewritePlan> {
+    ) -> Result<Vec<ReferenceRewritePlan>, crate::runtime::CatalogError> {
         let from_stem = stem(from);
         let to_stem = stem(to);
         let from_no_ext = without_markdown_extension(from);
@@ -70,7 +70,7 @@ impl Collection {
                     &mut fm_changed,
                     &mut pending_updates,
                     warnings,
-                );
+                )?;
             }
 
             let mut new_body = doc.body.clone();
@@ -86,7 +86,7 @@ impl Collection {
                 execution_path,
                 source_id.as_deref(),
                 &resolution_index,
-            );
+            )?;
             if body_changed {
                 pending_updates.push(serde_json::json!({
                     "path": execution_path,
@@ -140,7 +140,7 @@ impl Collection {
                 updates: pending_updates,
             });
         }
-        plans
+        Ok(plans)
     }
 }
 

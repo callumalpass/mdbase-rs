@@ -19,11 +19,12 @@ use super::{
     RECORD_STRUCTURE_SCHEMA_VERSION,
 };
 
-/// Format v5 excludes body-dependent computed values and body link labels/source
-/// spellings from provider-readable state. Older projections may contain body
-/// prose through either seam and must not be treated as current by a v5 executor.
-pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 5;
-pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v4";
+/// Format v6 adds bounded selector evidence to resolved structural occurrences.
+/// The evidence is persisted as part of the projection, so v5 projections are
+/// still deserializable for explicit stale-data handling but are never accepted
+/// by a v6 executor or mixed into a v6 storage/digest binding.
+pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 6;
+pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v5";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticProjectionFacts {
@@ -75,6 +76,7 @@ impl SemanticProjection {
             && self.structure.schema_version == RECORD_STRUCTURE_SCHEMA_VERSION
             && self.structure.path == self.facts.path
             && self.structure.structural_digest_is_valid()
+            && self.structure.resolution_evidence_is_valid()
     }
 
     /// Fail-closed currentness and internal-integrity check shared by every
@@ -427,7 +429,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::runtime::{CatalogInput, ResolvedTypeResource};
+    use crate::runtime::{
+        CatalogInput, RecordResolutionKeyKind, ResolutionReason, ResolvedTypeResource,
+    };
 
     fn catalog() -> CompiledCatalog {
         CompiledCatalog::compile(CatalogInput {
@@ -511,6 +515,202 @@ mod tests {
             .resolve_record_structure(&prepared.structure, &plan, &[])
             .unwrap();
         catalog.finalize_projection(prepared, resolved).unwrap()
+    }
+
+    fn resolved_projection(
+        body: &str,
+        kind: RecordResolutionKeyKind,
+        paths: &[&str],
+    ) -> SemanticProjection {
+        let catalog = catalog();
+        let document = format!("---\nuid: source\n---\n{body}");
+        let prepared = catalog.project_record(&input(&document)).unwrap();
+        let plan = catalog.plan_record_resolution(&prepared.structure).unwrap();
+        let lookup = &plan.lookups[0];
+        let selected = lookup
+            .alternatives
+            .iter()
+            .find(|alternative| alternative.kind == kind)
+            .unwrap()
+            .clone();
+        let candidates = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| ResolutionCandidate {
+                occurrence_ordinal: lookup.occurrence_ordinal,
+                lookup: selected.clone(),
+                record_id: format!("record-{index}"),
+                path: if path.is_empty() {
+                    selected.value.clone()
+                } else {
+                    (*path).to_string()
+                },
+            })
+            .collect::<Vec<_>>();
+        let resolved = catalog
+            .resolve_record_structure(&prepared.structure, &plan, &candidates)
+            .unwrap();
+        catalog.finalize_projection(prepared, resolved).unwrap()
+    }
+
+    #[test]
+    fn hostile_reason_evidence_never_passes_v6_projection_integrity() {
+        let cases = [
+            (
+                "[[target]]",
+                RecordResolutionKeyKind::Id,
+                vec!["elsewhere/by-id.md"],
+                ResolutionReason::ConfiguredId,
+            ),
+            (
+                "[[target]]",
+                RecordResolutionKeyKind::Title,
+                vec!["elsewhere/by-title.md"],
+                ResolutionReason::OnlyCandidate,
+            ),
+            (
+                "[Target](../target.md)",
+                RecordResolutionKeyKind::Path,
+                vec![""],
+                ResolutionReason::ExactPath,
+            ),
+            (
+                "[[target]]",
+                RecordResolutionKeyKind::Basename,
+                vec!["notes/target.md", "z/target.md"],
+                ResolutionReason::SameDirectory,
+            ),
+            (
+                "[[target]]",
+                RecordResolutionKeyKind::Basename,
+                vec!["a/target.md", "deep/nested/target.md"],
+                ResolutionReason::ShallowestPath,
+            ),
+            (
+                "[[target]]",
+                RecordResolutionKeyKind::Basename,
+                vec!["a/target.md", "z/target.md"],
+                ResolutionReason::LexicalTieBreak,
+            ),
+        ];
+
+        for (body, kind, paths, expected_reason) in cases {
+            let mut projection = resolved_projection(body, kind, &paths);
+            assert_eq!(
+                projection.structure.occurrences[0].reason,
+                Some(expected_reason)
+            );
+            assert!(projection.integrity_is_current_for(
+                &projection.facts.catalog_revision,
+                &projection.facts.semantic_engine_version,
+            ));
+            let occurrence = &mut projection.structure.occurrences[0];
+            match expected_reason {
+                ResolutionReason::ConfiguredId | ResolutionReason::OnlyCandidate => {
+                    occurrence.alternatives = vec!["other/target.md".to_string()];
+                }
+                ResolutionReason::ExactPath => {
+                    occurrence.target_path = Some("fabricated.md".to_string());
+                }
+                ResolutionReason::SameDirectory => {
+                    occurrence.alternatives = vec!["notes/target.md".to_string()];
+                }
+                ResolutionReason::ShallowestPath => {
+                    occurrence.alternatives = vec!["z/target.md".to_string()];
+                }
+                ResolutionReason::LexicalTieBreak => {
+                    occurrence.target_path = Some("z/target.md".to_string());
+                    occurrence.alternatives = vec!["a/target.md".to_string()];
+                }
+            }
+            occurrence.alternative_candidates = occurrence
+                .alternatives
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, path)| crate::runtime::ResolutionCandidateIdentity {
+                        record_id: format!("fabricated-{index}"),
+                        path: path.clone(),
+                    },
+                )
+                .collect();
+            occurrence.alternative_candidates.sort_by(|left, right| {
+                (&left.path, &left.record_id).cmp(&(&right.path, &right.record_id))
+            });
+            occurrence.alternatives = occurrence
+                .alternative_candidates
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .collect();
+            occurrence.candidate_count = occurrence.alternative_candidates.len() + 1;
+            let winner = crate::runtime::ResolutionCandidateIdentity {
+                record_id: occurrence.target_record_id.clone().unwrap(),
+                path: occurrence.target_path.clone().unwrap(),
+            };
+            occurrence.candidate_digest = Some(
+                crate::runtime::record_resolution::digest_candidate_identities(
+                    occurrence.selected_lookup.as_ref().unwrap().kind,
+                    &winner,
+                    &occurrence.alternative_candidates,
+                )
+                .unwrap(),
+            );
+            assert!(!projection.integrity_is_current_for(
+                &projection.facts.catalog_revision,
+                &projection.facts.semantic_engine_version,
+            ));
+        }
+    }
+
+    #[test]
+    fn projection_rejects_candidate_identity_substitution_after_redigest() {
+        let mut projection = resolved_projection(
+            "[[target]]",
+            RecordResolutionKeyKind::Basename,
+            &["a/target.md", "z/target.md"],
+        );
+        assert!(projection.integrity_is_current_for(
+            &projection.facts.catalog_revision,
+            &projection.facts.semantic_engine_version,
+        ));
+        let occurrence = &mut projection.structure.occurrences[0];
+        occurrence.target_record_id = Some(occurrence.alternative_candidates[0].record_id.clone());
+        let winner = crate::runtime::ResolutionCandidateIdentity {
+            record_id: occurrence.target_record_id.clone().unwrap(),
+            path: occurrence.target_path.clone().unwrap(),
+        };
+        occurrence.candidate_digest = Some(
+            crate::runtime::record_resolution::digest_candidate_identities(
+                occurrence.selected_lookup.as_ref().unwrap().kind,
+                &winner,
+                &occurrence.alternative_candidates,
+            )
+            .unwrap(),
+        );
+        assert!(!projection.integrity_is_current_for(
+            &projection.facts.catalog_revision,
+            &projection.facts.semantic_engine_version,
+        ));
+    }
+
+    #[test]
+    fn old_projection_storage_is_read_but_never_accepted_as_current() {
+        let current = projection("---\nuid: note-1\n---\n[[target]]\n");
+        let mut old = serde_json::to_value(&current).unwrap();
+        old["format_version"] = serde_json::json!(5);
+        old["schema_version"] = serde_json::json!("mdbase-semantic-projection-v4");
+        let old: SemanticProjection = serde_json::from_value(old).unwrap();
+        assert!(!old.integrity_is_current_for(
+            &current.facts.catalog_revision,
+            &current.facts.semantic_engine_version,
+        ));
+
+        let mut mixed = current.clone();
+        mixed.structure.occurrences[0].alternatives = vec!["other.md".to_string()];
+        assert!(!mixed.integrity_is_current_for(
+            &current.facts.catalog_revision,
+            &current.facts.semantic_engine_version,
+        ));
     }
 
     #[test]

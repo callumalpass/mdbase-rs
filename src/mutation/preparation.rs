@@ -197,8 +197,16 @@ pub(crate) fn prepare_delete(
                     Some(path.clone()),
                 )]
             })?;
-            let broken_links = collection
+            let backlinks = collection
                 .build_backlinks_index_for_snapshot(&snapshot)
+                .map_err(|error| {
+                    vec![Diagnostic::error(
+                        error.code,
+                        error.message,
+                        Some(path.clone()),
+                    )]
+                })?;
+            let broken_links = backlinks
                 .get(&path)
                 .into_iter()
                 .flatten()
@@ -378,14 +386,22 @@ pub(crate) fn prepare_rename(
     let mut warnings = Vec::new();
     let mut reference_failures = Vec::new();
     let reference_plans = if request.update_refs {
-        collection.plan_reference_rewrites(
-            &snapshot,
-            request.from.as_ref(),
-            request.to.as_ref(),
-            &source_id,
-            &mut warnings,
-            &mut reference_failures,
-        )
+        collection
+            .plan_reference_rewrites(
+                &snapshot,
+                request.from.as_ref(),
+                request.to.as_ref(),
+                &source_id,
+                &mut warnings,
+                &mut reference_failures,
+            )
+            .map_err(|error| {
+                vec![Diagnostic::error(
+                    error.code,
+                    error.message,
+                    Some(request.from.to_string()),
+                )]
+            })?
     } else {
         Vec::new()
     };

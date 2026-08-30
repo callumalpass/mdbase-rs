@@ -243,18 +243,20 @@ fn non_partial_batch_commits_one_staged_multi_file_plan() {
 #[test]
 fn untrusted_backlink_inputs_with_unsafe_paths_fail_closed() {
     let (_root, collection) = collection();
-    let backlinks = collection.build_backlinks_index(&[
-        mdbase::expressions::evaluator::ResolvedFileData {
-            path: "../escape/source.md".to_string(),
-            frontmatter: json!({}),
-            body: "[[alice]]".to_string(),
-        },
-        mdbase::expressions::evaluator::ResolvedFileData {
-            path: "../escape/alice.md".to_string(),
-            frontmatter: json!({"type": "person"}),
-            body: String::new(),
-        },
-    ]);
+    let backlinks = collection
+        .build_backlinks_index(&[
+            mdbase::expressions::evaluator::ResolvedFileData {
+                path: "../escape/source.md".to_string(),
+                frontmatter: json!({}),
+                body: "[[alice]]".to_string(),
+            },
+            mdbase::expressions::evaluator::ResolvedFileData {
+                path: "../escape/alice.md".to_string(),
+                frontmatter: json!({"type": "person"}),
+                body: String::new(),
+            },
+        ])
+        .unwrap();
     assert!(backlinks.is_empty());
 }
 
@@ -273,7 +275,7 @@ fn target_scoped_links_drive_backlinks_to_the_same_winner() {
     );
 
     let all_files = collection.build_all_files_data().unwrap();
-    let backlinks = collection.build_backlinks_index(&all_files);
+    let backlinks = collection.build_backlinks_index(&all_files).unwrap();
     assert_eq!(
         backlinks.get("people/alice.md"),
         Some(&vec!["tasks/source.md".to_string()])
@@ -320,7 +322,7 @@ fn malformed_frontmatter_record_remains_a_resolution_and_backlink_candidate() {
                 .is_some_and(|map| map.is_empty())
             && file.body.contains("[[alice]]")
     }));
-    let backlinks = collection.build_backlinks_index(&all_files);
+    let backlinks = collection.build_backlinks_index(&all_files).unwrap();
     assert_eq!(
         backlinks.get("people/alice.md"),
         Some(&vec!["broken.md".to_string()])
