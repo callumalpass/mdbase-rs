@@ -274,9 +274,6 @@ impl<'a> Operations<'a> {
     }
 
     fn create_direct(&self, input: &Value) -> OperationResult {
-        if let Some(result) = invalid_revision_input(input) {
-            return result;
-        }
         let (request, options) = match super::mutation_adapter::decode_create(input) {
             Ok(decoded) => decoded,
             Err(diagnostics) => return failed_result(diagnostics),
@@ -288,9 +285,6 @@ impl<'a> Operations<'a> {
     }
 
     fn update_direct(&self, input: &Value) -> OperationResult {
-        if let Some(result) = invalid_revision_input(input) {
-            return result;
-        }
         let (request, options) = match super::mutation_adapter::decode_update(input) {
             Ok(decoded) => decoded,
             Err(diagnostics) => return failed_result(diagnostics),
@@ -302,10 +296,14 @@ impl<'a> Operations<'a> {
     }
 
     fn delete_direct(&self, input: &Value) -> OperationResult {
-        if let Some(result) = invalid_revision_input(input) {
-            return result;
+        let (request, options) = match super::mutation_adapter::decode_delete(input) {
+            Ok(decoded) => decoded,
+            Err(diagnostics) => return failed_result(diagnostics),
+        };
+        match crate::mutation::staged_delete(self.collection, request, options) {
+            Ok(planned) => planned_delete_result(&planned),
+            Err(error) => typed_error_result(error),
         }
-        self.normalize("delete", input, self.collection.delete(input))
     }
 
     fn rename_direct(&self, input: &Value) -> OperationResult {
@@ -577,7 +575,7 @@ impl<'a> Operations<'a> {
     }
 }
 
-fn typed_error_result(error: crate::api::MdbaseError) -> OperationResult {
+pub(super) fn typed_error_result(error: crate::api::MdbaseError) -> OperationResult {
     let diagnostics = error
         .diagnostics()
         .iter()
@@ -606,6 +604,25 @@ fn typed_error_result(error: crate::api::MdbaseError) -> OperationResult {
         )])
     } else {
         failed_result(diagnostics)
+    }
+}
+
+pub(super) fn planned_delete_result(planned: &crate::mutation::PlannedDelete) -> OperationResult {
+    let mut result = serde_json::to_value(planned.result()).expect("delete results serialize");
+    if !planned.deleted {
+        result["dry_run"] = Value::Bool(true);
+        result["would_delete"] = Value::Bool(true);
+    }
+    if planned.broken_links.is_empty() {
+        result
+            .as_object_mut()
+            .expect("delete results are objects")
+            .remove("broken_links");
+    }
+    OperationResult {
+        valid: true,
+        result,
+        diagnostics: Vec::new(),
     }
 }
 

@@ -33,7 +33,7 @@ pub(crate) fn prepare_single_runtime(
 ) -> Result<RuntimeSinglePreparation, ProviderError> {
     context.check()?;
     #[cfg(test)]
-    if matches!(operation, "create" | "update") {
+    if matches!(operation, "create" | "update" | "delete") {
         crate::mutation::probe_runtime_decode();
     }
     if matches!(operation, "create" | "update" | "delete") {
@@ -150,11 +150,30 @@ fn prepare_sparse_runtime(
         }
     };
     context.check()?;
-    let shadow_operations = shadow
-        .collection
-        .v03_operations()
-        .map_err(|diagnostic| ProviderError::CollectionOpen(diagnostic.message.clone()))?;
-    let mut result = shadow_operations.execute_mutation_direct(operation, &shadow_input);
+    let (result, delete_plan) = if operation == "delete" {
+        let (request, options) = match super::mutation_adapter::decode_delete(&shadow_input) {
+            Ok(decoded) => decoded,
+            Err(diagnostics) => {
+                return Ok(RuntimeSinglePreparation::NoMutation(failed(diagnostics)))
+            }
+        };
+        match crate::mutation::plan_delete(collection, &shadow.collection, request, options) {
+            Ok(planned) => (
+                super::operations::planned_delete_result(&planned),
+                Some(planned),
+            ),
+            Err(error) => (super::operations::typed_error_result(error), None),
+        }
+    } else {
+        let shadow_operations = shadow
+            .collection
+            .v03_operations()
+            .map_err(|diagnostic| ProviderError::CollectionOpen(diagnostic.message.clone()))?;
+        (
+            shadow_operations.execute_mutation_direct(operation, &shadow_input),
+            None,
+        )
+    };
     context.check()?;
     if !result.valid {
         return Ok(RuntimeSinglePreparation::NoMutation(result));
@@ -178,9 +197,15 @@ fn prepare_sparse_runtime(
             )
         })?
         .to_string();
-    let mut baseline = crate::transactions::FileBaseline::new();
-    if let Ok(bytes) = fs::read(collection.root.join(&path)) {
-        baseline.insert(path.clone(), bytes);
+    let mut baseline = if operation == "delete" {
+        shadow.baseline.clone()
+    } else {
+        crate::transactions::FileBaseline::new()
+    };
+    if operation != "delete" {
+        if let Ok(bytes) = fs::read(collection.root.join(&path)) {
+            baseline.insert(path.clone(), bytes);
+        }
     }
     if operation == "create" && baseline.contains_key(&path) && input_path != Some(path.as_str()) {
         return Ok(RuntimeSinglePreparation::NoMutation(failed(vec![
@@ -197,28 +222,6 @@ fn prepare_sparse_runtime(
     }
     if baseline == desired {
         return Ok(RuntimeSinglePreparation::NoMutation(result));
-    }
-
-    if operation == "delete"
-        && input
-            .get("check_backlinks")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    {
-        context.check()?;
-        let mut preview_input = input.as_object().cloned().unwrap_or_default();
-        preview_input.insert("dry_run".to_string(), Value::Bool(true));
-        let preview = collection
-            .v03_operations()
-            .map_err(|diagnostic| ProviderError::CollectionOpen(diagnostic.message.clone()))?
-            .execute_mutation_direct("delete", &Value::Object(preview_input));
-        context.check()?;
-        if !preview.valid {
-            return Ok(RuntimeSinglePreparation::NoMutation(preview));
-        }
-        if let Some(broken_links) = preview.result.get("broken_links") {
-            result.result["broken_links"] = broken_links.clone();
-        }
     }
 
     if matches!(operation, "create" | "update") && collection.settings.default_validation == "error"
@@ -249,7 +252,10 @@ fn prepare_sparse_runtime(
         }
     }
 
-    let before = targeted_snapshot(collection, &path)?;
+    let before = delete_plan
+        .as_ref()
+        .map(planned_delete_snapshot)
+        .unwrap_or_else(|| targeted_snapshot(collection, &path))?;
     let after = targeted_snapshot(&shadow.collection, &path)?;
     context.check()?;
     Ok(RuntimeSinglePreparation::Prepared(Box::new(
@@ -261,6 +267,26 @@ fn prepare_sparse_runtime(
             after,
         },
     )))
+}
+
+fn planned_delete_snapshot(
+    planned: &crate::mutation::PlannedDelete,
+) -> Result<CollectionSnapshot, ProviderError> {
+    Ok(CollectionSnapshot {
+        revision: String::new(),
+        resource_revision: String::new(),
+        spec_version: super::SPEC_VERSION.to_string(),
+        resources: Vec::new(),
+        records: vec![crate::runtime::CollectionSnapshotRecord {
+            path: planned.path.to_string(),
+            revision: planned.before_revision.clone(),
+            frontmatter: planned.before_frontmatter.clone(),
+            body: planned.before_body.clone(),
+            types: planned.types.clone(),
+            document: String::new(),
+            frontmatter_error: None,
+        }],
+    })
 }
 
 fn targeted_snapshot(

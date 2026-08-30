@@ -1,4 +1,4 @@
-//! Version-neutral typed create/update mutation service.
+//! Version-neutral typed create/update/delete mutation service.
 //!
 //! Phase 3 deliberately retains one full-collection shadow for recoverable
 //! filesystem commit. The typed request and outcome never cross a JSON wire
@@ -14,11 +14,14 @@ pub(crate) mod shadow;
 pub(crate) use lifecycle::LifecycleEvent;
 pub(crate) use membership::ResolvedWriteMembership;
 pub(crate) use model::{
-    diagnostic_from_issue, MutationFailure, MutationFailureKind, PlannedRecord, PreparationOptions,
-    PreparedCreate, PreparedUpdate,
+    diagnostic_from_issue, MutationFailure, MutationFailureKind, PlannedDelete, PlannedRecord,
+    PreparationOptions, PreparedCreate, PreparedDelete, PreparedUpdate,
 };
-pub(crate) use preparation::{prepare_create, prepare_update};
-pub(crate) use service::{create, project_record, staged_create, staged_update, update};
+pub(crate) use preparation::{prepare_create, prepare_delete, prepare_update};
+pub(crate) use service::{
+    create, delete, plan_delete, preflight_delete, project_record, staged_create, staged_delete,
+    staged_update, update,
+};
 #[cfg(test)]
 pub(crate) use service::{
     mutation_path_probes, probe_full_shadow, probe_hydration_read, probe_legacy_parse,

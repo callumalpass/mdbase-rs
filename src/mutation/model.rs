@@ -1,6 +1,6 @@
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-use crate::api::{CollectionPath, CreateRequest, UpdateRequest};
+use crate::api::{CollectionPath, CreateRequest, DeleteRequest, UpdateRequest};
 use crate::diagnostic::Diagnostic;
 use crate::errors::{Issue, Severity};
 
@@ -27,6 +27,49 @@ pub(crate) struct PreparedUpdate {
     pub legacy_path: Option<String>,
     pub legacy_revision: Option<String>,
     pub legacy_last_known_mtime: Option<u64>,
+}
+
+/// A typed delete whose target and collection-dependent evidence were captured
+/// before any file is removed.
+pub(crate) struct PreparedDelete {
+    pub request: DeleteRequest,
+    pub dry_run: bool,
+    pub before_revision: String,
+    pub before_frontmatter: Map<String, Value>,
+    pub before_body: String,
+    pub types: Vec<String>,
+    pub broken_links: Vec<Value>,
+    pub legacy_last_known_mtime: Option<u64>,
+}
+
+/// Exact planned deletion evidence retained across durable publication.
+#[derive(Clone, Debug)]
+pub(crate) struct PlannedDelete {
+    pub path: CollectionPath,
+    pub before_revision: String,
+    pub before_frontmatter: Map<String, Value>,
+    pub before_body: String,
+    pub types: Vec<String>,
+    pub broken_links: Vec<Value>,
+    pub deleted: bool,
+}
+
+impl PlannedDelete {
+    pub(crate) fn result(&self) -> crate::api::DeleteResult {
+        crate::api::DeleteResult {
+            path: self.path.clone(),
+            deleted: self.deleted,
+            broken_links: self.broken_links.clone(),
+        }
+    }
+
+    pub(crate) fn preflight_result(&self) -> crate::api::DeletePreflightResult {
+        crate::api::DeletePreflightResult {
+            path: self.path.clone(),
+            would_delete: true,
+            broken_links: self.broken_links.clone(),
+        }
+    }
 }
 
 /// Exact planned record and semantic projection produced before publication.

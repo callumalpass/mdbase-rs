@@ -39,8 +39,10 @@ helpers, and legacy request builders under `src/mutation` and the crate root.
 
 ## Remaining paths and budgets
 
-Delete, rename, batch encoding, runtime wire transport, and legacy v0.2 JSON
-CRUD remain outside this slice. Rename alone retains compatibility hydration.
+Delete is now covered by the follow-on
+[`typed-delete-phase3.md`](typed-delete-phase3.md) slice. Rename, batch encoding,
+runtime wire transport, and legacy v0.2 JSON CRUD remain outside this original
+create/update slice. Rename alone retains compatibility hydration.
 Runtime and batch create/update use the staged typed entry and do not nest a
 second shadow. Committed facts replace shadow metadata in direct v0.3 and durable
 runtime journal responses. Postcommit replacement/removal tests cover typed,

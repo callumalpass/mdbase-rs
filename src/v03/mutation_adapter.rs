@@ -3,6 +3,29 @@ use serde_json::Value;
 use super::operations::collect_diagnostics;
 use super::Diagnostic;
 
+pub(super) fn parse_optional_revision(
+    input: &Value,
+    path: Option<&str>,
+) -> Result<Option<crate::api::Revision>, Vec<Diagnostic>> {
+    match input.get("if_revision") {
+        None => Ok(None),
+        Some(Value::String(revision)) => crate::api::Revision::parse(revision.clone())
+            .map(Some)
+            .map_err(|error| {
+                vec![Diagnostic::error(
+                    "invalid_request",
+                    error.to_string(),
+                    path.map(str::to_string),
+                )]
+            }),
+        Some(_) => Err(vec![Diagnostic::error(
+            "invalid_request",
+            "if_revision must be an opaque string token.",
+            path.map(str::to_string),
+        )]),
+    }
+}
+
 pub(super) fn decode_create(
     input: &Value,
 ) -> Result<
@@ -24,18 +47,7 @@ pub(super) fn decode_create(
                 .map_err(|error| vec![Diagnostic::error("invalid_path", error.to_string(), None)])
         })
         .transpose()?;
-    let if_revision = input
-        .get("if_revision")
-        .and_then(Value::as_str)
-        .map(crate::api::Revision::parse)
-        .transpose()
-        .map_err(|error| {
-            vec![Diagnostic::error(
-                "invalid_request",
-                error.to_string(),
-                None,
-            )]
-        })?;
+    let if_revision = parse_optional_revision(input, input.get("path").and_then(Value::as_str))?;
     Ok((
         crate::api::CreateRequest {
             path,
@@ -72,6 +84,53 @@ pub(super) fn decode_create(
                 .get("document")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            dry_run: input
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
+    ))
+}
+
+pub(super) fn decode_delete(
+    input: &Value,
+) -> Result<
+    (
+        crate::api::DeleteRequest,
+        crate::mutation::PreparationOptions,
+    ),
+    Vec<Diagnostic>,
+> {
+    #[cfg(test)]
+    crate::mutation::probe_wire_decode();
+    let raw_path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| vec![Diagnostic::error("invalid_path", "path is required", None)])?;
+    let path = match crate::api::CollectionPath::new(raw_path) {
+        Ok(path) => path,
+        Err(error) => {
+            crate::operations::ensure_safe_relative_path(raw_path, crate::SpecProfile::V03)
+                .map_err(|error| collect_diagnostics(&error, Some(raw_path), "error"))?;
+            return Err(vec![Diagnostic::error(
+                "invalid_path",
+                error.to_string(),
+                Some(raw_path.to_string()),
+            )]);
+        }
+    };
+    let if_revision = parse_optional_revision(input, Some(raw_path))?;
+    Ok((
+        crate::api::DeleteRequest {
+            path,
+            check_backlinks: input
+                .get("check_backlinks")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            if_revision,
+        },
+        crate::mutation::PreparationOptions {
+            create_document: None,
             dry_run: input
                 .get("dry_run")
                 .and_then(Value::as_bool)
@@ -129,18 +188,7 @@ pub(super) fn decode_update(
             Some(raw_path.to_string()),
         )]);
     }
-    let if_revision = input
-        .get("if_revision")
-        .and_then(Value::as_str)
-        .map(crate::api::Revision::parse)
-        .transpose()
-        .map_err(|error| {
-            vec![Diagnostic::error(
-                "invalid_request",
-                error.to_string(),
-                Some(raw_path.to_string()),
-            )]
-        })?;
+    let if_revision = parse_optional_revision(input, Some(raw_path))?;
     Ok((
         crate::api::UpdateRequest {
             path,

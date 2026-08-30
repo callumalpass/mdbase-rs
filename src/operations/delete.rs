@@ -1,113 +1,169 @@
 //! Delete operation (§12.4).
 
 use crate::api::operations::{DeleteInput, DeleteOutput};
+use crate::api::{DeleteRequest, Revision};
 use crate::errors::*;
+use crate::mutation::{PlannedDelete, PreparationOptions, PreparedDelete};
 use crate::operations::{
-    ensure_no_symlink_components, ensure_regular_record_file, ensure_revision,
-    mutation_record_path, sync_directory,
+    ensure_no_symlink_components_diagnostic, ensure_regular_record_file_diagnostic, sync_directory,
 };
 use crate::Collection;
 
 impl Collection {
-    /// Delete a file (§12.4).
+    /// Legacy JSON delete edge. Canonical callers use the typed mutation service.
     pub fn delete(&self, input: &serde_json::Value) -> serde_json::Value {
+        #[cfg(test)]
+        crate::mutation::probe_legacy_parse();
         let input = match DeleteInput::parse(input) {
             Ok(parsed) => parsed,
-            Err(err) => return err,
-        };
-        let path = match mutation_record_path(self, &input.path) {
-            Ok(path) => path,
             Err(error) => return error,
         };
-        if let Err(error) =
-            ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)
+        let path = match crate::operations::mutation_record_path_diagnostic(self, &input.path) {
+            Ok(path) => path,
+            Err(error) => return serde_json::json!({"error": error}),
+        };
+        let if_revision = match input
+            .if_revision
+            .as_deref()
+            .map(Revision::parse)
+            .transpose()
         {
-            return error;
-        }
-        let check_backlinks = input.check_backlinks;
-        let dry_run = input.dry_run;
-        let _write_lock = if dry_run {
-            None
-        } else {
-            match crate::transactions::WriteLock::acquire(self) {
-                Ok(write_lock) => Some(write_lock),
-                Err(error) => return op_error(error.code(), &error.to_string()),
+            Ok(revision) => revision,
+            Err(_) => {
+                return op_error(
+                    CONCURRENT_MODIFICATION,
+                    &format!("File '{}' was modified externally", input.path),
+                )
             }
         };
-
-        let full_path = path.under(&self.root);
-        if let Err(error) = ensure_regular_record_file(&full_path, path.as_str()) {
-            return error;
-        }
-        if let Err(error) = ensure_revision(&full_path, path.as_str(), input.if_revision.as_deref())
-        {
-            return error;
-        }
-
-        // Concurrent modification detection
-        if let Some(known_ms) = input.last_known_mtime {
-            if let Ok(meta) = std::fs::metadata(&full_path) {
-                if let Ok(mtime) = meta.modified() {
-                    let current_ms = mtime
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    if current_ms != known_ms {
-                        return op_error(
-                            CONCURRENT_MODIFICATION,
-                            &format!("File '{}' was modified externally", path.as_str()),
-                        );
-                    }
-                }
+        let request = DeleteRequest {
+            path,
+            check_backlinks: input.check_backlinks,
+            if_revision,
+        };
+        let prepared = match crate::mutation::prepare_delete(
+            self,
+            request,
+            PreparationOptions {
+                create_document: None,
+                dry_run: input.dry_run,
+            },
+            input.last_known_mtime,
+        ) {
+            Ok(prepared) => prepared,
+            Err(diagnostics) => return mutation_failure_json(diagnostics),
+        };
+        match self.delete_planned(prepared) {
+            Ok(planned) => DeleteOutput {
+                path: planned.path.to_string(),
+                deleted: planned.deleted,
+                dry_run: !planned.deleted,
+                broken_links: planned.broken_links,
             }
+            .into_json(),
+            Err(failure) => mutation_failure_json(failure.diagnostics),
         }
+    }
 
-        // Check backlinks before deletion
-        let mut broken_links: Vec<serde_json::Value> = Vec::new();
-        if check_backlinks {
-            let bl_index = match self.build_authoritative_backlinks_index() {
-                Ok(index) => index,
-                Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
-            };
-            if let Some(sources) = bl_index.get(path.as_str()) {
-                for source in sources {
-                    broken_links.push(serde_json::json!({
-                        "path": source,
-                    }));
-                }
+    pub(crate) fn delete_planned(
+        &self,
+        prepared: PreparedDelete,
+    ) -> Result<PlannedDelete, crate::mutation::MutationFailure> {
+        let PreparedDelete {
+            request,
+            dry_run,
+            before_revision,
+            before_frontmatter,
+            before_body,
+            types,
+            broken_links,
+            legacy_last_known_mtime,
+        } = prepared;
+        let path = request.path;
+        let display_path = path.to_string();
+        ensure_no_symlink_components_diagnostic(&self.root, &display_path, self.spec_profile)
+            .map_err(crate::mutation::MutationFailure::diagnostic)?;
+        let full_path = path.under(&self.root);
+        ensure_regular_record_file_diagnostic(&full_path, &display_path)
+            .map_err(crate::mutation::MutationFailure::diagnostic)?;
+        let loaded = crate::record_load::load_record(self, &display_path).map_err(|error| {
+            crate::mutation::MutationFailure::operation(
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    FILE_NOT_FOUND
+                } else {
+                    "file_read_failed"
+                },
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    format!("File not found: {display_path}")
+                } else {
+                    "Record could not be read.".to_string()
+                },
+            )
+        })?;
+        if loaded.facts().revision != before_revision
+            || request
+                .if_revision
+                .as_ref()
+                .is_some_and(|expected| expected.as_str() != loaded.facts().revision)
+        {
+            return Err(crate::mutation::MutationFailure::operation(
+                CONCURRENT_MODIFICATION,
+                format!("File '{display_path}' was modified externally"),
+            ));
+        }
+        if let Some(known_ms) = legacy_last_known_mtime {
+            let current_ms = std::fs::metadata(&full_path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64);
+            if current_ms.is_some_and(|current| current != known_ms) {
+                return Err(crate::mutation::MutationFailure::operation(
+                    CONCURRENT_MODIFICATION,
+                    format!("File '{display_path}' was modified externally"),
+                ));
             }
         }
 
         if !dry_run {
-            if let Err(error) =
-                ensure_revision(&full_path, path.as_str(), input.if_revision.as_deref())
-            {
-                return error;
-            }
-            if let Err(error) =
-                ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)
-            {
-                return error;
-            }
-            if let Err(e) = std::fs::remove_file(&full_path) {
-                return op_error("io_error", &format!("Failed to delete: {}", e));
-            }
+            ensure_no_symlink_components_diagnostic(&self.root, &display_path, self.spec_profile)
+                .map_err(crate::mutation::MutationFailure::diagnostic)?;
+            std::fs::remove_file(&full_path).map_err(|error| {
+                crate::mutation::MutationFailure::operation(
+                    "io_error",
+                    format!("Failed to delete: {error}"),
+                )
+            })?;
             if let Some(parent) = full_path.parent() {
-                if let Err(error) = sync_directory(parent) {
-                    return op_error(
+                sync_directory(parent).map_err(|error| {
+                    crate::mutation::MutationFailure::operation(
                         "io_error",
-                        &format!("Failed to make deletion durable: {error}"),
-                    );
-                }
+                        format!("Failed to make deletion durable: {error}"),
+                    )
+                })?;
             }
         }
 
-        DeleteOutput {
-            path: path.to_string(),
-            deleted: !dry_run,
-            dry_run,
+        Ok(PlannedDelete {
+            path,
+            before_revision,
+            before_frontmatter,
+            before_body,
+            types,
             broken_links,
-        }
-        .into_json()
+            deleted: !dry_run,
+        })
+    }
+}
+
+fn mutation_failure_json(diagnostics: Vec<crate::diagnostic::Diagnostic>) -> serde_json::Value {
+    if diagnostics.len() == 1 {
+        serde_json::json!({"error": diagnostics.into_iter().next().unwrap()})
+    } else {
+        serde_json::json!({"error": {
+            "code": VALIDATION_FAILED,
+            "message": "Validation failed",
+            "issues": diagnostics,
+        }})
     }
 }

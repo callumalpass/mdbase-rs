@@ -15,6 +15,8 @@ use schema_diagnostics::validation_diagnostic;
 
 pub(crate) mod batch;
 mod collection_setup;
+#[cfg(test)]
+mod delete_tests;
 mod mutation_adapter;
 mod operations;
 pub(crate) mod query;

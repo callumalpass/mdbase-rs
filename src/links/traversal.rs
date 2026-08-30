@@ -55,15 +55,6 @@ impl Collection {
         self.build_backlinks_index_with_resolution(all_files, profile, &resolution_index)
     }
 
-    pub(crate) fn build_authoritative_backlinks_index(
-        &self,
-    ) -> Result<HashMap<String, Vec<String>>, CollectionSnapshotError> {
-        let snapshot = self
-            .capture_collection_snapshot(&OperationCancellation::new())
-            .map_err(CollectionSnapshotError::from)?;
-        Ok(self.build_backlinks_index_for_snapshot(&snapshot))
-    }
-
     pub(crate) fn build_backlinks_index_for_snapshot(
         &self,
         snapshot: &crate::snapshot::AuthoritativeCollectionSnapshot,

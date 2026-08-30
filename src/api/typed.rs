@@ -762,8 +762,7 @@ impl<'a> TypedCollection<'a> {
     /// Delete one canonical record.
     pub fn delete(&self, request: DeleteRequest) -> MdbaseResult<OperationOutcome<DeleteResult>> {
         self.require_canonical("delete")?;
-        let input = request.into_wire();
-        self.execute(self.operations()?.delete(&input))
+        crate::mutation::delete(self.collection, request)
     }
 
     /// Preview one delete without mutating authoritative state.
@@ -772,9 +771,7 @@ impl<'a> TypedCollection<'a> {
         request: DeleteRequest,
     ) -> MdbaseResult<OperationOutcome<DeletePreflightResult>> {
         self.require_canonical("delete")?;
-        let mut input = request.into_wire();
-        input["dry_run"] = Value::Bool(true);
-        self.execute(self.operations()?.delete(&input))
+        crate::mutation::preflight_delete(self.collection, request)
     }
 
     /// Rename one canonical record and optionally rewrite references.

@@ -1,9 +1,10 @@
 use serde_json::{Map, Value};
 
 use super::{
-    LifecycleEvent, PreparationOptions, PreparedCreate, PreparedUpdate, ResolvedWriteMembership,
+    LifecycleEvent, PreparationOptions, PreparedCreate, PreparedDelete, PreparedUpdate,
+    ResolvedWriteMembership,
 };
-use crate::api::{CreateRequest, Revision, UpdateRequest};
+use crate::api::{CreateRequest, DeleteRequest, Revision, UpdateRequest};
 use crate::diagnostic::Diagnostic;
 use crate::frontmatter::parser::{
     parse_document_for_rewrite, yaml_mapping_to_json, FrontmatterState,
@@ -165,6 +166,144 @@ pub(crate) fn prepare_update(
         legacy_revision: None,
         legacy_last_known_mtime: None,
     })
+}
+
+pub(crate) fn prepare_delete(
+    collection: &Collection,
+    request: DeleteRequest,
+    options: PreparationOptions,
+    legacy_last_known_mtime: Option<u64>,
+) -> Result<PreparedDelete, Vec<Diagnostic>> {
+    let path = request.path.to_string();
+    crate::operations::mutation_record_path_diagnostic(collection, &path).map_err(
+        |mut error| {
+            error.path = Some(path.clone());
+            vec![error]
+        },
+    )?;
+    crate::operations::ensure_no_symlink_components_diagnostic(
+        &collection.root,
+        &path,
+        collection.spec_profile,
+    )
+    .map_err(|mut error| {
+        error.path = Some(path.clone());
+        vec![error]
+    })?;
+    crate::operations::ensure_regular_record_file_diagnostic(
+        &request.path.under(&collection.root),
+        &path,
+    )
+    .map_err(|mut error| {
+        error.path = Some(path.clone());
+        vec![error]
+    })?;
+
+    let (before_revision, before_frontmatter, before_body, types, broken_links) =
+        if request.check_backlinks {
+            let snapshot = collection
+                .capture_collection_snapshot(&crate::OperationCancellation::new())
+                .map_err(|error| {
+                    vec![Diagnostic::error(
+                        "collection_snapshot_failed",
+                        error.to_string(),
+                        Some(path.clone()),
+                    )]
+                })?;
+            let target = snapshot.entry(&path).ok_or_else(|| {
+                vec![Diagnostic::error(
+                    crate::errors::FILE_NOT_FOUND,
+                    format!("File not found: {path}"),
+                    Some(path.clone()),
+                )]
+            })?;
+            let broken_links = collection
+                .build_backlinks_index_for_snapshot(&snapshot)
+                .get(&path)
+                .into_iter()
+                .flatten()
+                .map(|source| serde_json::json!({"path": source}))
+                .collect();
+            let (frontmatter, body) = delete_record_projection(target.outcome());
+            (
+                target.facts().revision.clone(),
+                frontmatter,
+                body,
+                target.type_names().to_vec(),
+                broken_links,
+            )
+        } else {
+            let loaded = crate::record_load::load_record(collection, &path).map_err(|error| {
+                vec![Diagnostic::error(
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        crate::errors::FILE_NOT_FOUND
+                    } else {
+                        "file_read_failed"
+                    },
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        format!("File not found: {path}")
+                    } else {
+                        "Record could not be read.".to_string()
+                    },
+                    Some(path.clone()),
+                )]
+            })?;
+            let (frontmatter, body) = delete_record_projection(&loaded);
+            (
+                loaded.facts().revision.clone(),
+                frontmatter,
+                body,
+                loaded.type_names().to_vec(),
+                Vec::new(),
+            )
+        };
+
+    if request
+        .if_revision
+        .as_ref()
+        .is_some_and(|expected| expected.as_str() != before_revision)
+    {
+        return Err(vec![Diagnostic::error(
+            crate::errors::CONCURRENT_MODIFICATION,
+            format!("File '{path}' was modified externally"),
+            Some(path),
+        )]);
+    }
+    if let Some(known_ms) = legacy_last_known_mtime {
+        let current_ms = std::fs::metadata(request.path.under(&collection.root))
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as u64);
+        if current_ms.is_some_and(|current| current != known_ms) {
+            return Err(vec![Diagnostic::error(
+                crate::errors::CONCURRENT_MODIFICATION,
+                format!("File '{}' was modified externally", request.path),
+                Some(request.path.to_string()),
+            )]);
+        }
+    }
+
+    Ok(PreparedDelete {
+        request,
+        dry_run: options.dry_run,
+        before_revision,
+        before_frontmatter,
+        before_body,
+        types,
+        broken_links,
+        legacy_last_known_mtime,
+    })
+}
+
+fn delete_record_projection(record: &RecordLoadOutcome) -> (Map<String, Value>, String) {
+    let frontmatter = record
+        .parsed()
+        .and_then(|parsed| parsed.raw_frontmatter.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let body = record.body().unwrap_or_default().to_string();
+    (frontmatter, body)
 }
 
 struct Candidate {

@@ -1,8 +1,11 @@
-use crate::api::{CreateRequest, MdbaseError, OperationOutcome, RecordDocument, UpdateRequest};
+use crate::api::{
+    CreateRequest, DeletePreflightResult, DeleteRequest, DeleteResult, MdbaseError,
+    OperationOutcome, RecordDocument, UpdateRequest,
+};
 use crate::diagnostic::Diagnostic as CanonicalDiagnostic;
 use crate::{Collection, SpecProfile};
 
-use super::{PlannedRecord, PreparationOptions};
+use super::{PlannedDelete, PlannedRecord, PreparationOptions};
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -89,6 +92,28 @@ pub(crate) fn update(
     })
 }
 
+pub(crate) fn delete(
+    collection: &Collection,
+    request: DeleteRequest,
+) -> Result<OperationOutcome<DeleteResult>, MdbaseError> {
+    let planned = execute_delete_shadow(collection, request, false)?;
+    Ok(OperationOutcome {
+        value: planned.result(),
+        diagnostics: Vec::new(),
+    })
+}
+
+pub(crate) fn preflight_delete(
+    collection: &Collection,
+    request: DeleteRequest,
+) -> Result<OperationOutcome<DeletePreflightResult>, MdbaseError> {
+    let planned = execute_delete_shadow(collection, request, true)?;
+    Ok(OperationOutcome {
+        value: planned.preflight_result(),
+        diagnostics: Vec::new(),
+    })
+}
+
 pub(crate) fn staged_create(
     collection: &Collection,
     request: CreateRequest,
@@ -112,6 +137,67 @@ pub(crate) fn staged_update(
     collection
         .update_planned(prepared)
         .map_err(|failure| canonical_error(failure.diagnostics))
+}
+
+pub(crate) fn staged_delete(
+    collection: &Collection,
+    request: DeleteRequest,
+    options: PreparationOptions,
+) -> Result<PlannedDelete, MdbaseError> {
+    plan_delete(collection, collection, request, options)
+}
+
+/// Capture deletion evidence from the authority and apply that exact plan to a
+/// caller-owned working set. A sparse working set therefore cannot substitute
+/// stale bytes or incomplete backlink/type evidence.
+pub(crate) fn plan_delete(
+    authority: &Collection,
+    working_set: &Collection,
+    request: DeleteRequest,
+    options: PreparationOptions,
+) -> Result<PlannedDelete, MdbaseError> {
+    let prepared =
+        super::prepare_delete(authority, request, options, None).map_err(canonical_error)?;
+    working_set
+        .delete_planned(prepared)
+        .map_err(|failure| canonical_error(failure.diagnostics))
+}
+
+fn execute_delete_shadow(
+    collection: &Collection,
+    request: DeleteRequest,
+    dry_run: bool,
+) -> Result<PlannedDelete, MdbaseError> {
+    if collection.spec_profile != SpecProfile::V03 {
+        return Err(MdbaseError::MigrationRequired {
+            operation: "mutation",
+        });
+    }
+    let shadow = super::shadow_collection(collection)
+        .map_err(|diagnostic| canonical_error(vec![*diagnostic]))?;
+    let planned = staged_delete(
+        &shadow.collection,
+        request,
+        PreparationOptions {
+            create_document: None,
+            dry_run,
+        },
+    )?;
+    if dry_run {
+        return Ok(planned);
+    }
+    let desired = super::collect_collection_files(&shadow.collection)
+        .map_err(|diagnostic| canonical_error(vec![*diagnostic]))?;
+    crate::transactions::commit_shadow(collection, &shadow.baseline, &desired).map_err(
+        |error| {
+            canonical_error(vec![CanonicalDiagnostic::error(
+                error.code(),
+                error.to_string(),
+                Some(planned.path.to_string()),
+            )])
+        },
+    )?;
+    Ok(planned)
 }
 
 fn execute_shadow(
@@ -321,6 +407,52 @@ mod tests {
     }
 
     #[test]
+    fn typed_delete_and_preflight_use_one_full_shadow_without_bridges() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        std::fs::write(root.path().join("target.md"), "target\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        let request =
+            crate::api::DeleteRequest::new(crate::api::CollectionPath::new("target.md").unwrap());
+
+        reset_mutation_path_probes();
+        let preview = collection
+            .typed()
+            .unwrap()
+            .preflight_delete(request.clone())
+            .unwrap();
+        assert!(preview.value.would_delete);
+        assert!(root.path().join("target.md").exists());
+        assert_eq!(
+            mutation_path_probes(),
+            MutationPathProbes {
+                full_shadows: 1,
+                ..MutationPathProbes::default()
+            }
+        );
+
+        reset_mutation_path_probes();
+        crate::transactions::inject_post_commit_replacement(
+            root.path(),
+            "target.md",
+            Some(b"external replacement".to_vec()),
+        );
+        let deleted = collection.typed().unwrap().delete(request).unwrap();
+        assert!(deleted.value.deleted);
+        assert_eq!(
+            std::fs::read(root.path().join("target.md")).unwrap(),
+            b"external replacement"
+        );
+        assert_eq!(
+            mutation_path_probes(),
+            MutationPathProbes {
+                full_shadows: 1,
+                ..MutationPathProbes::default()
+            }
+        );
+    }
+
+    #[test]
     fn committed_facts_survive_post_commit_path_replacement() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
@@ -406,15 +538,37 @@ mod tests {
         }
         let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let batch = std::fs::read_to_string(repository.join("src/v03/batch.rs")).unwrap();
+        let runtime_delete_adapter = batch
+            .split("fn prepare_sparse_runtime")
+            .nth(1)
+            .unwrap()
+            .split("if matches!(operation, \"create\" | \"update\")")
+            .next()
+            .unwrap();
+        assert_eq!(runtime_delete_adapter.matches("plan_delete(").count(), 1);
+        for forbidden in [
+            "staged_delete(",
+            "request.check_backlinks =",
+            "planned.broken_links =",
+            "planned.types =",
+            "authoritative",
+        ] {
+            assert!(!runtime_delete_adapter.contains(forbidden), "{forbidden}");
+        }
         assert!(!batch.contains(&["struct", "ShadowCollection"].join(" ")));
         assert!(!batch.contains(&["fn", "shadow_collection"].join(" ")));
         assert!(!batch.contains(&["pub(crate)", "use", "crate::mutation"].join(" ")));
-        for relative in ["src/operations/create.rs", "src/operations/update.rs"] {
+        for relative in [
+            "src/operations/create.rs",
+            "src/operations/update.rs",
+            "src/operations/delete.rs",
+        ] {
             let source = std::fs::read_to_string(repository.join(relative)).unwrap();
             let core = source
                 .split("fn create_planned")
                 .nth(1)
                 .or_else(|| source.split("fn update_planned").nth(1))
+                .or_else(|| source.split("fn delete_planned").nth(1))
                 .unwrap();
             let edge_marker = if relative.ends_with("update.rs") {
                 "fn legacy_prepared_update"
@@ -430,6 +584,8 @@ mod tests {
                 ["serde_json", "to_value"].join("::"),
                 ["Create", "Input"].join(""),
                 ["Update", "Input"].join(""),
+                ["Delete", "Input"].join(""),
+                ["Operation", "Result"].join(""),
             ] {
                 assert!(!core.contains(&forbidden), "{relative}: {forbidden}");
             }
