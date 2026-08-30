@@ -26,7 +26,7 @@ pub(crate) fn canonical_changes(
         .collect::<BTreeMap<_, _>>();
     let mut changes = Vec::new();
 
-    if let Some((from, to)) = proven_requested_rename(request, &before_records, &after_records) {
+    for (from, to) in proven_requested_renames(request, &before_records, &after_records) {
         let before = before_records
             .remove(from.as_str())
             .expect("a proven rename source exists");
@@ -118,21 +118,44 @@ pub(crate) fn canonical_changes(
     ChangeBatch::new(changes)
 }
 
-fn proven_requested_rename(
+fn proven_requested_renames(
     request: Option<&OperationRequest>,
     before: &BTreeMap<&str, &CollectionSnapshotRecord>,
     after: &BTreeMap<&str, &CollectionSnapshotRecord>,
-) -> Option<(CollectionPath, CollectionPath)> {
-    let request = request.filter(|request| request.operation == OperationKind::Rename)?;
-    let from = request.input.get("from")?.as_str()?;
-    let to = request.input.get("to")?.as_str()?;
-    let from = CollectionPath::new(from).ok()?;
-    let to = CollectionPath::new(to).ok()?;
-    (before.contains_key(from.as_str())
-        && !after.contains_key(from.as_str())
-        && !before.contains_key(to.as_str())
-        && after.contains_key(to.as_str()))
-    .then_some((from, to))
+) -> Vec<(CollectionPath, CollectionPath)> {
+    let Some(request) = request else {
+        return Vec::new();
+    };
+    let candidates = match request.operation {
+        OperationKind::Rename => vec![&request.input],
+        OperationKind::Batch => request
+            .input
+            .get("operations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("kind").and_then(Value::as_str) == Some("rename"))
+            .filter_map(|item| item.get("input"))
+            .collect(),
+        _ => return Vec::new(),
+    };
+    candidates
+        .into_iter()
+        .filter_map(|input| {
+            let from = input.get("from").or_else(|| input.get("path"))?.as_str()?;
+            let to = input
+                .get("to")
+                .or_else(|| input.get("new_path"))?
+                .as_str()?;
+            let from = CollectionPath::new(from).ok()?;
+            let to = CollectionPath::new(to).ok()?;
+            (before.contains_key(from.as_str())
+                && !after.contains_key(from.as_str())
+                && !before.contains_key(to.as_str())
+                && after.contains_key(to.as_str()))
+            .then_some((from, to))
+        })
+        .collect()
 }
 
 fn record_change(

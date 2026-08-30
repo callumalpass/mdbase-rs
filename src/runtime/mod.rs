@@ -6,6 +6,7 @@
 //! corresponding change is available.
 
 mod api;
+mod batch;
 #[cfg(feature = "hosted-storage-benchmark")]
 mod benchmark;
 mod catalog;

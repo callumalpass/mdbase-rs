@@ -1,13 +1,11 @@
 use std::fmt;
 
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 use super::{CollectionPath, CollectionPathError, QueryRequest, QueryResult};
 use crate::diagnostic::Diagnostic as CanonicalDiagnostic;
-use crate::v03;
 use crate::{Collection, SpecProfile};
 
 fn empty_json_object() -> Value {
@@ -59,6 +57,17 @@ pub enum MdbaseError {
         /// Canonical diagnostics returned by the failed operation.
         diagnostics: Vec<Diagnostic>,
     },
+    /// A best-effort batch committed one or more items and also failed items.
+    ///
+    /// This pre-release variant intentionally exposes the complete ordered
+    /// result so callers can never mistake committed successes for rollback.
+    #[error("mdbase partial batch committed with one or more failed items")]
+    PartialBatch {
+        /// Complete ordered aggregate, including committed successes.
+        result: BatchResult,
+        /// Aggregate diagnostics in operation order.
+        diagnostics: Vec<Diagnostic>,
+    },
     /// A canonical wire result could not be decoded into its typed form.
     #[error("could not decode canonical operation result: {message}")]
     InvalidResult {
@@ -72,6 +81,7 @@ impl MdbaseError {
     pub fn diagnostics(&self) -> &[Diagnostic] {
         match self {
             Self::Operation { diagnostics } => diagnostics,
+            Self::PartialBatch { diagnostics, .. } => diagnostics,
             Self::LossyMigration { diagnostics } => diagnostics,
             _ => &[],
         }
@@ -645,7 +655,7 @@ pub struct DeleteResult {
     /// Whether the authoritative file was deleted.
     pub deleted: bool,
     /// Inbound references that would become broken.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub broken_links: Vec<Value>,
 }
 
@@ -672,7 +682,7 @@ pub struct RenameResult {
     /// New record path.
     pub to: CollectionPath,
     /// References rewritten as part of the rename.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references_updated: Vec<Value>,
 }
 
@@ -693,17 +703,104 @@ pub struct RenamePreflightResult {
     pub warnings: Vec<Value>,
 }
 
+/// Exact non-mutating delete result within a batch.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BatchDeletePreflightResult {
+    /// Target record path.
+    pub path: CollectionPath,
+    /// A dry run never deletes the authoritative file.
+    pub deleted: bool,
+    /// Whether the item was explicitly evaluated as a dry run.
+    pub dry_run: bool,
+    /// Whether execution would delete the record.
+    pub would_delete: bool,
+    /// Inbound references that would become broken.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broken_links: Vec<Value>,
+}
+
+/// Failed reference rewrites retained by a batch rename result.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BatchRenamePartialUpdates {
+    /// Reference writes which could not be applied to the working set.
+    pub failed: Vec<Value>,
+}
+
+/// Exact rename result within a batch, including partial reference failures.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BatchRenameResult {
+    /// Canonical rename result.
+    #[serde(flatten)]
+    pub result: RenameResult,
+    /// Failed reference rewrites, when some working-set updates failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_updates: Option<BatchRenamePartialUpdates>,
+}
+
+/// Exact non-mutating rename result within a batch.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BatchRenamePreflightResult {
+    /// Original record path.
+    pub from: CollectionPath,
+    /// Proposed record path.
+    pub to: CollectionPath,
+    /// Whether the item was explicitly evaluated as a dry run.
+    pub dry_run: bool,
+    /// Whether execution would rename the record.
+    pub would_rename: bool,
+    /// References that would be rewritten.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references_affected: Vec<Value>,
+    /// Failed reference rewrites, when planning found partial failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_updates: Option<BatchRenamePartialUpdates>,
+}
+
+/// Empty mutation result used for an item which failed before producing a plan.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyBatchOperationResult {}
+
+/// Strongly typed result of one heterogeneous batch mutation.
+///
+/// The enum is untagged so its JSON representation remains the canonical flat
+/// mutation result object used by the v0.3 wire protocol.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BatchOperationResult {
+    /// Rename result, ordered before its flattened record shape for decoding.
+    Rename(BatchRenameResult),
+    /// Dry-run rename result.
+    RenamePreflight(BatchRenamePreflightResult),
+    /// Dry-run delete result.
+    DeletePreflight(BatchDeletePreflightResult),
+    /// Created or updated record.
+    Record(RecordDocument),
+    /// Delete result.
+    Delete(DeleteResult),
+    /// No mutation-specific result was produced.
+    Empty(EmptyBatchOperationResult),
+}
+
+impl Default for BatchOperationResult {
+    fn default() -> Self {
+        Self::Empty(EmptyBatchOperationResult {})
+    }
+}
+
 /// Result for one operation within a batch.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BatchItemResult {
     /// Zero-based position in the request.
     pub index: usize,
-    /// Canonical mutation kind.
+    /// Canonical mutation kind. It is absent only when a wire item omitted it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
     /// Whether this mutation succeeded.
     pub valid: bool,
-    /// Mutation-specific canonical result.
-    pub result: Value,
+    /// Mutation-specific strongly typed canonical result.
+    #[serde(default)]
+    pub result: BatchOperationResult,
     /// Diagnostics emitted by this mutation.
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
@@ -792,8 +889,7 @@ impl<'a> TypedCollection<'a> {
     /// Execute typed mutations as one recoverable batch.
     pub fn batch(&self, request: BatchRequest) -> MdbaseResult<OperationOutcome<BatchResult>> {
         self.require_canonical("batch")?;
-        let input = request.to_wire();
-        self.execute(self.operations()?.batch(&input))
+        crate::mutation::batch(self.collection, request)
     }
 
     /// Query canonical or read-only-compatible records.
@@ -836,40 +932,11 @@ impl<'a> TypedCollection<'a> {
         crate::compat::v02_migration::migrate(self.collection, request)
     }
 
-    fn operations(&self) -> MdbaseResult<v03::Operations<'_>> {
-        self.collection
-            .v03_operations()
-            .map_err(|diagnostic| MdbaseError::Operation {
-                diagnostics: vec![(*diagnostic).into()],
-            })
-    }
-
     fn require_canonical(&self, operation: &'static str) -> MdbaseResult<()> {
         if self.collection.spec_profile == SpecProfile::V02 {
             return Err(MdbaseError::MigrationRequired { operation });
         }
         Ok(())
-    }
-
-    fn execute<T: DeserializeOwned>(
-        &self,
-        result: v03::OperationResult,
-    ) -> MdbaseResult<OperationOutcome<T>> {
-        #[cfg(test)]
-        crate::mutation::probe_result_decode();
-        let diagnostics = result
-            .diagnostics
-            .into_iter()
-            .map(Diagnostic::from)
-            .collect::<Vec<_>>();
-        if !result.valid {
-            return Err(MdbaseError::Operation { diagnostics });
-        }
-        let value =
-            serde_json::from_value(result.result).map_err(|error| MdbaseError::InvalidResult {
-                message: error.to_string(),
-            })?;
-        Ok(OperationOutcome { value, diagnostics })
     }
 }
 

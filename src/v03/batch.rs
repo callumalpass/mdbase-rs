@@ -57,7 +57,7 @@ pub(crate) fn prepare_single_runtime(
     } else {
         let shadow_operations = Operations::new(&shadow.collection)
             .map_err(|diagnostic| ProviderError::CollectionOpen(diagnostic.message.clone()))?;
-        execute_staged_operation(&shadow_operations, operation, &shadow_input)
+        execute_non_record_runtime_operation(&shadow_operations, operation, &shadow_input)
     };
     context.check()?;
     if !result.valid {
@@ -80,16 +80,12 @@ pub(crate) fn prepare_single_runtime(
     )))
 }
 
-fn execute_staged_operation(
+fn execute_non_record_runtime_operation(
     operations: &Operations<'_>,
     operation: &str,
     input: &Value,
 ) -> OperationResult {
     match operation {
-        "create" | "update" | "delete" | "rename" => {
-            operations.execute_mutation_direct(operation, input)
-        }
-        "batch" => operations.batch(input),
         "create_view_source" => operations.create_view_source(input),
         "update_view_source" => operations.update_view_source(input),
         "delete_view_source" => operations.delete_view_source(input),
@@ -167,12 +163,10 @@ fn prepare_sparse_runtime(
             Err(error) => (super::operations::typed_error_result(error), None),
         }
     } else {
-        let shadow_operations = shadow
-            .collection
-            .v03_operations()
+        let shadow_operations = Operations::new(&shadow.collection)
             .map_err(|diagnostic| ProviderError::CollectionOpen(diagnostic.message.clone()))?;
         (
-            shadow_operations.execute_mutation_direct(operation, &shadow_input),
+            shadow_operations.execute_staged_mutation(operation, &shadow_input),
             None,
         )
     };
@@ -391,7 +385,7 @@ fn copy_sparse_controls(
     Ok(())
 }
 
-pub(crate) fn execute_single(
+pub(crate) fn execute_wire_mutation(
     collection: &Collection,
     operation: &str,
     input: &Value,
@@ -405,11 +399,11 @@ pub(crate) fn execute_single(
             Ok(shadow) => shadow,
             Err(diagnostic) => return failed(vec![*diagnostic]),
         };
-        let operations = match shadow.collection.v03_operations() {
+        let operations = match Operations::new(&shadow.collection) {
             Ok(operations) => operations,
             Err(diagnostic) => return failed(vec![*diagnostic]),
         };
-        return operations.execute_mutation_direct(operation, input);
+        return operations.execute_staged_mutation(operation, input);
     }
 
     let shadow = match shadow_collection(collection) {
@@ -420,11 +414,11 @@ pub(crate) fn execute_single(
         Ok(input) => input,
         Err(diagnostic) => return failed(vec![*diagnostic]),
     };
-    let shadow_operations = match shadow.collection.v03_operations() {
+    let shadow_operations = match Operations::new(&shadow.collection) {
         Ok(operations) => operations,
         Err(diagnostic) => return failed(vec![*diagnostic]),
     };
-    let mut result = shadow_operations.execute_mutation_direct(operation, &shadow_input);
+    let mut result = shadow_operations.execute_staged_mutation(operation, &shadow_input);
     if !result.valid {
         return result;
     }
@@ -459,81 +453,182 @@ pub(crate) fn execute_single(
 }
 
 pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult {
-    let Some(items) = input.get("operations").and_then(Value::as_array) else {
-        return invalid_request("Batch input requires an operations array.");
+    let items = match validate_batch_envelope(input) {
+        Ok(items) => items,
+        Err(diagnostics) => return failed(diagnostics),
     };
-    if items.is_empty() {
-        return invalid_request("Batch operations must not be empty.");
+    if let Some(diagnostic) = duplicate_batch_path(items) {
+        return failed(vec![diagnostic]);
     }
-    let dry_run = input
-        .get("dry_run")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let allow_partial = input
         .get("allow_partial")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-
-    // A path may participate in at most one explicit batch item. Reject this
-    // before creating a shadow or evaluating generated values so dry-run,
-    // atomic, and best-effort execution reserve exactly the same inputs.
-    if let Some(diagnostic) = duplicate_batch_path(items) {
-        return failed(vec![diagnostic]);
+    let dry_run = input
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if allow_partial && !dry_run {
+        return execute_partial_wire(collection, items);
     }
-
-    if dry_run || !allow_partial {
-        let shadow = match shadow_collection(collection) {
-            Ok(shadow) => shadow,
-            Err(diagnostic) => return failed(vec![*diagnostic]),
-        };
-        let shadow_operations = match shadow.collection.v03_operations() {
-            Ok(operations) => operations,
-            Err(diagnostic) => return failed(vec![*diagnostic]),
-        };
-        let preview = execute_items(&shadow_operations, items, false, false);
-        if dry_run || !preview.valid {
-            return batch_result(preview, true, dry_run);
-        }
-        let desired = match collect_collection_files(&shadow.collection) {
-            Ok(desired) => desired,
-            Err(diagnostic) => return failed(vec![*diagnostic]),
-        };
-        let commit =
-            match crate::transactions::commit_shadow(collection, &shadow.baseline, &desired) {
-                Ok(commit) => commit,
-                Err(error) => {
-                    return failed(vec![Diagnostic::error(
-                        error.code(),
-                        error.to_string(),
-                        None,
-                    )])
-                }
-            };
-        let mut result = batch_result(preview, false, false);
-        if commit.cleanup_deferred {
-            result.diagnostics.push(Diagnostic {
-                severity: "warning".to_string(),
-                code: "transaction_cleanup_deferred".to_string(),
-                message: "The batch committed, but transaction cleanup was deferred.".to_string(),
-                path: None,
-                field: None,
-                type_name: None,
-                schema_location: None,
-                details: None,
-            });
-        }
-        return result;
-    }
-
-    let operations = match collection.v03_operations() {
-        Ok(operations) => operations,
-        Err(diagnostic) => return failed(vec![*diagnostic]),
+    let (request, options) = match decode_batch_request(collection, input) {
+        Ok(decoded) => decoded,
+        Err(diagnostics) => return failed(diagnostics),
     };
-    batch_result(
-        execute_items(&operations, items, allow_partial, true),
-        false,
-        false,
-    )
+    match crate::mutation::batch_wire(collection, request, options) {
+        Ok(execution) => batch_operation_result(execution),
+        Err(error) => super::operations::typed_error_result(error),
+    }
+}
+
+pub(crate) fn decode_batch_request(
+    collection: &Collection,
+    input: &Value,
+) -> Result<(crate::api::BatchRequest, crate::mutation::BatchWireOptions), Vec<Diagnostic>> {
+    let items = validate_batch_envelope(input)?;
+    if let Some(diagnostic) = duplicate_batch_path(items) {
+        return Err(vec![diagnostic]);
+    }
+    let mut operations = Vec::with_capacity(items.len());
+    let mut create_documents = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let (operation, create_document) = decode_batch_item(collection, index, item)?;
+        operations.push(operation);
+        create_documents.push(create_document);
+    }
+    Ok((
+        crate::api::BatchRequest {
+            operations,
+            allow_partial: input
+                .get("allow_partial")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            dry_run: input
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
+        crate::mutation::BatchWireOptions { create_documents },
+    ))
+}
+
+fn validate_batch_envelope(input: &Value) -> Result<&[Value], Vec<Diagnostic>> {
+    let items = input
+        .get("operations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            vec![Diagnostic::error(
+                "invalid_request",
+                "Batch input requires an operations array.",
+                None,
+            )]
+        })?;
+    if items.is_empty() {
+        return Err(vec![Diagnostic::error(
+            "invalid_request",
+            "Batch operations must not be empty.",
+            None,
+        )]);
+    }
+    for name in ["allow_partial", "dry_run"] {
+        if input.get(name).is_some_and(|value| !value.is_boolean()) {
+            return Err(vec![Diagnostic::error(
+                "invalid_request",
+                format!("{name} must be a boolean."),
+                None,
+            )]);
+        }
+    }
+    Ok(items)
+}
+
+fn decode_batch_item(
+    collection: &Collection,
+    index: usize,
+    item: &Value,
+) -> Result<(crate::api::BatchOperation, Option<String>), Vec<Diagnostic>> {
+    let kind = item.get("kind").and_then(Value::as_str).ok_or_else(|| {
+        vec![Diagnostic::error(
+            "invalid_request",
+            format!("Batch operation {index} requires kind."),
+            None,
+        )]
+    })?;
+    let operation_input = item.get("input").cloned().unwrap_or_else(|| json!({}));
+    if !operation_input.is_object() {
+        return Err(vec![Diagnostic::error(
+            "invalid_request",
+            format!("Batch operation {index} input must be an object."),
+            None,
+        )]);
+    }
+    validate_authoritative_mtime(collection, &operation_input)?;
+    match kind {
+        "create" => {
+            let (request, options) = super::mutation_adapter::decode_create(&operation_input)?;
+            Ok((
+                crate::api::BatchOperation::Create(request),
+                options.create_document,
+            ))
+        }
+        "update" => {
+            let (request, _) = super::mutation_adapter::decode_update(&operation_input)?;
+            Ok((crate::api::BatchOperation::Update(request), None))
+        }
+        "delete" => {
+            let (request, _) = super::mutation_adapter::decode_delete(&operation_input)?;
+            Ok((crate::api::BatchOperation::Delete(request), None))
+        }
+        "rename" => {
+            let (request, _, _) =
+                super::mutation_adapter::decode_rename(collection, &operation_input)?;
+            Ok((crate::api::BatchOperation::Rename(request), None))
+        }
+        _ => Err(vec![Diagnostic::error(
+            "invalid_request",
+            format!("Unsupported batch operation kind '{kind}'."),
+            None,
+        )]),
+    }
+}
+
+fn execute_partial_wire(collection: &Collection, items: &[Value]) -> OperationResult {
+    let mut results = Vec::with_capacity(items.len());
+    let mut diagnostics = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        match decode_batch_item(collection, index, item) {
+            Ok((operation, create_document)) => {
+                let (result, mut aggregate) = crate::mutation::execute_partial_item(
+                    collection,
+                    index,
+                    operation,
+                    create_document,
+                );
+                results.push(result);
+                diagnostics.append(&mut aggregate);
+            }
+            Err(item_diagnostics) => {
+                let typed = item_diagnostics
+                    .iter()
+                    .cloned()
+                    .map(crate::api::Diagnostic::from)
+                    .collect::<Vec<_>>();
+                diagnostics.extend(typed.iter().cloned());
+                results.push(crate::api::BatchItemResult {
+                    index,
+                    kind: item
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    valid: false,
+                    result: crate::api::BatchOperationResult::default(),
+                    diagnostics: typed,
+                });
+            }
+        }
+    }
+    batch_operation_result(crate::mutation::aggregate_partial(results, diagnostics))
 }
 
 fn duplicate_batch_path(items: &[Value]) -> Option<Diagnostic> {
@@ -564,6 +659,77 @@ fn duplicate_batch_path(items: &[Value]) -> Option<Diagnostic> {
         }
     }
     None
+}
+
+fn validate_authoritative_mtime(
+    collection: &Collection,
+    input: &Value,
+) -> Result<(), Vec<Diagnostic>> {
+    let Some(expected) = input.get("last_known_mtime").and_then(Value::as_u64) else {
+        return Ok(());
+    };
+    let path = input
+        .get("path")
+        .or_else(|| input.get("from"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            vec![Diagnostic::error(
+                "invalid_request",
+                "A mutation mtime precondition requires a record path.",
+                None,
+            )]
+        })?;
+    let current = modified_millis(&collection.root.join(path)).ok_or_else(|| {
+        vec![Diagnostic::error(
+            "concurrent_modification",
+            format!("File '{path}' no longer matches the requested modification time."),
+            Some(path.to_string()),
+        )]
+    })?;
+    if current != expected {
+        return Err(vec![Diagnostic::error(
+            "concurrent_modification",
+            format!("File '{path}' was modified externally."),
+            Some(path.to_string()),
+        )]);
+    }
+    Ok(())
+}
+
+pub(crate) fn batch_operation_result(
+    execution: crate::mutation::BatchExecution,
+) -> OperationResult {
+    OperationResult {
+        valid: execution.result.failed == 0
+            && execution
+                .diagnostics
+                .iter()
+                .all(|item| item.severity != crate::api::Severity::Error),
+        result: serde_json::to_value(execution.result).expect("batch result serializes"),
+        diagnostics: execution
+            .diagnostics
+            .into_iter()
+            .map(typed_diagnostic)
+            .collect(),
+    }
+}
+
+fn typed_diagnostic(value: crate::api::Diagnostic) -> Diagnostic {
+    Diagnostic {
+        severity: match value.severity {
+            crate::api::Severity::Error => "error",
+            crate::api::Severity::Warning => "warning",
+            crate::api::Severity::Info => "info",
+        }
+        .to_string(),
+        code: value.code.to_string(),
+        message: value.message,
+        path: value.path,
+        field: value.field,
+        type_name: value.type_name,
+        schema_location: value.schema_location,
+        details: value.details,
+    }
 }
 
 fn adapt_mtime_precondition(
@@ -624,102 +790,6 @@ fn modified_millis(path: &Path) -> Option<u64> {
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
 
-struct BatchExecution {
-    valid: bool,
-    results: Vec<Value>,
-    diagnostics: Vec<Diagnostic>,
-}
-
-fn execute_items(
-    operations: &Operations<'_>,
-    items: &[Value],
-    allow_partial: bool,
-    atomic: bool,
-) -> BatchExecution {
-    let mut results = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut valid = true;
-    for (index, item) in items.iter().enumerate() {
-        let Some(kind) = item.get("kind").and_then(Value::as_str) else {
-            let diagnostic = Diagnostic::error(
-                "invalid_request",
-                format!("Batch operation {index} requires kind."),
-                None,
-            );
-            diagnostics.push(diagnostic.clone());
-            results.push(json!({
-                "index": index,
-                "valid": false,
-                "result": {},
-                "diagnostics": [diagnostic],
-            }));
-            valid = false;
-            if !allow_partial {
-                break;
-            }
-            continue;
-        };
-        let operation_input = item.get("input").cloned().unwrap_or_else(|| json!({}));
-        let operation = match (kind, atomic) {
-            ("create", true) => operations.create(&operation_input),
-            ("update", true) => operations.update(&operation_input),
-            ("delete", true) => operations.delete(&operation_input),
-            ("rename", true) => operations.rename(&operation_input),
-            ("create" | "update" | "delete" | "rename", false) => {
-                operations.execute_mutation_direct(kind, &operation_input)
-            }
-            _ => OperationResult {
-                valid: false,
-                result: json!({}),
-                diagnostics: vec![Diagnostic::error(
-                    "invalid_request",
-                    format!("Unsupported batch operation kind '{kind}'."),
-                    None,
-                )],
-            },
-        };
-        if !operation.valid {
-            valid = false;
-        }
-        diagnostics.extend(operation.diagnostics.iter().cloned());
-        results.push(json!({
-            "index": index,
-            "kind": kind,
-            "valid": operation.valid,
-            "result": operation.result,
-            "diagnostics": operation.diagnostics,
-        }));
-        if !valid && !allow_partial {
-            break;
-        }
-    }
-    BatchExecution {
-        valid,
-        results,
-        diagnostics,
-    }
-}
-
-fn batch_result(execution: BatchExecution, preflight: bool, dry_run: bool) -> OperationResult {
-    let succeeded = execution
-        .results
-        .iter()
-        .filter(|result| result.get("valid") == Some(&Value::Bool(true)))
-        .count();
-    let failed = execution.results.len() - succeeded;
-    OperationResult {
-        valid: execution.valid,
-        result: json!({
-            "operations": execution.results,
-            "succeeded": succeeded,
-            "failed": failed,
-            "preflight": preflight,
-            "dry_run": dry_run,
-        }),
-        diagnostics: execution.diagnostics,
-    }
-}
-
 fn invalid_request(message: &str) -> OperationResult {
     failed(vec![Diagnostic::error("invalid_request", message, None)])
 }
@@ -741,6 +811,168 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn wire_partial_lazily_rejects_late_malformed_unsupported_and_stale_items() {
+        let source = tempfile::tempdir().unwrap();
+        write(
+            &source.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        );
+        write(&source.path().join("stale.md"), "stale\n");
+        let collection = Collection::open(source.path()).unwrap();
+        crate::mutation::reset_mutation_path_probes();
+
+        let result = execute(
+            &collection,
+            &json!({
+                "allow_partial": true,
+                "operations": [
+                    {"kind": "create", "input": {"path": "first.md", "body": "first"}},
+                    {"input": {"path": "missing-kind.md"}},
+                    {"kind": "future", "input": {"path": "unsupported.md"}},
+                    {"kind": "update", "input": {
+                        "path": "stale.md", "body": "changed", "last_known_mtime": 0
+                    }},
+                    {"kind": "create", "input": {"path": "last.md", "body": "last"}}
+                ]
+            }),
+        );
+
+        assert!(!result.valid);
+        assert_eq!(result.result["succeeded"], 2);
+        assert_eq!(result.result["failed"], 3);
+        assert_eq!(result.result["operations"].as_array().unwrap().len(), 5);
+        assert!(result.result["operations"][1].get("kind").is_none());
+        assert_eq!(result.result["operations"][2]["kind"], "future");
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|item| item.code.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "invalid_request",
+                "invalid_request",
+                "concurrent_modification"
+            ]
+        );
+        assert!(source.path().join("first.md").is_file());
+        assert!(source.path().join("last.md").is_file());
+        assert_eq!(
+            fs::read_to_string(source.path().join("stale.md")).unwrap(),
+            "stale\n"
+        );
+        assert_eq!(
+            crate::mutation::mutation_path_probes().full_shadows,
+            2,
+            "only successfully decoded items execute"
+        );
+    }
+
+    #[test]
+    fn typed_and_wire_mixed_batch_items_and_diagnostics_have_exact_json_parity() {
+        fn prepared_fixture() -> tempfile::TempDir {
+            let root = tempfile::tempdir().unwrap();
+            write(&root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n");
+            write(&root.path().join("update.md"), "---\ntitle: before\n---\n");
+            write(&root.path().join("rename.md"), "rename\n");
+            write(&root.path().join("delete.md"), "delete\n");
+            root
+        }
+        for dry_run in [false, true] {
+            let typed_root = prepared_fixture();
+            let wire_root = prepared_fixture();
+            let typed_collection = Collection::open(typed_root.path()).unwrap();
+            let wire_collection = Collection::open(wire_root.path()).unwrap();
+            let request = crate::api::BatchRequest {
+                operations: vec![
+                    crate::api::BatchOperation::Update(crate::api::UpdateRequest::new(
+                        crate::api::CollectionPath::new("update.md").unwrap(),
+                        json!({"title": "after"}),
+                    )),
+                    crate::api::BatchOperation::Rename(crate::api::RenameRequest::new(
+                        crate::api::CollectionPath::new("rename.md").unwrap(),
+                        crate::api::CollectionPath::new("renamed.md").unwrap(),
+                    )),
+                    crate::api::BatchOperation::Create(
+                        crate::api::CreateRequest::new(
+                            crate::api::CollectionPath::new("created.md").unwrap(),
+                        )
+                        .with_body("created"),
+                    ),
+                    crate::api::BatchOperation::Delete(crate::api::DeleteRequest::new(
+                        crate::api::CollectionPath::new("delete.md").unwrap(),
+                    )),
+                ],
+                allow_partial: false,
+                dry_run,
+            };
+            let wire_input = request.clone().to_wire();
+            let typed = typed_collection.typed().unwrap().batch(request).unwrap();
+            let wire = execute(&wire_collection, &wire_input);
+            assert!(wire.valid, "{wire:#?}");
+            assert_eq!(
+                serde_json::to_value(&typed.value).unwrap(),
+                wire.result,
+                "dry_run={dry_run}"
+            );
+            assert_eq!(
+                typed.diagnostics,
+                wire.diagnostics
+                    .into_iter()
+                    .map(crate::api::Diagnostic::from)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn committed_cleanup_deferred_is_a_nonfatal_warning_for_typed_and_wire() {
+        let typed_root = tempfile::tempdir().unwrap();
+        write(
+            &typed_root.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\n",
+        );
+        let typed_collection = Collection::open(typed_root.path()).unwrap();
+        crate::transactions::inject_cleanup_deferred(typed_root.path());
+        let typed = typed_collection
+            .typed()
+            .unwrap()
+            .batch(
+                crate::api::BatchRequest::new(vec![crate::api::BatchOperation::Create(
+                    crate::api::CreateRequest::new(
+                        crate::api::CollectionPath::new("typed.md").unwrap(),
+                    ),
+                )])
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(typed.diagnostics.len(), 1);
+        assert_eq!(typed.diagnostics[0].severity, crate::api::Severity::Warning);
+        assert_eq!(
+            typed.diagnostics[0].code.as_str(),
+            "transaction_cleanup_deferred"
+        );
+        assert!(typed_root.path().join("typed.md").is_file());
+
+        let wire_root = tempfile::tempdir().unwrap();
+        write(
+            &wire_root.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\n",
+        );
+        let wire_collection = Collection::open(wire_root.path()).unwrap();
+        crate::transactions::inject_cleanup_deferred(wire_root.path());
+        let wire = execute(
+            &wire_collection,
+            &json!({"operations": [{"kind": "create", "input": {"path": "wire.md"}}]}),
+        );
+        assert!(wire.valid, "{wire:#?}");
+        assert_eq!(wire.diagnostics.len(), 1);
+        assert_eq!(wire.diagnostics[0].severity, "warning");
+        assert_eq!(wire.diagnostics[0].code, "transaction_cleanup_deferred");
+        assert!(wire_root.path().join("wire.md").is_file());
     }
 
     #[test]
@@ -900,7 +1132,7 @@ mod tests {
         );
 
         let collection = Collection::open(stage.path()).unwrap();
-        let operations = collection.v03_operations().unwrap();
+        let operations = Operations::new(&collection).unwrap();
         let result = operations.execute_staged_mutation(
             "create",
             &json!({

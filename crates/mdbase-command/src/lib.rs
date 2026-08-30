@@ -1479,10 +1479,16 @@ fn typed_error_result(error: MdbaseError) -> (serde_json::Value, i32) {
         .first()
         .map(|diagnostic| diagnostic_code_to_exit(diagnostic.code.as_str()))
         .unwrap_or(EXIT_GENERAL_ERROR);
+    let result = match &error {
+        MdbaseError::PartialBatch { result, .. } => {
+            serde_json::to_value(result).expect("typed batch results serialize")
+        }
+        _ => serde_json::json!({}),
+    };
     (
         serde_json::json!({
             "valid": false,
-            "result": {},
+            "result": result,
             "diagnostics": diagnostics,
         }),
         exit,
@@ -1501,6 +1507,7 @@ fn typed_error_diagnostics(error: &MdbaseError) -> Vec<mdbase::api::Diagnostic> 
         MdbaseError::InvalidRequest { .. } => "invalid_request",
         MdbaseError::InvalidResult { .. } => "invalid_result",
         MdbaseError::Operation { .. } => "operation_failed",
+        MdbaseError::PartialBatch { .. } => "partial_batch",
     };
     vec![mdbase::api::Diagnostic {
         severity: mdbase::api::Severity::Error,

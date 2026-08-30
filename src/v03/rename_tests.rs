@@ -67,7 +67,7 @@ fn serialization_fixture() -> tempfile::TempDir {
 
 fn wire(root: &std::path::Path, input: &Value) -> OperationResult {
     let collection = Collection::open(root).unwrap();
-    crate::v03::batch::execute_single(&collection, "rename", input)
+    crate::v03::batch::execute_wire_mutation(&collection, "rename", input)
 }
 
 fn runtime(
@@ -145,7 +145,7 @@ fn typed_result(root: &std::path::Path) -> (Value, Value) {
 fn wire_and_runtime_rename_use_one_full_shadow_without_nested_planning() {
     let (_wire_root, wire_collection) = basic_collection();
     crate::mutation::reset_mutation_path_probes();
-    let result = crate::v03::batch::execute_single(
+    let result = crate::v03::batch::execute_wire_mutation(
         &wire_collection,
         "rename",
         &json!({
@@ -393,7 +393,7 @@ fn typed_wire_and_runtime_reject_replaced_collection_roots() {
     .unwrap();
     fs::write(wire_external.path().join("source.md"), "external\n").unwrap();
     let held = replace(wire_root.path(), wire_external.path());
-    let wire = crate::v03::batch::execute_single(
+    let wire = crate::v03::batch::execute_wire_mutation(
         &wire_collection,
         "rename",
         &json!({"from": "source.md", "to": "renamed.md"}),

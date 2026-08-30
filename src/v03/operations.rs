@@ -209,15 +209,15 @@ impl<'a> Operations<'a> {
     }
 
     pub fn create(&self, input: &Value) -> OperationResult {
-        super::batch::execute_single(self.collection, "create", input)
+        super::batch::execute_wire_mutation(self.collection, "create", input)
     }
 
     pub fn update(&self, input: &Value) -> OperationResult {
-        super::batch::execute_single(self.collection, "update", input)
+        super::batch::execute_wire_mutation(self.collection, "update", input)
     }
 
     pub fn delete(&self, input: &Value) -> OperationResult {
-        super::batch::execute_single(self.collection, "delete", input)
+        super::batch::execute_wire_mutation(self.collection, "delete", input)
     }
 
     pub fn rename(&self, input: &Value) -> OperationResult {
@@ -230,7 +230,7 @@ impl<'a> Operations<'a> {
                 None,
             )]);
         }
-        super::batch::execute_single(self.collection, "rename", input)
+        super::batch::execute_wire_mutation(self.collection, "rename", input)
     }
 
     /// Execute one mutation directly inside a disposable staging collection.
@@ -243,14 +243,6 @@ impl<'a> Operations<'a> {
     /// not commit. Ordinary filesystem callers should use the atomic mutation
     /// methods instead.
     pub fn execute_staged_mutation(&self, operation: &str, input: &Value) -> OperationResult {
-        self.execute_mutation_direct(operation, input)
-    }
-
-    pub(super) fn execute_mutation_direct(
-        &self,
-        operation: &str,
-        input: &Value,
-    ) -> OperationResult {
         if input.get("simulate_before_ref_update").is_some()
             || input.get("last_known_ref_mtimes").is_some()
         {
@@ -273,7 +265,7 @@ impl<'a> Operations<'a> {
         }
     }
 
-    fn create_direct(&self, input: &Value) -> OperationResult {
+    pub(super) fn create_direct(&self, input: &Value) -> OperationResult {
         let (request, options) = match super::mutation_adapter::decode_create(input) {
             Ok(decoded) => decoded,
             Err(diagnostics) => return failed_result(diagnostics),
@@ -284,7 +276,7 @@ impl<'a> Operations<'a> {
         }
     }
 
-    fn update_direct(&self, input: &Value) -> OperationResult {
+    pub(super) fn update_direct(&self, input: &Value) -> OperationResult {
         let (request, options) = match super::mutation_adapter::decode_update(input) {
             Ok(decoded) => decoded,
             Err(diagnostics) => return failed_result(diagnostics),
@@ -295,7 +287,7 @@ impl<'a> Operations<'a> {
         }
     }
 
-    fn delete_direct(&self, input: &Value) -> OperationResult {
+    pub(super) fn delete_direct(&self, input: &Value) -> OperationResult {
         let (request, options) = match super::mutation_adapter::decode_delete(input) {
             Ok(decoded) => decoded,
             Err(diagnostics) => return failed_result(diagnostics),
@@ -306,7 +298,7 @@ impl<'a> Operations<'a> {
         }
     }
 
-    fn rename_direct(&self, input: &Value) -> OperationResult {
+    pub(super) fn rename_direct(&self, input: &Value) -> OperationResult {
         let (request, options, last_known_mtime) =
             match super::mutation_adapter::decode_rename(self.collection, input) {
                 Ok(decoded) => decoded,

@@ -15,13 +15,12 @@ pub(crate) struct MutationPathProbes {
     pub legacy_request_parses: usize,
     pub wire_request_decodes: usize,
     pub runtime_request_decodes: usize,
-    pub result_decodes: usize,
     pub full_shadows: usize,
     pub sparse_shadows: usize,
 }
 
 #[cfg(test)]
-thread_local! { static PROBES: std::cell::Cell<MutationPathProbes> = const { std::cell::Cell::new(MutationPathProbes { request_value_constructions: 0, legacy_request_parses: 0, wire_request_decodes: 0, runtime_request_decodes: 0, result_decodes: 0, full_shadows: 0, sparse_shadows: 0 }) }; }
+thread_local! { static PROBES: std::cell::Cell<MutationPathProbes> = const { std::cell::Cell::new(MutationPathProbes { request_value_constructions: 0, legacy_request_parses: 0, wire_request_decodes: 0, runtime_request_decodes: 0, full_shadows: 0, sparse_shadows: 0 }) }; }
 
 #[cfg(test)]
 pub(crate) fn reset_mutation_path_probes() {
@@ -55,10 +54,6 @@ pub(crate) fn probe_wire_decode() {
 #[cfg(test)]
 pub(crate) fn probe_runtime_decode() {
     increment(|value| value.runtime_request_decodes += 1);
-}
-#[cfg(test)]
-pub(crate) fn probe_result_decode() {
-    increment(|value| value.result_decodes += 1);
 }
 #[cfg(test)]
 pub(crate) fn probe_full_shadow() {
@@ -799,7 +794,7 @@ mod tests {
             .split("pub(crate) fn prepare_single_runtime")
             .nth(1)
             .unwrap()
-            .split("fn execute_staged_operation")
+            .split("fn execute_non_record_runtime_operation")
             .next()
             .unwrap();
         assert_eq!(

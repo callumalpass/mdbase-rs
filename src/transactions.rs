@@ -40,6 +40,21 @@ fn post_commit_replacements() -> &'static std::sync::Mutex<PostCommitReplacement
 }
 
 #[cfg(test)]
+fn deferred_cleanup_roots() -> &'static std::sync::Mutex<BTreeSet<PathBuf>> {
+    static ROOTS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    ROOTS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn inject_cleanup_deferred(root: &Path) {
+    deferred_cleanup_roots()
+        .lock()
+        .expect("deferred cleanup lock")
+        .insert(root.to_path_buf());
+}
+
+#[cfg(test)]
 pub(crate) fn inject_post_commit_replacement(root: &Path, path: &str, bytes: Option<Vec<u8>>) {
     post_commit_replacements()
         .lock()
@@ -92,6 +107,17 @@ pub(crate) fn attach_committed_file_facts(
     result: &mut serde_json::Value,
     facts: &BTreeMap<String, CommittedFileFacts>,
 ) {
+    if let Some(operations) = result
+        .get_mut("operations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for operation in operations {
+            if let Some(item_result) = operation.get_mut("result") {
+                attach_committed_file_facts(item_result, facts);
+            }
+        }
+        return;
+    }
     let Some(path) = result.get("path").and_then(serde_json::Value::as_str) else {
         return;
     };
@@ -385,7 +411,14 @@ fn commit_shadow_controlled(
     persist_journal(&directory, &journal)?;
     #[cfg(test)]
     apply_post_commit_hook(collection)?;
-    let cleanup_deferred = fs::remove_dir_all(&directory).is_err();
+    #[cfg(test)]
+    let injected_cleanup_deferred = deferred_cleanup_roots()
+        .lock()
+        .expect("deferred cleanup lock")
+        .remove(&collection.root);
+    #[cfg(not(test))]
+    let injected_cleanup_deferred = false;
+    let cleanup_deferred = injected_cleanup_deferred || fs::remove_dir_all(&directory).is_err();
     if !cleanup_deferred {
         let _ = sync_dir(&collection.root.join(TRANSACTIONS_DIR));
     }
