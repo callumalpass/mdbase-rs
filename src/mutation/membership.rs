@@ -1,7 +1,7 @@
 use semver::Version;
 use serde_json::{Map, Value};
 
-use super::Diagnostic;
+use crate::diagnostic::Diagnostic;
 use crate::expressions::evaluator::EvaluationClock;
 use crate::Collection;
 
@@ -27,15 +27,23 @@ impl ResolvedWriteMembership {
 
     pub(crate) fn resolve_create(
         collection: &Collection,
-        input: &Value,
+        requested_type_name: Option<&str>,
+        contract: Option<&str>,
+        contract_version: Option<&str>,
         draft: &mut Map<String, Value>,
         path: &str,
     ) -> Result<Self, Vec<Diagnostic>> {
         // Presence is deliberately separate from validity. A malformed declaration
         // must never fall through to implicit matching.
         let (mut explicit, declarations_present) = explicit_membership(collection, draft, path)?;
-        let requested = requested_type(collection, input, path)?;
-        let designated = resolve_contract(collection, input, requested.as_deref(), path)?;
+        let requested = requested_type(collection, requested_type_name, path)?;
+        let designated = resolve_contract(
+            collection,
+            contract,
+            contract_version,
+            requested.as_deref(),
+            path,
+        )?;
         let selected = designated.as_ref().or(requested.as_ref());
         let initially_explicit = declarations_present || selected.is_some();
 
@@ -160,14 +168,12 @@ impl ResolvedWriteMembership {
 
 fn requested_type(
     collection: &Collection,
-    input: &Value,
+    requested: Option<&str>,
     path: &str,
 ) -> Result<Option<String>, Vec<Diagnostic>> {
-    match input.get("type") {
+    match requested {
         None => Ok(None),
-        Some(Value::String(name)) if !name.is_empty() => {
-            known_type(collection, name, path, "type").map(Some)
-        }
+        Some(name) if !name.is_empty() => known_type(collection, name, path, "type").map(Some),
         Some(_) => Err(vec![diagnostic(
             "invalid_type",
             "type must be a non-empty string.",
@@ -180,12 +186,11 @@ fn requested_type(
 
 fn resolve_contract(
     collection: &Collection,
-    input: &Value,
+    contract_value: Option<&str>,
+    version_value: Option<&str>,
     requested: Option<&str>,
     path: &str,
 ) -> Result<Option<String>, Vec<Diagnostic>> {
-    let contract_value = input.get("contract");
-    let version_value = input.get("contract_version");
     if contract_value.is_none() && version_value.is_none() {
         return Ok(None);
     }
@@ -199,8 +204,8 @@ fn resolve_contract(
             } else {
                 "contract_version"
             },
-            contract_value.and_then(Value::as_str),
-            version_value.and_then(Value::as_str),
+            contract_value,
+            version_value,
             requested,
             &[],
         )]);
@@ -500,25 +505,22 @@ fn known_type(
 }
 
 fn non_empty_string<'a>(
-    value: Option<&'a Value>,
+    value: Option<&'a str>,
     field: &str,
     path: &str,
 ) -> Result<&'a str, Vec<Diagnostic>> {
-    value
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            vec![contract_diagnostic(
-                "invalid_contract_envelope",
-                format!("{field} must be a non-empty string."),
-                path,
-                field,
-                None,
-                None,
-                None,
-                &[],
-            )]
-        })
+    value.filter(|v| !v.is_empty()).ok_or_else(|| {
+        vec![contract_diagnostic(
+            "invalid_contract_envelope",
+            format!("{field} must be a non-empty string."),
+            path,
+            field,
+            None,
+            None,
+            None,
+            &[],
+        )]
+    })
 }
 fn canonicalize(types: &mut Vec<String>) {
     types.sort();
@@ -610,18 +612,6 @@ fn changed(
     d
 }
 
-pub(crate) fn diagnostics_error(diagnostics: Vec<Diagnostic>) -> Value {
-    let code = diagnostics
-        .first()
-        .map(|d| d.code.as_str())
-        .unwrap_or("operation_failed");
-    let message = diagnostics
-        .first()
-        .map(|d| d.message.as_str())
-        .unwrap_or("Operation failed.");
-    serde_json::json!({"error":{"code":code,"message":message,"issues":diagnostics}})
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,20 +651,21 @@ mod tests {
         // in-memory policy so the public staged-operation boundary reaches the
         // omission path that final revalidation must guard if it becomes configurable.
         collection.settings.write_nulls = "omit".to_string();
-        let result = collection
-            .v03_operations()
-            .unwrap()
-            .execute_staged_mutation(
-                "create",
-                &json!({"path":"clock.md", "type":"note", "frontmatter":{}}),
-            );
-        assert!(!result.valid, "{result:#?}");
+        let request =
+            crate::api::CreateRequest::new(crate::api::CollectionPath::new("clock.md").unwrap())
+                .with_type("note");
+        let result = crate::mutation::staged_create(
+            &collection,
+            request,
+            crate::mutation::PreparationOptions::default(),
+        )
+        .unwrap_err();
         assert_eq!(
-            result.diagnostics[0].code,
+            result.diagnostics()[0].code.as_str(),
             "type_membership_authority_changed"
         );
         assert_eq!(
-            result.diagnostics[0].details.as_ref().unwrap()["after"],
+            result.diagnostics()[0].details.as_ref().unwrap()["after"],
             json!(["note"])
         );
         assert_eq!(TEST_CLOCK_CAPTURES.with(|captures| captures.get()), 1);

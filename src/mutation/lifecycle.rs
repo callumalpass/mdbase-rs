@@ -46,7 +46,7 @@ impl Collection {
     ///
     /// The returned map is an in-memory draft. Callers re-evaluate membership
     /// and validate it before any bytes are written.
-    pub(crate) fn apply_v03_lifecycle(
+    pub(crate) fn apply_mutation_lifecycle(
         &self,
         event: LifecycleEvent,
         type_names: &[String],

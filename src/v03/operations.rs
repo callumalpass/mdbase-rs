@@ -1,13 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::lifecycle::LifecycleEvent;
 use super::Diagnostic;
-use crate::frontmatter::parser::{
-    json_to_yaml_mapping, parse_document_for_rewrite, yaml_mapping_to_json, FrontmatterState,
-    ParsedDocument,
-};
-use crate::frontmatter::serializer;
 use crate::{Collection, SpecProfile};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -283,30 +277,28 @@ impl<'a> Operations<'a> {
         if let Some(result) = invalid_revision_input(input) {
             return result;
         }
-        let (input, membership) = match self.prepare_create(input) {
-            Ok(prepared) => prepared,
+        let (request, options) = match super::mutation_adapter::decode_create(input) {
+            Ok(decoded) => decoded,
             Err(diagnostics) => return failed_result(diagnostics),
         };
-        self.normalize(
-            "create",
-            &input,
-            self.collection.create_v03_prepared(&input, membership),
-        )
+        match crate::mutation::staged_create(self.collection, request, options) {
+            Ok(record) => planned_operation_result(self.collection, record),
+            Err(error) => typed_error_result(error),
+        }
     }
 
     fn update_direct(&self, input: &Value) -> OperationResult {
         if let Some(result) = invalid_revision_input(input) {
             return result;
         }
-        let (input, membership) = match self.prepare_update(input) {
-            Ok(prepared) => prepared,
+        let (request, options) = match super::mutation_adapter::decode_update(input) {
+            Ok(decoded) => decoded,
             Err(diagnostics) => return failed_result(diagnostics),
         };
-        self.normalize(
-            "update",
-            &input,
-            self.collection.update_v03_prepared(&input, membership),
-        )
+        match crate::mutation::staged_update(self.collection, request, options) {
+            Ok(record) => planned_operation_result(self.collection, record),
+            Err(error) => typed_error_result(error),
+        }
     }
 
     fn delete_direct(&self, input: &Value) -> OperationResult {
@@ -485,7 +477,7 @@ impl<'a> Operations<'a> {
                 .get("dry_run")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
-            && matches!(operation, "create" | "update" | "rename")
+            && operation == "rename"
         {
             let persisted_path = persisted_path(operation, input, &result);
             if let Some(persisted_path) = persisted_path {
@@ -533,6 +525,8 @@ impl<'a> Operations<'a> {
             ));
             return;
         }
+        #[cfg(test)]
+        crate::mutation::probe_hydration_read();
         let read = self.collection.read(&serde_json::json!({
             "path": path,
             "include_document": include_document,
@@ -581,231 +575,97 @@ impl<'a> Operations<'a> {
             }
         }
     }
+}
 
-    fn prepare_create(
-        &self,
-        input: &Value,
-    ) -> Result<(Value, super::write_membership::ResolvedWriteMembership), Vec<Diagnostic>> {
-        let mut normalized = input.as_object().cloned().unwrap_or_default();
-        let mut draft = input
-            .get("frontmatter")
-            .or_else(|| input.get("fields"))
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        // An explicit path is canonicalized before it can affect membership.
-        // A derived path intentionally starts path-independent; the designated
-        // type selects its path pattern and the core create performs the final,
-        // authoritative canonical-path revalidation.
-        let canonical_path = match input.get("path").and_then(Value::as_str) {
-            Some(path) => match crate::operations::mutation_record_path(self.collection, path) {
-                Ok(path) => Some(path.to_string()),
-                Err(error) => return Err(collect_diagnostics(&error, Some(path), "error")),
-            },
-            None => None,
-        };
-        if let Some(path) = &canonical_path {
-            normalized.insert("path".to_string(), Value::String(path.clone()));
-        }
-        let path = canonical_path.as_deref().unwrap_or("");
-        if let Some(candidate) = classify_raw_candidate(input, path)? {
-            draft = candidate.frontmatter;
-            normalized.insert("body".to_string(), Value::String(candidate.document.body));
-        }
-        let membership = super::write_membership::ResolvedWriteMembership::resolve_create(
-            self.collection,
-            input,
-            &mut draft,
-            path,
-        )?;
-        let lifecycle_draft = self.collection.apply_v03_lifecycle(
-            LifecycleEvent::Create,
-            membership.types(),
-            draft,
+fn typed_error_result(error: crate::api::MdbaseError) -> OperationResult {
+    let diagnostics = error
+        .diagnostics()
+        .iter()
+        .cloned()
+        .map(|diagnostic| Diagnostic {
+            severity: match diagnostic.severity {
+                crate::api::Severity::Error => "error",
+                crate::api::Severity::Warning => "warning",
+                crate::api::Severity::Info => "info",
+            }
+            .to_string(),
+            code: diagnostic.code.to_string(),
+            message: diagnostic.message,
+            path: diagnostic.path,
+            field: diagnostic.field,
+            type_name: diagnostic.type_name,
+            schema_location: diagnostic.schema_location,
+            details: diagnostic.details,
+        })
+        .collect::<Vec<_>>();
+    if diagnostics.is_empty() {
+        failed_result(vec![Diagnostic::error(
+            "invalid_request",
+            error.to_string(),
             None,
-            path,
-        )?;
-        normalized.insert("frontmatter".to_string(), Value::Object(lifecycle_draft));
-        Ok((Value::Object(normalized), membership))
+        )])
+    } else {
+        failed_result(diagnostics)
     }
+}
 
-    fn prepare_update(
-        &self,
-        input: &Value,
-    ) -> Result<(Value, super::write_membership::ResolvedWriteMembership), Vec<Diagnostic>> {
-        let Some(raw_path) = input.get("path").and_then(Value::as_str) else {
-            return Err(vec![Diagnostic::error(
-                "invalid_request",
-                "Update requires path.",
-                None,
-            )]);
-        };
-        let path = match crate::operations::mutation_record_path(self.collection, raw_path) {
-            Ok(path) => path.to_string(),
-            Err(error) => return Err(collect_diagnostics(&error, Some(raw_path), "error")),
-        };
-        let candidate = classify_raw_candidate(input, &path)?;
-        if let Err(error) = crate::operations::ensure_no_symlink_components(
-            &self.collection.root,
-            &path,
-            self.collection.spec_profile,
-        ) {
-            return Err(collect_diagnostics(&error, Some(&path), "error"));
+fn planned_operation_result(
+    collection: &Collection,
+    record: crate::mutation::PlannedRecord,
+) -> OperationResult {
+    let path = record.path.to_string();
+    let metadata = match std::fs::metadata(record.path.under(&collection.root)) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return failed_result(vec![Diagnostic::error(
+                "io_error",
+                format!("Failed to stat persisted record: {error}"),
+                Some(path),
+            )])
         }
-        let full_path = self.collection.root.join(&path);
-        if let Err(error) = crate::operations::ensure_regular_record_file(&full_path, &path) {
-            return Err(collect_diagnostics(&error, Some(&path), "error"));
-        }
-        let loaded = crate::record_load::load_record(self.collection, &path).map_err(|_| {
-            vec![Diagnostic::error(
-                "file_read_failed",
-                "Record could not be read.",
-                Some(path.clone()),
-            )]
-        })?;
-        let (old, prepared_revision) = match loaded {
-            crate::record_load::RecordLoadOutcome::Parsed {
-                raw_frontmatter,
-                facts,
-                ..
-            } => (
-                raw_frontmatter.as_object().cloned().unwrap_or_default(),
-                Some(Value::String(facts.revision)),
-            ),
-            crate::record_load::RecordLoadOutcome::Invalid { facts, state, .. } => {
-                if candidate.is_none() {
-                    return Err(vec![invalid_record_diagnostic(
-                        &path,
-                        state.reason().as_str(),
-                    )]);
-                }
-                (Map::new(), Some(Value::String(facts.revision)))
-            }
-        };
-        let draft = if let Some(candidate) = candidate.as_ref() {
-            candidate.frontmatter.clone()
-        } else {
-            let patch = input
-                .get("patch")
-                .or_else(|| input.get("fields"))
-                .or_else(|| input.get("frontmatter"))
-                .and_then(Value::as_object)
+    };
+    match crate::mutation::project_record(collection, record, metadata) {
+        Ok(outcome) => OperationResult {
+            valid: true,
+            result: serde_json::to_value(outcome.value).expect("record documents serialize"),
+            diagnostics: outcome
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| Diagnostic {
+                    severity: match diagnostic.severity {
+                        crate::api::Severity::Error => "error",
+                        crate::api::Severity::Warning => "warning",
+                        crate::api::Severity::Info => "info",
+                    }
+                    .to_string(),
+                    code: diagnostic.code.to_string(),
+                    message: diagnostic.message,
+                    path: diagnostic.path,
+                    field: diagnostic.field,
+                    type_name: diagnostic.type_name,
+                    schema_location: diagnostic.schema_location,
+                    details: diagnostic.details,
+                })
+                .collect(),
+        },
+        Err(error) => failed_result(
+            error
+                .diagnostics()
+                .iter()
                 .cloned()
-                .unwrap_or_default();
-            let mut draft = old.clone();
-            apply_patch(&mut draft, &patch, &self.collection.settings.write_nulls);
-            draft
-        };
-        let membership = super::write_membership::ResolvedWriteMembership::resolve_update(
-            self.collection,
-            &draft,
-            &path,
-        )?;
-        let lifecycle_draft = self.collection.apply_v03_lifecycle(
-            LifecycleEvent::Update,
-            membership.types(),
-            draft.clone(),
-            Some(&old),
-            &path,
-        )?;
-        let mut normalized = input.as_object().cloned().unwrap_or_default();
-        normalized.insert("path".to_string(), Value::String(path.clone()));
-        // Preparation read and locked core reread form one optimistic operation.
-        // When the caller omitted a precondition, carry the prepared revision so
-        // an intervening write cannot be merged into stale preparation.
-        if normalized.get("if_revision").is_none() {
-            if let Some(revision) = prepared_revision {
-                normalized.insert("if_revision".to_string(), revision);
-            }
-        }
-        if let Some(candidate) = candidate {
-            if lifecycle_draft != draft {
-                let canonical = json_to_yaml_mapping(&Value::Object(lifecycle_draft.clone()));
-                let frontmatter = candidate
-                    .document
-                    .frontmatter
-                    .as_ref()
-                    .and_then(serde_yaml::Value::as_mapping)
-                    .map_or(canonical, |authored| {
-                        serializer::reconcile_json_object(authored, &lifecycle_draft)
-                    });
-                let document = serializer::serialize_document_with_bom(
-                    candidate.had_bom,
-                    &frontmatter,
-                    &candidate.document.body,
-                )
-                .map_err(|error| {
-                    vec![Diagnostic::error(
-                        crate::errors::FRONTMATTER_SERIALIZATION_FAILED,
-                        error.to_string(),
-                        Some(path.clone()),
-                    )]
-                })?;
-                normalized.insert("document".to_string(), Value::String(document));
-            }
-            normalized.insert("include_document".to_string(), Value::Bool(true));
-        } else {
-            normalized.remove("patch");
-            normalized.remove("frontmatter");
-            normalized.insert(
-                "fields".to_string(),
-                Value::Object(diff_frontmatter(&old, &lifecycle_draft)),
-            );
-        }
-        Ok((Value::Object(normalized), membership))
+                .map(|diagnostic| Diagnostic {
+                    severity: "error".to_string(),
+                    code: diagnostic.code.to_string(),
+                    message: diagnostic.message,
+                    path: diagnostic.path,
+                    field: diagnostic.field,
+                    type_name: diagnostic.type_name,
+                    schema_location: diagnostic.schema_location,
+                    details: diagnostic.details,
+                })
+                .collect(),
+        ),
     }
-}
-
-fn invalid_record_diagnostic(path: &str, reason: &str) -> Diagnostic {
-    let mut diagnostic = Diagnostic::error(
-        "invalid_frontmatter",
-        format!("Invalid frontmatter: {reason}"),
-        Some(path.to_string()),
-    );
-    diagnostic.details = Some(serde_json::json!({"reason": reason}));
-    diagnostic
-}
-
-struct RawCandidate {
-    document: ParsedDocument,
-    had_bom: bool,
-    frontmatter: Map<String, Value>,
-}
-
-fn classify_raw_candidate(
-    input: &Value,
-    path: &str,
-) -> Result<Option<RawCandidate>, Vec<Diagnostic>> {
-    let Some(source) = input.get("document").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let (document, had_bom) = parse_document_for_rewrite(source);
-    let frontmatter = match document.frontmatter_state() {
-        FrontmatterState::Absent => Map::new(),
-        FrontmatterState::Mapping(mapping) => yaml_mapping_to_json(mapping)
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
-        FrontmatterState::InvalidYaml => {
-            return Err(vec![Diagnostic::error(
-                "invalid_frontmatter",
-                "Failed to parse replacement document YAML frontmatter.",
-                Some(path.to_string()),
-            )]);
-        }
-        FrontmatterState::Null | FrontmatterState::NonMapping(_) => {
-            return Err(vec![Diagnostic::error(
-                "invalid_frontmatter",
-                "Replacement document frontmatter must be a YAML mapping.",
-                Some(path.to_string()),
-            )]);
-        }
-    };
-    Ok(Some(RawCandidate {
-        document,
-        had_bom,
-        frontmatter,
-    }))
 }
 
 fn match_failure_diagnostics(
@@ -831,31 +691,6 @@ fn match_failure_diagnostics(
             })),
         })
         .collect()
-}
-
-fn apply_patch(draft: &mut Map<String, Value>, patch: &Map<String, Value>, write_nulls: &str) {
-    for (field, value) in patch {
-        if value.is_null() && write_nulls == "omit" {
-            draft.remove(field);
-        } else {
-            draft.insert(field.clone(), value.clone());
-        }
-    }
-}
-
-fn diff_frontmatter(before: &Map<String, Value>, after: &Map<String, Value>) -> Map<String, Value> {
-    let mut fields = Map::new();
-    for (field, value) in after {
-        if before.get(field) != Some(value) {
-            fields.insert(field.clone(), value.clone());
-        }
-    }
-    for field in before.keys() {
-        if !after.contains_key(field) {
-            fields.insert(field.clone(), Value::Null);
-        }
-    }
-    fields
 }
 
 fn typed_read_result(evaluation: crate::operations::read::TypedReadEvaluation) -> OperationResult {
@@ -935,7 +770,7 @@ fn persisted_path(operation: &str, input: &Value, result: &Map<String, Value>) -
         .map(str::to_string)
 }
 
-fn collect_diagnostics(
+pub(super) fn collect_diagnostics(
     value: &Value,
     fallback_path: Option<&str>,
     validation_severity: &str,

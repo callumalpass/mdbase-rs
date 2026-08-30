@@ -1,6 +1,6 @@
 {
-  "rustSourceFileCountMax": 159,
-  "rustSourceLineCountMax": 84928,
+  "rustSourceFileCountMax": 165,
+  "rustSourceLineCountMax": 86476,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-command/src/lib.rs": 1809,
@@ -14,11 +14,9 @@
     "src/runtime/filesystem.rs": 1248,
     "src/runtime/hosted_base.rs": 1943,
     "src/runtime/hosted_query.rs": 3296,
-    "src/runtime/tests.rs": 3050,
-    "src/transactions/runtime.rs": 1078,
-    "src/v03/batch.rs": 1146,
-    "src/v03/collection_setup.rs": 1478,
-    "src/v03/operations.rs": 1029,
+    "src/runtime/tests.rs": 3184,
+    "src/transactions/runtime.rs": 1084,
+    "src/v03/collection_setup.rs": 1479,
     "src/v03/type_pack.rs": 2110,
     "src/views/execute.rs": 1376,
     "src/views/expression.rs": 2965,
@@ -36,6 +34,6 @@
   },
   "transitionalReferenceBudgets": {
     "uncheckedCollectionScans": 0,
-    "v03OperationFacade": 36
+    "v03OperationFacade": 35
   }
 }

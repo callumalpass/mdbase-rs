@@ -303,6 +303,8 @@ impl CreateRequest {
     }
 
     fn into_wire(self) -> Value {
+        #[cfg(test)]
+        crate::mutation::probe_request_value();
         let mut input = json!({
             "frontmatter": self.frontmatter,
             "body": self.body,
@@ -381,6 +383,8 @@ impl UpdateRequest {
     }
 
     fn into_wire(self) -> Value {
+        #[cfg(test)]
+        crate::mutation::probe_request_value();
         let mut input = json!({ "path": self.path });
         if let Some(document) = self.document {
             input["document"] = Value::String(document);
@@ -746,15 +750,13 @@ impl<'a> TypedCollection<'a> {
     /// Create one canonical record.
     pub fn create(&self, request: CreateRequest) -> MdbaseResult<OperationOutcome<RecordDocument>> {
         self.require_canonical("create")?;
-        let input = request.into_wire();
-        self.execute(self.operations()?.create(&input))
+        crate::mutation::create(self.collection, request)
     }
 
     /// Patch one canonical record.
     pub fn update(&self, request: UpdateRequest) -> MdbaseResult<OperationOutcome<RecordDocument>> {
         self.require_canonical("update")?;
-        let input = request.into_wire();
-        self.execute(self.operations()?.update(&input))
+        crate::mutation::update(self.collection, request)
     }
 
     /// Delete one canonical record.
@@ -859,6 +861,8 @@ impl<'a> TypedCollection<'a> {
         &self,
         result: v03::OperationResult,
     ) -> MdbaseResult<OperationOutcome<T>> {
+        #[cfg(test)]
+        crate::mutation::probe_result_decode();
         let diagnostics = result
             .diagnostics
             .into_iter()

@@ -8,6 +8,18 @@ use mdbase::api::{
 use mdbase::{Collection, CompatibilityMode};
 use serde_json::{json, Value};
 
+fn diagnostic_values<T: serde::Serialize>(diagnostics: &[T]) -> Value {
+    let mut value = serde_json::to_value(diagnostics).unwrap();
+    for diagnostic in value.as_array_mut().unwrap() {
+        let object = diagnostic.as_object_mut().unwrap();
+        if let Some(type_name) = object.remove("type_name") {
+            object.insert("type".to_string(), type_name);
+        }
+        object.retain(|_, value| !value.is_null());
+    }
+    value
+}
+
 fn typed_collection() -> (tempfile::TempDir, Collection) {
     let root = tempfile::tempdir().unwrap();
     fs::write(
@@ -617,4 +629,118 @@ fn lossy_v02_migration_requires_explicit_apply_opt_in() {
         })
         .unwrap();
     assert!(applied.applied);
+}
+
+#[test]
+fn typed_and_wire_create_update_outcomes_and_diagnostic_order_match() {
+    let (_typed_root, typed_records) = typed_collection();
+    let (_wire_root, wire_collection) = typed_collection();
+    let path = CollectionPath::new("tasks/differential.md").unwrap();
+    let frontmatter = json!({"type": "task", "title": "Differential"});
+
+    let invalid_path = CollectionPath::new("tasks/create-invalid.md").unwrap();
+    let typed_create_error = typed_records
+        .typed()
+        .unwrap()
+        .create(
+            CreateRequest::new(invalid_path.clone()).with_frontmatter(json!({
+                "type": "task", "title": 7, "status": 9
+            })),
+        )
+        .unwrap_err();
+    let wire_create_error = wire_collection.v03_operations().unwrap().create(&json!({
+        "path": invalid_path.as_str(),
+        "frontmatter": {"type": "task", "title": 7, "status": 9}
+    }));
+    assert!(!wire_create_error.valid);
+    assert!(wire_create_error.result == json!({}));
+    assert_eq!(
+        diagnostic_values(typed_create_error.diagnostics()),
+        diagnostic_values(wire_create_error.diagnostics.as_slice())
+    );
+    assert!(typed_create_error.diagnostics().len() >= 2);
+
+    let typed_create = typed_records
+        .typed()
+        .unwrap()
+        .create(
+            CreateRequest::new(path.clone())
+                .with_frontmatter(frontmatter.clone())
+                .with_body("Body")
+                .with_document(),
+        )
+        .unwrap();
+    let wire_create = wire_collection.v03_operations().unwrap().create(&json!({
+        "path": path.as_str(),
+        "frontmatter": frontmatter,
+        "body": "Body",
+        "include_document": true,
+    }));
+    assert!(wire_create.valid, "{:?}", wire_create.diagnostics);
+    let typed_value = serde_json::to_value(&typed_create.value).unwrap();
+    assert_eq!(typed_value, wire_create.result);
+
+    let replacement = "\u{feff}---\ntype: task\ntitle: Replaced\n---\r\nBody\r\n";
+    let typed_update = typed_records
+        .typed()
+        .unwrap()
+        .update(UpdateRequest::replace_document(path.clone(), replacement))
+        .unwrap();
+    let wire_update = wire_collection.v03_operations().unwrap().update(&json!({
+        "path": path.as_str(),
+        "document": replacement,
+    }));
+    assert!(wire_update.valid, "{:?}", wire_update.diagnostics);
+    assert_eq!(typed_update.value.document.as_deref(), Some(replacement));
+    assert_eq!(wire_update.result["document"], replacement);
+
+    let stale = Revision::parse("sha256:stale").unwrap();
+    let mut typed_request = UpdateRequest::new(path.clone(), json!({"title": "stale"}));
+    typed_request.if_revision = Some(stale);
+    let typed_error = typed_records
+        .typed()
+        .unwrap()
+        .update(typed_request)
+        .unwrap_err();
+    let wire_error = wire_collection.v03_operations().unwrap().update(&json!({
+        "path": path.as_str(),
+        "patch": {"title": "stale"},
+        "if_revision": "sha256:stale",
+    }));
+    assert!(!wire_error.valid);
+    assert!(wire_error.result == json!({}));
+    assert_eq!(
+        diagnostic_values(typed_error.diagnostics()),
+        diagnostic_values(wire_error.diagnostics.as_slice())
+    );
+
+    let typed_membership = typed_records
+        .typed()
+        .unwrap()
+        .update(UpdateRequest::new(path.clone(), json!({"type": "missing"})))
+        .unwrap_err();
+    let wire_membership = wire_collection.v03_operations().unwrap().update(&json!({
+        "path": path.as_str(), "patch": {"type": "missing"}
+    }));
+    assert!(!wire_membership.valid);
+    assert!(wire_membership.result == json!({}));
+    assert_eq!(
+        diagnostic_values(typed_membership.diagnostics()),
+        diagnostic_values(wire_membership.diagnostics.as_slice())
+    );
+
+    let typed_validation = typed_records
+        .typed()
+        .unwrap()
+        .update(UpdateRequest::new(path.clone(), json!({"title": 7})))
+        .unwrap_err();
+    let wire_validation = wire_collection.v03_operations().unwrap().update(&json!({
+        "path": path.as_str(), "patch": {"title": 7}
+    }));
+    assert!(!wire_validation.valid);
+    assert!(wire_validation.result == json!({}));
+    assert_eq!(
+        diagnostic_values(typed_validation.diagnostics()),
+        diagnostic_values(wire_validation.diagnostics.as_slice())
+    );
 }

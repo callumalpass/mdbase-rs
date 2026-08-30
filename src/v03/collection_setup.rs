@@ -8,9 +8,10 @@ use sha2::{Digest, Sha256};
 
 use super::type_pack::{plan_type_pack, stage_type_pack_plan};
 use super::{
-    batch, collection_validation_errors, introduced_validation_errors, revision,
+    collection_validation_errors, introduced_validation_errors, revision,
     validation_diagnostic_digest, Diagnostic, OperationResult,
 };
+use crate::mutation::shadow as mutation_shadow;
 use crate::v03::{ContractSetupChoice, TypePackAssessmentOptions, TypePackProvision};
 use crate::Collection;
 
@@ -184,7 +185,7 @@ struct ProvisionLock {
 }
 
 struct CollectionSetupPlan {
-    shadow: Option<batch::ShadowCollection>,
+    shadow: Option<mutation_shadow::ShadowCollection>,
     assessment: CollectionSetupAssessment,
     receipt_configuration: Vec<ConfigurationContributionReceipt>,
 }
@@ -271,7 +272,7 @@ impl Collection {
             );
         };
 
-        let desired = match batch::collect_collection_files(&shadow.collection) {
+        let desired = match mutation_shadow::collect_collection_files(&shadow.collection) {
             Ok(desired) => desired,
             Err(diagnostic) => return failed(vec![*diagnostic]),
         };
@@ -290,7 +291,7 @@ impl Collection {
         };
         // Reopening verifies structural integrity. Record schema diagnostics are
         // reported by the assessment but do not block application setup.
-        let committed = match batch::collect_collection_files(&reopened) {
+        let committed = match mutation_shadow::collect_collection_files(&reopened) {
             Ok(files) => baseline_revision(&files),
             Err(diagnostic) => return failed(vec![*diagnostic]),
         };
@@ -316,7 +317,7 @@ fn plan_collection_setup(
         return Ok(plan);
     }
     let mut shadow =
-        batch::shadow_collection(collection).map_err(|diagnostic| vec![*diagnostic])?;
+        mutation_shadow::shadow_collection(collection).map_err(|diagnostic| vec![*diagnostic])?;
     let collection_revision = baseline_revision(&shadow.baseline);
     let config_path = shadow.directory.path().join("mdbase.yaml");
     let config_bytes = fs::read(&config_path).map_err(|error| {
@@ -423,7 +424,7 @@ fn plan_collection_setup(
         introduced_validation_errors(&baseline_validation_errors, &final_validation_errors);
     let resolved_diagnostic_count =
         introduced_validation_errors(&final_validation_errors, &baseline_validation_errors).len();
-    let desired = batch::collect_collection_files(&shadow.collection)
+    let desired = mutation_shadow::collect_collection_files(&shadow.collection)
         .map_err(|diagnostic| vec![*diagnostic])?;
     let final_collection_revision = baseline_revision(&desired);
     let mut final_resource_revisions = BTreeMap::new();
@@ -535,8 +536,8 @@ fn plan_unchanged_collection_setup(
         return Ok(None);
     }
 
-    let baseline =
-        batch::collect_collection_files(collection).map_err(|diagnostic| vec![*diagnostic])?;
+    let baseline = mutation_shadow::collect_collection_files(collection)
+        .map_err(|diagnostic| vec![*diagnostic])?;
     let collection_revision = baseline_revision(&baseline);
     let mut final_resource_revisions = BTreeMap::new();
     for path in ["mdbase.yaml", "mdbase.lock.yaml", PROVISION_LOCK_PATH] {

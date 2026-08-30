@@ -15,13 +15,11 @@ use schema_diagnostics::validation_diagnostic;
 
 pub(crate) mod batch;
 mod collection_setup;
-mod lifecycle;
+mod mutation_adapter;
 mod operations;
 pub(crate) mod query;
 mod schema_diagnostics;
 mod type_pack;
-pub(crate) mod write_membership;
-
 pub use crate::cel::{
     evaluate_runtime_expression, evaluate_runtime_template, validate_runtime_expression,
     WorkflowCelError,

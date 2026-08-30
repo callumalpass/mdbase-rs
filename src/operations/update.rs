@@ -1,11 +1,14 @@
 //! Update operation (§12.3).
 
 use crate::api::operations::{UpdateInput, UpdateOutput};
+use crate::api::{CollectionPath, Revision, UpdateRequest};
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document_for_rewrite, yaml_mapping_to_json};
 use crate::frontmatter::serializer;
+use crate::mutation::{PlannedRecord, PreparedUpdate};
 use crate::operations::{
-    atomic_write, ensure_no_symlink_components, ensure_regular_record_file, mutation_record_path,
+    atomic_write, ensure_no_symlink_components_diagnostic, ensure_regular_record_file_diagnostic,
+    mutation_record_path_diagnostic,
 };
 use crate::Collection;
 
@@ -76,7 +79,15 @@ fn apply_injected_publication_replacement(path: &std::path::Path) {
 impl Collection {
     /// Update a file (§12.3).
     pub fn update(&self, input: &serde_json::Value) -> serde_json::Value {
-        self.update_prepared(input, None, true, None)
+        let parsed = match UpdateInput::parse(input) {
+            Ok(parsed) => parsed,
+            Err(error) => return error,
+        };
+        let prepared = legacy_prepared_update(parsed);
+        match self.update_core(prepared, true, None) {
+            Ok(planned) => planned_update_output(planned),
+            Err(error) => mutation_failure_json(error),
+        }
     }
 
     pub(crate) fn update_prevalidated(
@@ -84,54 +95,68 @@ impl Collection {
         input: &serde_json::Value,
         prepared: PrevalidatedUpdate,
     ) -> serde_json::Value {
-        self.update_prepared(input, None, false, Some(prepared))
-    }
-
-    pub(crate) fn update_v03_prepared(
-        &self,
-        input: &serde_json::Value,
-        membership: crate::v03::write_membership::ResolvedWriteMembership,
-    ) -> serde_json::Value {
-        self.update_prepared(input, Some(membership), true, None)
-    }
-
-    fn update_prepared(
-        &self,
-        input: &serde_json::Value,
-        membership: Option<crate::v03::write_membership::ResolvedWriteMembership>,
-        validate_collection: bool,
-        prevalidated: Option<PrevalidatedUpdate>,
-    ) -> serde_json::Value {
         let input = match UpdateInput::parse(input) {
             Ok(parsed) => parsed,
-            Err(err) => return err,
-        };
-        let UpdateInput {
-            path,
-            fields,
-            body: new_body,
-            document,
-            last_known_mtime,
-            if_revision,
-        } = input;
-        let path = match mutation_record_path(self, &path) {
-            Ok(path) => path,
             Err(error) => return error,
         };
+        let input = legacy_prepared_update(input);
+        match self.update_core(input, false, Some(prepared)) {
+            Ok(planned) => planned_update_output(planned),
+            Err(error) => mutation_failure_json(error),
+        }
+    }
+
+    pub(crate) fn update_planned(
+        &self,
+        prepared: PreparedUpdate,
+    ) -> Result<PlannedRecord, crate::mutation::MutationFailure> {
+        self.update_core(prepared, true, None)
+    }
+
+    fn update_core(
+        &self,
+        prepared: PreparedUpdate,
+        validate_collection: bool,
+        prevalidated: Option<PrevalidatedUpdate>,
+    ) -> Result<PlannedRecord, crate::mutation::MutationFailure> {
+        let PreparedUpdate {
+            request,
+            membership,
+            legacy_path,
+            legacy_revision,
+            legacy_last_known_mtime,
+        } = prepared;
+        let canonical_path = request.path.to_string();
+        let path = legacy_path.unwrap_or(canonical_path);
+        let fields = request.patch;
+        let new_body = request.body;
+        let document = request.document;
+        let canonical_revision = request.if_revision.as_ref().map(ToString::to_string);
+        let if_revision = legacy_revision.or(canonical_revision);
+        let last_known_mtime = legacy_last_known_mtime;
+        let path = match mutation_record_path_diagnostic(self, &path) {
+            Ok(path) => path,
+            Err(error) => return Err(crate::mutation::MutationFailure::diagnostic(error)),
+        };
         if let Err(error) =
-            ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)
+            ensure_no_symlink_components_diagnostic(&self.root, path.as_str(), self.spec_profile)
         {
-            return error;
+            return Err(crate::mutation::MutationFailure::diagnostic(error));
         }
         let _write_lock = match crate::transactions::WriteLock::acquire(self) {
             Ok(write_lock) => write_lock,
-            Err(error) => return op_error(error.code(), &error.to_string()),
+            Err(error) => {
+                return Err(crate::mutation::MutationFailure::operation(
+                    error.code(),
+                    error.to_string(),
+                ))
+            }
         };
 
         let new_body = new_body.as_deref();
         let full_path = path.under(&self.root);
-        if let Err(error) = ensure_regular_record_file(&full_path, path.as_str()) {
-            return error;
+        if let Err(error) = ensure_regular_record_file_diagnostic(&full_path, path.as_str()) {
+            return Err(crate::mutation::MutationFailure::diagnostic(error));
         }
 
         // Load bytes, metadata, and revision from one open handle. The loaded
@@ -143,16 +168,21 @@ impl Collection {
         }
         let loaded = match crate::record_load::load_record(self, path.as_str()) {
             Ok(loaded) => loaded,
-            Err(error) => return op_error(FILE_NOT_FOUND, &format!("Failed to read: {error}")),
+            Err(error) => {
+                return Err(crate::mutation::MutationFailure::operation(
+                    FILE_NOT_FOUND,
+                    format!("Failed to read: {error}"),
+                ))
+            }
         };
         let loaded_facts = loaded.facts().clone();
         if let Some(known_ms) = last_known_mtime {
             let current_ms = loaded_facts.mtime_ns.max(0) as u64 / 1_000_000;
             if current_ms != known_ms {
-                return op_error(
+                return Err(crate::mutation::MutationFailure::operation(
                     CONCURRENT_MODIFICATION,
-                    &format!("File '{}' was modified externally", path.as_str()),
-                );
+                    format!("File '{}' was modified externally", path.as_str()),
+                ));
             }
         }
         if prevalidated
@@ -162,10 +192,10 @@ impl Collection {
                 .as_deref()
                 .is_some_and(|expected| expected != loaded_facts.revision)
         {
-            return op_error(
+            return Err(crate::mutation::MutationFailure::operation(
                 CONCURRENT_MODIFICATION,
-                &format!("File '{}' was modified externally", path.as_str()),
-            );
+                format!("File '{}' was modified externally", path.as_str()),
+            ));
         }
         let replacement = document.as_deref().map(parse_document_for_rewrite);
         let existing = match loaded {
@@ -186,7 +216,12 @@ impl Collection {
             crate::record_load::RecordLoadOutcome::Invalid {
                 state: crate::record_load::InvalidRecordState::InvalidUtf8,
                 ..
-            } => return op_error(INVALID_FRONTMATTER, "Invalid frontmatter: invalid_utf8"),
+            } => {
+                return Err(crate::mutation::MutationFailure::operation(
+                    INVALID_FRONTMATTER,
+                    "Invalid frontmatter: invalid_utf8",
+                ))
+            }
         };
         let replacement_doc = replacement.as_ref().map(|(doc, _)| doc);
         let replacement_mapping = match replacement_doc
@@ -195,10 +230,10 @@ impl Collection {
         {
             Some(serde_yaml::Value::Mapping(mapping)) => Some(mapping.clone()),
             Some(_) => {
-                return op_error(
+                return Err(crate::mutation::MutationFailure::operation(
                     INVALID_FRONTMATTER,
                     "Replacement document frontmatter must be a YAML mapping",
-                )
+                ));
             }
             None if document.is_some() => Some(serde_yaml::Mapping::new()),
             None => None,
@@ -248,7 +283,12 @@ impl Collection {
         {
             match self.capture_collection_snapshot(&crate::OperationCancellation::new()) {
                 Ok(snapshot) => Some(snapshot),
-                Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
+                Err(error) => {
+                    return Err(crate::mutation::MutationFailure::operation(
+                        "collection_snapshot_failed",
+                        error.to_string(),
+                    ))
+                }
             }
         } else {
             None
@@ -267,7 +307,10 @@ impl Collection {
                 false,
                 Some(path.as_str()),
             ) {
-                return op_error(error.code(), &error.to_string());
+                return Err(crate::mutation::MutationFailure::operation(
+                    error.code(),
+                    error.to_string(),
+                ));
             }
         }
 
@@ -298,7 +341,9 @@ impl Collection {
             }
 
             if !validation.valid {
-                return validation_failed_error(&validation.issues);
+                return Err(crate::mutation::MutationFailure::validation(
+                    &validation.issues,
+                ));
             }
         }
 
@@ -318,7 +363,7 @@ impl Collection {
         }
         if let Some(membership) = &membership {
             if let Err(diagnostics) = membership.revalidate(self, &write_obj, path.as_str()) {
-                return crate::v03::write_membership::diagnostics_error(diagnostics);
+                return Err(crate::mutation::MutationFailure::diagnostics(diagnostics));
             }
         }
 
@@ -347,14 +392,17 @@ impl Collection {
         let output = match output {
             Ok(output) => output,
             Err(error) => {
-                return op_error(FRONTMATTER_SERIALIZATION_FAILED, &error.to_string());
+                return Err(crate::mutation::MutationFailure::operation(
+                    FRONTMATTER_SERIALIZATION_FAILED,
+                    error.to_string(),
+                ));
             }
         };
 
         if let Err(error) =
-            ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)
+            ensure_no_symlink_components_diagnostic(&self.root, path.as_str(), self.spec_profile)
         {
-            return error;
+            return Err(crate::mutation::MutationFailure::diagnostic(error));
         }
         #[cfg(test)]
         apply_injected_publication_replacement(&full_path);
@@ -366,32 +414,41 @@ impl Collection {
         let current_facts = match crate::record_load::load_record(self, path.as_str()) {
             Ok(current) => current.facts().clone(),
             Err(error) => {
-                return op_error("io_error", &format!("Failed to revalidate record: {error}"));
+                return Err(crate::mutation::MutationFailure::operation(
+                    "io_error",
+                    format!("Failed to revalidate record: {error}"),
+                ));
             }
         };
         if current_facts.revision != loaded_facts.revision {
-            return op_error(
+            return Err(crate::mutation::MutationFailure::operation(
                 CONCURRENT_MODIFICATION,
-                &format!("File '{}' was modified during operation", path.as_str()),
-            );
+                format!("File '{}' was modified during operation", path.as_str()),
+            ));
         }
         if let Err(error) = atomic_write(&full_path, output.as_bytes()) {
-            return op_error("io_error", &format!("Failed to write: {error}"));
+            return Err(crate::mutation::MutationFailure::operation(
+                "io_error",
+                format!("Failed to write: {error}"),
+            ));
         }
 
         // Collect warnings (deprecated fields, etc.)
-        let mut result_warnings: Vec<serde_json::Value> = Vec::new();
+        let mut result_warnings: Vec<crate::diagnostic::Diagnostic> = Vec::new();
         for type_name in &type_names {
             if let Some(type_def) = self.types.get(type_name) {
                 if let Some(fields_obj) = fields.as_object() {
                     for field_name in fields_obj.keys() {
                         if let Some(field_def) = type_def.fields.get(field_name) {
                             if field_def.deprecated.is_some() {
-                                result_warnings.push(serde_json::json!({
-                                    "code": "deprecated_field",
-                                    "message": format!("Field '{}' is deprecated", field_name),
-                                    "field": field_name,
-                                }));
+                                let mut warning = crate::diagnostic::Diagnostic::error(
+                                    "deprecated_field",
+                                    format!("Field '{}' is deprecated", field_name),
+                                    Some(path.to_string()),
+                                );
+                                warning.severity = "warning".to_string();
+                                warning.field = Some(field_name.clone());
+                                result_warnings.push(warning);
                             }
                         }
                     }
@@ -403,14 +460,70 @@ impl Collection {
         let effective =
             self.evaluate_computed_fields(effective, &type_names, path.as_str(), Some(body));
 
-        UpdateOutput {
-            path: path.to_string(),
-            frontmatter: effective,
+        let diagnostics = result_warnings;
+        Ok(PlannedRecord {
+            path,
+            types: type_names,
+            frontmatter: serde_json::Value::Object(write_obj),
+            effective_frontmatter: effective,
             body: body.to_string(),
-            warnings: result_warnings,
-        }
-        .into_json()
+            bytes: output.into_bytes(),
+            diagnostics,
+            before_revision: Some(loaded_facts.revision),
+            include_document: request.include_document || document.is_some(),
+        })
     }
+}
+
+fn legacy_prepared_update(input: UpdateInput) -> PreparedUpdate {
+    let legacy_path = input.path;
+    let path = CollectionPath::new(&legacy_path)
+        .unwrap_or_else(|_| CollectionPath::new("_legacy-invalid.md").unwrap());
+    let request = UpdateRequest {
+        path,
+        patch: input.fields,
+        document: input.document,
+        body: input.body,
+        if_revision: input
+            .if_revision
+            .as_deref()
+            .and_then(|revision| Revision::parse(revision).ok()),
+        include_document: false,
+    };
+    PreparedUpdate {
+        request,
+        membership: None,
+        legacy_path: Some(legacy_path),
+        legacy_revision: input.if_revision,
+        legacy_last_known_mtime: input.last_known_mtime,
+    }
+}
+
+fn mutation_failure_json(failure: crate::mutation::MutationFailure) -> serde_json::Value {
+    match failure.kind {
+        crate::mutation::MutationFailureKind::Operation if failure.diagnostics.len() == 1 => {
+            serde_json::json!({"error": failure.diagnostics.into_iter().next().unwrap()})
+        }
+        _ => serde_json::json!({"error": {
+            "code": VALIDATION_FAILED,
+            "message": "Validation failed",
+            "issues": failure.diagnostics,
+        }}),
+    }
+}
+
+fn planned_update_output(planned: PlannedRecord) -> serde_json::Value {
+    UpdateOutput {
+        path: planned.path.to_string(),
+        frontmatter: planned.effective_frontmatter,
+        body: planned.body,
+        warnings: planned
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| serde_json::to_value(diagnostic).expect("diagnostics serialize"))
+            .collect(),
+    }
+    .into_json()
 }
 
 #[cfg(test)]

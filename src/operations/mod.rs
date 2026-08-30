@@ -53,6 +53,49 @@ pub(crate) fn ensure_safe_relative_path(
 /// root can redirect a read or write elsewhere. The root itself is deliberately
 /// not inspected: hosts may authorize a collection through a symlink after
 /// resolving that grant themselves.
+#[allow(clippy::result_large_err)]
+pub(crate) fn ensure_safe_relative_path_diagnostic(
+    path: &str,
+    spec_profile: SpecProfile,
+) -> Result<(), crate::diagnostic::Diagnostic> {
+    if path.is_empty() {
+        return Err(crate::diagnostic::Diagnostic::error(
+            INVALID_PATH,
+            "Path must not be empty",
+            None,
+        ));
+    }
+    if path.contains('\0') {
+        return Err(crate::diagnostic::Diagnostic::error(
+            INVALID_PATH,
+            "Path contains null bytes",
+            None,
+        ));
+    }
+    let bytes = path.as_bytes();
+    let windows_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if path.starts_with(['/', '\\']) || windows_prefix || Path::new(path).is_absolute() {
+        return Err(crate::diagnostic::Diagnostic::error(
+            INVALID_PATH,
+            "Absolute paths are not allowed",
+            None,
+        ));
+    }
+    if path.replace('\\', "/").split('/').any(|part| part == "..") {
+        let code = if spec_profile == SpecProfile::V03 {
+            PATH_TRAVERSAL
+        } else {
+            INVALID_PATH
+        };
+        return Err(crate::diagnostic::Diagnostic::error(
+            code,
+            "Path contains path traversal",
+            None,
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_no_symlink_components(
     collection_root: &Path,
     relative_path: &str,
@@ -91,6 +134,63 @@ pub(crate) fn ensure_no_symlink_components(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
+pub(crate) fn ensure_no_symlink_components_diagnostic(
+    collection_root: &Path,
+    relative_path: &str,
+    spec_profile: SpecProfile,
+) -> Result<(), crate::diagnostic::Diagnostic> {
+    let mut candidate = collection_root.to_path_buf();
+    for component in Path::new(relative_path).components() {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(part) => candidate.push(part),
+            _ => {
+                return Err(path_boundary_diagnostic(
+                    spec_profile,
+                    "Path must remain inside the collection",
+                    relative_path,
+                ))
+            }
+        }
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(path_boundary_diagnostic(
+                    spec_profile,
+                    "Symbolic links are not allowed in collection operation paths",
+                    relative_path,
+                ))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => {
+                return Err(crate::diagnostic::Diagnostic::error(
+                    PERMISSION_DENIED,
+                    "Path could not be inspected safely",
+                    Some(relative_path.to_string()),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn path_boundary_diagnostic(
+    spec_profile: SpecProfile,
+    message: &str,
+    _path: &str,
+) -> crate::diagnostic::Diagnostic {
+    crate::diagnostic::Diagnostic::error(
+        if spec_profile == SpecProfile::V03 {
+            PATH_TRAVERSAL
+        } else {
+            INVALID_PATH
+        },
+        message,
+        None,
+    )
+}
+
 fn path_boundary_error(spec_profile: SpecProfile, message: &str) -> serde_json::Value {
     op_error(
         if spec_profile == SpecProfile::V03 {
@@ -100,6 +200,16 @@ fn path_boundary_error(spec_profile: SpecProfile, message: &str) -> serde_json::
         },
         message,
     )
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn mutation_record_path_diagnostic(
+    collection: &Collection,
+    path: &str,
+) -> Result<crate::api::CollectionPath, crate::diagnostic::Diagnostic> {
+    collection.validate_record_path(path).map_err(|error| {
+        path_boundary_diagnostic(collection.spec_profile, &error.to_string(), path)
+    })
 }
 
 pub(crate) fn mutation_record_path(
@@ -365,6 +475,21 @@ pub(crate) fn readable_record_path(
     collection
         .validate_record_path(path)
         .map_err(|_| op_error(FILE_NOT_FOUND, &format!("File not found: {path}")))
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn ensure_regular_record_file_diagnostic(
+    path: &Path,
+    display_path: &str,
+) -> Result<(), crate::diagnostic::Diagnostic> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) | Err(_) => Err(crate::diagnostic::Diagnostic::error(
+            FILE_NOT_FOUND,
+            format!("File not found: {display_path}"),
+            None,
+        )),
+    }
 }
 
 pub(crate) fn ensure_regular_record_file(

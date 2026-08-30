@@ -6,11 +6,10 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{
-    batch, revision, validate_type_pack, validate_type_pack_lock, Diagnostic, OperationResult,
-};
+use super::{revision, validate_type_pack, validate_type_pack_lock, Diagnostic, OperationResult};
 use crate::api::CollectionPath;
 use crate::frontmatter::parser::{is_parse_error, parse_document};
+use crate::mutation::shadow as mutation_shadow;
 use crate::{Collection, SpecProfile};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -659,14 +658,14 @@ pub(crate) fn plan_type_pack(
 }
 
 fn apply_type_pack_plan(collection: &Collection, plan: TypePackPlan) -> OperationResult {
-    let mut shadow = match batch::shadow_collection(collection) {
+    let mut shadow = match mutation_shadow::shadow_collection(collection) {
         Ok(shadow) => shadow,
         Err(diagnostic) => return failed(vec![*diagnostic]),
     };
     if let Err(diagnostic) = stage_type_pack_plan(&mut shadow, &plan) {
         return failed(vec![*diagnostic]);
     }
-    let desired = match batch::collect_collection_files(&shadow.collection) {
+    let desired = match mutation_shadow::collect_collection_files(&shadow.collection) {
         Ok(desired) => desired,
         Err(diagnostic) => return failed(vec![*diagnostic]),
     };
@@ -704,7 +703,7 @@ fn apply_type_pack_plan(collection: &Collection, plan: TypePackPlan) -> Operatio
 }
 
 pub(crate) fn stage_type_pack_plan(
-    shadow: &mut batch::ShadowCollection,
+    shadow: &mut mutation_shadow::ShadowCollection,
     plan: &TypePackPlan,
 ) -> Result<(), Box<Diagnostic>> {
     for resource in &plan.resources {
@@ -929,7 +928,7 @@ fn prepared_contract_setup_resources(
 }
 
 fn stage_prepared_contract_setup(
-    shadow: &batch::ShadowCollection,
+    shadow: &mutation_shadow::ShadowCollection,
     prepared: &PreparedContractSetupPack,
     pack_resources: &[PlannedPackResource],
 ) -> Result<(), Box<Diagnostic>> {

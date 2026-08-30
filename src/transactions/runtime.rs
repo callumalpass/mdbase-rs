@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use super::apply_post_commit_hook;
 use super::{
-    apply_entry, cleanup_transaction, current_revision, ensure_transaction_root, io_error,
-    read_regular_file, sync_dir, validate_entry_path, write_synced, FileBaseline, JournalEntry,
-    StagingGuard, TransactionError, TransactionScope, WriteLock, JOURNAL_FILE, TRANSACTIONS_DIR,
+    apply_entry, attach_committed_file_facts, capture_committed_file_facts, cleanup_transaction,
+    current_revision, ensure_transaction_root, io_error, read_regular_file, sync_dir,
+    validate_entry_path, write_synced, FileBaseline, JournalEntry, StagingGuard, TransactionError,
+    TransactionScope, WriteLock, JOURNAL_FILE, TRANSACTIONS_DIR,
 };
 use crate::runtime::{
     CanonicalChange, ChangeBatch, ChangeBatchDescriptor, ChangeEventId, ChangeWatermark,
@@ -606,8 +609,12 @@ fn settle(
         persist_runtime_journal(directory, journal)?;
         simulate_runtime_crash(&journal.id, 3)?;
     }
+    let file_facts = capture_committed_file_facts(collection, &journal.entries)?;
+    attach_committed_file_facts(&mut journal.operation_result.result, &file_facts);
     journal.phase = RuntimePhase::Committed;
     persist_runtime_journal(directory, journal)?;
+    #[cfg(test)]
+    apply_post_commit_hook(collection)?;
     simulate_runtime_crash(&journal.id, 4)
 }
 

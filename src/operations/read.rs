@@ -337,9 +337,9 @@ impl Collection {
     /// Read a file (§12.2).
     ///
     /// Legacy JSON compatibility only. Production consumers are limited to the
-    /// v0.2 adapter and Phase 3 mutation-result hydration in
-    /// `v03::operations::hydrate_persisted_result`. Remove this facade with
-    /// those consumers after mutation hydration uses the typed evaluator.
+    /// v0.2 adapter and rename-result compatibility hydration in
+    /// `v03::operations::hydrate_persisted_result`. Remove this facade when
+    /// that remaining consumer uses the typed evaluator.
     pub fn read(&self, input: &serde_json::Value) -> serde_json::Value {
         let input = match ReadInput::parse(input) {
             Ok(parsed) => parsed,
@@ -387,8 +387,8 @@ impl Collection {
 
     /// Evaluate one exact Markdown record without discovering any other record.
     ///
-    /// Retained behind [`Collection::read`] for v0.2 compatibility and Phase 3
-    /// mutation hydration only; canonical reads use `evaluate_typed_read`.
+    /// Retained behind [`Collection::read`] for v0.2 compatibility and rename
+    /// hydration only; canonical reads use `evaluate_typed_read`.
     /// Storage providers validate and fetch the requested identity, then supply
     /// the exact document and non-semantic file facts from the same snapshot.
     pub(crate) fn read_document(

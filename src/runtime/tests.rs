@@ -527,6 +527,140 @@ fn runtime_prepare_is_durable_but_does_not_change_canonical_files() {
 }
 
 #[test]
+fn runtime_create_update_replay_committed_facts_after_reopen_and_postcommit_path_changes() {
+    let directory = collection();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    crate::mutation::reset_mutation_path_probes();
+    let claim = HostClaimId::generate();
+    let create = OperationRequest::new(
+        OperationKind::Create,
+        json!({"path": "runtime-facts.md", "body": "planned", "include_document": true}),
+    );
+    let prepared = match runtime
+        .prepare(&create, &claim, &OperationContext::legacy())
+        .unwrap()
+    {
+        PreparationOutcome::Prepared(prepared) => prepared,
+        other => panic!("expected create preparation: {other:?}"),
+    };
+    assert_eq!(
+        crate::mutation::mutation_path_probes(),
+        crate::mutation::MutationPathProbes {
+            wire_request_decodes: 1,
+            runtime_request_decodes: 1,
+            sparse_shadows: 1,
+            ..Default::default()
+        }
+    );
+    crate::transactions::inject_post_commit_replacement(
+        directory.path(),
+        "runtime-facts.md",
+        Some(b"external replacement".to_vec()),
+    );
+    let created = match runtime
+        .commit(&prepared, &OperationContext::legacy())
+        .unwrap()
+    {
+        CommitAttempt::Committed(outcome) => outcome,
+        other => panic!("expected committed create: {other:?}"),
+    };
+    assert_eq!(created.result.result["document"], "planned");
+    assert_eq!(
+        created.result.result["revision"],
+        crate::v03::revision(b"planned")
+    );
+    assert_eq!(created.result.result["file"]["size"], 7);
+    assert_ne!(created.result.result["file"]["mtime"], "");
+    assert_eq!(
+        fs::read(directory.path().join("runtime-facts.md")).unwrap(),
+        b"external replacement"
+    );
+    let create_commit_id = prepared.commit_id().clone();
+    drop(runtime);
+    let reopened = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    assert_eq!(
+        reopened
+            .resolve_commit(&create_commit_id, &OperationContext::legacy())
+            .unwrap(),
+        Some(DurableCommitState::Committed {
+            outcome: created.clone()
+        })
+    );
+    assert_eq!(
+        reopened
+            .resolve_claim(&claim, &OperationContext::legacy())
+            .unwrap(),
+        Some((
+            create_commit_id,
+            DurableCommitState::Committed { outcome: created }
+        ))
+    );
+    drop(reopened);
+
+    let directory = collection();
+    fs::write(directory.path().join("runtime-facts.md"), "before").unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    crate::mutation::reset_mutation_path_probes();
+    let claim = HostClaimId::generate();
+    let update = OperationRequest::new(
+        OperationKind::Update,
+        json!({"path": "runtime-facts.md", "document": "after"}),
+    );
+    let prepared = match runtime
+        .prepare(&update, &claim, &OperationContext::legacy())
+        .unwrap()
+    {
+        PreparationOutcome::Prepared(prepared) => prepared,
+        other => panic!("expected update preparation: {other:?}"),
+    };
+    assert_eq!(
+        crate::mutation::mutation_path_probes(),
+        crate::mutation::MutationPathProbes {
+            wire_request_decodes: 1,
+            runtime_request_decodes: 1,
+            sparse_shadows: 1,
+            ..Default::default()
+        }
+    );
+    crate::transactions::inject_post_commit_replacement(directory.path(), "runtime-facts.md", None);
+    let updated = match runtime
+        .commit(&prepared, &OperationContext::legacy())
+        .unwrap()
+    {
+        CommitAttempt::Committed(outcome) => outcome,
+        other => panic!("expected committed update: {other:?}"),
+    };
+    assert_eq!(updated.result.result["document"], "after");
+    assert_eq!(
+        updated.result.result["revision"],
+        crate::v03::revision(b"after")
+    );
+    assert_eq!(updated.result.result["file"]["size"], 5);
+    assert_ne!(updated.result.result["file"]["mtime"], "");
+    assert!(!directory.path().join("runtime-facts.md").exists());
+    let update_commit_id = prepared.commit_id().clone();
+    drop(runtime);
+    let reopened = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    assert_eq!(
+        reopened
+            .resolve_commit(&update_commit_id, &OperationContext::legacy())
+            .unwrap(),
+        Some(DurableCommitState::Committed {
+            outcome: updated.clone()
+        })
+    );
+    assert_eq!(
+        reopened
+            .resolve_claim(&claim, &OperationContext::legacy())
+            .unwrap(),
+        Some((
+            update_commit_id,
+            DurableCommitState::Committed { outcome: updated }
+        ))
+    );
+}
+
+#[test]
 fn runtime_commits_type_resources_without_a_host_side_mutation_path() {
     let directory = collection();
     let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();

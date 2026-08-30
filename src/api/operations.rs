@@ -35,6 +35,8 @@ pub struct CreateInput {
 
 impl CreateInput {
     pub fn parse(input: &serde_json::Value) -> Self {
+        #[cfg(test)]
+        crate::mutation::probe_legacy_parse();
         let type_name = input
             .get("type")
             .and_then(|v| v.as_str())
@@ -80,6 +82,8 @@ pub struct UpdateInput {
 
 impl UpdateInput {
     pub fn parse(input: &serde_json::Value) -> Result<Self, serde_json::Value> {
+        #[cfg(test)]
+        crate::mutation::probe_legacy_parse();
         let path = input
             .get("path")
             .and_then(|v| v.as_str())
