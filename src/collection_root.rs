@@ -246,8 +246,13 @@ impl CollectionRoot {
             drop(file);
             // Linking a private temporary file publishes without replacing a
             // concurrent creator; removing the temporary name leaves one link.
-            dir.hard_link(&temp, &dir, leaf)
-                .and_then(|()| dir.remove_file(&temp))
+            match dir.hard_link(&temp, &dir, leaf) {
+                Ok(()) => dir.remove_file(&temp),
+                Err(_) if dir.symlink_metadata(leaf).is_ok() => {
+                    Err(std::io::ErrorKind::AlreadyExists.into())
+                }
+                Err(error) => Err(error),
+            }
         } else {
             atomic_replace(&file, &dir, &temp, leaf)
         };
