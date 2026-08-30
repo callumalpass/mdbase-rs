@@ -63,5 +63,6 @@ The semantic outcome and sole wire adapter are isolated in
 `src/runtime/canonical_operation.rs`; dynamic public domains are split into
 `src/api/dynamic.rs`. Journal compatibility remains colocated with the
 durability state machine in `src/transactions/runtime.rs`. The reviewed
-ceilings are 171 Rust files and 91,840 Rust lines; the three existing runtime
-legacy-file ceilings move to their measured formatted totals.
+Phase 4 final ceilings are 171 Rust files and 93,200 Rust lines; the completed
+stack measures 93,127 lines. The three existing runtime legacy-file ceilings
+move to their measured formatted totals.
