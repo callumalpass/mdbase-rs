@@ -15,7 +15,8 @@ use super::{OperationKind, ProviderError};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalQueryValue {
     pub records: Vec<ProjectedValue>,
-    pub total_count: usize,
+    /// Exact total when computed; `None` when the provider explicitly deferred it.
+    pub total_count: Option<usize>,
     pub has_more: bool,
     pub meta: QueryMetadata,
     pub embedded_diagnostics: Vec<Diagnostic>,
@@ -59,8 +60,44 @@ pub enum WireOnlyOperationValue {
     Validation(Value),
     ViewResource(Value),
     TypeResource(Value),
-    TypePack(Value),
-    CollectionSetup(Value),
+}
+
+/// Explicitly named storage for forward-compatible definition-result fields.
+/// Core fields consumed by hosts remain closed and typed.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DefinitionResultExtensions(pub std::collections::BTreeMap<String, Value>);
+
+/// Typed assessment/apply result for one managed type pack.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalTypePackValue {
+    pub applicable: bool,
+    pub assessment_digest: String,
+    #[serde(flatten)]
+    pub extensions: DefinitionResultExtensions,
+}
+
+/// Successful applied collection-setup result.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalCollectionSetupAppliedValue {
+    pub assessment: crate::v03::CollectionSetupAssessment,
+    pub receipt: crate::v03::CollectionSetupReceipt,
+}
+
+/// Rejected collection-setup result that retains its complete assessment.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalCollectionSetupConflictValue {
+    pub assessment: crate::v03::CollectionSetupAssessment,
+    pub conflicts: Vec<crate::v03::ConfigurationConflict>,
+}
+
+/// Closed typed collection-setup result family.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CanonicalCollectionSetupValue {
+    Applied(CanonicalCollectionSetupAppliedValue),
+    Conflict(CanonicalCollectionSetupConflictValue),
+    Assessment(crate::v03::CollectionSetupAssessment),
 }
 
 /// Closed semantic value returned by the filesystem runtime.
@@ -77,6 +114,8 @@ pub enum CanonicalOperationValue {
     Delete(Option<CanonicalDeleteValue>),
     Rename(Option<CanonicalRenameValue>),
     Batch(Option<BatchResult>),
+    TypePack(Option<CanonicalTypePackValue>),
+    CollectionSetup(Option<Box<CanonicalCollectionSetupValue>>),
     WireOnly(WireOnlyOperationValue),
     /// Exact non-semantic recovery of an ambiguous version-2 runtime journal.
     LegacyRecoveredV03(OperationResult),
@@ -101,18 +140,14 @@ impl CanonicalOperationValue {
             Self::Delete(_) => Some(OperationKind::Delete),
             Self::Rename(_) => Some(OperationKind::Rename),
             Self::Batch(_) => Some(OperationKind::Batch),
+            Self::TypePack(_) => Some(OperationKind::AssessTypePack),
+            Self::CollectionSetup(_) => Some(OperationKind::AssessCollectionSetup),
             Self::WireOnly(WireOnlyOperationValue::Validation(_)) => Some(OperationKind::Validate),
             Self::WireOnly(WireOnlyOperationValue::ViewResource(_)) => {
                 Some(OperationKind::ExecuteView)
             }
             Self::WireOnly(WireOnlyOperationValue::TypeResource(_)) => {
                 Some(OperationKind::ReadType)
-            }
-            Self::WireOnly(WireOnlyOperationValue::TypePack(_)) => {
-                Some(OperationKind::AssessTypePack)
-            }
-            Self::WireOnly(WireOnlyOperationValue::CollectionSetup(_)) => {
-                Some(OperationKind::AssessCollectionSetup)
             }
             Self::LegacyRecoveredV03(_) => None,
         }
@@ -134,7 +169,7 @@ impl CanonicalOperationOutcome {
             valid: true,
             value: CanonicalOperationValue::Query(Some(CanonicalQueryValue {
                 records: outcome.value.records,
-                total_count: outcome.value.total_count,
+                total_count: Some(outcome.value.total_count),
                 has_more: outcome.value.has_more,
                 meta: outcome.value.meta,
                 embedded_diagnostics,
@@ -203,6 +238,16 @@ impl CanonicalOperationOutcome {
     }
 
     pub(crate) fn wire_only(operation: OperationKind, result: OperationResult) -> Self {
+        if matches!(
+            operation,
+            OperationKind::AssessTypePack
+                | OperationKind::ApplyTypePack
+                | OperationKind::AssessCollectionSetup
+                | OperationKind::ApplyCollectionSetup
+        ) {
+            return Self::definition(operation, result)
+                .expect("definition APIs produce their closed typed result shape");
+        }
         let OperationResult {
             valid,
             result,
@@ -220,19 +265,45 @@ impl CanonicalOperationOutcome {
             | OperationKind::ReadType
             | OperationKind::CreateType
             | OperationKind::UpdateType => WireOnlyOperationValue::TypeResource(result),
-            OperationKind::AssessTypePack | OperationKind::ApplyTypePack => {
-                WireOnlyOperationValue::TypePack(result)
-            }
-            OperationKind::AssessCollectionSetup | OperationKind::ApplyCollectionSetup => {
-                WireOnlyOperationValue::CollectionSetup(result)
-            }
-            _ => unreachable!("migrated operations cannot use the wire-only constructor"),
+            _ => unreachable!("typed operations cannot use the wire-only constructor"),
         };
         Self {
             valid,
             value: CanonicalOperationValue::WireOnly(value),
             diagnostics: diagnostics.into_iter().map(Into::into).collect(),
         }
+    }
+
+    pub(crate) fn definition(
+        operation: OperationKind,
+        result: OperationResult,
+    ) -> Result<Self, ProviderError> {
+        let OperationResult {
+            valid,
+            result,
+            diagnostics,
+        } = result;
+        let empty = result.as_object().is_some_and(serde_json::Map::is_empty);
+        let value = match operation {
+            OperationKind::AssessTypePack | OperationKind::ApplyTypePack => {
+                CanonicalOperationValue::TypePack(
+                    (!empty).then(|| decode_value(result)).transpose()?,
+                )
+            }
+            OperationKind::AssessCollectionSetup | OperationKind::ApplyCollectionSetup => {
+                CanonicalOperationValue::CollectionSetup(
+                    (!empty)
+                        .then(|| decode_value(result).map(Box::new))
+                        .transpose()?,
+                )
+            }
+            _ => unreachable!("definition constructor requires a definition operation"),
+        };
+        Ok(Self {
+            valid,
+            value,
+            diagnostics: diagnostics.into_iter().map(Into::into).collect(),
+        })
     }
 
     pub(crate) fn record(&self) -> Option<&RecordDocument> {
@@ -317,7 +388,7 @@ impl CanonicalOperationOutcome {
             result,
             diagnostics,
         } = result;
-        let diagnostics = diagnostics.into_iter().map(Into::into).collect();
+        let diagnostics: Vec<Diagnostic> = diagnostics.into_iter().map(Into::into).collect();
         let empty = result.as_object().is_some_and(serde_json::Map::is_empty);
         let value = match operation {
             OperationKind::Read => {
@@ -340,7 +411,11 @@ impl CanonicalOperationOutcome {
                         .get("total_count")
                         .and_then(Value::as_u64)
                         .and_then(|value| usize::try_from(value).ok())
-                        .unwrap_or(records.len());
+                        .or_else(|| {
+                            meta.get("total_count_outcome")
+                                .is_none()
+                                .then_some(records.len())
+                        });
                     let has_more = meta
                         .get("has_more")
                         .and_then(Value::as_bool)
@@ -413,10 +488,24 @@ impl CanonicalOperationOutcome {
                 CanonicalOperationValue::WireOnly(WireOnlyOperationValue::TypeResource(result))
             }
             OperationKind::AssessTypePack | OperationKind::ApplyTypePack => {
-                CanonicalOperationValue::WireOnly(WireOnlyOperationValue::TypePack(result))
+                return Self::definition(
+                    operation,
+                    OperationResult {
+                        valid,
+                        result,
+                        diagnostics: diagnostics.into_iter().map(wire_diagnostic).collect(),
+                    },
+                );
             }
             OperationKind::AssessCollectionSetup | OperationKind::ApplyCollectionSetup => {
-                CanonicalOperationValue::WireOnly(WireOnlyOperationValue::CollectionSetup(result))
+                return Self::definition(
+                    operation,
+                    OperationResult {
+                        valid,
+                        result,
+                        diagnostics: diagnostics.into_iter().map(wire_diagnostic).collect(),
+                    },
+                );
             }
         };
         Ok(Self {
@@ -451,7 +540,11 @@ impl CanonicalOperationOutcome {
                     if !meta.is_object() {
                         meta = serde_json::json!({});
                     }
-                    meta["total_count"] = Value::from(query.total_count as u64);
+                    if let Some(total_count) = query.total_count {
+                        meta["total_count"] = Value::from(total_count as u64);
+                    } else if let Some(meta) = meta.as_object_mut() {
+                        meta.remove("total_count");
+                    }
                     meta["has_more"] = Value::Bool(query.has_more);
                     let diagnostics = query
                         .embedded_diagnostics
@@ -479,12 +572,12 @@ impl CanonicalOperationOutcome {
                     })
             }
             CanonicalOperationValue::Batch(value) => encode_optional(value),
+            CanonicalOperationValue::TypePack(value) => encode_optional(value),
+            CanonicalOperationValue::CollectionSetup(value) => encode_optional(value),
             CanonicalOperationValue::WireOnly(value) => match value {
                 WireOnlyOperationValue::Validation(value)
                 | WireOnlyOperationValue::ViewResource(value)
-                | WireOnlyOperationValue::TypeResource(value)
-                | WireOnlyOperationValue::TypePack(value)
-                | WireOnlyOperationValue::CollectionSetup(value) => value.clone(),
+                | WireOnlyOperationValue::TypeResource(value) => value.clone(),
             },
             CanonicalOperationValue::LegacyRecoveredV03(result) => return result.clone(),
         };
@@ -670,6 +763,47 @@ mod tests {
     }
 
     #[test]
+    fn query_wire_omits_deferred_total_but_retains_outcome() {
+        let deferred = CanonicalOperationOutcome {
+            valid: true,
+            value: CanonicalOperationValue::Query(Some(CanonicalQueryValue {
+                records: Vec::new(),
+                total_count: None,
+                has_more: true,
+                meta: QueryMetadata::new(json!({
+                    "total_count": 999,
+                    "total_count_outcome": {"status": "deferred"}
+                })),
+                embedded_diagnostics: Vec::new(),
+            })),
+            diagnostics: Vec::new(),
+        };
+        assert_eq!(
+            deferred.to_v03().result,
+            json!({
+                "results": [],
+                "meta": {
+                    "has_more": true,
+                    "total_count_outcome": {"status": "deferred"}
+                },
+                "diagnostics": []
+            })
+        );
+
+        let exact = CanonicalOperationOutcome {
+            value: CanonicalOperationValue::Query(Some(CanonicalQueryValue {
+                records: Vec::new(),
+                total_count: Some(7),
+                has_more: false,
+                meta: QueryMetadata::new(json!({})),
+                embedded_diagnostics: Vec::new(),
+            })),
+            ..deferred
+        };
+        assert_eq!(exact.to_v03().result["meta"]["total_count"], 7);
+    }
+
+    #[test]
     #[allow(deprecated)]
     fn deprecated_ephemeral_result_fields_compile_and_match_the_adapter() {
         let operation = roundtrip(OperationKind::Read, record("a.md"));
@@ -696,11 +830,43 @@ mod tests {
             OperationKind::Validate,
             OperationKind::ListViews,
             OperationKind::ReadType,
-            OperationKind::AssessTypePack,
-            OperationKind::AssessCollectionSetup,
         ] {
             let typed = roundtrip(kind, json!({"family": kind.as_str()}));
             assert!(matches!(typed.value, CanonicalOperationValue::WireOnly(_)));
         }
+    }
+
+    #[test]
+    fn definition_families_are_closed_typed_values_and_wire_exact() {
+        let pack = roundtrip(
+            OperationKind::AssessTypePack,
+            json!({"applicable": true, "assessment_digest": "sha256:pack", "status": "current"}),
+        );
+        assert!(matches!(
+            pack.value,
+            CanonicalOperationValue::TypePack(Some(CanonicalTypePackValue {
+                applicable: true,
+                ..
+            }))
+        ));
+
+        let setup = roundtrip(
+            OperationKind::AssessCollectionSetup,
+            json!({
+                "status": "current", "applicable": true,
+                "application_id": "dev.mdbase.test", "declaration_digest": "sha256:d",
+                "provision_digest": "sha256:p", "collection_revision": "sha256:c",
+                "final_collection_revision": "sha256:c", "configuration": [],
+                "type_packs": [], "final_resource_revisions": {},
+                "baseline_diagnostic_count": 0, "final_diagnostic_count": 0,
+                "resolved_diagnostic_count": 0, "introduced_diagnostic_count": 0,
+                "baseline_diagnostic_digest": "sha256:b", "assessment_digest": "sha256:a"
+            }),
+        );
+        assert!(matches!(
+            setup.value,
+            CanonicalOperationValue::CollectionSetup(Some(value))
+                if matches!(*value, CanonicalCollectionSetupValue::Assessment(_))
+        ));
     }
 }

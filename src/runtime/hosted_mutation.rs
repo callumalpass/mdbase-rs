@@ -53,7 +53,7 @@ pub struct HostedRecordChange {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<CanonicalRecordInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after: Option<CanonicalRecordInput>,
+    pub after: Option<crate::api::RecordDocument>,
     pub change: RecordChange,
 }
 
@@ -390,11 +390,30 @@ impl CompiledCatalog {
             }
             let change =
                 hosted_record_change(self, before.as_ref(), record.as_ref(), &request.operation)?;
+            let after = record
+                .as_ref()
+                .map(|record| {
+                    let outcome = self.read_record_typed(
+                        &serde_json::json!({
+                            "path": record.path,
+                            "include_document": true,
+                        }),
+                        record,
+                    )?;
+                    match outcome.value {
+                        super::CanonicalOperationValue::Read(Some(document)) => Ok(document),
+                        _ => Err(mutation_error(
+                            "hosted_mutation_plan_incomplete",
+                            "Canonical mutation output could not be represented as a typed document.",
+                        )),
+                    }
+                })
+                .transpose()?;
             changes.push(HostedRecordChange {
                 stable_id,
                 before_path,
                 before,
-                after: record,
+                after,
                 change,
             });
         }
@@ -431,9 +450,15 @@ impl CompiledCatalog {
                 .changes
                 .into_iter()
                 .map(|change| HostedMutationChange {
-                    stable_id: change.stable_id,
+                    stable_id: change.stable_id.clone(),
                     before_path: change.before_path,
-                    record: change.after,
+                    record: change.after.map(|record| CanonicalRecordInput {
+                        stable_id: Some(change.stable_id),
+                        path: record.path.to_string(),
+                        file_size: record.file.size,
+                        document: record.document.unwrap_or_default(),
+                        file_mtime: Some(record.file.mtime),
+                    }),
                 })
                 .collect(),
         })
@@ -1070,11 +1095,15 @@ mod tests {
             .unwrap();
         assert!(created.before.is_none());
         let created_after = created.after.as_ref().unwrap();
-        assert_eq!(created_after.path, "tasks/new.md");
-        assert!(created_after.document.contains("status: new"));
+        assert_eq!(created_after.path.as_str(), "tasks/new.md");
+        assert!(created_after
+            .document
+            .as_deref()
+            .unwrap()
+            .contains("status: new"));
         assert_eq!(
-            created.change.after_revision.as_ref().unwrap().to_string(),
-            catalog.classify_record(created_after).unwrap().revision
+            created.change.after_revision.as_ref().unwrap(),
+            &created_after.revision
         );
 
         let updated = planned
@@ -1088,6 +1117,8 @@ mod tests {
             .as_ref()
             .unwrap()
             .document
+            .as_deref()
+            .unwrap()
             .contains("status: done"));
         assert_eq!(
             updated.change.before_revision.as_ref().unwrap().to_string(),
@@ -1108,7 +1139,10 @@ mod tests {
             .find(|change| change.stable_id == "record-b")
             .unwrap();
         assert_eq!(renamed.before.as_ref(), Some(&b));
-        assert_eq!(renamed.after.as_ref().unwrap().path, "tasks/b-two.md");
+        assert_eq!(
+            renamed.after.as_ref().unwrap().path.as_str(),
+            "tasks/b-two.md"
+        );
         assert_eq!(renamed.change.kind, RecordChangeKind::Renamed);
         assert_eq!(renamed.change.from.as_ref().unwrap().as_str(), "tasks/b.md");
     }

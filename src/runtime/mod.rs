@@ -41,8 +41,11 @@ pub use benchmark::{
     CandidateTruth, CompiledCandidate, ProjectionRelationship, QueryRequirements,
 };
 pub use canonical_operation::{
-    CanonicalDeleteValue, CanonicalOperationOutcome, CanonicalOperationValue, CanonicalQueryValue,
-    CanonicalRenamePreflightValue, CanonicalRenameValue, WireOnlyOperationValue,
+    CanonicalCollectionSetupAppliedValue, CanonicalCollectionSetupConflictValue,
+    CanonicalCollectionSetupValue, CanonicalDeleteValue, CanonicalOperationOutcome,
+    CanonicalOperationValue, CanonicalQueryValue, CanonicalRenamePreflightValue,
+    CanonicalRenameValue, CanonicalTypePackValue, DefinitionResultExtensions,
+    WireOnlyOperationValue,
 };
 pub use catalog::{
     CanonicalRecordInput, CatalogError, CatalogInput, CompiledCatalog, ResolvedTypeResource,

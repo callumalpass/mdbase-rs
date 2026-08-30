@@ -37,7 +37,7 @@ fn connect_api_compile_probe(
         query,
         HostedQueryPageInput {
             records: Vec::<HostedNamedProjectedValue>::new(),
-            total_count: 0,
+            total_count: Some(0),
             has_more: false,
             meta: mdbase::api::QueryMetadata::new(serde_json::json!({})),
             cursor: None::<HostedQueryCursorState>,

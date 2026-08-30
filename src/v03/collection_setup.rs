@@ -118,7 +118,7 @@ pub struct ConfigurationSetupAssessment {
     pub conflict: Option<ConfigurationConflict>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollectionSetupAssessment {
     pub status: String,
     pub applicable: bool,
@@ -150,7 +150,7 @@ pub struct ConfigurationContributionReceipt {
     pub value: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollectionSetupReceipt {
     pub application_id: String,
     pub declaration_digest: String,

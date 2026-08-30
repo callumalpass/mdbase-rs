@@ -108,7 +108,8 @@ pub struct HostedQueryCursorState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostedQueryPageInput {
     pub records: Vec<HostedNamedProjectedValue>,
-    pub total_count: usize,
+    /// Exact total, or `None` when exact counting was explicitly deferred.
+    pub total_count: Option<usize>,
     pub has_more: bool,
     pub meta: crate::api::QueryMetadata,
     #[serde(default, skip_serializing_if = "Option::is_none")]
