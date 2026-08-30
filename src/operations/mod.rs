@@ -283,6 +283,12 @@ pub(crate) fn open_regular_record_no_follow(
         };
         directory = next;
     }
+    match directory.symlink_metadata(leaf) {
+        Ok(metadata) if !metadata.is_file() => return Ok(None),
+        Ok(_) => {}
+        Err(error) if is_unavailable_no_follow_error(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    }
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let Some(file) = open_result_or_unavailable(directory.open_with(leaf, &options))? else {

@@ -507,9 +507,9 @@ fn held_authority_bypasses(source: &str) -> BTreeSet<String> {
     let source = source.as_str();
     let mut failures = BTreeSet::new();
     let display = if source.contains("impl Collection") {
-        r"(?:self|collection|shadow\.collection)\.root(?:\s*\(\s*\))?"
+        r"(?:self|collection|shadow\.collection)\.root\b(?:\s*\(\s*\))?"
     } else {
-        r"(?:collection|shadow\.collection)\.root(?:\s*\(\s*\))?"
+        r"(?:collection|shadow\.collection)\.root\b(?:\s*\(\s*\))?"
     };
     let direct_patterns = [
         (
@@ -1160,6 +1160,10 @@ mod tests {
         }
         assert!(held_authority_bypasses(
             "fn display(collection: &Collection) { format!(\"{}\", collection.root().display()); }"
+        )
+        .is_empty());
+        assert!(held_authority_bypasses(
+            "fn held(collection: &Collection) { let directory = collection.root_capability(); directory.symlink_metadata(\"x\"); }"
         )
         .is_empty());
     }

@@ -1135,11 +1135,20 @@ mod tests {
             let typed = typed_collection.typed().unwrap().batch(request).unwrap();
             let wire = execute(&wire_collection, &wire_input);
             assert!(wire.valid, "{wire:#?}");
-            assert_eq!(
-                serde_json::to_value(&typed.value).unwrap(),
-                wire.result,
-                "dry_run={dry_run}"
-            );
+            let mut typed_value = serde_json::to_value(&typed.value).unwrap();
+            let mut wire_value = wire.result.clone();
+            // These independent fixtures can commit on opposite sides of a
+            // wall-clock second. Verify the timestamp shape separately and
+            // compare every deterministic typed/wire field exactly.
+            for value in [&mut typed_value, &mut wire_value] {
+                for operation in value["operations"].as_array_mut().unwrap() {
+                    if let Some(mtime) = operation["result"]["file"]["mtime"].as_str() {
+                        assert!(!mtime.is_empty());
+                        operation["result"]["file"]["mtime"] = json!("<mtime>");
+                    }
+                }
+            }
+            assert_eq!(typed_value, wire_value, "dry_run={dry_run}");
             assert_eq!(
                 typed.diagnostics,
                 wire.diagnostics
