@@ -46,10 +46,12 @@ pub mod watch;
 pub use cancellation::{OperationCancellation, OperationCancelled, OperationStopReason};
 pub use snapshot::{CollectionDiscoveryCause, CollectionSnapshotError};
 
+#[cfg(all(test, unix))]
+pub(crate) use snapshot::replace_descendant_on_scan_for_test;
 #[cfg(test)]
 pub(crate) use snapshot::{
-    cancel_scan_after_entries_for_test, replace_descendant_on_scan_for_test,
-    reset_snapshot_scan_calls_for_test, snapshot_scan_calls_for_test,
+    cancel_scan_after_entries_for_test, reset_snapshot_scan_calls_for_test,
+    snapshot_scan_calls_for_test,
 };
 
 use std::collections::HashMap;
