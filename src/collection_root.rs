@@ -112,6 +112,7 @@ impl CollectionRoot {
         let dir = self.open_dir(parent)?;
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
+        allow_atomic_replacement(&mut options);
         let file = dir.open_with(leaf, &options)?.into_std();
         let metadata = file.metadata()?;
         if !metadata.is_file() || has_multiple_hard_links(&metadata) {
@@ -200,6 +201,7 @@ impl CollectionRoot {
         if !create_only {
             let mut options = OpenOptions::new();
             options.read(true).follow(FollowSymlinks::No);
+            allow_atomic_replacement(&mut options);
             match dir.open_with(leaf, &options) {
                 Ok(file) => {
                     let metadata = file.metadata()?;
@@ -264,6 +266,7 @@ impl CollectionRoot {
         let target_dir = self.create_dir_all(to_parent)?;
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
+        allow_atomic_replacement(&mut options);
         let source = source_dir.open_with(from_leaf, &options)?;
         let metadata = source.metadata()?;
         if !metadata.is_file() || cap_has_multiple_hard_links(&metadata) {
@@ -289,6 +292,7 @@ impl CollectionRoot {
         let dir = self.open_dir(parent)?;
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
+        allow_atomic_replacement(&mut options);
         let file = dir.open_with(leaf, &options)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || cap_has_multiple_hard_links(&metadata) {
@@ -449,6 +453,18 @@ fn atomic_replace(
     }
     Ok(())
 }
+
+#[cfg(windows)]
+fn allow_atomic_replacement(options: &mut OpenOptions) {
+    options.share_mode(
+        windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+            | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE
+            | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+    );
+}
+
+#[cfg(not(windows))]
+fn allow_atomic_replacement(_options: &mut OpenOptions) {}
 
 fn sync_directory(dir: &Dir) -> std::io::Result<()> {
     #[cfg(not(windows))]
