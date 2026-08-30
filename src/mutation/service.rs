@@ -1,11 +1,12 @@
 use crate::api::{
     CreateRequest, DeletePreflightResult, DeleteRequest, DeleteResult, MdbaseError,
-    OperationOutcome, RecordDocument, UpdateRequest,
+    OperationOutcome, RecordDocument, RenamePreflightResult, RenameRequest, RenameResult,
+    UpdateRequest,
 };
 use crate::diagnostic::Diagnostic as CanonicalDiagnostic;
 use crate::{Collection, SpecProfile};
 
-use super::{PlannedDelete, PlannedRecord, PreparationOptions};
+use super::{PlannedDelete, PlannedRecord, PlannedRename, PreparationOptions};
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -15,13 +16,12 @@ pub(crate) struct MutationPathProbes {
     pub wire_request_decodes: usize,
     pub runtime_request_decodes: usize,
     pub result_decodes: usize,
-    pub hydration_byte_reads: usize,
     pub full_shadows: usize,
     pub sparse_shadows: usize,
 }
 
 #[cfg(test)]
-thread_local! { static PROBES: std::cell::Cell<MutationPathProbes> = const { std::cell::Cell::new(MutationPathProbes { request_value_constructions: 0, legacy_request_parses: 0, wire_request_decodes: 0, runtime_request_decodes: 0, result_decodes: 0, hydration_byte_reads: 0, full_shadows: 0, sparse_shadows: 0 }) }; }
+thread_local! { static PROBES: std::cell::Cell<MutationPathProbes> = const { std::cell::Cell::new(MutationPathProbes { request_value_constructions: 0, legacy_request_parses: 0, wire_request_decodes: 0, runtime_request_decodes: 0, result_decodes: 0, full_shadows: 0, sparse_shadows: 0 }) }; }
 
 #[cfg(test)]
 pub(crate) fn reset_mutation_path_probes() {
@@ -59,10 +59,6 @@ pub(crate) fn probe_runtime_decode() {
 #[cfg(test)]
 pub(crate) fn probe_result_decode() {
     increment(|value| value.result_decodes += 1);
-}
-#[cfg(test)]
-pub(crate) fn probe_hydration_read() {
-    increment(|value| value.hydration_byte_reads += 1);
 }
 #[cfg(test)]
 pub(crate) fn probe_full_shadow() {
@@ -114,6 +110,39 @@ pub(crate) fn preflight_delete(
     })
 }
 
+pub(crate) fn rename(
+    collection: &Collection,
+    request: RenameRequest,
+) -> Result<OperationOutcome<RenameResult>, MdbaseError> {
+    let (planned, mut document) = execute_rename_shadow(collection, request, false)?;
+    let diagnostics = rename_diagnostics(&planned);
+    if diagnostics.iter().any(|item| item.severity == "error") {
+        return Err(canonical_error(diagnostics));
+    }
+    document
+        .diagnostics
+        .extend(diagnostics.into_iter().map(Into::into));
+    Ok(OperationOutcome {
+        value: planned.result(document.value),
+        diagnostics: document.diagnostics,
+    })
+}
+
+pub(crate) fn preflight_rename(
+    collection: &Collection,
+    request: RenameRequest,
+) -> Result<OperationOutcome<RenamePreflightResult>, MdbaseError> {
+    let (planned, _) = execute_rename_shadow(collection, request, true)?;
+    let diagnostics = rename_diagnostics(&planned);
+    if diagnostics.iter().any(|item| item.severity == "error") {
+        return Err(canonical_error(diagnostics));
+    }
+    Ok(OperationOutcome {
+        value: planned.preflight_result(),
+        diagnostics: diagnostics.into_iter().map(Into::into).collect(),
+    })
+}
+
 pub(crate) fn staged_create(
     collection: &Collection,
     request: CreateRequest,
@@ -145,6 +174,34 @@ pub(crate) fn staged_delete(
     options: PreparationOptions,
 ) -> Result<PlannedDelete, MdbaseError> {
     plan_delete(collection, collection, request, options)
+}
+
+pub(crate) fn staged_rename(
+    collection: &Collection,
+    request: RenameRequest,
+    options: PreparationOptions,
+) -> Result<PlannedRename, MdbaseError> {
+    plan_rename(collection, request, options, None)
+}
+
+pub(crate) fn plan_rename(
+    collection: &Collection,
+    request: RenameRequest,
+    options: PreparationOptions,
+    last_known_mtime: Option<u64>,
+) -> Result<PlannedRename, MdbaseError> {
+    let prepared = super::prepare_rename(
+        collection,
+        request,
+        options,
+        last_known_mtime,
+        std::collections::HashMap::new(),
+        Vec::new(),
+    )
+    .map_err(canonical_error)?;
+    collection
+        .rename_planned(prepared)
+        .map_err(|failure| canonical_error(failure.diagnostics))
 }
 
 /// Capture deletion evidence from the authority and apply that exact plan to a
@@ -198,6 +255,119 @@ fn execute_delete_shadow(
         },
     )?;
     Ok(planned)
+}
+
+fn execute_rename_shadow(
+    collection: &Collection,
+    request: RenameRequest,
+    dry_run: bool,
+) -> Result<(PlannedRename, OperationOutcome<RecordDocument>), MdbaseError> {
+    if collection.spec_profile != SpecProfile::V03 {
+        return Err(MdbaseError::MigrationRequired {
+            operation: "rename",
+        });
+    }
+    let shadow = super::shadow_collection(collection)
+        .map_err(|diagnostic| canonical_error(vec![*diagnostic]))?;
+    let planned = staged_rename(
+        &shadow.collection,
+        request,
+        PreparationOptions {
+            create_document: None,
+            dry_run,
+        },
+    )?;
+    let destination = planned.destination.clone();
+    let mut projected = project_record_facts(
+        &shadow.collection,
+        destination,
+        crate::transactions::CommittedFileFacts {
+            size: planned.destination.bytes.len() as u64,
+            mtime: None,
+        },
+    )?;
+    if dry_run {
+        return Ok((planned, projected));
+    }
+    let desired = super::collect_collection_files(&shadow.collection)
+        .map_err(|diagnostic| canonical_error(vec![*diagnostic]))?;
+    let commit = crate::transactions::commit_shadow(collection, &shadow.baseline, &desired)
+        .map_err(|error| {
+            canonical_error(vec![CanonicalDiagnostic::error(
+                error.code(),
+                error.to_string(),
+                Some(planned.to.to_string()),
+            )])
+        })?;
+    let facts = commit
+        .file_facts
+        .get(planned.to.as_str())
+        .expect("a committed rename destination has locked file facts");
+    facts.attach_record_file(&mut projected.value.file);
+    Ok((planned, projected))
+}
+
+pub(crate) fn project_planned_record(
+    collection: &Collection,
+    record: PlannedRecord,
+) -> Result<OperationOutcome<RecordDocument>, MdbaseError> {
+    let size = record.bytes.len() as u64;
+    project_record_facts(
+        collection,
+        record,
+        crate::transactions::CommittedFileFacts { size, mtime: None },
+    )
+}
+
+fn rename_diagnostics(planned: &PlannedRename) -> Vec<CanonicalDiagnostic> {
+    let mut diagnostics = planned
+        .warnings
+        .iter()
+        .map(|warning| value_diagnostic(warning, "warning", "rename_warning"))
+        .collect::<Vec<_>>();
+    diagnostics.extend(planned.reference_failures.iter().map(|failure| {
+        let mut diagnostic =
+            value_diagnostic(failure, "error", crate::errors::RENAME_REF_UPDATE_FAILED);
+        diagnostic.code = crate::errors::RENAME_REF_UPDATE_FAILED.to_string();
+        diagnostic
+    }));
+    diagnostics
+}
+
+fn value_diagnostic(
+    value: &serde_json::Value,
+    severity: &str,
+    fallback_code: &str,
+) -> CanonicalDiagnostic {
+    CanonicalDiagnostic {
+        severity: severity.to_string(),
+        code: value
+            .get("code")
+            .or_else(|| value.get("reason"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(fallback_code)
+            .to_string(),
+        message: value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(if severity == "error" {
+                "Some reference updates failed"
+            } else {
+                "Rename warning"
+            })
+            .to_string(),
+        path: value
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        field: value
+            .get("field")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        type_name: None,
+        schema_location: None,
+        details: Some(value.clone()),
+    }
 }
 
 fn execute_shadow(
@@ -453,6 +623,86 @@ mod tests {
     }
 
     #[test]
+    fn typed_rename_and_preflight_use_one_full_shadow_without_bridges() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        std::fs::write(root.path().join("target.md"), "target\n").unwrap();
+        std::fs::write(root.path().join("ref.md"), "See [[target]].\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        let request = crate::api::RenameRequest::new(
+            crate::api::CollectionPath::new("target.md").unwrap(),
+            crate::api::CollectionPath::new("renamed.md").unwrap(),
+        );
+
+        reset_mutation_path_probes();
+        crate::record_load::reset_snapshot_record_loads_for_test();
+        let preview = collection
+            .typed()
+            .unwrap()
+            .preflight_rename(request.clone())
+            .unwrap();
+        assert!(preview.value.would_rename);
+        assert_eq!(
+            mutation_path_probes(),
+            MutationPathProbes {
+                full_shadows: 1,
+                ..MutationPathProbes::default()
+            }
+        );
+        assert_eq!(crate::record_load::snapshot_record_loads_for_test(), 2);
+
+        reset_mutation_path_probes();
+        crate::record_load::reset_snapshot_record_loads_for_test();
+        let renamed = collection.typed().unwrap().rename(request).unwrap();
+        assert_eq!(renamed.value.to.as_str(), "renamed.md");
+        assert_eq!(
+            mutation_path_probes(),
+            MutationPathProbes {
+                full_shadows: 1,
+                ..MutationPathProbes::default()
+            }
+        );
+        assert_eq!(crate::record_load::snapshot_record_loads_for_test(), 4);
+    }
+
+    #[test]
+    fn rename_result_uses_planned_bytes_and_locked_facts_after_postcommit_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        std::fs::write(root.path().join("before.md"), "planned\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        crate::transactions::inject_post_commit_replacement(
+            root.path(),
+            "after.md",
+            Some(b"external replacement much longer".to_vec()),
+        );
+        let outcome = collection
+            .typed()
+            .unwrap()
+            .rename(
+                crate::api::RenameRequest::new(
+                    crate::api::CollectionPath::new("before.md").unwrap(),
+                    crate::api::CollectionPath::new("after.md").unwrap(),
+                )
+                .with_document(),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome.value.document.document.as_deref(),
+            Some("planned\n")
+        );
+        assert_eq!(outcome.value.document.file.size, 8);
+        assert_eq!(
+            outcome.value.document.revision.as_str(),
+            revision(b"planned\n")
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("after.md")).unwrap(),
+            b"external replacement much longer"
+        );
+    }
+
+    #[test]
     fn committed_facts_survive_post_commit_path_replacement() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
@@ -537,7 +787,40 @@ mod tests {
             }
         }
         let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut all_sources = Vec::new();
+        rust_sources(&repository.join("src"), &mut all_sources);
+        let removed_hydrator = ["hydrate", "persisted", "result"].join("_");
+        for path in all_sources {
+            let source = std::fs::read_to_string(&path).unwrap();
+            assert!(!source.contains(&removed_hydrator), "{}", path.display());
+        }
         let batch = std::fs::read_to_string(repository.join("src/v03/batch.rs")).unwrap();
+        let runtime_rename_adapter = batch
+            .split("pub(crate) fn prepare_single_runtime")
+            .nth(1)
+            .unwrap()
+            .split("fn execute_staged_operation")
+            .next()
+            .unwrap();
+        assert_eq!(
+            runtime_rename_adapter
+                .matches("mutation_adapter::prepare_runtime_rename(")
+                .count(),
+            1
+        );
+        assert!(!runtime_rename_adapter.contains(&["v03", "operations"].join("_")));
+        assert!(!runtime_rename_adapter.contains("execute_mutation_direct"));
+        let rename_adapter =
+            std::fs::read_to_string(repository.join("src/v03/mutation_adapter.rs")).unwrap();
+        let runtime_rename_core = rename_adapter
+            .split("pub(super) fn prepare_runtime_rename")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) fn planned_rename_result")
+            .next()
+            .unwrap();
+        assert_eq!(runtime_rename_core.matches("decode_rename(").count(), 1);
+        assert_eq!(runtime_rename_core.matches("plan_rename(").count(), 1);
         let runtime_delete_adapter = batch
             .split("fn prepare_sparse_runtime")
             .nth(1)

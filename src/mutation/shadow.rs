@@ -31,6 +31,8 @@ pub(crate) fn shadow_collection_context(
     collection: &Collection,
     context: &OperationContext,
 ) -> Result<ShadowCollection, ProviderError> {
+    #[cfg(test)]
+    crate::mutation::probe_full_shadow();
     shadow_collection_inner(collection, Some(context)).map_err(|error| match error {
         RuntimeBatchError::Diagnostic(diagnostic) => {
             ProviderError::CollectionOpen(diagnostic.message.clone())
@@ -48,6 +50,13 @@ fn shadow_collection_inner(
     collection: &Collection,
     context: Option<&OperationContext>,
 ) -> Result<ShadowCollection, RuntimeBatchError> {
+    if !collection.rename_root_path_is_current() {
+        return Err(RuntimeBatchError::Diagnostic(Box::new(Diagnostic::error(
+            crate::errors::CONCURRENT_MODIFICATION,
+            "Collection root was replaced before mutation planning.",
+            None,
+        ))));
+    }
     if let Some(context) = context {
         context.check().map_err(RuntimeBatchError::Provider)?;
     }

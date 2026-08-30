@@ -33,7 +33,7 @@ pub(crate) fn prepare_single_runtime(
 ) -> Result<RuntimeSinglePreparation, ProviderError> {
     context.check()?;
     #[cfg(test)]
-    if matches!(operation, "create" | "update" | "delete") {
+    if matches!(operation, "create" | "update" | "delete" | "rename") {
         crate::mutation::probe_runtime_decode();
     }
     if matches!(operation, "create" | "update" | "delete") {
@@ -52,11 +52,13 @@ pub(crate) fn prepare_single_runtime(
         }
     };
     context.check()?;
-    let shadow_operations = shadow
-        .collection
-        .v03_operations()
-        .map_err(|diagnostic| ProviderError::CollectionOpen(diagnostic.message.clone()))?;
-    let result = execute_staged_operation(&shadow_operations, operation, &shadow_input);
+    let result = if operation == "rename" {
+        super::mutation_adapter::prepare_runtime_rename(&shadow.collection, &shadow_input)
+    } else {
+        let shadow_operations = Operations::new(&shadow.collection)
+            .map_err(|diagnostic| ProviderError::CollectionOpen(diagnostic.message.clone()))?;
+        execute_staged_operation(&shadow_operations, operation, &shadow_input)
+    };
     context.check()?;
     if !result.valid {
         return Ok(RuntimeSinglePreparation::NoMutation(result));

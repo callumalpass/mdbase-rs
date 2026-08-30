@@ -1,10 +1,12 @@
 use serde_json::{Map, Value};
 
 use super::{
-    LifecycleEvent, PreparationOptions, PreparedCreate, PreparedDelete, PreparedUpdate,
-    ResolvedWriteMembership,
+    LifecycleEvent, PreparationOptions, PreparedCreate, PreparedDelete, PreparedRename,
+    PreparedUpdate, ResolvedWriteMembership,
 };
-use crate::api::{CreateRequest, DeleteRequest, Revision, UpdateRequest};
+use crate::api::{
+    CollectionPath, CreateRequest, DeleteRequest, RenameRequest, Revision, UpdateRequest,
+};
 use crate::diagnostic::Diagnostic;
 use crate::frontmatter::parser::{
     parse_document_for_rewrite, yaml_mapping_to_json, FrontmatterState,
@@ -294,6 +296,149 @@ pub(crate) fn prepare_delete(
         broken_links,
         legacy_last_known_mtime,
     })
+}
+
+pub(crate) fn prepare_rename(
+    collection: &Collection,
+    request: RenameRequest,
+    options: PreparationOptions,
+    legacy_last_known_mtime: Option<u64>,
+    legacy_ref_mtimes: std::collections::HashMap<String, u64>,
+    legacy_simulations: Vec<(CollectionPath, String)>,
+) -> Result<PreparedRename, Vec<Diagnostic>> {
+    let from = request.from.to_string();
+    let to = request.to.to_string();
+    for path in [&request.from, &request.to] {
+        crate::operations::mutation_record_path_diagnostic(collection, path.as_str()).map_err(
+            |mut error| {
+                error.path = Some(path.to_string());
+                vec![error]
+            },
+        )?;
+        crate::operations::ensure_no_symlink_components_diagnostic(
+            &collection.root,
+            path.as_str(),
+            collection.spec_profile,
+        )
+        .map_err(|mut error| {
+            error.path = Some(path.to_string());
+            vec![error]
+        })?;
+    }
+    crate::operations::ensure_regular_record_file_diagnostic(
+        &request.from.under(&collection.root),
+        &from,
+    )
+    .map_err(|mut error| {
+        error.path = Some(from.clone());
+        vec![error]
+    })?;
+    if request.to.under(&collection.root).exists() {
+        return Err(vec![Diagnostic::error(
+            crate::errors::PATH_CONFLICT,
+            format!("Target already exists: {to}"),
+            Some(to),
+        )]);
+    }
+
+    let snapshot = collection
+        .capture_collection_snapshot(&crate::OperationCancellation::new())
+        .map_err(|error| {
+            vec![Diagnostic::error(
+                "collection_snapshot_failed",
+                error.to_string(),
+                Some(from.clone()),
+            )]
+        })?;
+    let source = snapshot.entry(&from).ok_or_else(|| {
+        vec![Diagnostic::error(
+            crate::errors::FILE_NOT_FOUND,
+            format!("Source not found: {from}"),
+            Some(from.clone()),
+        )]
+    })?;
+    let source_revision = source.facts().revision.clone();
+    if request
+        .if_revision
+        .as_ref()
+        .is_some_and(|expected| expected.as_str() != source_revision)
+    {
+        return Err(vec![Diagnostic::error(
+            crate::errors::CONCURRENT_MODIFICATION,
+            format!("File '{from}' no longer matches the requested revision"),
+            Some(from),
+        )]);
+    }
+    if legacy_last_known_mtime
+        .is_some_and(|known| source.facts().mtime_ns.max(0) as u64 / 1_000_000 != known)
+    {
+        return Err(vec![Diagnostic::error(
+            crate::errors::CONCURRENT_MODIFICATION,
+            format!("File '{}' was modified externally", request.from),
+            Some(request.from.to_string()),
+        )]);
+    }
+    let source_bytes = std::fs::read(request.from.under(&collection.root)).map_err(|error| {
+        vec![Diagnostic::error(
+            "file_read_failed",
+            error.to_string(),
+            Some(request.from.to_string()),
+        )]
+    })?;
+    if content_revision(&source_bytes) != source_revision {
+        return Err(vec![Diagnostic::error(
+            crate::errors::CONCURRENT_MODIFICATION,
+            format!("File '{}' was modified externally", request.from),
+            Some(request.from.to_string()),
+        )]);
+    }
+    let source_id = source
+        .raw_frontmatter()
+        .and_then(Value::as_object)
+        .and_then(|frontmatter| frontmatter.get(&collection.settings.id_field))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut warnings = Vec::new();
+    let mut reference_failures = Vec::new();
+    let reference_plans = if request.update_refs {
+        collection.plan_reference_rewrites(
+            &snapshot,
+            request.from.as_ref(),
+            request.to.as_ref(),
+            &source_id,
+            &mut warnings,
+            &mut reference_failures,
+        )
+    } else {
+        Vec::new()
+    };
+    Ok(PreparedRename {
+        request,
+        dry_run: options.dry_run,
+        source_revision,
+        source_types: source.type_names().to_vec(),
+        source_id,
+        source_frontmatter: source
+            .raw_frontmatter()
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new())),
+        source_effective_frontmatter: source
+            .effective_frontmatter()
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new())),
+        source_body: source.body().unwrap_or_default().to_string(),
+        source_bytes,
+        reference_plans,
+        warnings,
+        reference_failures,
+        legacy_ref_mtimes,
+        legacy_simulations,
+    })
+}
+
+fn content_revision(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 fn delete_record_projection(record: &RecordLoadOutcome) -> (Map<String, Value>, String) {

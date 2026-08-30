@@ -20,6 +20,8 @@ mod delete_tests;
 mod mutation_adapter;
 mod operations;
 pub(crate) mod query;
+#[cfg(test)]
+mod rename_tests;
 mod schema_diagnostics;
 mod type_pack;
 pub use crate::cel::{

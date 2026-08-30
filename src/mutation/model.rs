@@ -1,6 +1,8 @@
 use serde_json::{Map, Value};
 
-use crate::api::{CollectionPath, CreateRequest, DeleteRequest, UpdateRequest};
+use crate::api::{
+    CollectionPath, CreateRequest, DeleteRequest, RenameRequest, RenameResult, UpdateRequest,
+};
 use crate::diagnostic::Diagnostic;
 use crate::errors::{Issue, Severity};
 
@@ -40,6 +42,62 @@ pub(crate) struct PreparedDelete {
     pub types: Vec<String>,
     pub broken_links: Vec<Value>,
     pub legacy_last_known_mtime: Option<u64>,
+}
+
+/// Typed rename plus all collection-wide evidence captured before publication.
+pub(crate) struct PreparedRename {
+    pub request: RenameRequest,
+    pub dry_run: bool,
+    pub source_revision: String,
+    pub source_types: Vec<String>,
+    pub source_id: Option<String>,
+    pub source_frontmatter: Value,
+    pub source_effective_frontmatter: Value,
+    pub source_body: String,
+    pub source_bytes: Vec<u8>,
+    pub reference_plans: Vec<crate::operations::rename::ReferenceRewritePlan>,
+    pub warnings: Vec<Value>,
+    pub reference_failures: Vec<Value>,
+    pub legacy_ref_mtimes: std::collections::HashMap<String, u64>,
+    pub legacy_simulations: Vec<(CollectionPath, String)>,
+}
+
+/// Exact rename and reference-write evidence retained across publication.
+#[derive(Clone, Debug)]
+pub(crate) struct PlannedRename {
+    pub from: CollectionPath,
+    pub to: CollectionPath,
+    pub source_revision: String,
+    pub source_types: Vec<String>,
+    pub source_id: Option<String>,
+    pub destination: PlannedRecord,
+    pub reference_plans: Vec<crate::operations::rename::ReferenceRewritePlan>,
+    pub references_affected: Vec<Value>,
+    pub references_updated: Vec<Value>,
+    pub warnings: Vec<Value>,
+    pub reference_failures: Vec<Value>,
+    pub dry_run: bool,
+}
+
+impl PlannedRename {
+    pub(crate) fn result(&self, document: crate::api::RecordDocument) -> RenameResult {
+        RenameResult {
+            document,
+            from: self.from.clone(),
+            to: self.to.clone(),
+            references_updated: self.references_updated.clone(),
+        }
+    }
+
+    pub(crate) fn preflight_result(&self) -> crate::api::RenamePreflightResult {
+        crate::api::RenamePreflightResult {
+            from: self.from.clone(),
+            to: self.to.clone(),
+            would_rename: true,
+            references_affected: self.references_affected.clone(),
+            warnings: self.warnings.clone(),
+        }
+    }
 }
 
 /// Exact planned deletion evidence retained across durable publication.

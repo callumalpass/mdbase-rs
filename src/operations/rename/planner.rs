@@ -2,16 +2,17 @@ use crate::errors::FRONTMATTER_SERIALIZATION_FAILED;
 use crate::frontmatter::serializer;
 use crate::Collection;
 
-pub(super) struct ReferenceRewritePlan {
-    pub(super) execution_path: String,
-    pub(super) expected_revision: String,
-    pub(super) expected_mtime_ns: i64,
-    pub(super) output: String,
-    pub(super) updates: Vec<serde_json::Value>,
+#[derive(Clone, Debug)]
+pub(crate) struct ReferenceRewritePlan {
+    pub(crate) execution_path: String,
+    pub(crate) expected_revision: String,
+    pub(crate) expected_mtime_ns: i64,
+    pub(crate) output: String,
+    pub(crate) updates: Vec<serde_json::Value>,
 }
 
 impl Collection {
-    pub(super) fn plan_reference_rewrites(
+    pub(crate) fn plan_reference_rewrites(
         &self,
         snapshot: &crate::snapshot::AuthoritativeCollectionSnapshot,
         from: &str,

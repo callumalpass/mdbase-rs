@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use super::Diagnostic;
 use crate::{Collection, SpecProfile};
@@ -307,10 +307,15 @@ impl<'a> Operations<'a> {
     }
 
     fn rename_direct(&self, input: &Value) -> OperationResult {
-        if let Some(result) = invalid_revision_input(input) {
-            return result;
+        let (request, options, last_known_mtime) =
+            match super::mutation_adapter::decode_rename(self.collection, input) {
+                Ok(decoded) => decoded,
+                Err(diagnostics) => return failed_result(diagnostics),
+            };
+        match crate::mutation::plan_rename(self.collection, request, options, last_known_mtime) {
+            Ok(planned) => super::mutation_adapter::planned_rename_result(self.collection, planned),
+            Err(error) => typed_error_result(error),
         }
-        self.normalize("rename", input, self.collection.rename(input))
     }
 
     /// Execute or dry-run a deterministic sequence of core mutations.
@@ -448,12 +453,12 @@ impl<'a> Operations<'a> {
         self.collection.update_type_file(input)
     }
 
-    fn normalize(&self, operation: &str, input: &Value, legacy: Value) -> OperationResult {
+    fn normalize(&self, _operation: &str, input: &Value, legacy: Value) -> OperationResult {
         let path = input
             .get("path")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let mut diagnostics = collect_diagnostics(&legacy, path.as_deref(), "error");
+        let diagnostics = collect_diagnostics(&legacy, path.as_deref(), "error");
         let has_error = diagnostics
             .iter()
             .any(|diagnostic| diagnostic.severity == "error");
@@ -470,29 +475,6 @@ impl<'a> Operations<'a> {
             result.remove(envelope_key);
         }
 
-        if valid
-            && !input
-                .get("dry_run")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            && operation == "rename"
-        {
-            let persisted_path = persisted_path(operation, input, &result);
-            if let Some(persisted_path) = persisted_path {
-                let include_document = input
-                    .get("include_document")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                    || input.get("document").is_some();
-                self.hydrate_persisted_result(
-                    &persisted_path,
-                    include_document,
-                    &mut result,
-                    &mut diagnostics,
-                );
-            }
-        }
-
         let valid = valid
             && !diagnostics
                 .iter()
@@ -501,76 +483,6 @@ impl<'a> Operations<'a> {
             valid,
             result: Value::Object(result),
             diagnostics,
-        }
-    }
-
-    fn hydrate_persisted_result(
-        &self,
-        path: &str,
-        include_document: bool,
-        result: &mut Map<String, Value>,
-        diagnostics: &mut Vec<Diagnostic>,
-    ) {
-        if let Err(error) = crate::operations::ensure_no_symlink_components(
-            &self.collection.root,
-            path,
-            self.collection.spec_profile,
-        ) {
-            diagnostics.push(diagnostic_from_value(
-                error.get("error").unwrap_or(&error),
-                "error",
-                Some(path),
-            ));
-            return;
-        }
-        #[cfg(test)]
-        crate::mutation::probe_hydration_read();
-        let read = self.collection.read(&serde_json::json!({
-            "path": path,
-            "include_document": include_document,
-        }));
-        if let Some(error) = read.get("error") {
-            if error.get("code").and_then(Value::as_str) == Some("invalid_frontmatter") {
-                match self.collection.snapshot_record(path) {
-                    Ok(record) if record.frontmatter_error.is_some() => {
-                        result.insert("path".to_string(), Value::String(record.path));
-                        result.insert("revision".to_string(), Value::String(record.revision));
-                        result.insert("types".to_string(), serde_json::json!(record.types));
-                        result.insert("frontmatter".to_string(), Value::Object(record.frontmatter));
-                        result.insert("effective_frontmatter".to_string(), serde_json::json!({}));
-                        result.insert("body".to_string(), Value::String(record.body));
-                        if include_document {
-                            result.insert("document".to_string(), Value::String(record.document));
-                        }
-                        return;
-                    }
-                    Ok(_) => {}
-                    Err(snapshot_error) => {
-                        diagnostics.push(Diagnostic::error(
-                            snapshot_error.code(),
-                            snapshot_error.to_string(),
-                            Some(path.to_string()),
-                        ));
-                        return;
-                    }
-                }
-            }
-            diagnostics.push(diagnostic_from_value(error, "error", Some(path)));
-            return;
-        }
-        for key in [
-            "path",
-            "revision",
-            "types",
-            "frontmatter",
-            "effective_frontmatter",
-            "body",
-            "document",
-            "file",
-        ] {
-            if let Some(value) = read.get(key) {
-                result.insert(key.to_string(), value.clone());
-            }
         }
     }
 }
@@ -759,34 +671,6 @@ fn failed_result(diagnostics: Vec<Diagnostic>) -> OperationResult {
     }
 }
 
-fn invalid_revision_input(input: &Value) -> Option<OperationResult> {
-    let revision = input.get("if_revision")?;
-    if revision.is_string() {
-        return None;
-    }
-    Some(OperationResult {
-        valid: false,
-        result: serde_json::json!({}),
-        diagnostics: vec![Diagnostic::error(
-            "invalid_request",
-            "if_revision must be an opaque string token.",
-            input
-                .get("path")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        )],
-    })
-}
-
-fn persisted_path(operation: &str, input: &Value, result: &Map<String, Value>) -> Option<String> {
-    let key = if operation == "rename" { "to" } else { "path" };
-    result
-        .get(key)
-        .or_else(|| input.get(key))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
 pub(super) fn collect_diagnostics(
     value: &Value,
     fallback_path: Option<&str>,
@@ -827,7 +711,7 @@ pub(super) fn collect_diagnostics(
     deduplicate_diagnostics(diagnostics)
 }
 
-fn diagnostic_from_value(
+pub(super) fn diagnostic_from_value(
     value: &Value,
     default_severity: &str,
     fallback_path: Option<&str>,

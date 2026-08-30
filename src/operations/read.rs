@@ -336,10 +336,8 @@ fn format_mtime(mtime_ns: i64) -> Option<String> {
 impl Collection {
     /// Read a file (§12.2).
     ///
-    /// Legacy JSON compatibility only. Production consumers are limited to the
-    /// v0.2 adapter and rename-result compatibility hydration in
-    /// `v03::operations::hydrate_persisted_result`. Remove this facade when
-    /// that remaining consumer uses the typed evaluator.
+    /// Legacy JSON compatibility only. Canonical typed and v0.3 wire reads use
+    /// the version-neutral evaluator directly.
     pub fn read(&self, input: &serde_json::Value) -> serde_json::Value {
         let input = match ReadInput::parse(input) {
             Ok(parsed) => parsed,

@@ -777,8 +777,7 @@ impl<'a> TypedCollection<'a> {
     /// Rename one canonical record and optionally rewrite references.
     pub fn rename(&self, request: RenameRequest) -> MdbaseResult<OperationOutcome<RenameResult>> {
         self.require_canonical("rename")?;
-        let input = request.into_wire();
-        self.execute(self.operations()?.rename(&input))
+        crate::mutation::rename(self.collection, request)
     }
 
     /// Preview one rename without mutating authoritative state.
@@ -787,9 +786,7 @@ impl<'a> TypedCollection<'a> {
         request: RenameRequest,
     ) -> MdbaseResult<OperationOutcome<RenamePreflightResult>> {
         self.require_canonical("rename")?;
-        let mut input = request.into_wire();
-        input["dry_run"] = Value::Bool(true);
-        self.execute(self.operations()?.rename(&input))
+        crate::mutation::preflight_rename(self.collection, request)
     }
 
     /// Execute typed mutations as one recoverable batch.

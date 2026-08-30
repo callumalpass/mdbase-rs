@@ -661,6 +661,114 @@ fn runtime_create_update_replay_committed_facts_after_reopen_and_postcommit_path
 }
 
 #[test]
+fn runtime_rename_replays_planned_facts_and_exact_changes_after_reopen() {
+    let directory = collection();
+    let source = b"---\nid: stable\n---\nSee [[source]].\n";
+    let reference = b"See [[source]].\n";
+    fs::write(directory.path().join("source.md"), source).unwrap();
+    fs::write(directory.path().join("reference.md"), reference).unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    crate::mutation::reset_mutation_path_probes();
+    let claim = HostClaimId::generate();
+    let request = OperationRequest::new(
+        OperationKind::Rename,
+        json!({
+            "from": "source.md",
+            "to": "renamed.md",
+            "update_refs": true,
+            "include_document": true
+        }),
+    );
+    let prepared = match runtime
+        .prepare(&request, &claim, &OperationContext::legacy())
+        .unwrap()
+    {
+        PreparationOutcome::Prepared(prepared) => prepared,
+        other => panic!("expected rename preparation: {other:?}"),
+    };
+    assert_eq!(
+        crate::mutation::mutation_path_probes(),
+        crate::mutation::MutationPathProbes {
+            wire_request_decodes: 1,
+            runtime_request_decodes: 1,
+            full_shadows: 1,
+            ..Default::default()
+        }
+    );
+    crate::transactions::inject_post_commit_replacement(
+        directory.path(),
+        "renamed.md",
+        Some(b"external replacement".to_vec()),
+    );
+    let renamed = match runtime
+        .commit(&prepared, &OperationContext::legacy())
+        .unwrap()
+    {
+        CommitAttempt::Committed(outcome) => outcome,
+        other => panic!("expected committed rename: {other:?}"),
+    };
+    assert_eq!(renamed.result.result["from"], "source.md");
+    assert_eq!(renamed.result.result["to"], "renamed.md");
+    let planned_document = renamed.result.result["document"].as_str().unwrap();
+    assert_eq!(
+        renamed.result.result["file"]["size"],
+        planned_document.len()
+    );
+    assert_eq!(
+        renamed.result.result["revision"],
+        crate::v03::revision(planned_document.as_bytes())
+    );
+    assert_ne!(renamed.result.result["file"]["mtime"], "");
+    assert!(planned_document.contains("[[renamed]]"));
+    let ChangeSet::Exact(changes) = &renamed.changes else {
+        panic!("runtime rename must retain exact changes")
+    };
+    assert_eq!(changes.items().len(), 2);
+    let records = changes
+        .items()
+        .iter()
+        .map(|change| match change {
+            CanonicalChange::Record(record) => record,
+            _ => panic!("rename effects must be record changes"),
+        })
+        .collect::<Vec<_>>();
+    let primary = records
+        .iter()
+        .find(|record| record.kind == RecordChangeKind::Renamed)
+        .unwrap();
+    assert_eq!(primary.from.as_ref().unwrap().as_str(), "source.md");
+    let reference_change = records
+        .iter()
+        .find(|record| record.kind == RecordChangeKind::Updated)
+        .unwrap();
+    assert_eq!(reference_change.path.as_str(), "reference.md");
+    assert_eq!(
+        fs::read(directory.path().join("renamed.md")).unwrap(),
+        b"external replacement"
+    );
+    let commit_id = prepared.commit_id().clone();
+    drop(runtime);
+    let reopened = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    assert_eq!(
+        reopened
+            .resolve_commit(&commit_id, &OperationContext::legacy())
+            .unwrap(),
+        Some(DurableCommitState::Committed {
+            outcome: renamed.clone()
+        })
+    );
+    assert_eq!(
+        reopened
+            .resolve_claim(&claim, &OperationContext::legacy())
+            .unwrap(),
+        Some((
+            commit_id,
+            DurableCommitState::Committed { outcome: renamed }
+        ))
+    );
+}
+
+#[test]
 fn runtime_delete_uses_sparse_stage_and_replays_planned_result_after_reopen() {
     let directory = collection();
     fs::create_dir(directory.path().join("_types")).unwrap();
