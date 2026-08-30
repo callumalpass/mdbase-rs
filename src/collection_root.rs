@@ -397,28 +397,33 @@ fn atomic_replace(
 ) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileRenameInfoEx, SetFileInformationByHandle, FILE_RENAME_INFO,
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileRenameInformationEx, NtSetInformationFile, FILE_RENAME_INFORMATION,
+        FILE_RENAME_REPLACE_IF_EXISTS,
     };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     let name = destination.encode_wide().collect::<Vec<_>>();
     let name_bytes = name
         .len()
         .checked_mul(std::mem::size_of::<u16>())
         .ok_or(std::io::ErrorKind::InvalidInput)?;
-    let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let header = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
     let size = header
         .checked_add(name_bytes)
-        .ok_or(std::io::ErrorKind::InvalidInput)?;
+        .ok_or(std::io::ErrorKind::InvalidInput)?
+        .max(std::mem::size_of::<FILE_RENAME_INFORMATION>());
     let words = size.div_ceil(std::mem::size_of::<usize>());
     let mut buffer = vec![0_usize; words];
-    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     let parent_file = parent.try_clone()?.into_std_file();
+    let mut status_block = IO_STATUS_BLOCK::default();
     unsafe {
-        // FileRenameInfoEx interprets the union's first u32 as flags. Flag 1 is
-        // FILE_RENAME_FLAG_REPLACE_IF_EXISTS. The destination is a leaf name
-        // resolved by the kernel relative to this held parent handle.
-        (*info).Anonymous.Flags = 1;
+        // The NT handle-relative API resolves this leaf in the already-open
+        // parent directory. The Win32 SetFileInformationByHandle wrapper does
+        // not support a non-null RootDirectory and would return ERROR_INVALID_PARAMETER.
+        (*info).Anonymous.Flags = FILE_RENAME_REPLACE_IF_EXISTS;
         (*info).RootDirectory = parent_file.as_raw_handle();
         (*info).FileNameLength =
             u32::try_from(name_bytes).map_err(|_| std::io::ErrorKind::InvalidInput)?;
@@ -427,17 +432,19 @@ fn atomic_replace(
             buffer.as_mut_ptr().cast::<u8>().add(header),
             name_bytes,
         );
-        let ok = SetFileInformationByHandle(
+        let status = NtSetInformationFile(
             source.as_raw_handle(),
-            FileRenameInfoEx,
+            &mut status_block,
             info.cast(),
             u32::try_from(size).map_err(|_| std::io::ErrorKind::InvalidInput)?,
+            FileRenameInformationEx,
         );
-        if ok == 0 {
-            // Unsupported FileRenameInfoEx and all other failures are
-            // deliberately fail-closed. Never emulate replace with
-            // remove-then-rename, which would lose atomicity and authority.
-            return Err(std::io::Error::last_os_error());
+        if status < 0 {
+            // Unsupported handle-relative replacement and every other failure
+            // are fail-closed; never emulate this with remove-then-rename.
+            return Err(std::io::Error::from_raw_os_error(
+                RtlNtStatusToDosError(status) as i32,
+            ));
         }
     }
     Ok(())
@@ -530,12 +537,18 @@ mod windows_tests {
 
     #[test]
     fn rename_info_ex_layout_can_hold_a_relative_destination() {
-        use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0,
+        };
 
         assert!(
-            std::mem::offset_of!(FILE_RENAME_INFO, FileName)
-                >= std::mem::size_of::<windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO_0>(
-                )
+            std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName)
+                >= std::mem::size_of::<FILE_RENAME_INFORMATION_0>()
+        );
+        assert!(
+            std::mem::size_of::<FILE_RENAME_INFORMATION>()
+                >= std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName)
+                    + std::mem::size_of::<u16>()
         );
     }
 

@@ -30,11 +30,12 @@ Capability-relative publication writes and syncs a private file, then publishes
 it inside the held parent. Create uses a no-clobber hard-link publication step.
 On Unix, replacement is `renameat` through cap-std with both names relative to
 the same open parent, preserving atomic destination replacement. On Windows,
-replacement uses `SetFileInformationByHandle(FileRenameInfoEx)` on the open
+replacement uses `NtSetInformationFile(FileRenameInformationEx)` on the open
 temporary-file handle, supplies the held destination-parent handle in
-`FILE_RENAME_INFO.RootDirectory`, and requests
-`FILE_RENAME_FLAG_REPLACE_IF_EXISTS`. Unsupported `FileRenameInfoEx` and all
-other failures fail closed; there is no remove-then-rename fallback.
+`FILE_RENAME_INFORMATION.RootDirectory`, and requests
+`FILE_RENAME_REPLACE_IF_EXISTS`. The Win32 wrapper cannot accept that relative
+root; the NT API preserves handle-relative resolution. Unsupported operations
+and all other failures fail closed; there is no remove-then-rename fallback.
 
 The file is synced before publication. Parent directories are synced after
 publication on Unix. Windows directory handles do not provide the same portable
@@ -58,7 +59,7 @@ All collection record/resource publication callers terminate at
 
 No audited caller performs ambient remove+rename or publishes through the
 collection display path. Unix replacement retains `renameat` semantics; Windows
-replacement retains one handle-rooted `FileRenameInfoEx` operation.
+replacement retains one handle-rooted `FileRenameInformationEx` operation.
 
 ## Guard
 
