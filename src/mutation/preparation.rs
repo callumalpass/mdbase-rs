@@ -182,7 +182,7 @@ pub(crate) fn prepare_delete(
     let (before_revision, before_frontmatter, before_body, types, broken_links) =
         if request.check_backlinks {
             let snapshot = collection
-                .capture_collection_snapshot(&crate::OperationCancellation::new())
+                .capture_collection_snapshot_current()
                 .map_err(|error| {
                     vec![Diagnostic::error(
                         "collection_snapshot_failed",
@@ -320,7 +320,7 @@ pub(crate) fn prepare_rename(
     }
 
     let snapshot = collection
-        .capture_collection_snapshot(&crate::OperationCancellation::new())
+        .capture_collection_snapshot_current()
         .map_err(|error| {
             vec![Diagnostic::error(
                 "collection_snapshot_failed",
@@ -356,13 +356,12 @@ pub(crate) fn prepare_rename(
             Some(request.from.to_string()),
         )]);
     }
-    let source_bytes = std::fs::read(request.from.under(&collection.root)).map_err(|error| {
-        vec![Diagnostic::error(
-            "file_read_failed",
-            error.to_string(),
-            Some(request.from.to_string()),
-        )]
-    })?;
+    let source_bytes = source
+        .outcome()
+        .document()
+        .ok_or_else(|| vec![invalid_record(&from, "invalid_utf8")])?
+        .as_bytes()
+        .to_vec();
     if content_revision(&source_bytes) != source_revision {
         return Err(vec![Diagnostic::error(
             crate::errors::CONCURRENT_MODIFICATION,

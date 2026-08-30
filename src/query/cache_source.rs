@@ -568,10 +568,11 @@ impl Collection {
         profile: bool,
         include_link_graph: bool,
     ) -> Result<(CollectionSnapshot, Option<LoadQueryPerf>), SnapshotError> {
+        let context = crate::runtime::OperationContext::current_or_legacy();
         self.load_query_data_profiled_cancellable(
             profile,
             include_link_graph,
-            &OperationCancellation::new(),
+            context.cancellation(),
         )
     }
 
@@ -659,12 +660,26 @@ impl Collection {
                                 perf.cache_used = true;
                                 cached_records = Some(records);
                             }
+                            Err(CacheError::Cancelled)
+                            | Err(CacheError::Scan(
+                                crate::snapshot::CollectionScanError::Cancelled,
+                            )) => return Err(SnapshotError::Cancelled),
+                            Err(CacheError::Scan(
+                                crate::snapshot::CollectionScanError::Provider(error),
+                            )) => return Err(SnapshotError::Provider(error)),
                             Err(error) => {
                                 perf.cache_fallback = true;
                                 coordinated_cache_error = Some(error.to_string());
                             }
                         }
                     }
+                    Err(CacheError::Cancelled)
+                    | Err(CacheError::Scan(crate::snapshot::CollectionScanError::Cancelled)) => {
+                        return Err(SnapshotError::Cancelled)
+                    }
+                    Err(CacheError::Scan(crate::snapshot::CollectionScanError::Provider(
+                        error,
+                    ))) => return Err(SnapshotError::Provider(error)),
                     Err(error) => {
                         perf.cache_fallback = true;
                         coordinated_cache_error = Some(error.to_string());

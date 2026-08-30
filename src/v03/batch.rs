@@ -43,7 +43,7 @@ pub(crate) fn prepare_single_runtime(
         return prepare_sparse_runtime(collection, operation, input, context);
     }
 
-    let before = collection.snapshot()?;
+    let before = collection.snapshot_with_context(context)?;
     context.check()?;
     let shadow = shadow_collection_context(collection, context)?;
     let typed_operation = operation.parse::<OperationKind>()?;
@@ -74,7 +74,7 @@ pub(crate) fn prepare_single_runtime(
     if desired == shadow.baseline {
         return Ok(RuntimeSinglePreparation::NoMutation(outcome));
     }
-    let after = shadow.collection.snapshot()?;
+    let after = shadow.collection.snapshot_with_context(context)?;
     context.check()?;
     Ok(RuntimeSinglePreparation::Prepared(Box::new(
         RuntimeMutationPlan {
@@ -244,10 +244,9 @@ fn prepare_sparse_runtime(
     } else {
         crate::transactions::FileBaseline::new()
     };
-    if kind != OperationKind::Delete {
-        if let Ok(bytes) = fs::read(collection.root.join(&path)) {
-            baseline.insert(path.clone(), bytes);
-        }
+    if kind != OperationKind::Delete && collection.held_root().exists_file(Path::new(&path)) {
+        let bytes = read_held_bounded(collection, Path::new(&path), context)?;
+        baseline.insert(path.clone(), bytes);
     }
     if kind == OperationKind::Create
         && baseline.contains_key(&path)
@@ -270,7 +269,8 @@ fn prepare_sparse_runtime(
         ));
     }
     let mut desired = crate::transactions::FileBaseline::new();
-    if let Ok(bytes) = fs::read(shadow.collection.root.join(&path)) {
+    if shadow.collection.held_root().exists_file(Path::new(&path)) {
+        let bytes = read_held_bounded(&shadow.collection, Path::new(&path), context)?;
         desired.insert(path.clone(), bytes);
     }
     if baseline == desired {
@@ -319,8 +319,8 @@ fn prepare_sparse_runtime(
     let before = delete_plan
         .as_ref()
         .map(planned_delete_snapshot)
-        .unwrap_or_else(|| targeted_snapshot(collection, &path))?;
-    let after = targeted_snapshot(&shadow.collection, &path)?;
+        .unwrap_or_else(|| targeted_snapshot(collection, &path, context))?;
+    let after = targeted_snapshot(&shadow.collection, &path, context)?;
     context.check()?;
     Ok(RuntimeSinglePreparation::Prepared(Box::new(
         RuntimeMutationPlan {
@@ -429,8 +429,9 @@ fn planned_delete_snapshot(
 fn targeted_snapshot(
     collection: &Collection,
     path: &str,
+    context: &OperationContext,
 ) -> Result<CollectionSnapshot, ProviderError> {
-    let records = match collection.snapshot_record(path) {
+    let records = match collection.snapshot_record_with_context(path, context) {
         Ok(record) => vec![record],
         Err(ProviderError::CollectionOpen(_)) => Vec::new(),
         Err(error) => return Err(error),
@@ -454,13 +455,21 @@ fn sparse_shadow_collection(
     context.check()?;
     let directory =
         tempfile::tempdir().map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-    copy_sparse_controls(collection, directory.path(), context)?;
+    let mut captured_entries = 0_u64;
+    let mut resource_entries = 0_u64;
+    copy_sparse_controls(
+        collection,
+        directory.path(),
+        context,
+        &mut captured_entries,
+        &mut resource_entries,
+    )?;
     let mut baseline = crate::transactions::FileBaseline::new();
     if let Some(target) = target {
-        let source = collection.root.join(target);
-        if source.is_file() {
-            let bytes = fs::read(&source)
-                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+        if collection.held_root().exists_file(Path::new(target)) {
+            captured_entries = checked_capture_increment(captured_entries)?;
+            context.check_entries(captured_entries)?;
+            let bytes = read_held_bounded(collection, Path::new(target), context)?;
             let destination = directory.path().join(target);
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)
@@ -485,11 +494,17 @@ fn copy_sparse_controls(
     collection: &Collection,
     destination: &Path,
     context: &OperationContext,
+    captured_entries: &mut u64,
+    resource_entries: &mut u64,
 ) -> Result<(), ProviderError> {
     for relative in ["mdbase.yaml", "mdbase.lock.yaml"] {
-        let source = collection.root.join(relative);
-        if source.is_file() {
-            fs::copy(&source, destination.join(relative))
+        if collection.held_root().exists_file(Path::new(relative)) {
+            *captured_entries = checked_capture_increment(*captured_entries)?;
+            *resource_entries = checked_capture_increment(*resource_entries)?;
+            context.check_entries(*captured_entries)?;
+            context.check_resource_entries(*resource_entries)?;
+            let bytes = read_held_bounded(collection, Path::new(relative), context)?;
+            fs::write(destination.join(relative), bytes)
                 .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
         }
     }
@@ -514,16 +529,91 @@ fn copy_sparse_controls(
                 fs::create_dir_all(&target)
                     .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
             } else if entry.file_type().is_file() {
+                *captured_entries = checked_capture_increment(*captured_entries)?;
+                *resource_entries = checked_capture_increment(*resource_entries)?;
+                context.check_entries(*captured_entries)?;
+                context.check_resource_entries(*resource_entries)?;
+                context.check_depth(relative.components().count().saturating_sub(1) as u64)?;
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent)
                         .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
                 }
-                fs::copy(entry.path(), &target)
+                let bytes = read_held_bounded(collection, relative, context)?;
+                fs::write(&target, bytes)
                     .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
             }
         }
     }
     Ok(())
+}
+
+fn checked_capture_increment(value: u64) -> Result<u64, ProviderError> {
+    value.checked_add(1).ok_or({
+        ProviderError::CaptureLimitExceeded(crate::runtime::CaptureLimitExceeded {
+            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+            limit: u64::MAX,
+            attempted: u64::MAX,
+        })
+    })
+}
+
+fn read_held_bounded(
+    collection: &Collection,
+    relative: &Path,
+    context: &OperationContext,
+) -> Result<Vec<u8>, ProviderError> {
+    use std::io::Read;
+    context.check()?;
+    let mut file = collection
+        .held_root()
+        .open_file(relative)
+        .map_err(|error| {
+            ProviderError::CollectionOpen(format!(
+                "failed to open '{}': {error}",
+                relative.display()
+            ))
+        })?;
+    let size = file
+        .metadata()
+        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?
+        .len();
+    context.check_file_bytes(size)?;
+    let capacity = usize::try_from(size).map_err(|_| crate::runtime::CaptureLimitExceeded {
+        kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+        limit: usize::MAX as u64,
+        attempted: size,
+    })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| crate::runtime::CaptureLimitExceeded {
+            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+            limit: usize::MAX as u64,
+            attempted: size,
+        })?;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        context.check()?;
+        let read = file
+            .read(&mut chunk)
+            .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        let attempted = (bytes.len() as u64).checked_add(read as u64).ok_or(
+            crate::runtime::CaptureLimitExceeded {
+                kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                limit: u64::MAX,
+                attempted: u64::MAX,
+            },
+        )?;
+        context.check_file_bytes(attempted)?;
+        context.charge_read(read as u64)?;
+        context.charge_retained(read as u64)?;
+        bytes.extend_from_slice(&chunk[..read]);
+        context.check()?;
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn execute_wire_mutation(

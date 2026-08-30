@@ -127,15 +127,16 @@ pub(crate) struct QueryExecution {
 pub(crate) type QueryEvaluation = Result<QueryExecution, Vec<Diagnostic>>;
 
 pub(crate) fn execute_typed(collection: &Collection, query: Query) -> QueryEvaluation {
+    let context = crate::runtime::OperationContext::legacy();
     execute_model_profiled_cancellable(
         collection,
         query,
-        &OperationCancellation::new(),
+        context.cancellation(),
         false,
         Instant::now(),
         0,
     )
-    .expect("a fresh cancellation token cannot be cancelled")
+    .expect("the context-free compatibility context is active")
     .0
 }
 
@@ -237,6 +238,15 @@ pub(crate) fn execute_model_profiled_cancellable(
             )
         };
         cancellation.check()?;
+        if let Some(error) = crate::runtime::OperationContext::current()
+            .and_then(|context| context.capture_limit_error())
+        {
+            finish!(Err(vec![Diagnostic::error(
+                error.code(),
+                error.to_string(),
+                None,
+            )]));
+        }
         if let Some(page) = loaded {
             performance.load_us = micros(phase.elapsed());
             apply_load_performance(&mut performance, &page.performance);

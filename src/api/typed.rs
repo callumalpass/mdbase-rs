@@ -933,6 +933,7 @@ impl<'a> TypedCollection<'a> {
     pub(crate) fn query_runtime(
         &self,
         request: QueryRequest,
+        cancellation: &crate::OperationCancellation,
     ) -> MdbaseResult<OperationOutcome<QueryResult>> {
         let schema_diagnostics = crate::query::canonical::model::validate_typed(&request);
         if !schema_diagnostics.is_empty() {
@@ -947,12 +948,14 @@ impl<'a> TypedCollection<'a> {
         let (evaluation, _) = crate::query::canonical::execute_model_profiled_cancellable(
             self.collection,
             query,
-            &crate::OperationCancellation::new(),
+            cancellation,
             true,
             std::time::Instant::now(),
             0,
         )
-        .expect("a fresh cancellation token cannot be cancelled");
+        .map_err(|_| MdbaseError::InvalidRequest {
+            message: "operation cancelled".to_string(),
+        })?;
         match evaluation {
             Ok(execution) => Ok(OperationOutcome {
                 value: QueryResult {

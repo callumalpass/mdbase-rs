@@ -64,14 +64,34 @@ impl Collection {
     /// Long-running hosts should normally call [`super::FilesystemProvider::snapshot`],
     /// which also holds the provider's read gate for the full capture.
     pub fn snapshot(&self) -> Result<CollectionSnapshot, ProviderError> {
-        Ok(collection_snapshot(self, InvalidRecordPolicy::Strict)?.snapshot)
+        self.snapshot_with_context(&super::OperationContext::legacy())
+    }
+
+    /// Capture with caller-owned cancellation, deadline, and finite budgets.
+    pub fn snapshot_with_context(
+        &self,
+        context: &super::OperationContext,
+    ) -> Result<CollectionSnapshot, ProviderError> {
+        Ok(collection_snapshot(self, InvalidRecordPolicy::Strict, context)?.snapshot)
     }
 
     /// Capture watcher state without changing the public synchronization
     /// contract. Classified invalid records are reported out-of-band so the
     /// watcher can retain prior state; genuine capture failures remain errors.
     pub(crate) fn snapshot_for_watcher(&self) -> Result<WatcherSnapshot, ProviderError> {
-        collection_snapshot(self, InvalidRecordPolicy::Observe)
+        collection_snapshot(
+            self,
+            InvalidRecordPolicy::Observe,
+            &super::OperationContext::legacy(),
+        )
+    }
+
+    #[allow(dead_code)] // watcher command transport does not yet carry contexts
+    pub(crate) fn snapshot_for_watcher_with_context(
+        &self,
+        context: &super::OperationContext,
+    ) -> Result<WatcherSnapshot, ProviderError> {
+        collection_snapshot(self, InvalidRecordPolicy::Observe, context)
     }
 
     /// Materialize one record for provider and synchronization boundaries.
@@ -83,11 +103,20 @@ impl Collection {
     /// wire format. Typed `read` remains strict, but transport layers do not
     /// reimplement parsing policy.
     pub fn snapshot_record(&self, path: &str) -> Result<CollectionSnapshotRecord, ProviderError> {
+        self.snapshot_record_with_context(path, &super::OperationContext::legacy())
+    }
+
+    pub fn snapshot_record_with_context(
+        &self,
+        path: &str,
+        context: &super::OperationContext,
+    ) -> Result<CollectionSnapshotRecord, ProviderError> {
+        context.check()?;
         ensure_safe_relative_path(path, self.spec_profile)
             .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
         let record_path = readable_record_path(self, path)
             .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
-        match load_snapshot_record(self, record_path.as_str())? {
+        match load_snapshot_record(self, record_path.as_str(), context)? {
             SnapshotRecordLoad::Record(record) => Ok(record),
             SnapshotRecordLoad::InvalidUtf8 => Err(ProviderError::CollectionOpen(format!(
                 "collection record '{path}' contains invalid UTF-8"
@@ -113,13 +142,17 @@ enum InvalidRecordPolicy {
 fn collection_snapshot(
     collection: &Collection,
     invalid_policy: InvalidRecordPolicy,
+    context: &super::OperationContext,
 ) -> Result<WatcherSnapshot, ProviderError> {
-    let root = collection.root();
+    context.check()?;
     let authority = collection.held_root();
+    let mut resource_entries = 1_u64;
+    context.check_resource_entries(resource_entries)?;
     let configuration = read_resource_held(
         authority,
         "mdbase.yaml".to_string(),
         CollectionSnapshotResourceKind::Configuration,
+        context,
     )?;
     let mut resources = vec![configuration];
     for path in authority
@@ -128,6 +161,7 @@ fn collection_snapshot(
             ProviderError::CollectionOpen(format!("failed to inspect resources: {error}"))
         })?
     {
+        context.check()?;
         let portable = path.to_string_lossy().replace('\\', "/");
         let kind = if matches!(
             portable.as_str(),
@@ -158,22 +192,33 @@ fn collection_snapshot(
             None
         };
         if let Some(kind) = kind {
-            resources.push(read_resource_held(authority, portable, kind)?);
+            resource_entries =
+                resource_entries
+                    .checked_add(1)
+                    .ok_or(crate::runtime::CaptureLimitExceeded {
+                        kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                        limit: u64::MAX,
+                        attempted: u64::MAX,
+                    })?;
+            context.check_resource_entries(resource_entries)?;
+            resources.push(read_resource_held(authority, portable, kind, context)?);
         }
     }
-    let mut paths = collection
-        .scan_collection_files_checked()
-        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-    paths.sort();
-    let mut records = Vec::with_capacity(paths.len());
+    context.check()?;
+    let paths = collection.scan_collection_relative_paths_context(context)?;
+    context.check()?;
+    let mut records = Vec::new();
+    records
+        .try_reserve(paths.len())
+        .map_err(|_| crate::runtime::CaptureLimitExceeded {
+            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+            limit: usize::MAX as u64,
+            attempted: paths.len() as u64,
+        })?;
     let mut invalid_records = BTreeSet::new();
-    for absolute in paths {
-        let path = absolute
-            .strip_prefix(root)
-            .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        let record = match load_snapshot_record(collection, &path)? {
+    for path in paths {
+        context.check()?;
+        let record = match load_snapshot_record(collection, &path, context)? {
             SnapshotRecordLoad::Record(record) => {
                 if record.frontmatter_error.is_some()
                     && matches!(invalid_policy, InvalidRecordPolicy::Observe)
@@ -215,6 +260,7 @@ fn collection_snapshot(
             records.push(record);
         }
     }
+    context.check()?;
     resources[1..].sort_by(|left, right| left.path.cmp(&right.path));
 
     let spec_version = serde_yaml::from_str::<serde_yaml::Value>(&resources[0].document)
@@ -259,13 +305,10 @@ enum SnapshotRecordLoad {
 fn load_snapshot_record(
     collection: &Collection,
     path: &str,
+    context: &super::OperationContext,
 ) -> Result<SnapshotRecordLoad, ProviderError> {
     let Some(outcome) =
-        crate::record_load::load_record_no_follow(collection, path).map_err(|error| {
-            ProviderError::CollectionOpen(format!(
-                "failed to read collection record '{path}': {error}"
-            ))
-        })?
+        crate::record_load::load_record_no_follow_context(collection, path, context)?
     else {
         return Ok(SnapshotRecordLoad::Absent);
     };
@@ -381,10 +424,57 @@ fn read_resource_held(
     root: &crate::collection_root::CollectionRoot,
     path: String,
     kind: CollectionSnapshotResourceKind,
+    context: &super::OperationContext,
 ) -> Result<CollectionSnapshotResource, ProviderError> {
-    let bytes = root.read(std::path::Path::new(&path)).map_err(|error| {
-        ProviderError::CollectionOpen(format!("failed to read {path}: {error}"))
+    use std::io::Read;
+    context.check()?;
+    let mut file = root
+        .open_file(std::path::Path::new(&path))
+        .map_err(|error| {
+            ProviderError::CollectionOpen(format!("failed to open {path}: {error}"))
+        })?;
+    let size = file
+        .metadata()
+        .map_err(|error| {
+            ProviderError::CollectionOpen(format!("failed to inspect {path}: {error}"))
+        })?
+        .len();
+    context.check_file_bytes(size)?;
+    let capacity = usize::try_from(size).map_err(|_| crate::runtime::CaptureLimitExceeded {
+        kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+        limit: usize::MAX as u64,
+        attempted: size,
     })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| crate::runtime::CaptureLimitExceeded {
+            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+            limit: usize::MAX as u64,
+            attempted: size,
+        })?;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        context.check()?;
+        let read = file.read(&mut chunk).map_err(|error| {
+            ProviderError::CollectionOpen(format!("failed to read {path}: {error}"))
+        })?;
+        if read == 0 {
+            break;
+        }
+        let attempted = (bytes.len() as u64).checked_add(read as u64).ok_or(
+            crate::runtime::CaptureLimitExceeded {
+                kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                limit: u64::MAX,
+                attempted: u64::MAX,
+            },
+        )?;
+        context.check_file_bytes(attempted)?;
+        context.charge_read(read as u64)?;
+        context.charge_retained(read as u64)?;
+        bytes.extend_from_slice(&chunk[..read]);
+        context.check()?;
+    }
     let document = String::from_utf8(bytes.clone()).map_err(|error| {
         ProviderError::CollectionOpen(format!("{path} is not valid UTF-8: {error}"))
     })?;

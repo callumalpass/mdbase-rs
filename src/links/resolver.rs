@@ -215,8 +215,7 @@ impl Collection {
             return serde_json::json!({"error": {"code": "path_traversal", "message": "Link source path is unsafe"}});
         }
 
-        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
-        {
+        let snapshot = match self.capture_collection_snapshot_current() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return crate::errors::op_error("collection_snapshot_failed", &error.to_string())

@@ -275,7 +275,7 @@ impl Collection {
             && (has_generated
                 || (validate_collection && self.settings.default_validation == "error"))
         {
-            match self.capture_collection_snapshot(&crate::OperationCancellation::new()) {
+            match self.capture_collection_snapshot_current() {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) => {
                     return Err(crate::mutation::MutationFailure::operation(

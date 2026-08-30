@@ -151,7 +151,9 @@ impl FilesystemProvider {
         &self,
         context: &OperationContext,
     ) -> Result<CollectionSnapshot, ProviderError> {
-        self.with_collection_read_context(context, Collection::snapshot)
+        self.with_collection_read_context(context, |collection| {
+            collection.snapshot_with_context(context)
+        })
     }
 
     /// Materialize one record at the provider's read boundary.
@@ -165,7 +167,9 @@ impl FilesystemProvider {
         path: &str,
         context: &OperationContext,
     ) -> Result<CollectionSnapshotRecord, ProviderError> {
-        self.with_collection_read_context(context, |collection| collection.snapshot_record(path))
+        self.with_collection_read_context(context, |collection| {
+            collection.snapshot_record_with_context(path, context)
+        })
     }
 
     /// Execute a compound provider operation against one freshly loaded
@@ -196,7 +200,7 @@ impl FilesystemProvider {
         context.check().map_err(E::from)?;
         let collection = self.current_collection().map_err(E::from)?;
         context.check().map_err(E::from)?;
-        let result = operation(collection.as_ref())?;
+        let result = context.scope(|| operation(collection.as_ref()))?;
         context.check().map_err(E::from)?;
         Ok(result)
     }
@@ -219,7 +223,7 @@ impl FilesystemProvider {
         context.check().map_err(E::from)?;
         let collection = self.current_collection().map_err(E::from)?;
         context.check().map_err(E::from)?;
-        operation(collection.as_ref())
+        context.scope(|| operation(collection.as_ref()))
     }
 
     /// Execute a compound read-only provider operation while allowing other
@@ -247,7 +251,7 @@ impl FilesystemProvider {
         context.check().map_err(E::from)?;
         let collection = self.current_collection().map_err(E::from)?;
         context.check().map_err(E::from)?;
-        let result = operation(collection.as_ref())?;
+        let result = context.scope(|| operation(collection.as_ref()))?;
         context.check().map_err(E::from)?;
         Ok(result)
     }
@@ -299,21 +303,45 @@ impl FilesystemProvider {
         timings.open = open_started.elapsed();
         context.check()?;
         let execute_started = Instant::now();
-        let result =
-            match execute_collection(collection.as_ref(), request, context, self.coordinated) {
-                Ok(result) => result,
-                Err(error) => {
-                    timings.execute = execute_started.elapsed();
-                    return Err(self.finish_provider_error(
-                        request.operation.as_str(),
-                        "execute",
-                        started,
-                        timings,
-                        error,
-                    ));
-                }
-            };
+        let result = match context
+            .scope(|| execute_collection(collection.as_ref(), request, context, self.coordinated))
+        {
+            Ok(result) => result,
+            Err(error) => {
+                timings.execute = execute_started.elapsed();
+                return Err(self.finish_provider_error(
+                    request.operation.as_str(),
+                    "execute",
+                    started,
+                    timings,
+                    error,
+                ));
+            }
+        };
         timings.execute = execute_started.elapsed();
+        if let Some(error) = context.capture_limit_error() {
+            return Err(self.finish_provider_error(
+                request.operation.as_str(),
+                "execute",
+                started,
+                timings,
+                error,
+            ));
+        }
+        if request.operation == OperationKind::Query {
+            let records = result
+                .result
+                .get("results")
+                .and_then(Value::as_array)
+                .filter(|records| !records.is_empty());
+            if let Some(records) = records {
+                let bytes = super::cursor::measured_json_bytes(
+                    records,
+                    context.capture_limits().max_retained_bytes,
+                )?;
+                context.charge_retained(bytes)?;
+            }
+        }
         if !request.operation.is_mutation() {
             context.check()?;
         }

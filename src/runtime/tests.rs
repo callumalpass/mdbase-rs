@@ -34,6 +34,211 @@ fn collection() -> tempfile::TempDir {
     directory
 }
 
+#[test]
+fn authority_capture_sources_reject_fresh_tokens_and_unbounded_reads() {
+    let sources = [
+        ("snapshot", include_str!("../snapshot.rs")),
+        ("discovery", include_str!("../snapshot/discovery.rs")),
+        ("record_load", include_str!("../record_load.rs")),
+        ("runtime_snapshot", include_str!("snapshot.rs")),
+        ("mutation_shadow", include_str!("../mutation/shadow.rs")),
+        (
+            "mutation_preparation",
+            include_str!("../mutation/preparation.rs"),
+        ),
+        ("mutation_batch", include_str!("../mutation/batch.rs")),
+        ("runtime_batch", include_str!("../v03/batch.rs")),
+        ("links", include_str!("../links/traversal.rs")),
+        ("validation", include_str!("../validation/validator.rs")),
+        ("backfill", include_str!("../operations/backfill.rs")),
+    ];
+    for (name, source) in sources {
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            !production.contains("OperationCancellation::new()"),
+            "{name}"
+        );
+        assert!(!production.contains("fs::read("), "{name}");
+        assert!(!production.contains("fs::read_to_string("), "{name}");
+        assert!(!production.contains("collection.snapshot()"), "{name}");
+        assert!(
+            !production.contains("shadow.collection.snapshot()"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn provider_capture_limits_are_exact_and_never_publish_partial_snapshots() {
+    let directory = collection();
+    let config = fs::read(directory.path().join("mdbase.yaml")).unwrap();
+    let record = b"---\ntitle: bounded\n---\nbody\n";
+    fs::write(directory.path().join("bounded.md"), record).unwrap();
+    let provider = FilesystemProvider::open(directory.path()).unwrap();
+    let total = (config.len() + record.len()) as u64;
+    let limits = CaptureLimits::builder()
+        .max_entries(1)
+        .max_resource_entries(1)
+        .max_file_bytes(config.len().max(record.len()) as u64)
+        .max_aggregate_bytes(total)
+        .max_retained_bytes(total)
+        .build();
+    let context = OperationContext::with_capture_limits(
+        &crate::OperationCancellation::new(),
+        OperationDeadline::after(Duration::from_secs(1)),
+        limits,
+    );
+    let snapshot = provider.snapshot_with_context(&context).unwrap();
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(snapshot.resources.len(), 1);
+
+    let too_small = CaptureLimits::builder()
+        .max_entries(1)
+        .max_resource_entries(1)
+        .max_file_bytes(config.len().max(record.len()) as u64)
+        .max_aggregate_bytes(total - 1)
+        .max_retained_bytes(total)
+        .build();
+    let context = OperationContext::with_capture_limits(
+        &crate::OperationCancellation::new(),
+        OperationDeadline::after(Duration::from_secs(1)),
+        too_small,
+    );
+    assert!(matches!(
+        provider.snapshot_with_context(&context),
+        Err(ProviderError::CaptureLimitExceeded(CaptureLimitExceeded {
+            kind: CaptureLimitKind::AggregateBytes,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn provider_capture_rejects_oversized_single_record_and_entry_boundary() {
+    let directory = collection();
+    fs::write(directory.path().join("large.md"), vec![b'x'; 128]).unwrap();
+    let provider = FilesystemProvider::open(directory.path()).unwrap();
+    let limits = CaptureLimits::builder()
+        .max_entries(1)
+        .max_file_bytes(127)
+        .build();
+    let context = OperationContext::with_capture_limits(
+        &crate::OperationCancellation::new(),
+        OperationDeadline::after(Duration::from_secs(1)),
+        limits,
+    );
+    assert!(matches!(
+        provider.snapshot_with_context(&context),
+        Err(ProviderError::CaptureLimitExceeded(CaptureLimitExceeded {
+            kind: CaptureLimitKind::FileBytes,
+            limit: 127,
+            attempted: 128
+        }))
+    ));
+
+    let limits = CaptureLimits::builder().max_entries(0).build();
+    let context = OperationContext::with_capture_limits(
+        &crate::OperationCancellation::new(),
+        OperationDeadline::after(Duration::from_secs(1)),
+        limits,
+    );
+    assert!(matches!(
+        provider.snapshot_with_context(&context),
+        Err(ProviderError::CaptureLimitExceeded(CaptureLimitExceeded {
+            kind: CaptureLimitKind::Entries,
+            limit: 0,
+            attempted: 1
+        }))
+    ));
+}
+
+#[test]
+fn query_capture_limit_is_terminal_before_cache_fallback_and_scans_once() {
+    let directory = collection();
+    fs::write(
+        directory.path().join("bounded.md"),
+        "---\ntitle: bounded\n---\n",
+    )
+    .unwrap();
+    let provider = FilesystemProvider::open(directory.path()).unwrap();
+    let request = OperationRequest::new(OperationKind::Query, json!({}));
+
+    for cache_state in ["missing", "warmed"] {
+        if cache_state == "warmed" {
+            provider.execute(&request).unwrap();
+        } else {
+            let _ = fs::remove_dir_all(directory.path().join(".mdbase/cache"));
+        }
+        crate::reset_snapshot_scan_calls_for_test();
+        let limits = CaptureLimits::builder().max_entries(0).build();
+        let context = OperationContext::with_capture_limits(
+            &crate::OperationCancellation::new(),
+            OperationDeadline::after(Duration::from_secs(2)),
+            limits,
+        );
+        assert!(matches!(
+            provider.execute_with_context(&request, &context),
+            Err(ProviderError::CaptureLimitExceeded(CaptureLimitExceeded {
+                kind: CaptureLimitKind::Entries,
+                limit: 0,
+                attempted: 1,
+            }))
+        ));
+        assert_eq!(
+            crate::snapshot_scan_calls_for_test(),
+            1,
+            "{cache_state} cache must not trigger a fallback scan"
+        );
+    }
+}
+
+#[test]
+fn zero_retained_bytes_rejects_nonempty_regular_and_cache_backed_queries() {
+    let directory = collection();
+    fs::write(
+        directory.path().join("bounded.md"),
+        "---\ntitle: bounded\n---\n",
+    )
+    .unwrap();
+    let provider = FilesystemProvider::open(directory.path()).unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    let request = OperationRequest::new(OperationKind::Query, json!({}));
+    let provider_context = OperationContext::with_capture_limits(
+        &crate::OperationCancellation::new(),
+        OperationDeadline::after(Duration::from_secs(2)),
+        CaptureLimits::builder().max_retained_bytes(0).build(),
+    );
+    assert!(matches!(
+        provider.execute_with_context(&request, &provider_context),
+        Err(ProviderError::CaptureLimitExceeded(CaptureLimitExceeded {
+            kind: CaptureLimitKind::RetainedBytes,
+            limit: 0,
+            ..
+        }))
+    ));
+
+    for paged in [false, true] {
+        let context = OperationContext::with_capture_limits(
+            &crate::OperationCancellation::new(),
+            OperationDeadline::after(Duration::from_secs(2)),
+            CaptureLimits::builder().max_retained_bytes(0).build(),
+        );
+        let result = if paged {
+            runtime.open_read(&request, &context).map(|_| ())
+        } else {
+            runtime.read(&request, &context).map(|_| ())
+        };
+        assert!(matches!(
+            result,
+            Err(ProviderError::CaptureLimitExceeded(CaptureLimitExceeded {
+                kind: CaptureLimitKind::RetainedBytes,
+                limit: 0,
+                ..
+            }))
+        ));
+    }
+}
+
 fn runtime_query_paths(runtime: &FilesystemRuntime) -> BTreeSet<String> {
     let outcome = runtime
         .read(

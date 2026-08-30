@@ -212,11 +212,69 @@ pub(crate) fn snapshot_resolved_projections_for_test() -> usize {
 }
 
 impl Collection {
+    /// Capture using the caller runtime context when present, otherwise the
+    /// finite compatibility context owned by a context-free API.
+    pub(crate) fn capture_collection_snapshot_current(
+        &self,
+    ) -> Result<AuthoritativeCollectionSnapshot, SnapshotError> {
+        let context = crate::runtime::OperationContext::current_or_legacy();
+        self.capture_collection_snapshot_context(&context)
+    }
+
+    /// Budgeted authoritative capture used by runtime/canonical paths.
+    pub(crate) fn capture_collection_snapshot_context(
+        &self,
+        context: &crate::runtime::OperationContext,
+    ) -> Result<AuthoritativeCollectionSnapshot, SnapshotError> {
+        context.check()?;
+        let paths = self.scan_collection_all_relative_paths_context(context)?;
+        context.check()?;
+        let mut entries = Vec::new();
+        entries.try_reserve(paths.len()).map_err(|_| {
+            crate::runtime::ProviderError::from(crate::runtime::CaptureLimitExceeded {
+                kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                limit: usize::MAX as u64,
+                attempted: paths.len() as u64,
+            })
+        })?;
+        for relative_path in &paths {
+            context.check()?;
+            if self.validate_record_path(relative_path).is_err() {
+                continue;
+            }
+            let display_path = self.root.join(relative_path);
+            let outcome =
+                crate::record_load::load_record_no_follow_context(self, relative_path, context)?
+                    .ok_or_else(|| SnapshotError::Unavailable {
+                        collection_path: relative_path.clone(),
+                        filesystem_path: display_path,
+                    })?;
+            entries.push(AuthoritativeCollectionSnapshotEntry { outcome });
+            context.check()?;
+        }
+        context.check()?;
+        let path_to_index = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.relative_path().to_string(), index))
+            .collect();
+        Ok(AuthoritativeCollectionSnapshot {
+            entries,
+            path_to_index,
+            known_file_paths: paths,
+        })
+    }
+
     /// Discover, no-follow open, read, and classify every record exactly once.
+    /// This is a compatibility seam; runtime callers use the context variant.
+    #[allow(dead_code)] // retained for explicit-token compatibility and cancellation tests
     pub(crate) fn capture_collection_snapshot(
         &self,
         cancellation: &OperationCancellation,
     ) -> Result<AuthoritativeCollectionSnapshot, SnapshotError> {
+        if let Some(context) = crate::runtime::OperationContext::current() {
+            return self.capture_collection_snapshot_context(&context);
+        }
         cancellation.check().map_err(|_| SnapshotError::Cancelled)?;
         let paths = self.scan_collection_all_relative_paths_checked_cancellable(cancellation)?;
         let mut entries = Vec::new();
@@ -269,6 +327,8 @@ impl Collection {
 pub(crate) enum CollectionScanError {
     #[error("collection operation cancelled")]
     Cancelled,
+    #[error(transparent)]
+    Provider(#[from] crate::runtime::ProviderError),
     #[error("failed to read collection directory '{}': {source}", path.display())]
     ReadDirectory {
         path: PathBuf,
@@ -370,6 +430,8 @@ impl CollectionSnapshotError {
 pub(crate) enum SnapshotError {
     #[error("collection operation cancelled")]
     Cancelled,
+    #[error(transparent)]
+    Provider(#[from] crate::runtime::ProviderError),
     #[error("coordinated runtime cache is unavailable: {0}")]
     Cache(String),
     #[error(transparent)]
@@ -381,6 +443,7 @@ pub(crate) enum SnapshotError {
     #[error(
         "discovered collection record is no longer an available regular file: {collection_path}"
     )]
+    #[allow(dead_code)] // explicit-token compatibility capture can still classify this race
     Unavailable {
         collection_path: String,
         filesystem_path: PathBuf,
@@ -410,7 +473,11 @@ impl SnapshotError {
 
     pub(crate) fn path(&self) -> Option<&Path> {
         match self {
-            Self::Cancelled | Self::Cache(_) | Self::Scan(CollectionScanError::Cancelled) => None,
+            Self::Cancelled
+            | Self::Provider(_)
+            | Self::Cache(_)
+            | Self::Scan(CollectionScanError::Cancelled)
+            | Self::Scan(CollectionScanError::Provider(_)) => None,
             Self::Scan(CollectionScanError::ReadDirectory { path, .. })
             | Self::Scan(CollectionScanError::InspectEntry { path, .. })
             | Self::Scan(CollectionScanError::NonUtf8Path { path })
@@ -431,6 +498,7 @@ impl From<CollectionScanError> for SnapshotError {
     fn from(error: CollectionScanError) -> Self {
         match error {
             CollectionScanError::Cancelled => Self::Cancelled,
+            CollectionScanError::Provider(error) => Self::Provider(error),
             CollectionScanError::NonUtf8Path { path } => Self::NonUtf8Path { path },
             other => Self::Scan(other),
         }
@@ -443,6 +511,13 @@ impl From<SnapshotError> for CollectionSnapshotError {
             SnapshotError::Cancelled | SnapshotError::Scan(CollectionScanError::Cancelled) => {
                 Self::Cancelled
             }
+            SnapshotError::Provider(crate::runtime::ProviderError::OperationCancelled)
+            | SnapshotError::Provider(crate::runtime::ProviderError::OperationDeadline) => {
+                Self::Cancelled
+            }
+            SnapshotError::Provider(error) => Self::CacheUnavailable {
+                reason: error.to_string(),
+            },
             SnapshotError::Scan(CollectionScanError::ReadDirectory { path, source }) => {
                 Self::Discovery {
                     filesystem_path: path,
@@ -471,6 +546,9 @@ impl From<SnapshotError> for CollectionSnapshotError {
                 cause: CollectionDiscoveryCause::OutsideRoot,
             },
             SnapshotError::Cache(reason) => Self::CacheUnavailable { reason },
+            SnapshotError::Scan(CollectionScanError::Provider(error)) => Self::CacheUnavailable {
+                reason: error.to_string(),
+            },
             SnapshotError::Unavailable {
                 collection_path,
                 filesystem_path,

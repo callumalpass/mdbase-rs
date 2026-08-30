@@ -532,9 +532,7 @@ impl Collection {
             }
         }
 
-        let collection_snapshot = match self
-            .capture_collection_snapshot(&crate::OperationCancellation::new())
-        {
+        let collection_snapshot = match self.capture_collection_snapshot_current() {
             Ok(snapshot) => snapshot,
             Err(error)
                 if path

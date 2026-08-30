@@ -1,6 +1,6 @@
 {
   "rustSourceFileCountMax": 172,
-  "rustSourceLineCountMax": 93679,
+  "rustSourceLineCountMax": 94955,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-command/src/lib.rs": 1816,
@@ -11,15 +11,15 @@
     "src/expressions/evaluator.rs": 3390,
     "src/links/resolver.rs": 1040,
     "src/query/engine.rs": 1086,
-    "src/runtime/filesystem.rs": 1333,
+    "src/runtime/filesystem.rs": 1368,
     "src/runtime/hosted_base.rs": 1943,
     "src/runtime/hosted_mutation.rs": 1200,
     "src/runtime/hosted_query.rs": 3400,
     "src/runtime/hosted_resource.rs": 1040,
-    "src/runtime/tests.rs": 4098,
+    "src/runtime/tests.rs": 4303,
     "src/transactions.rs": 1029,
     "src/transactions/runtime.rs": 1296,
-    "src/v03/batch.rs": 1377,
+    "src/v03/batch.rs": 1467,
     "src/v03/collection_setup.rs": 1479,
     "src/v03/type_pack.rs": 2110,
     "src/views/execute.rs": 1376,
@@ -34,6 +34,9 @@
     "src/matching/engine.rs": 1,
     "src/runtime/outcome.rs": 2,
     "src/runtime/provider.rs": 2,
+    "src/runtime/snapshot.rs": 1,
+    "src/snapshot.rs": 2,
+    "src/snapshot/discovery.rs": 1,
     "src/cel.rs": 2
   },
   "transitionalReferenceBudgets": {

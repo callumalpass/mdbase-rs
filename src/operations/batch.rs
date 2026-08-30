@@ -113,8 +113,7 @@ impl Collection {
         }
 
         // Select and preflight from one authoritative generation.
-        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
-        {
+        let snapshot = match self.capture_collection_snapshot_current() {
             Ok(snapshot) => snapshot,
             Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
         };
@@ -364,8 +363,7 @@ impl Collection {
             }
         }
 
-        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
-        {
+        let snapshot = match self.capture_collection_snapshot_current() {
             Ok(snapshot) => snapshot,
             Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
         };
@@ -583,8 +581,7 @@ impl Collection {
             return op_error("invalid_input", "batch_delete requires 'where'");
         }
 
-        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
-        {
+        let snapshot = match self.capture_collection_snapshot_current() {
             Ok(snapshot) => snapshot,
             Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
         };

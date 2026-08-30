@@ -149,7 +149,7 @@ pub(crate) fn prepare_runtime_batch(
             request.dry_run,
         )));
     }
-    let before = collection.snapshot()?;
+    let before = collection.snapshot_with_context(context)?;
     context.check()?;
     let shadow = super::shadow_collection_context(collection, context)?;
     let mut execution = execute_items(
@@ -165,7 +165,7 @@ pub(crate) fn prepare_runtime_batch(
     }
     context.check()?;
     let desired = super::collect_collection_files_context(&shadow.collection, context)?;
-    let after = shadow.collection.snapshot()?;
+    let after = shadow.collection.snapshot_with_context(context)?;
     execution.result.preflight = false;
     context.check()?;
     Ok(RuntimeBatchPreparation::Prepared(Box::new(

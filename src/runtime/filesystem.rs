@@ -11,13 +11,13 @@ use sha2::{Digest, Sha256};
 use super::diff::canonical_changes;
 use super::observer::NoopObserver;
 use super::{
-    CancelOutcome, CanonicalOperationOutcome, ChangeBatch, ChangeEventIdentity, ChangeFeed,
-    ChangeFeedBaseline, ChangeFeedOwnerId, ChangeFeedTransfer, ChangeFeedTransferId,
-    ChangeFeedTransferIntent, ChangePage, ChangePageCursor, ChangeSet, ChangeWatermark,
-    CollectionGeneration, CommitAttempt, CommitId, CommitRejection, DurableCommitState,
-    ExecutionOutcome, FilesystemProvider, HostClaimId, ObserverOptions, OperationContext,
-    OperationRequest, PreparationOutcome, PreparedMutation, ProviderError, ReadCursor, ReadPage,
-    RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeObserver,
+    CancelOutcome, CanonicalOperationOutcome, CanonicalOperationValue, ChangeBatch,
+    ChangeEventIdentity, ChangeFeed, ChangeFeedBaseline, ChangeFeedOwnerId, ChangeFeedTransfer,
+    ChangeFeedTransferId, ChangeFeedTransferIntent, ChangePage, ChangePageCursor, ChangeSet,
+    ChangeWatermark, CollectionGeneration, CommitAttempt, CommitId, CommitRejection,
+    DurableCommitState, ExecutionOutcome, FilesystemProvider, HostClaimId, ObserverOptions,
+    OperationContext, OperationRequest, PreparationOutcome, PreparedMutation, ProviderError,
+    ReadCursor, ReadPage, RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeObserver,
 };
 use crate::transactions::{
     self, RuntimeCommitAttempt, RuntimePrepareOutcome, RuntimeResolution, TransactionError,
@@ -214,6 +214,15 @@ impl FilesystemRuntime {
         request: &OperationRequest,
         context: &OperationContext,
     ) -> Result<ExecutionOutcome, ProviderError> {
+        self.read_with_result_charge(request, context, true)
+    }
+
+    fn read_with_result_charge(
+        &self,
+        request: &OperationRequest,
+        context: &OperationContext,
+        charge_query_result: bool,
+    ) -> Result<ExecutionOutcome, ProviderError> {
         if request.operation.is_mutation() {
             return Err(ProviderError::UnsupportedOperation(
                 "read requires a non-mutation operation".to_string(),
@@ -226,7 +235,7 @@ impl FilesystemRuntime {
             super::OperationKind::Read | super::OperationKind::Query => self
                 .provider
                 .with_collection_read_context(context, |collection| {
-                    Ok::<_, ProviderError>(execute_typed_read_operation(collection, request))
+                    execute_typed_read_operation(collection, request, context)
                 })?,
             _ => {
                 let result = self
@@ -236,6 +245,9 @@ impl FilesystemRuntime {
             }
         };
         let generation = self.current_generation()?;
+        if charge_query_result {
+            charge_returned_query(&operation, context)?;
+        }
         Ok(ExecutionOutcome::new(
             operation,
             generation,
@@ -265,7 +277,7 @@ impl FilesystemRuntime {
         if let Some(input) = expanded.input.as_object_mut() {
             input.remove("limit");
         }
-        let outcome = self.read(&expanded, context)?;
+        let outcome = self.read_with_result_charge(&expanded, context, false)?;
         self.cursor_lock(context)?
             .open(outcome, page_items, context)
     }
@@ -1191,12 +1203,13 @@ fn synchronize_known_shared(
 fn execute_typed_read_operation(
     collection: &crate::Collection,
     request: &OperationRequest,
-) -> CanonicalOperationOutcome {
+    context: &OperationContext,
+) -> Result<CanonicalOperationOutcome, ProviderError> {
     let typed = match collection.typed() {
         Ok(typed) => typed,
-        Err(error) => return CanonicalOperationOutcome::failure(request.operation, error),
+        Err(error) => return Ok(CanonicalOperationOutcome::failure(request.operation, error)),
     };
-    match request.operation {
+    let operation = match request.operation {
         super::OperationKind::Read => {
             match serde_json::from_value::<crate::api::ReadRequest>(request.input.clone()) {
                 Ok(request) => typed
@@ -1216,7 +1229,7 @@ fn execute_typed_read_operation(
         super::OperationKind::Query => {
             match crate::api::QueryRequest::decode_wire(request.input.clone()) {
                 Ok(request) => typed
-                    .query_runtime(request)
+                    .query_runtime(request, context.cancellation())
                     .map(CanonicalOperationOutcome::query)
                     .unwrap_or_else(|error| {
                         CanonicalOperationOutcome::failure(super::OperationKind::Query, error)
@@ -1230,7 +1243,29 @@ fn execute_typed_read_operation(
             }
         }
         _ => unreachable!("only migrated read operations use the typed read executor"),
+    };
+    if let Some(error) = context.capture_limit_error() {
+        return Err(error);
     }
+    context.check()?;
+    Ok(operation)
+}
+
+fn charge_returned_query(
+    operation: &CanonicalOperationOutcome,
+    context: &OperationContext,
+) -> Result<(), ProviderError> {
+    let CanonicalOperationValue::Query(Some(query)) = &operation.value else {
+        return Ok(());
+    };
+    if query.records.is_empty() {
+        return Ok(());
+    }
+    let bytes = super::cursor::measured_json_bytes(
+        &query.records,
+        context.capture_limits().max_retained_bytes,
+    )?;
+    context.charge_retained(bytes)
 }
 
 fn mutation_digest(request: &OperationRequest) -> Result<String, ProviderError> {

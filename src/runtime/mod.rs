@@ -50,7 +50,10 @@ pub use canonical_operation::{
 pub use catalog::{
     CanonicalRecordInput, CatalogError, CatalogInput, CompiledCatalog, ResolvedTypeResource,
 };
-pub use context::{OperationContext, OperationDeadline};
+pub use context::{
+    CaptureLimitExceeded, CaptureLimitKind, CaptureLimits, CaptureLimitsBuilder, OperationContext,
+    OperationDeadline,
+};
 pub use filesystem::FilesystemRuntime;
 pub use hosted_base::{
     HostedBaseEvaluation, HostedBaseGroupAccumulator, HostedBasePlan, HostedBasePlanning,
@@ -136,6 +139,8 @@ pub enum ProviderError {
     OperationCancelled,
     #[error("collection operation deadline elapsed before its durable boundary")]
     OperationDeadline,
+    #[error(transparent)]
+    CaptureLimitExceeded(#[from] CaptureLimitExceeded),
     #[error("collection generation sequence is exhausted")]
     GenerationExhausted,
     #[error("collection change watermark is exhausted")]
@@ -180,6 +185,7 @@ impl ProviderError {
             Self::LockPoisoned => "operation_lock_unavailable",
             Self::OperationCancelled => "operation_cancelled",
             Self::OperationDeadline => "operation_deadline",
+            Self::CaptureLimitExceeded(_) => "capture_limit_exceeded",
             Self::GenerationExhausted => "generation_exhausted",
             Self::WatermarkExhausted => "change_watermark_exhausted",
             Self::InvalidChangeSet(_) => "invalid_change_set",

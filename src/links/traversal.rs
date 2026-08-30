@@ -1,6 +1,6 @@
 //! asFile() traversal (§8.7).
 
-use crate::{Collection, CollectionSnapshotError, OperationCancellation};
+use crate::{Collection, CollectionSnapshotError};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -32,7 +32,7 @@ impl Collection {
     pub fn build_all_files_data(
         &self,
     ) -> Result<Vec<crate::expressions::evaluator::ResolvedFileData>, CollectionSnapshotError> {
-        self.capture_collection_snapshot(&OperationCancellation::new())
+        self.capture_collection_snapshot_current()
             .map(|snapshot| snapshot.resolved_files_data())
             .map_err(CollectionSnapshotError::from)
     }

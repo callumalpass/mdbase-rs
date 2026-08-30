@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use crate::diagnostic::Diagnostic;
@@ -79,6 +80,7 @@ fn copy_collection(
     context: Option<&OperationContext>,
 ) -> Result<crate::transactions::FileBaseline, RuntimeBatchError> {
     let mut baseline = BTreeMap::new();
+    let mut captured_entries = 0_u64;
     let files = collection
         .held_root()
         .files_recursive(Path::new(""))
@@ -94,15 +96,25 @@ fn copy_collection(
         {
             continue;
         }
+        if let Some(context) = context {
+            captured_entries = captured_entries.checked_add(1).ok_or({
+                RuntimeBatchError::Provider(ProviderError::CaptureLimitExceeded(
+                    crate::runtime::CaptureLimitExceeded {
+                        kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                        limit: u64::MAX,
+                        attempted: u64::MAX,
+                    },
+                ))
+            })?;
+            charge_capture_path(context, &relative, captured_entries)?;
+        }
         let target = destination.join(&relative);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 RuntimeBatchError::Diagnostic(Box::new(copy_error(&relative, error)))
             })?;
         }
-        let bytes = collection.held_root().read(&relative).map_err(|error| {
-            RuntimeBatchError::Diagnostic(Box::new(copy_error(&relative, error)))
-        })?;
+        let bytes = read_capture_file(collection, &relative, context)?;
         fs::write(&target, &bytes).map_err(|error| {
             RuntimeBatchError::Diagnostic(Box::new(copy_error(&relative, error)))
         })?;
@@ -139,6 +151,7 @@ fn collect_collection_files_inner(
     context: Option<&OperationContext>,
 ) -> Result<crate::transactions::FileBaseline, RuntimeBatchError> {
     let mut files = BTreeMap::new();
+    let mut captured_entries = 0_u64;
     let paths = collection
         .held_root()
         .files_recursive(Path::new(""))
@@ -152,13 +165,114 @@ fn collect_collection_files_inner(
         if should_copy_file(collection, &relative)
             && !below_nested_collection(collection, &relative)
         {
-            let bytes = collection.held_root().read(&relative).map_err(|error| {
-                RuntimeBatchError::Diagnostic(Box::new(copy_error(&relative, error)))
-            })?;
+            if let Some(context) = context {
+                captured_entries = captured_entries.checked_add(1).ok_or({
+                    RuntimeBatchError::Provider(ProviderError::CaptureLimitExceeded(
+                        crate::runtime::CaptureLimitExceeded {
+                            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                            limit: u64::MAX,
+                            attempted: u64::MAX,
+                        },
+                    ))
+                })?;
+                charge_capture_path(context, &relative, captured_entries)?;
+            }
+            let bytes = read_capture_file(collection, &relative, context)?;
             files.insert(portable_path(&relative), bytes);
         }
     }
     Ok(files)
+}
+
+fn charge_capture_path(
+    context: &OperationContext,
+    path: &Path,
+    captured_entries: u64,
+) -> Result<(), RuntimeBatchError> {
+    context.check().map_err(RuntimeBatchError::Provider)?;
+    context
+        .check_entries(captured_entries)
+        .map_err(RuntimeBatchError::Provider)?;
+    let depth = path.components().count().saturating_sub(1) as u64;
+    context
+        .check_depth(depth)
+        .map_err(RuntimeBatchError::Provider)
+}
+
+fn read_capture_file(
+    collection: &Collection,
+    relative: &Path,
+    context: Option<&OperationContext>,
+) -> Result<Vec<u8>, RuntimeBatchError> {
+    let mut file = collection
+        .held_root()
+        .open_file(relative)
+        .map_err(|error| RuntimeBatchError::Diagnostic(Box::new(copy_error(relative, error))))?;
+    if context.is_none() {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|error| {
+            RuntimeBatchError::Diagnostic(Box::new(copy_error(relative, error)))
+        })?;
+        return Ok(bytes);
+    }
+    let context = context.unwrap();
+    let size = file
+        .metadata()
+        .map_err(|error| RuntimeBatchError::Diagnostic(Box::new(copy_error(relative, error))))?
+        .len();
+    context
+        .check_file_bytes(size)
+        .map_err(RuntimeBatchError::Provider)?;
+    let capacity = usize::try_from(size).map_err(|_| {
+        RuntimeBatchError::Provider(ProviderError::CaptureLimitExceeded(
+            crate::runtime::CaptureLimitExceeded {
+                kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                limit: usize::MAX as u64,
+                attempted: size,
+            },
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|_| {
+        RuntimeBatchError::Provider(ProviderError::CaptureLimitExceeded(
+            crate::runtime::CaptureLimitExceeded {
+                kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                limit: usize::MAX as u64,
+                attempted: size,
+            },
+        ))
+    })?;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        context.check().map_err(RuntimeBatchError::Provider)?;
+        let read = file.read(&mut chunk).map_err(|error| {
+            RuntimeBatchError::Diagnostic(Box::new(copy_error(relative, error)))
+        })?;
+        if read == 0 {
+            break;
+        }
+        let attempted = (bytes.len() as u64).checked_add(read as u64).ok_or({
+            RuntimeBatchError::Provider(ProviderError::CaptureLimitExceeded(
+                crate::runtime::CaptureLimitExceeded {
+                    kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                    limit: u64::MAX,
+                    attempted: u64::MAX,
+                },
+            ))
+        })?;
+        context
+            .check_file_bytes(attempted)
+            .map_err(RuntimeBatchError::Provider)?;
+        context
+            .charge_read(read as u64)
+            .map_err(RuntimeBatchError::Provider)?;
+        context
+            .charge_retained(read as u64)
+            .map_err(RuntimeBatchError::Provider)?;
+        bytes.extend_from_slice(&chunk[..read]);
+        context.check().map_err(RuntimeBatchError::Provider)?;
+    }
+    Ok(bytes)
 }
 
 fn below_nested_collection(collection: &Collection, path: &Path) -> bool {

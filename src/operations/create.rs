@@ -148,7 +148,7 @@ impl Collection {
             })
         });
         let operation_snapshot = if has_generated || self.settings.default_validation == "error" {
-            match self.capture_collection_snapshot(&crate::OperationCancellation::new()) {
+            match self.capture_collection_snapshot_current() {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) => {
                     return Err(crate::mutation::MutationFailure::operation(
