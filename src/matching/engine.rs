@@ -436,6 +436,13 @@ use crate::Collection;
 impl Collection {
     /// Check if a path is excluded from the collection.
     pub(crate) fn is_excluded(&self, rel_path: &str) -> bool {
+        self.is_excluded_without_nested_collection(rel_path)
+            || self.is_in_nested_collection(rel_path)
+    }
+
+    /// Apply lexical/configured exclusions when traversal has already fenced
+    /// nested collections using the currently opened descendant handle.
+    pub(crate) fn is_excluded_without_nested_collection(&self, rel_path: &str) -> bool {
         // Check types folder
         if rel_path.starts_with(&format!("{}/", self.settings.types_folder))
             || rel_path == self.settings.types_folder
@@ -488,13 +495,6 @@ impl Collection {
             return true;
         }
 
-        // Check nested collection boundary (§2.8)
-        // If any parent directory of this path contains mdbase.yaml,
-        // the file is inside a nested collection and not part of this one.
-        if self.is_in_nested_collection(rel_path) {
-            return true;
-        }
-
         false
     }
 
@@ -522,8 +522,8 @@ impl Collection {
         // Check each parent directory component (not the file itself)
         for component in path.parent().into_iter().flat_map(|p| p.components()) {
             current.push(component);
-            let config_path = self.root.join(&current).join("mdbase.yaml");
-            if config_path.exists() {
+            let config_path = current.join("mdbase.yaml");
+            if self.held_root().entry_exists(&config_path).unwrap_or(true) {
                 return true;
             }
         }

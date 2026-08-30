@@ -1,4 +1,6 @@
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+#[cfg(windows)]
+use cap_std::fs::OpenOptionsExt;
 use cap_std::fs::{Dir, OpenOptions};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -14,7 +16,6 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 #[derive(Clone)]
 pub(crate) struct CollectionRoot {
     directory: Arc<Dir>,
-    identity: Arc<same_file::Handle>,
     display_path: Arc<PathBuf>,
     cache_storage: Arc<tempfile::TempDir>,
 }
@@ -37,7 +38,6 @@ impl CollectionRoot {
         let cache_storage = cache_storage_for(&identity)?;
         Ok(Self {
             directory: Arc::new(directory),
-            identity,
             display_path: Arc::new(path.to_path_buf()),
             // SQLite accepts path names rather than directory capabilities. Keep
             // its derived state in identity-keyed private storage, shared only
@@ -57,13 +57,6 @@ impl CollectionRoot {
 
     pub(crate) fn cache_storage_path(&self) -> &Path {
         self.cache_storage.path()
-    }
-
-    /// Identity checking is the only post-acquisition ambient lookup. It never
-    /// returns a replacement handle and is used solely to fail closed.
-    pub(crate) fn display_identity_is_current(&self) -> bool {
-        same_file::Handle::from_path(self.display_path())
-            .is_ok_and(|current| current == *self.identity)
     }
 
     pub(crate) fn open_dir(&self, relative: &Path) -> std::io::Result<Dir> {
@@ -146,6 +139,45 @@ impl CollectionRoot {
         self.open_file(relative.as_ref()).is_ok()
     }
 
+    /// Inspect a leaf relative to the held root without following it.
+    pub(crate) fn entry_exists(&self, relative: &Path) -> std::io::Result<bool> {
+        let (parent, leaf) = split_parent(relative)?;
+        let dir = match self.open_dir(parent) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        match dir.symlink_metadata(leaf) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn metadata(&self, relative: &Path) -> std::io::Result<std::fs::Metadata> {
+        self.open_file(relative)?.metadata()
+    }
+
+    pub(crate) fn modified_millis(&self, relative: &Path) -> std::io::Result<u64> {
+        let modified = self.metadata(relative)?.modified()?;
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            .and_then(|duration| {
+                u64::try_from(duration.as_millis())
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            })
+    }
+
+    pub(crate) fn modified_nanos(&self, relative: &Path) -> std::io::Result<i64> {
+        let modified = self.metadata(relative)?.modified()?;
+        Ok(modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(0))
+    }
+
     pub(crate) fn atomic_create(&self, relative: &Path, bytes: &[u8]) -> std::io::Result<()> {
         self.atomic_publish(relative, bytes, true)
     }
@@ -171,7 +203,10 @@ impl CollectionRoot {
             match dir.open_with(leaf, &options) {
                 Ok(file) => {
                     let metadata = file.metadata()?;
-                    if !metadata.is_file() || cap_has_multiple_hard_links(&metadata) {
+                    if !metadata.is_file()
+                        || cap_has_multiple_hard_links(&metadata)
+                        || file.into_std().metadata()?.permissions().readonly()
+                    {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::PermissionDenied,
                             "unsafe publication target",
@@ -188,25 +223,65 @@ impl CollectionRoot {
             .write(true)
             .create_new(true)
             .follow(FollowSymlinks::No);
+        #[cfg(windows)]
+        options
+            .access_mode(
+                windows_sys::Win32::Storage::FileSystem::GENERIC_READ
+                    | windows_sys::Win32::Storage::FileSystem::GENERIC_WRITE
+                    | windows_sys::Win32::Storage::FileSystem::DELETE,
+            )
+            .share_mode(
+                windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                    | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE
+                    | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+            );
         let mut file = dir.open_with(&temp, &options)?;
         if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
             let _ = dir.remove_file(&temp);
             return Err(error);
         }
-        drop(file);
         let result = if create_only {
+            drop(file);
             // Linking a private temporary file publishes without replacing a
             // concurrent creator; removing the temporary name leaves one link.
             dir.hard_link(&temp, &dir, leaf)
                 .and_then(|()| dir.remove_file(&temp))
         } else {
-            dir.rename(&temp, &dir, leaf)
+            atomic_replace(&file, &dir, &temp, leaf)
         };
         if result.is_err() {
             let _ = dir.remove_file(&temp);
         }
         result?;
-        dir.open(".")?.sync_all()
+        sync_directory(&dir)
+    }
+
+    /// Rename a regular file inside the held collection without replacing a target.
+    pub(crate) fn rename_noclobber(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        let (from_parent, from_leaf) = split_parent(from)?;
+        let (to_parent, to_leaf) = split_parent(to)?;
+        let source_dir = self.open_dir(from_parent)?;
+        let target_dir = self.create_dir_all(to_parent)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let source = source_dir.open_with(from_leaf, &options)?;
+        let metadata = source.metadata()?;
+        if !metadata.is_file() || cap_has_multiple_hard_links(&metadata) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unsafe rename source",
+            ));
+        }
+        source_dir.hard_link(from_leaf, &target_dir, to_leaf)?;
+        if let Err(error) = source_dir.remove_file(from_leaf) {
+            let _ = target_dir.remove_file(to_leaf);
+            return Err(error);
+        }
+        sync_directory(&target_dir)?;
+        if from_parent != to_parent {
+            sync_directory(&source_dir)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn remove_file(&self, relative: &Path) -> std::io::Result<()> {
@@ -223,7 +298,7 @@ impl CollectionRoot {
             ));
         }
         dir.remove_file(leaf)?;
-        dir.open(".")?.sync_all()
+        sync_directory(&dir)
     }
 
     pub(crate) fn open_lock_file(&self, relative: &Path) -> std::io::Result<std::fs::File> {
@@ -266,9 +341,7 @@ impl CollectionRoot {
     }
 
     pub(crate) fn sync_dir(&self, relative: &Path) -> std::io::Result<()> {
-        #[cfg(not(windows))]
-        self.open_dir(relative)?.open(".")?.sync_all()?;
-        Ok(())
+        sync_directory(&self.open_dir(relative)?)
     }
 
     pub(crate) fn child_directories(&self, relative: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -301,6 +374,81 @@ impl CollectionRoot {
         result.sort();
         Ok(result)
     }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(
+    _source: &cap_std::fs::File,
+    parent: &Dir,
+    temp: &str,
+    destination: &OsStr,
+) -> std::io::Result<()> {
+    // cap-std implements this as renameat on Unix, with both names resolved
+    // relative to the already-open parent directory.
+    parent.rename(temp, parent, destination)
+}
+
+#[cfg(windows)]
+fn atomic_replace(
+    source: &cap_std::fs::File,
+    parent: &Dir,
+    _temp: &str,
+    destination: &OsStr,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfoEx, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+
+    let name = destination.encode_wide().collect::<Vec<_>>();
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or(std::io::ErrorKind::InvalidInput)?;
+    let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let size = header
+        .checked_add(name_bytes)
+        .ok_or(std::io::ErrorKind::InvalidInput)?;
+    let words = size.div_ceil(std::mem::size_of::<usize>());
+    let mut buffer = vec![0_usize; words];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let parent_file = parent.try_clone()?.into_std_file();
+    unsafe {
+        // FileRenameInfoEx interprets the union's first u32 as flags. Flag 1 is
+        // FILE_RENAME_FLAG_REPLACE_IF_EXISTS. The destination is a leaf name
+        // resolved by the kernel relative to this held parent handle.
+        (*info).Anonymous.Flags = 1;
+        (*info).RootDirectory = parent_file.as_raw_handle();
+        (*info).FileNameLength =
+            u32::try_from(name_bytes).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr().cast::<u8>(),
+            buffer.as_mut_ptr().cast::<u8>().add(header),
+            name_bytes,
+        );
+        let ok = SetFileInformationByHandle(
+            source.as_raw_handle(),
+            FileRenameInfoEx,
+            info.cast(),
+            u32::try_from(size).map_err(|_| std::io::ErrorKind::InvalidInput)?,
+        );
+        if ok == 0 {
+            // Unsupported FileRenameInfoEx and all other failures are
+            // deliberately fail-closed. Never emulate replace with
+            // remove-then-rename, which would lose atomicity and authority.
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn sync_directory(dir: &Dir) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    dir.open(".")?.sync_all()?;
+    #[cfg(windows)]
+    let _ = dir;
+    Ok(())
 }
 
 static CACHE_STORAGE: LazyLock<Mutex<HashMap<Arc<same_file::Handle>, Weak<tempfile::TempDir>>>> =
@@ -373,4 +521,36 @@ fn cap_has_multiple_hard_links(metadata: &cap_std::fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn cap_has_multiple_hard_links(_metadata: &cap_std::fs::Metadata) -> bool {
     false
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::CollectionRoot;
+    use std::path::Path;
+
+    #[test]
+    fn rename_info_ex_layout_can_hold_a_relative_destination() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+
+        assert!(
+            std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+                >= std::mem::size_of::<windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO_0>(
+                )
+        );
+    }
+
+    #[test]
+    fn capability_relative_atomic_write_replaces_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = CollectionRoot::acquire(directory.path()).unwrap();
+        root.atomic_create(Path::new("record.md"), b"before")
+            .unwrap();
+        root.atomic_write(Path::new("record.md"), b"after").unwrap();
+        assert_eq!(root.read("record.md").unwrap(), b"after");
+        assert!(root
+            .files_recursive(Path::new(""))
+            .unwrap()
+            .iter()
+            .all(|path| !path.to_string_lossy().contains(".mdbase-publish-")));
+    }
 }

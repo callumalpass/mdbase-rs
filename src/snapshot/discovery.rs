@@ -24,6 +24,13 @@ impl Collection {
         self.scan_collection_files_checked_cancellable(context.cancellation())
     }
 
+    pub(crate) fn scan_collection_relative_paths_checked(
+        &self,
+    ) -> Result<Vec<String>, crate::snapshot::CollectionScanError> {
+        let context = OperationContext::current_or_legacy();
+        self.scan_collection_relative_paths_checked_cancellable(context.cancellation())
+    }
+
     pub(crate) fn scan_collection_files_checked_cancellable(
         &self,
         cancellation: &OperationCancellation,
@@ -242,8 +249,9 @@ impl Collection {
                     state,
                 )?;
             } else if file_type.is_file()
-                && (self.validate_record_path(&relative).is_ok()
-                    || (!state.records_only && self.validate_file_path(&relative).is_ok()))
+                && (self.validate_record_path_after_traversal(&relative).is_ok()
+                    || (!state.records_only
+                        && self.validate_file_path_after_traversal(&relative).is_ok()))
             {
                 state.discovered = state.discovered.checked_add(1).ok_or({
                     CollectionScanError::Provider(ProviderError::CaptureLimitExceeded(

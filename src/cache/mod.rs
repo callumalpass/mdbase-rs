@@ -25,8 +25,6 @@ pub(crate) enum CacheError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Scan(#[from] crate::snapshot::CollectionScanError),
-    #[error("collection path is outside the configured root: {0}")]
-    OutsideRoot(String),
     #[error("relationship resolution failed: {0}")]
     Resolution(String),
     #[error("collection operation cancelled")]

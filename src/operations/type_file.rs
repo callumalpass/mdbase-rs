@@ -1,14 +1,11 @@
 //! Revision-safe type definition resource operations.
 
-use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 use serde_json::{json, Value};
-use tempfile::NamedTempFile;
 
 use crate::diagnostic::Diagnostic;
-use crate::operations::{ensure_no_symlink_components, ensure_revision, ensure_safe_relative_path};
+use crate::operations::ensure_safe_relative_path;
 use crate::v03::{self, OperationResult};
 use crate::Collection;
 
@@ -49,15 +46,17 @@ impl Collection {
         if let Err(diagnostic) = self.validate_type_path(&path) {
             return failed(*diagnostic);
         }
-        let full_path = self.root.join(&path);
-        if full_path.exists() {
+        if self.held_root().exists_file(&path) {
             return failed(Diagnostic::error(
                 "path_conflict",
                 format!("A type definition already exists at '{path}'."),
                 Some(path),
             ));
         }
-        if let Err(error) = atomic_create(&full_path, document.as_bytes()) {
+        if let Err(error) = self
+            .held_root()
+            .atomic_create(Path::new(&path), document.as_bytes())
+        {
             return failed(if error.kind() == std::io::ErrorKind::AlreadyExists {
                 Diagnostic::error(
                     "path_conflict",
@@ -68,10 +67,10 @@ impl Collection {
                 io_diagnostic(&path, error)
             });
         }
-        match Collection::open(&self.root) {
+        match self.reopen_held(true) {
             Ok(reloaded) => reloaded.type_file_result(&path),
             Err(error) => {
-                let _ = fs::remove_file(&full_path);
+                let _ = self.held_root().remove_file(Path::new(&path));
                 failed(open_diagnostic(error, &path))
             }
         }
@@ -89,28 +88,27 @@ impl Collection {
         if let Err(diagnostics) = self.parse_type_candidate(document, Some(&path)) {
             return failed_many(diagnostics);
         }
-        let full_path = self.root.join(&path);
-        if let Err(error) = ensure_revision(
-            &full_path,
+        let previous = match self.held_root().read(&path) {
+            Ok(previous) => previous,
+            Err(error) => return failed(io_diagnostic(&path, error)),
+        };
+        if let Err(error) = ensure_revision_bytes(
+            &previous,
             &path,
             input.get("if_revision").and_then(Value::as_str),
         ) {
             return legacy_failure(error, Some(&path));
         }
-        let previous = match fs::read(&full_path) {
-            Ok(previous) => previous,
-            Err(error) => return failed(io_diagnostic(&path, error)),
-        };
-        let permissions = fs::metadata(&full_path)
-            .ok()
-            .map(|metadata| metadata.permissions());
-        if let Err(error) = atomic_write(&full_path, document.as_bytes(), permissions) {
+        if let Err(error) = self
+            .held_root()
+            .atomic_write(Path::new(&path), document.as_bytes())
+        {
             return failed(io_diagnostic(&path, error));
         }
-        match Collection::open(&self.root) {
+        match self.reopen_held(true) {
             Ok(reloaded) => reloaded.type_file_result(&path),
             Err(error) => {
-                let rollback = atomic_write(&full_path, &previous, None);
+                let rollback = self.held_root().atomic_write(Path::new(&path), &previous);
                 let mut diagnostic = open_diagnostic(error, &path);
                 if let Err(rollback_error) = rollback {
                     diagnostic.message = format!(
@@ -162,8 +160,9 @@ impl Collection {
     fn validate_type_path(&self, path: &str) -> Result<(), Box<Diagnostic>> {
         ensure_safe_relative_path(path, self.spec_profile)
             .map_err(|error| Box::new(open_diagnostic(error, path)))?;
-        ensure_no_symlink_components(&self.root, path, self.spec_profile)
-            .map_err(|error| Box::new(open_diagnostic(error, path)))?;
+        self.held_root()
+            .ensure_no_symlink_components(Path::new(path))
+            .map_err(|error| Box::new(io_diagnostic(path, error)))?;
         let prefix = format!("{}/", self.settings.types_folder.trim_end_matches('/'));
         if !path.starts_with(&prefix)
             || Path::new(path).extension().and_then(|value| value.to_str()) != Some("md")
@@ -190,12 +189,31 @@ impl Collection {
         if let Err(diagnostic) = self.validate_type_path(path) {
             return Err(vec![*diagnostic]);
         }
-        v03::parse_type_file(document, &self.root.join(path), &self.root, path)
+        // `parse_type_file` may resolve a local schema.ref. Materialize a private snapshot
+        // from the held authority so its pathname-based resolver cannot adopt a replacement root.
+        let staging = tempfile::tempdir().map_err(|error| vec![io_diagnostic(path, error)])?;
+        for relative in self
+            .held_root()
+            .files_recursive(Path::new(""))
+            .map_err(|error| vec![io_diagnostic(path, error)])?
+        {
+            let bytes = self
+                .held_root()
+                .read(&relative)
+                .map_err(|error| vec![io_diagnostic(path, error)])?;
+            let destination = staging.path().join(&relative);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| vec![io_diagnostic(path, error)])?;
+            }
+            std::fs::write(destination, bytes).map_err(|error| vec![io_diagnostic(path, error)])?;
+        }
+        let candidate = staging.path().join(path);
+        v03::parse_type_file(document, &candidate, staging.path(), path)
     }
 
     fn type_file_result(&self, path: &str) -> OperationResult {
-        let full_path = self.root.join(path);
-        let bytes = match fs::read(&full_path) {
+        let bytes = match self.held_root().read(path) {
             Ok(bytes) => bytes,
             Err(error) => return failed(io_diagnostic(path, error)),
         };
@@ -251,33 +269,21 @@ fn candidate_path(input: &Value) -> Option<&str> {
     input.get("path").and_then(Value::as_str)
 }
 
-fn atomic_write(
-    path: &Path,
+fn ensure_revision_bytes(
     bytes: &[u8],
-    permissions: Option<fs::Permissions>,
-) -> Result<(), std::io::Error> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let mut temporary = NamedTempFile::new_in(parent)?;
-    if let Some(permissions) = permissions {
-        temporary.as_file().set_permissions(permissions)?;
+    display_path: &str,
+    expected: Option<&str>,
+) -> Result<(), Value> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if v03::revision(bytes) != expected {
+        return Err(crate::errors::op_error(
+            crate::errors::CONCURRENT_MODIFICATION,
+            &format!("File '{display_path}' was modified externally"),
+        ));
     }
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    crate::operations::sync_directory(parent)
-}
-
-fn atomic_create(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let mut temporary = NamedTempFile::new_in(parent)?;
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist_noclobber(path)
-        .map_err(|error| error.error)?;
-    crate::operations::sync_directory(parent)
+    Ok(())
 }
 
 fn failed(diagnostic: Diagnostic) -> OperationResult {
@@ -327,6 +333,7 @@ fn legacy_failure(error: Value, path: Option<&str>) -> OperationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -403,6 +410,34 @@ mod tests {
         assert!(!invalid.valid);
         let reloaded = Collection::open(directory.path()).unwrap();
         assert!(reloaded.read_type_file(&json!({"name": "note"})).valid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_root_never_receives_type_resource_io() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("collection");
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  types_folder: _types\n",
+        )
+        .unwrap();
+        fs::create_dir(root.join("_types")).unwrap();
+        fs::write(root.join("_types/note.md"), type_document("note", "Note")).unwrap();
+        let collection = Collection::open(&root).unwrap();
+        let held = parent.path().join("held");
+        fs::rename(&root, &held).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+
+        assert!(collection.read_type_file(&json!({"name": "note"})).valid);
+        let created = collection.create_type_file(&json!({
+            "document": type_document("project", "Project")
+        }));
+        assert!(created.valid, "{:?}", created.diagnostics);
+        assert!(held.join("_types/project.md").is_file());
+        assert!(!root.join("_types").exists());
     }
 
     #[test]

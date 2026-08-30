@@ -10,7 +10,7 @@ use super::{revision, validate_type_pack, validate_type_pack_lock, Diagnostic, O
 use crate::api::CollectionPath;
 use crate::frontmatter::parser::{is_parse_error, parse_document};
 use crate::mutation::shadow as mutation_shadow;
-use crate::{Collection, SpecProfile};
+use crate::Collection;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TypePackResource {
@@ -380,18 +380,17 @@ pub(crate) fn plan_type_pack(
         }
         let target = validate_resource_target(collection, &resource.kind, &resource.target, bytes)
             .map_err(pack_plan_error)?;
-        crate::operations::ensure_no_symlink_components(
-            &collection.root,
-            target.as_str(),
-            SpecProfile::V03,
-        )
-        .map_err(|error| pack_plan_error(format!("Unsafe type-pack target: {error}")))?;
-        let before = read_optional(&target.under(&collection.root)).map_err(|error| {
-            pack_plan_error(format!(
-                "Could not inspect type-pack target '{}': {error}",
-                resource.target
-            ))
-        })?;
+        collection
+            .held_root()
+            .ensure_no_symlink_components(Path::new(target.as_str()))
+            .map_err(|error| pack_plan_error(format!("Unsafe type-pack target: {error}")))?;
+        let before =
+            read_optional_held(collection, Path::new(target.as_str())).map_err(|error| {
+                pack_plan_error(format!(
+                    "Could not inspect type-pack target '{}': {error}",
+                    resource.target
+                ))
+            })?;
         let current_digest = before.as_deref().map(revision);
         let installed = current_resources
             .get(resource.source.as_str())
@@ -494,12 +493,13 @@ pub(crate) fn plan_type_pack(
             let target = CollectionPath::new(&resource.target).map_err(|error| {
                 pack_plan_error(format!("Unsafe installed type-pack target: {error}"))
             })?;
-            let before = read_optional(&target.under(&collection.root)).map_err(|error| {
-                pack_plan_error(format!(
-                    "Could not inspect installed type-pack target '{}': {error}",
-                    resource.target
-                ))
-            })?;
+            let before =
+                read_optional_held(collection, Path::new(target.as_str())).map_err(|error| {
+                    pack_plan_error(format!(
+                        "Could not inspect installed type-pack target '{}': {error}",
+                        resource.target
+                    ))
+                })?;
             let current_digest = before.as_deref().map(revision);
             let (action, reason) = if resource.mode != "managed" {
                 ("preserve", None)
@@ -674,7 +674,7 @@ fn apply_type_pack_plan(collection: &Collection, plan: TypePackPlan) -> Operatio
         Ok(commit) => commit,
         Err(error) => return pack_diagnostic(error.code(), error.to_string()),
     };
-    let _reopened = match Collection::open(&collection.root) {
+    let _reopened = match collection.reopen_held(true) {
         Ok(reopened) => reopened,
         Err(error) => {
             return pack_diagnostic(
@@ -765,8 +765,7 @@ pub(crate) fn stage_type_pack_plan(
 fn read_type_pack_lock(
     collection: &Collection,
 ) -> Result<(TypePackLock, Option<Vec<u8>>), Box<Diagnostic>> {
-    let path = collection.root.join(TYPE_PACK_LOCK_PATH);
-    let bytes = match fs::read(&path) {
+    let bytes = match collection.held_root().read(TYPE_PACK_LOCK_PATH) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
@@ -832,8 +831,8 @@ fn serialize_type_pack_lock(lock: &TypePackLock) -> Result<Vec<u8>, Box<Diagnost
     Ok(bytes)
 }
 
-fn read_optional(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    match fs::read(path) {
+fn read_optional_held(collection: &Collection, path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match collection.held_root().read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -1640,6 +1639,33 @@ mod tests {
         );
         let collection = Collection::open(root.path()).unwrap();
         (root, collection)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_root_never_receives_type_pack_reads_or_publication() {
+        let (root, collection) = collection();
+        let document = "---\nkind: mdbase.type\nname: task\nschema:\n  dialect: json-schema-2020-12\n  value: { type: object }\n---\n";
+        let pack = provision(
+            manifest(&[("type", "task.md", "_types/task.md", document)]),
+            vec![resource("task.md", document)],
+        );
+        let original = root.path().to_path_buf();
+        let held = original.with_extension("pack-held");
+        fs::rename(&original, &held).unwrap();
+        fs::create_dir(&original).unwrap();
+        write(&original.join("mdbase.yaml"), "spec_version: 0.3.0\n");
+        write(&original.join("sentinel"), "replacement\n");
+
+        let applied = apply_pack(&collection, &pack);
+        assert!(applied.valid, "{:?}", applied.diagnostics);
+        assert!(held.join("_types/task.md").is_file());
+        assert!(held.join(TYPE_PACK_LOCK_PATH).is_file());
+        assert_eq!(
+            fs::read_to_string(original.join("sentinel")).unwrap(),
+            "replacement\n"
+        );
+        assert!(!original.join("_types").exists());
     }
 
     fn existing_setup(contract_id: &str, revision: &str) -> ContractSetupChoice {

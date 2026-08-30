@@ -40,17 +40,12 @@ pub(crate) fn rebuild(
         collection.held_root().cache_storage_path(),
         &collection.settings.cache_folder,
     )?;
-    let files = collection.scan_collection_files_checked()?;
+    let files = collection.scan_collection_relative_paths_checked()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
         "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_values; DELETE FROM identity_values; DELETE FROM files; DELETE FROM meta;",
     )?;
-    for absolute in files {
-        let relative = absolute
-            .strip_prefix(&collection.root)
-            .map_err(|_| CacheError::OutsideRoot(absolute.display().to_string()))?
-            .to_string_lossy()
-            .replace('\\', "/");
+    for relative in files {
         indexer::reindex_file(&transaction, collection, &relative)?;
     }
     indexer::resolve_all_links(&transaction, collection)?;
@@ -101,7 +96,10 @@ pub(crate) fn apply_changes(
                         )
             });
         remove.insert(change.path.as_str().to_string());
-        if collection.root.join(change.path.as_str()).is_file() {
+        if collection
+            .held_root()
+            .exists_file(std::path::Path::new(change.path.as_str()))
+        {
             reindex.insert(change.path.as_str().to_string());
         }
     }

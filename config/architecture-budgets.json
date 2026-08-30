@@ -1,8 +1,9 @@
 {
   "rustSourceFileCountMax": 173,
-  "rustSourceLineCountMax": 99227,
+  "rustSourceLineCountMax": 99942,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
+    "crates/mdbase-architecture-check/src/main.rs": 1184,
     "crates/mdbase-command/src/lib.rs": 1968,
     "crates/mdbase-command/src/profile.rs": 1382,
     "crates/mdbase-runtime/src/engine.rs": 1270,
@@ -24,11 +25,11 @@
     "src/transactions.rs": 1029,
     "src/transactions/runtime.rs": 2556,
     "src/v03/batch.rs": 1467,
-    "src/v03/collection_setup.rs": 1479,
-    "src/v03/type_pack.rs": 2110,
+    "src/v03/collection_setup.rs": 1508,
+    "src/v03/type_pack.rs": 2135,
     "src/views/execute.rs": 1376,
     "src/views/expression.rs": 2965,
-    "src/watch/real.rs": 3143
+    "src/watch/real.rs": 3220
   },
   "deadCodeAllowancesByFile": {
     "crates/mdbase-command/src/lib.rs": 1,
@@ -42,6 +43,35 @@
     "src/snapshot.rs": 2,
     "src/snapshot/discovery.rs": 1,
     "src/cel.rs": 2
+  },
+  "ambientIoAllowlist": {
+    "crates/mdbase-command/src/lib.rs": {"std::fs": 4},
+    "crates/mdbase-command/src/profile.rs": {"std::fs": 14},
+    "crates/mdbase-testbed-adapter/src/main.rs": {"std::fs": 4},
+    "src/bin/phase0-baseline.rs": {"std::fs": 15},
+    "src/cache/mod.rs": {"std::fs": 2},
+    "src/cache/sqlite.rs": {"std::fs": 3, "std::fs::File": 2, "std::fs::OpenOptions": 2},
+    "src/collection_root.rs": {"cap_std::ambient-acquisition": 2, "std::fs": 3, "std::fs::File": 2, "tempfile": 4},
+    "src/compat/v02_migration.rs": {"std::fs": 5, "tempfile": 1},
+    "src/config/mod.rs": {"std::fs": 2},
+    "src/data_contracts.rs": {"std::fs": 3, "tempfile": 1, "walkdir": 2},
+    "src/init.rs": {"std::fs": 6},
+    "src/mutation/shadow.rs": {"std::fs": 3, "tempfile": 2},
+    "src/operations/mod.rs": {"std::fs": 2, "std::fs::File": 1},
+    "src/operations/type_file.rs": {"std::fs": 2, "tempfile": 1},
+    "src/record_load.rs": {"std::fs": 3, "std::fs::File": 3},
+    "src/runtime/catalog.rs": {"tempfile": 1},
+    "src/runtime/hosted_mutation.rs": {"std::fs": 11, "tempfile": 1},
+    "src/runtime/hosted_resource.rs": {"std::fs": 6, "tempfile": 3, "walkdir": 1},
+    "src/runtime/hosted_validation.rs": {"std::fs": 3, "tempfile": 1},
+    "src/transactions.rs": {"std::fs::File": 3},
+    "src/types/loader.rs": {"std::fs": 5, "tempfile": 1},
+    "src/v03/batch.rs": {"std::fs": 6, "tempfile": 1},
+    "src/v03/collection_setup.rs": {"std::fs": 5},
+    "src/v03/mod.rs": {"std::fs": 4, "walkdir": 4},
+    "src/v03/type_pack.rs": {"std::fs": 6},
+    "src/watch/mod.rs": {"std::fs": 25},
+    "src/watch/real.rs": {"std::fs": 1}
   },
   "transitionalReferenceBudgets": {
     "uncheckedCollectionScans": 0,

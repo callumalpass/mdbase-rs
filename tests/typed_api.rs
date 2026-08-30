@@ -586,6 +586,40 @@ fields:
         .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok()));
 }
 
+#[cfg(unix)]
+#[test]
+fn v02_migration_never_reads_or_publishes_through_a_replacement_root() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.2.0\n").unwrap();
+    fs::write(root.path().join("legacy.md"), "Legacy\n").unwrap();
+    let collection = Collection::open(root.path()).unwrap();
+    let original = root.path().to_path_buf();
+    let held = original.with_extension("migration-held");
+    fs::rename(&original, &held).unwrap();
+    fs::create_dir(&original).unwrap();
+    fs::write(original.join("mdbase.yaml"), "spec_version: 0.2.0\n").unwrap();
+    fs::write(original.join("sentinel"), "replacement\n").unwrap();
+
+    let applied = collection
+        .typed()
+        .unwrap()
+        .migrate_v02(V02MigrationRequest {
+            dry_run: false,
+            allow_lossy: false,
+        })
+        .unwrap();
+    assert!(applied.applied);
+    assert!(held.join(&applied.manifest_path).is_file());
+    assert!(fs::read_to_string(held.join("mdbase.yaml"))
+        .unwrap()
+        .contains("0.3.0"));
+    assert_eq!(
+        fs::read_to_string(original.join("sentinel")).unwrap(),
+        "replacement\n"
+    );
+    assert!(!original.join(&applied.manifest_path).exists());
+}
+
 #[test]
 fn lossy_v02_migration_requires_explicit_apply_opt_in() {
     let root = tempfile::tempdir().unwrap();

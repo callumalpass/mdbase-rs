@@ -387,11 +387,9 @@ fn descendant_replacement_never_redirects_reference_writes() {
         "to": "renamed.md",
         "update_refs": true,
     }));
-    assert_eq!(
-        result["error"]["code"], "collection_snapshot_failed",
-        "{result:#}"
-    );
-    assert!(root.path().join("target.md").exists());
+    assert_eq!(result["to"], "renamed.md", "{result:#}");
+    assert!(!root.path().join("target.md").exists());
+    assert!(root.path().join("renamed.md").is_file());
     assert_eq!(
         fs::read_to_string(external.path().join("ref.md")).unwrap(),
         "external [[target]]\n"
@@ -400,7 +398,7 @@ fn descendant_replacement_never_redirects_reference_writes() {
 
 #[cfg(unix)]
 #[test]
-fn root_replacement_is_rejected_before_nested_parent_preparation() {
+fn root_replacement_keeps_rename_on_the_held_collection() {
     let (root, collection) = collection();
     fs::write(root.path().join("target.md"), "inside\n").unwrap();
     let external = tempfile::tempdir().unwrap();
@@ -415,10 +413,7 @@ fn root_replacement_is_rejected_before_nested_parent_preparation() {
         "to": "new/deep/renamed.md",
         "update_refs": false,
     }));
-    assert_eq!(
-        result["error"]["code"], CONCURRENT_MODIFICATION,
-        "{result:#}"
-    );
+    assert_eq!(result["to"], "new/deep/renamed.md", "{result:#}");
     assert_eq!(
         fs::read_to_string(external.path().join("target.md")).unwrap(),
         "external\n"
@@ -428,14 +423,14 @@ fn root_replacement_is_rejected_before_nested_parent_preparation() {
         "untouched\n"
     );
     assert!(!external.path().join("new").exists());
-    assert!(!held_root.join("new").exists());
+    assert!(!held_root.join("target.md").exists());
+    assert_eq!(
+        fs::read_to_string(held_root.join("new/deep/renamed.md")).unwrap(),
+        "inside\n"
+    );
 
     fs::remove_file(&original_root).unwrap();
     fs::rename(held_root, &original_root).unwrap();
-    assert_eq!(
-        fs::read_to_string(original_root.join("target.md")).unwrap(),
-        "inside\n"
-    );
 }
 
 #[cfg(unix)]

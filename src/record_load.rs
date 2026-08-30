@@ -11,6 +11,9 @@ use crate::frontmatter::parser::{
 use crate::runtime::{OperationContext, ProviderError};
 use crate::{Collection, OperationCancellation};
 
+/// Metadata captured from a file already opened through `CollectionRoot`.
+pub(crate) type FileMetadata = std::fs::Metadata;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvalidRecordReason {
     InvalidYaml,

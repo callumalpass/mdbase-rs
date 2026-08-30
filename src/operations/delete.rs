@@ -82,7 +82,6 @@ impl Collection {
         } = prepared;
         let path = request.path;
         let display_path = path.to_string();
-        let full_path = path.under(&self.root);
         let loaded = crate::record_load::load_record(self, &display_path).map_err(|error| {
             crate::mutation::MutationFailure::operation(
                 if error.kind() == std::io::ErrorKind::NotFound {
@@ -109,11 +108,7 @@ impl Collection {
             ));
         }
         if let Some(known_ms) = legacy_last_known_mtime {
-            let current_ms = std::fs::metadata(&full_path)
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_millis() as u64);
+            let current_ms = self.held_root().modified_millis(&path.to_path_buf()).ok();
             if current_ms.is_some_and(|current| current != known_ms) {
                 return Err(crate::mutation::MutationFailure::operation(
                     CONCURRENT_MODIFICATION,

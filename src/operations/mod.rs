@@ -10,13 +10,13 @@ pub mod rename;
 pub mod type_file;
 pub mod update;
 
+#[cfg(test)]
 use std::io::Write;
 use std::path::{Component, Path};
 
-use crate::errors::{
-    op_error, CONCURRENT_MODIFICATION, FILE_NOT_FOUND, INVALID_PATH, PATH_TRAVERSAL,
-    PERMISSION_DENIED,
-};
+#[cfg(test)]
+use crate::errors::PERMISSION_DENIED;
+use crate::errors::{op_error, FILE_NOT_FOUND, INVALID_PATH, PATH_TRAVERSAL};
 use crate::{Collection, SpecProfile};
 
 /// Validate that a user-supplied path is relative to the collection root.
@@ -96,6 +96,7 @@ pub(crate) fn ensure_safe_relative_path_diagnostic(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_no_symlink_components(
     collection_root: &Path,
     relative_path: &str,
@@ -127,47 +128,6 @@ pub(crate) fn ensure_no_symlink_components(
                 return Err(op_error(
                     PERMISSION_DENIED,
                     "Path could not be inspected safely",
-                ))
-            }
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::result_large_err)]
-pub(crate) fn ensure_no_symlink_components_diagnostic(
-    collection_root: &Path,
-    relative_path: &str,
-    spec_profile: SpecProfile,
-) -> Result<(), crate::diagnostic::Diagnostic> {
-    let mut candidate = collection_root.to_path_buf();
-    for component in Path::new(relative_path).components() {
-        match component {
-            Component::CurDir => continue,
-            Component::Normal(part) => candidate.push(part),
-            _ => {
-                return Err(path_boundary_diagnostic(
-                    spec_profile,
-                    "Path must remain inside the collection",
-                    relative_path,
-                ))
-            }
-        }
-        match std::fs::symlink_metadata(&candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(path_boundary_diagnostic(
-                    spec_profile,
-                    "Symbolic links are not allowed in collection operation paths",
-                    relative_path,
-                ))
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(_) => {
-                return Err(crate::diagnostic::Diagnostic::error(
-                    PERMISSION_DENIED,
-                    "Path could not be inspected safely",
-                    Some(relative_path.to_string()),
                 ))
             }
         }
@@ -208,6 +168,7 @@ fn path_boundary_diagnostic(
     )
 }
 
+#[cfg(any(test, feature = "legacy-collection-mutation"))]
 fn path_boundary_error(spec_profile: SpecProfile, message: &str) -> serde_json::Value {
     op_error(
         if spec_profile == SpecProfile::V03 {
@@ -501,26 +462,12 @@ pub(crate) fn readable_record_path(
         .map_err(|_| op_error(FILE_NOT_FOUND, &format!("File not found: {path}")))
 }
 
-#[allow(clippy::result_large_err)]
-pub(crate) fn ensure_regular_record_file_diagnostic(
-    path: &Path,
-    display_path: &str,
-) -> Result<(), crate::diagnostic::Diagnostic> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
-        Ok(_) | Err(_) => Err(crate::diagnostic::Diagnostic::error(
-            FILE_NOT_FOUND,
-            format!("File not found: {display_path}"),
-            None,
-        )),
-    }
-}
-
 /// Move a regular collection file without ever replacing an existing target.
 ///
 /// Creating the hard link is the atomic no-clobber point. Since both paths are
 /// inside one collection they are on the same filesystem. If unlinking the old
 /// name fails, the new link is rolled back and the source is left intact.
+#[cfg(test)]
 pub(crate) fn atomic_rename_noclobber(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::hard_link(from, to)?;
     if let Err(error) = std::fs::remove_file(from) {
@@ -538,53 +485,17 @@ pub(crate) fn atomic_rename_noclobber(from: &Path, to: &Path) -> std::io::Result
     Ok(())
 }
 
-/// Verify an opaque revision token against the current raw file contents.
-///
-/// Call this immediately before a mutation. Callers that perform work between
-/// this check and the write must retain their existing mtime/file-identity
-/// guard as a second check against changes during the operation.
-pub(crate) fn ensure_revision(
-    path: &Path,
-    display_path: &str,
-    expected: Option<&str>,
-) -> Result<(), serde_json::Value> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    let bytes = std::fs::read(path).map_err(|_| {
-        op_error(
-            CONCURRENT_MODIFICATION,
-            &format!("File '{display_path}' no longer matches the requested revision"),
-        )
-    })?;
-    let actual = crate::v03::revision(&bytes);
-    if actual != expected {
-        return Err(op_error(
-            CONCURRENT_MODIFICATION,
-            &format!("File '{display_path}' was modified externally"),
-        ));
-    }
-    Ok(())
-}
-
-/// Atomically replace one collection file with fully written contents.
-///
-/// The temporary file lives beside the destination so persistence remains on
-/// the same filesystem. Existing permissions are retained on replacement.
-pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+#[cfg(test)]
+fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     atomic_write_mode(path, contents, false, true)
 }
 
-/// Atomically create a new file without replacing a concurrent creator.
-pub(crate) fn atomic_create(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+#[cfg(test)]
+fn atomic_create(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     atomic_write_mode(path, contents, true, true)
 }
 
-/// Atomically replace a file whose parent was already prepared and fenced.
-pub(crate) fn atomic_write_in_prepared_parent(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    atomic_write_mode(path, contents, false, false)
-}
-
+#[cfg(test)]
 fn atomic_write_mode(
     path: &Path,
     contents: &[u8],
@@ -630,12 +541,12 @@ fn atomic_write_mode(
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(test, not(windows)))]
 pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(path)?.sync_all()
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;

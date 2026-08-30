@@ -64,20 +64,20 @@ claim that current Connect callers are zero.
 
 ## Version-2 runtime journals
 
-`LegacyRecoveredV03` is journal-read-only. Checked serde rejects it and version-3
+`LegacyRecoveredV03` is journal-read-only. Checked serde rejects it and current version-4
 persistence cannot write it. `FilesystemProvider::legacy_journal_inventory`
 and `FilesystemRuntime::legacy_journal_inventory` return only a version-2
 count; they expose no IDs, paths, claims, or payloads. Operators must record
 `is_zero() == true` before upgrading beyond the supported 0.4.x window.
 
-There is no general eager-upgrade API. A version-2 journal is upgraded to the
-version-3 typed shape when ordinary recovery settles a committing transaction;
+There is no general eager-upgrade API. A version-2 journal is upgraded to the current
+version-4 typed shape when ordinary recovery settles a committing transaction;
 prepared or already-final journals remain inventory-visible until their normal
 resolution/acknowledgement lifecycle removes them. The decoder and
 `LegacyRecoveredV03` can be removed only after the supported settlement and
 acknowledgement window, operator inventories, and all supported fixtures are
-zero. Migration tests prove a version-2 journal remains readable and every new
-journal starts at version 3.
+zero. Migration tests prove that exact version-2 and retained-evidence version-3 journals
+remain readable while every new journal starts at version 4.
 
 ## Ephemeral runtime projections and paired Connect migration
 

@@ -1,12 +1,10 @@
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use walkdir::WalkDir;
 
 use super::expression::{
     self, serialize_bases_file, BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone,
@@ -127,12 +125,11 @@ fn canonical_descriptor(
         diagnostics.push(diagnostic);
         return None;
     }
-    let source = collection.root.join(&record.rel_path);
     Some(ViewDocumentDescriptor {
         source: ViewSourceDescriptor {
             path: record.rel_path.clone(),
             format: "mdbase.view".to_string(),
-            revision: file_revision(&source).unwrap_or_default(),
+            revision: file_revision(collection, &record.rel_path).unwrap_or_default(),
             writable: true,
         },
         id: record
@@ -287,8 +284,8 @@ fn obsidian_documents(
     obsidian_source_paths(collection)
         .into_iter()
         .filter_map(|path| {
-            let relative = relative_path(&collection.root, &path)?;
-            let source = match fs::read_to_string(&path) {
+            let relative = path.to_string_lossy().replace('\\', "/");
+            let source = match collection.held_root().read_string(&path) {
                 Ok(source) => source,
                 Err(error) => {
                     let mut diagnostic = Diagnostic::error(
@@ -662,7 +659,7 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
             Some(request.path.clone()),
         );
     }
-    let source = match fs::read_to_string(&relative) {
+    let source = match collection.held_root().read_string(&relative) {
         Ok(source) => source,
         Err(error) => {
             return failed(
@@ -1177,19 +1174,17 @@ pub(crate) fn obsidian_source_paths(collection: &Collection) -> Vec<PathBuf> {
         .iter()
         .filter_map(|pattern| glob_regex(pattern).ok())
         .collect::<Vec<_>>();
-    WalkDir::new(&collection.root)
-        .follow_links(false)
+    collection
+        .held_root()
+        .files_recursive(Path::new(""))
+        .unwrap_or_default()
         .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("base"))
-        .filter(|entry| {
-            relative_path(&collection.root, entry.path()).is_some_and(|path| {
-                super::normalized_source_path(&path).is_some()
-                    && patterns.iter().any(|pattern| pattern.is_match(&path))
-            })
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("base"))
+        .filter(|path| {
+            let relative = path.to_string_lossy().replace('\\', "/");
+            super::normalized_source_path(&relative).is_some()
+                && patterns.iter().any(|pattern| pattern.is_match(&relative))
         })
-        .map(|entry| entry.into_path())
         .collect()
 }
 
@@ -1257,31 +1252,25 @@ fn safe_view_path(collection: &Collection, path: &str) -> Result<PathBuf, Box<Di
                 Some(path.to_string()),
             ))
         })?;
-    crate::operations::ensure_no_symlink_components(
-        &collection.root,
-        normalized.as_str(),
-        collection.spec_profile,
-    )
-    .map_err(|_| {
-        Box::new(Diagnostic::error(
-            "path_traversal",
-            "View source path traverses a symbolic link.",
-            Some(path.to_string()),
-        ))
-    })?;
-    Ok(normalized.under(&collection.root))
+    collection
+        .held_root()
+        .ensure_no_symlink_components(Path::new(normalized.as_str()))
+        .map_err(|_| {
+            Box::new(Diagnostic::error(
+                "path_traversal",
+                "View source path traverses a symbolic link.",
+                Some(path.to_string()),
+            ))
+        })?;
+    Ok(PathBuf::from(normalized.as_str()))
 }
 
-fn relative_path(root: &Path, path: &Path) -> Option<String> {
-    Some(
-        path.strip_prefix(root)
-            .ok()?
-            .to_string_lossy()
-            .replace('\\', "/"),
-    )
-}
-fn file_revision(path: &Path) -> Option<String> {
-    fs::read(path).ok().map(|bytes| revision(&bytes))
+fn file_revision(collection: &Collection, path: &str) -> Option<String> {
+    collection
+        .held_root()
+        .read(path)
+        .ok()
+        .map(|bytes| revision(&bytes))
 }
 fn revision(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);

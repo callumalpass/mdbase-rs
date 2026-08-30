@@ -135,8 +135,8 @@ impl Collection {
         &self,
         conn: &mut Connection,
         cancellation: &OperationCancellation,
-    ) -> Result<Vec<PathBuf>, CacheError> {
-        let disk_files = self.scan_collection_files_checked()?;
+    ) -> Result<Vec<String>, CacheError> {
+        let disk_files = self.scan_collection_relative_paths_checked()?;
 
         // Cache refresh errors deliberately fall back to disk. Treating
         // cancellation as an ordinary cache error would therefore continue
@@ -146,7 +146,7 @@ impl Collection {
             return Err(CacheError::Cancelled);
         }
 
-        let changes = staleness::find_changes(conn, &self.root, &disk_files)?;
+        let changes = staleness::find_changes(conn, self, &disk_files)?;
 
         if changes.stale.is_empty() && changes.deleted.is_empty() {
             return Ok(disk_files);
@@ -156,7 +156,7 @@ impl Collection {
         // only the uncommon cache-write section, then recompute against the
         // winning transaction so two refreshers cannot apply stale deltas.
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changes = staleness::find_changes(&transaction, &self.root, &disk_files)?;
+        let changes = staleness::find_changes(&transaction, self, &disk_files)?;
 
         // Remove deleted files from cache
         for rel_path in &changes.deleted {
@@ -167,16 +167,11 @@ impl Collection {
         }
 
         // Re-index stale/new files
-        for abs_path in &changes.stale {
+        for rel_path in &changes.stale {
             if cancellation.is_cancelled() {
                 return Err(CacheError::Cancelled);
             }
-            let rel_path = abs_path
-                .strip_prefix(&self.root)
-                .map_err(|_| CacheError::OutsideRoot(abs_path.display().to_string()))?
-                .to_string_lossy()
-                .replace('\\', "/");
-            indexer::reindex_file(&transaction, self, &rel_path)?;
+            indexer::reindex_file(&transaction, self, rel_path)?;
         }
 
         if !changes.stale.is_empty() || !changes.deleted.is_empty() {

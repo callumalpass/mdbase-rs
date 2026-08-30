@@ -380,8 +380,11 @@ fn execute_shadow(
     let planned = operation(&shadow.collection)?;
     let _before_revision = planned.before_revision.as_deref();
     let planned_path = planned.path.clone();
-    let shadow_metadata =
-        std::fs::metadata(planned_path.under(&shadow.collection.root)).map_err(invalid_result)?;
+    let shadow_metadata = shadow
+        .collection
+        .held_root()
+        .metadata(&planned_path.to_path_buf())
+        .map_err(invalid_result)?;
     let mut outcome = project_record(&shadow.collection, planned, shadow_metadata)?;
     if dry_run {
         return Ok(outcome);
@@ -423,7 +426,7 @@ fn validate_update_shape(request: &UpdateRequest) -> Result<(), MdbaseError> {
 pub(crate) fn project_record(
     collection: &Collection,
     planned: PlannedRecord,
-    metadata: std::fs::Metadata,
+    metadata: crate::record_load::FileMetadata,
 ) -> Result<OperationOutcome<RecordDocument>, MdbaseError> {
     let mtime = metadata.modified().ok().map(|time| {
         let value: chrono::DateTime<chrono::Utc> = time.into();

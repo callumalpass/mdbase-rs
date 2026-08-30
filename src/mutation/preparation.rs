@@ -258,11 +258,10 @@ pub(crate) fn prepare_delete(
         )]);
     }
     if let Some(known_ms) = legacy_last_known_mtime {
-        let current_ms = std::fs::metadata(request.path.under(&collection.root))
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_millis() as u64);
+        let current_ms = collection
+            .held_root()
+            .modified_millis(&request.path.to_path_buf())
+            .ok();
         if current_ms.is_some_and(|current| current != known_ms) {
             return Err(vec![Diagnostic::error(
                 crate::errors::CONCURRENT_MODIFICATION,
@@ -301,25 +300,32 @@ pub(crate) fn prepare_rename(
                 vec![error]
             },
         )?;
-        crate::operations::ensure_no_symlink_components_diagnostic(
-            &collection.root,
-            path.as_str(),
-            collection.spec_profile,
-        )
-        .map_err(|mut error| {
-            error.path = Some(path.to_string());
-            vec![error]
-        })?;
+        collection
+            .held_root()
+            .ensure_no_symlink_components(&path.to_path_buf())
+            .map_err(|error| {
+                vec![Diagnostic::error(
+                    crate::errors::PATH_TRAVERSAL,
+                    error.to_string(),
+                    Some(path.to_string()),
+                )]
+            })?;
     }
-    crate::operations::ensure_regular_record_file_diagnostic(
-        &request.from.under(&collection.root),
-        &from,
-    )
-    .map_err(|mut error| {
-        error.path = Some(from.clone());
-        vec![error]
-    })?;
-    if request.to.under(&collection.root).exists() {
+    collection
+        .held_root()
+        .metadata(&request.from.to_path_buf())
+        .map_err(|_| {
+            vec![Diagnostic::error(
+                crate::errors::FILE_NOT_FOUND,
+                format!("File not found: {from}"),
+                Some(from.clone()),
+            )]
+        })?;
+    if collection
+        .held_root()
+        .entry_exists(&request.to.to_path_buf())
+        .unwrap_or(true)
+    {
         return Err(vec![Diagnostic::error(
             crate::errors::PATH_CONFLICT,
             format!("Target already exists: {to}"),

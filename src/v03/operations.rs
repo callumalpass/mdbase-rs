@@ -535,7 +535,7 @@ fn planned_operation_result(
     record: crate::mutation::PlannedRecord,
 ) -> OperationResult {
     let path = record.path.to_string();
-    let metadata = match std::fs::metadata(record.path.under(&collection.root)) {
+    let metadata = match collection.held_root().metadata(&record.path.to_path_buf()) {
         Ok(metadata) => metadata,
         Err(error) => {
             return failed_result(vec![Diagnostic::error(

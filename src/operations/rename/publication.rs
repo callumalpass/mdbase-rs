@@ -13,11 +13,12 @@ impl Collection {
         failures: &mut Vec<serde_json::Value>,
     ) {
         for plan in plans {
-            let full_path = self.root.join(&plan.execution_path);
             #[cfg(test)]
-            apply_injected_reference_removal(&full_path);
+            let display_path = self.root.join(&plan.execution_path);
             #[cfg(test)]
-            let injected_open_failure = take_injected_reference_open_failure(&full_path);
+            apply_injected_reference_removal(&display_path);
+            #[cfg(test)]
+            let injected_open_failure = take_injected_reference_open_failure(&display_path);
             #[cfg(test)]
             if injected_open_failure {
                 crate::operations::set_record_open_failure(
@@ -71,16 +72,8 @@ impl Collection {
                 }));
                 continue;
             }
-            if !self.rename_root_path_is_current() {
-                failures.push(serde_json::json!({
-                    "path": plan.execution_path,
-                    "reason": "io_error",
-                    "message": "Collection root was replaced during rename",
-                }));
-                continue;
-            }
-            if let Err(error) = crate::operations::atomic_write_in_prepared_parent(
-                &full_path,
+            if let Err(error) = self.held_root().atomic_write(
+                std::path::Path::new(&plan.execution_path),
                 plan.output.as_bytes(),
             ) {
                 failures.push(serde_json::json!({
@@ -92,9 +85,5 @@ impl Collection {
             }
             references_updated.extend(plan.updates);
         }
-    }
-
-    pub(crate) fn rename_root_path_is_current(&self) -> bool {
-        self.held_root().display_identity_is_current()
     }
 }

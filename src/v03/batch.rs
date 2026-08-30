@@ -2,7 +2,6 @@ use std::fs;
 use std::path::Path;
 
 use serde_json::{json, Value};
-use walkdir::WalkDir;
 
 use super::{Diagnostic, OperationResult, Operations};
 use crate::mutation::{
@@ -513,35 +512,25 @@ fn copy_sparse_controls(
         collection.settings.contracts_folder.as_str(),
         "_schemas",
     ] {
-        let source = collection.root.join(folder);
-        if !source.is_dir() {
-            continue;
-        }
-        for entry in WalkDir::new(&source).follow_links(false) {
+        let paths = collection
+            .held_root()
+            .files_recursive(Path::new(folder))
+            .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+        for relative in paths {
             context.check()?;
-            let entry = entry.map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-            let relative = entry
-                .path()
-                .strip_prefix(&collection.root)
-                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-            let target = destination.join(relative);
-            if entry.file_type().is_dir() {
-                fs::create_dir_all(&target)
-                    .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-            } else if entry.file_type().is_file() {
-                *captured_entries = checked_capture_increment(*captured_entries)?;
-                *resource_entries = checked_capture_increment(*resource_entries)?;
-                context.check_entries(*captured_entries)?;
-                context.check_resource_entries(*resource_entries)?;
-                context.check_depth(relative.components().count().saturating_sub(1) as u64)?;
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-                }
-                let bytes = read_held_bounded(collection, relative, context)?;
-                fs::write(&target, bytes)
+            *captured_entries = checked_capture_increment(*captured_entries)?;
+            *resource_entries = checked_capture_increment(*resource_entries)?;
+            context.check_entries(*captured_entries)?;
+            context.check_resource_entries(*resource_entries)?;
+            context.check_depth(relative.components().count().saturating_sub(1) as u64)?;
+            let target = destination.join(&relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
                     .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
             }
+            let bytes = read_held_bounded(collection, &relative, context)?;
+            fs::write(&target, bytes)
+                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
         }
     }
     Ok(())
@@ -910,13 +899,17 @@ fn validate_authoritative_mtime(
                 None,
             )]
         })?;
-    let current = modified_millis(&collection.root.join(path)).ok_or_else(|| {
-        vec![Diagnostic::error(
-            "concurrent_modification",
-            format!("File '{path}' no longer matches the requested modification time."),
-            Some(path.to_string()),
-        )]
-    })?;
+    let current = collection
+        .held_root()
+        .modified_millis(Path::new(path))
+        .ok()
+        .ok_or_else(|| {
+            vec![Diagnostic::error(
+                "concurrent_modification",
+                format!("File '{path}' no longer matches the requested modification time."),
+                Some(path.to_string()),
+            )]
+        })?;
     if current != expected {
         return Err(vec![Diagnostic::error(
             "concurrent_modification",
@@ -982,13 +975,17 @@ fn adapt_mtime_precondition(
                 None,
             ))
         })?;
-    let current = modified_millis(&collection.root.join(path)).ok_or_else(|| {
-        Box::new(Diagnostic::error(
-            "concurrent_modification",
-            format!("File '{path}' no longer matches the requested modification time."),
-            Some(path.to_string()),
-        ))
-    })?;
+    let current = collection
+        .held_root()
+        .modified_millis(Path::new(path))
+        .ok()
+        .ok_or_else(|| {
+            Box::new(Diagnostic::error(
+                "concurrent_modification",
+                format!("File '{path}' no longer matches the requested modification time."),
+                Some(path.to_string()),
+            ))
+        })?;
     if current != expected {
         return Err(Box::new(Diagnostic::error(
             "concurrent_modification",
@@ -996,29 +993,23 @@ fn adapt_mtime_precondition(
             Some(path.to_string()),
         )));
     }
-    let shadow_mtime = modified_millis(&shadow.root.join(path)).ok_or_else(|| {
-        Box::new(Diagnostic::error(
-            "batch_preflight_failed",
-            format!("Preflight record '{path}' is unavailable."),
-            Some(path.to_string()),
-        ))
-    })?;
+    let shadow_mtime = shadow
+        .held_root()
+        .modified_millis(Path::new(path))
+        .ok()
+        .ok_or_else(|| {
+            Box::new(Diagnostic::error(
+                "batch_preflight_failed",
+                format!("Preflight record '{path}' is unavailable."),
+                Some(path.to_string()),
+            ))
+        })?;
     let mut adapted = input.as_object().cloned().unwrap_or_default();
     adapted.insert(
         "last_known_mtime".to_string(),
         Value::Number(shadow_mtime.into()),
     );
     Ok(Value::Object(adapted))
-}
-
-fn modified_millis(path: &Path) -> Option<u64> {
-    fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
 
 fn invalid_request(message: &str) -> OperationResult {

@@ -5,22 +5,21 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::CacheError;
+use crate::Collection;
 
 #[derive(Debug, Default)]
 pub(crate) struct CacheChanges {
-    pub stale: Vec<PathBuf>,
+    pub stale: Vec<String>,
     pub deleted: Vec<String>,
 }
 
-/// Compare one filesystem scan with the cache using one bulk SQLite read.
-///
-/// The previous implementation issued a SQLite lookup per collection file and
-/// then performed another filesystem existence pass for deletions. That made a
-/// no-op freshness check disproportionately expensive for paginated queries.
+/// Compare one capability-relative filesystem scan with the cache using one
+/// bulk SQLite read. Both the filesystem facts and the derived SQLite store are
+/// rooted in private held authorities rather than the collection display name.
 pub(crate) fn find_changes(
     conn: &Connection,
-    root: &Path,
-    files: &[PathBuf],
+    collection: &Collection,
+    files: &[String],
 ) -> Result<CacheChanges, CacheError> {
     let mut cached = HashMap::<String, (i64, bool)>::new();
     let mut statement =
@@ -41,21 +40,11 @@ pub(crate) fn find_changes(
 
     let mut disk_paths = HashSet::with_capacity(files.len());
     let mut stale = Vec::new();
-    for file_path in files {
-        let rel_path = file_path
-            .strip_prefix(root)
-            .map_err(|_| CacheError::OutsideRoot(file_path.display().to_string()))?
-            .to_string_lossy()
-            .replace('\\', "/");
+    for rel_path in files {
         disk_paths.insert(rel_path.clone());
-        let filesystem_mtime = std::fs::metadata(file_path)?
-            .modified()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|duration| duration.as_nanos() as i64)
-            .unwrap_or(0);
-        if !matches!(cached.get(&rel_path), Some((mtime, false)) if *mtime == filesystem_mtime) {
-            stale.push(file_path.clone());
+        let filesystem_mtime = collection.held_root().modified_nanos(Path::new(rel_path))?;
+        if !matches!(cached.get(rel_path), Some((mtime, false)) if *mtime == filesystem_mtime) {
+            stale.push(rel_path.clone());
         }
     }
     let deleted = cached
@@ -65,67 +54,25 @@ pub(crate) fn find_changes(
     Ok(CacheChanges { stale, deleted })
 }
 
-/// Compare filesystem mtimes against cached `mtime_ns` and return paths that
-/// are stale (file is newer than what the cache recorded).
-///
-/// `files` should be a list of *absolute* file paths already discovered on disk.
+/// Compatibility helpers retained for cache tests and older internal callers.
 #[allow(dead_code)]
-pub(crate) fn find_stale(conn: &Connection, root: &Path, files: &[PathBuf]) -> Vec<PathBuf> {
-    let mut stale = Vec::new();
-    for file_path in files {
-        let rel_path = match file_path.strip_prefix(root) {
-            Ok(p) => p.to_string_lossy().replace('\\', "/"),
-            Err(_) => continue,
-        };
-
-        // Read filesystem mtime
-        let fs_mtime_ns = match std::fs::metadata(file_path) {
-            Ok(meta) => {
-                use std::time::UNIX_EPOCH;
-                meta.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0)
-            }
-            Err(_) => continue, // can't stat => skip
-        };
-
-        // Look up cached mtime
-        let cached_mtime: Option<i64> = conn
-            .query_row(
-                "SELECT mtime_ns FROM files WHERE path = ?1",
-                rusqlite::params![rel_path],
-                |row| row.get(0),
-            )
-            .ok();
-
-        match cached_mtime {
-            Some(cm) if cm == fs_mtime_ns => {} // up to date
-            _ => stale.push(file_path.clone()), // missing or different
-        }
-    }
-    stale
+pub(crate) fn find_stale(
+    conn: &Connection,
+    collection: &Collection,
+    files: &[String],
+) -> Vec<PathBuf> {
+    find_changes(conn, collection, files)
+        .map(|changes| changes.stale.into_iter().map(PathBuf::from).collect())
+        .unwrap_or_default()
 }
 
-/// Return the set of relative paths present in the cache but **not** on disk.
 #[allow(dead_code)]
-pub(crate) fn find_deleted(conn: &Connection, root: &Path) -> Vec<String> {
-    let mut stmt = match conn.prepare("SELECT path FROM files") {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut deleted = Vec::new();
-    for rel_path in rows.flatten() {
-        let abs = root.join(&rel_path);
-        if !abs.exists() {
-            deleted.push(rel_path);
-        }
-    }
-    deleted
+pub(crate) fn find_deleted(
+    conn: &Connection,
+    collection: &Collection,
+    files: &[String],
+) -> Vec<String> {
+    find_changes(conn, collection, files)
+        .map(|changes| changes.deleted)
+        .unwrap_or_default()
 }

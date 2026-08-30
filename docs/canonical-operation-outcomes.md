@@ -22,16 +22,19 @@ a validation JSON envelope, has its own `CursorLifecycle` family, and can only b
 
 ## Journal compatibility
 
-Runtime journal versions are schema-strict. Version 2 accepts only legacy
-`operation_result`/`rejection` fields; version 3 accepts only canonical
-`operation_outcome`/`operation_rejection` fields. Rejection fields must agree with the phase,
-and readers never fall back across versions. Version-3 mutation journals also authenticate
-the outcome and rejection operation against the exact record or resource change family and
-reject wire-only, cursor-lifecycle, or legacy-recovery state.
+Runtime journal versions are schema-strict. The current writer emits version 4 with
+canonical `operation_outcome`/`operation_rejection` fields and authenticated transition
+evidence. Version 2 accepts only legacy `operation_result`/`rejection` fields. Version 3 is
+the Phase-4 canonical format: it accepts only canonical outcome/rejection fields and remains
+readable only when its retained physical entries exactly prove the transition. Rejection
+fields must agree with the phase, and readers never fall back across versions. Version-3 and
+version-4 mutation journals authenticate the outcome and rejection operation against the
+exact record or resource change family and reject wire-only, cursor-lifecycle, or
+legacy-recovery state.
 
 Version-2 journals continue to recover their exact v0.3 envelope. An ambiguous version-2
 envelope is represented internally as legacy recovery state only in `transactions::runtime`;
-it cannot be deserialized through the public outcome type or serialized into a new v3 journal.
+it cannot be deserialized through the public outcome type or serialized into a new journal.
 
 `ExecutionOutcome::result` and `CommitRejection::result` remain deprecated ephemeral v0.3
 projections derived from `operation.to_v03()`. They are never independent authority and are

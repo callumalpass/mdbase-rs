@@ -1,6 +1,5 @@
-use std::fs;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +15,6 @@ use crate::transactions::RuntimeResolution;
 use crate::Collection;
 
 const FEED_VERSION: u32 = 1;
-const RUNTIME_DIRECTORY: &str = ".mdbase/runtime";
-const FEED_FILE: &str = "change-feed.json";
 const MAX_UNACKED_EVENTS: usize = 100_000;
 const MAX_FEED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PAGE_ITEMS: usize = 256;
@@ -83,7 +80,7 @@ pub(crate) fn reconcile(
     let mut generation = initial_generation;
     let resolutions = crate::transactions::list_unacked_runtime_events(collection, context)
         .map_err(super::filesystem::transaction_error)?;
-    let mut changed = !feed_path(collection).exists();
+    let mut changed = !collection.held_root().exists_file(feed_relative_path());
     for resolution in resolutions {
         context.check()?;
         let RuntimeResolution::Committed {
@@ -146,8 +143,8 @@ pub(crate) fn ensure_capacity(collection: &Collection) -> Result<(), ProviderErr
     if journal.events.len() >= MAX_UNACKED_EVENTS.saturating_sub(1) {
         return Err(ProviderError::ChangeFeedCapacityExhausted);
     }
-    match fs::metadata(feed_path(collection)) {
-        Ok(metadata) if metadata.len() >= MAX_FEED_BYTES => {
+    match collection.held_root().open_file(feed_relative_path()) {
+        Ok(file) if file.metadata().map_err(feed_io)?.len() >= MAX_FEED_BYTES => {
             Err(ProviderError::ChangeFeedCapacityExhausted)
         }
         Ok(_) => Ok(()),
@@ -321,42 +318,14 @@ pub(crate) fn commit_baseline(
 /// Discard copied consumer history after durable transactions have been
 /// recovered and detached from their original host claims.
 pub(crate) fn reset_for_fork(collection: &Collection) -> Result<(), ProviderError> {
-    let path = feed_path(collection);
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(ProviderError::Transaction {
-                code: "change_feed_invalid",
-                message: "runtime change feed is not a regular file".to_string(),
-            });
-        }
-        Ok(_) => fs::remove_file(&path).map_err(|error| ProviderError::Transaction {
+    match collection.held_root().remove_file(feed_relative_path()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ProviderError::Transaction {
             code: "change_feed_reset_failed",
             message: error.to_string(),
-        })?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(ProviderError::Transaction {
-                code: "change_feed_reset_failed",
-                message: error.to_string(),
-            });
-        }
+        }),
     }
-    sync_feed_directory(path.parent().expect("feed path has a parent"))
-}
-
-#[cfg(not(windows))]
-fn sync_feed_directory(path: &Path) -> Result<(), ProviderError> {
-    std::fs::File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| ProviderError::Transaction {
-            code: "change_feed_reset_failed",
-            message: error.to_string(),
-        })
-}
-
-#[cfg(windows)]
-fn sync_feed_directory(_path: &Path) -> Result<(), ProviderError> {
-    Ok(())
 }
 
 pub(crate) fn read(
@@ -583,8 +552,7 @@ fn validate(journal: &FeedJournal) -> Result<(), ProviderError> {
 }
 
 fn read_or_default(collection: &Collection) -> Result<FeedJournal, ProviderError> {
-    let path = feed_path(collection);
-    match fs::read(&path) {
+    match collection.held_root().read(feed_relative_path()) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| corrupt(&error.to_string())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FeedJournal {
             version: FEED_VERSION,
@@ -603,18 +571,18 @@ fn read_or_default(collection: &Collection) -> Result<FeedJournal, ProviderError
 
 fn persist(collection: &Collection, journal: &FeedJournal) -> Result<(), ProviderError> {
     validate(journal)?;
-    let path = feed_path(collection);
-    let parent = path.parent().expect("feed path has a parent");
-    fs::create_dir_all(parent).map_err(feed_io)?;
     let bytes = serde_json::to_vec_pretty(journal).map_err(|error| corrupt(&error.to_string()))?;
     if bytes.len() as u64 > MAX_FEED_BYTES {
         return Err(ProviderError::ChangeFeedCapacityExhausted);
     }
-    crate::operations::atomic_write(&path, &bytes).map_err(feed_io)
+    collection
+        .held_root()
+        .atomic_write(feed_relative_path(), &bytes)
+        .map_err(feed_io)
 }
 
-fn feed_path(collection: &Collection) -> PathBuf {
-    collection.root.join(RUNTIME_DIRECTORY).join(FEED_FILE)
+fn feed_relative_path() -> &'static Path {
+    Path::new(".mdbase/runtime/change-feed.json")
 }
 
 fn corrupt(message: &str) -> ProviderError {
@@ -628,5 +596,29 @@ fn feed_io(error: std::io::Error) -> ProviderError {
     ProviderError::Transaction {
         code: "change_feed_io_failed",
         message: error.to_string(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod authority_tests {
+    use super::*;
+
+    #[test]
+    fn replacement_root_never_receives_feed_publication() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("collection");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        let collection = Collection::open(&root).unwrap();
+        let held = parent.path().join("held");
+        std::fs::rename(&root, &held).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+
+        let journal = read_or_default(&collection).unwrap();
+        persist(&collection, &journal).unwrap();
+
+        assert!(held.join(".mdbase/runtime/change-feed.json").is_file());
+        assert!(!root.join(".mdbase").exists());
     }
 }

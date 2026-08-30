@@ -419,6 +419,36 @@ x-obsidian:
     assert!(root.path().join("views/inbox.base").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn replacement_root_never_receives_saved_view_crud() {
+    let parent = tempdir().unwrap();
+    let root = parent.path().join("collection");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("mdbase.yaml"),
+        "spec_version: 0.3.0\nx-obsidian:\n  bases:\n    include: [\"views/**/*.base\"]\n",
+    )
+    .unwrap();
+    let collection = Collection::open(&root).unwrap();
+    let held = parent.path().join("held");
+    fs::rename(&root, &held).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+
+    let created = collection
+        .v03_operations()
+        .unwrap()
+        .create_view_source(&json!({
+            "format": "obsidian.base",
+            "name": "Inbox",
+            "document": "views:\n  - type: table\n    name: Inbox\n"
+        }));
+    assert!(created.valid, "{:?}", created.diagnostics);
+    assert!(held.join("views/inbox.base").is_file());
+    assert!(!root.join("views").exists());
+}
+
 #[test]
 fn configured_sources_are_not_ordinary_records() {
     let (_root, collection) = collection();

@@ -457,11 +457,12 @@ pub(crate) fn record_result(
     collection: &Collection,
     planned: PlannedRecord,
 ) -> Result<(bool, BatchOperationResult, Vec<Diagnostic>), MdbaseError> {
-    let metadata = std::fs::metadata(planned.path.under(&collection.root)).map_err(|error| {
-        MdbaseError::InvalidResult {
+    let metadata = collection
+        .held_root()
+        .metadata(&planned.path.to_path_buf())
+        .map_err(|error| MdbaseError::InvalidResult {
             message: error.to_string(),
-        }
-    })?;
+        })?;
     let outcome = super::project_record(collection, planned, metadata)?;
     Ok((
         true,

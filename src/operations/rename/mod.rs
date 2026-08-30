@@ -20,11 +20,7 @@ use crate::errors::*;
 #[cfg(feature = "legacy-collection-mutation")]
 use crate::mutation::PreparationOptions;
 use crate::mutation::{PlannedRecord, PlannedRename, PreparedRename};
-use crate::operations::{
-    atomic_rename_noclobber, atomic_write_in_prepared_parent,
-    ensure_no_symlink_components_diagnostic, ensure_regular_record_file_diagnostic,
-    prepare_record_parent_no_follow,
-};
+use crate::operations::prepare_record_parent_no_follow;
 use crate::Collection;
 
 #[cfg(test)]
@@ -74,12 +70,11 @@ impl Collection {
             Err(error) => return error,
         };
         for (path, _) in &simulations {
-            if let Err(error) = crate::operations::ensure_no_symlink_components(
-                &self.root,
-                path.as_str(),
-                self.spec_profile,
-            ) {
-                return error;
+            if let Err(error) = self
+                .held_root()
+                .ensure_no_symlink_components(&path.to_path_buf())
+            {
+                return crate::errors::op_error(PATH_TRAVERSAL, &error.to_string());
             }
         }
         let request = RenameRequest {
@@ -155,18 +150,23 @@ impl Collection {
         if !dry_run {
             #[cfg(test)]
             apply_injected_root_replacement(&self.root);
-            ensure_no_symlink_components_diagnostic(&self.root, &from, self.spec_profile)
-                .map_err(crate::mutation::MutationFailure::diagnostic)?;
-            ensure_no_symlink_components_diagnostic(&self.root, &to, self.spec_profile)
-                .map_err(crate::mutation::MutationFailure::diagnostic)?;
-            ensure_regular_record_file_diagnostic(&request.from.under(&self.root), &from)
-                .map_err(crate::mutation::MutationFailure::diagnostic)?;
-            if !self.rename_root_path_is_current() {
-                return Err(crate::mutation::MutationFailure::operation(
-                    CONCURRENT_MODIFICATION,
-                    "Collection root was replaced during rename",
-                ));
-            }
+            self.held_root()
+                .ensure_no_symlink_components(&request.from.to_path_buf())
+                .and_then(|()| {
+                    self.held_root()
+                        .ensure_no_symlink_components(&request.to.to_path_buf())
+                })
+                .map_err(|error| {
+                    crate::mutation::MutationFailure::operation(PATH_TRAVERSAL, error.to_string())
+                })?;
+            self.held_root()
+                .metadata(&request.from.to_path_buf())
+                .map_err(|_| {
+                    crate::mutation::MutationFailure::operation(
+                        FILE_NOT_FOUND,
+                        format!("File not found: {from}"),
+                    )
+                })?;
             prepare_record_parent_no_follow(self, &request.to).map_err(|error| {
                 crate::mutation::MutationFailure::operation(
                     "io_error",
@@ -193,38 +193,29 @@ impl Collection {
                     format!("File '{from}' was modified externally"),
                 ));
             }
-            if !self.rename_root_path_is_current() {
-                return Err(crate::mutation::MutationFailure::operation(
-                    CONCURRENT_MODIFICATION,
-                    "Collection root was replaced during rename",
-                ));
-            }
-            atomic_rename_noclobber(
-                &request.from.under(&self.root),
-                &request.to.under(&self.root),
-            )
-            .map_err(|error| {
-                crate::mutation::MutationFailure::operation(
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        PATH_CONFLICT
-                    } else {
-                        "io_error"
-                    },
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        format!("Target already exists: {to}")
-                    } else {
-                        format!("Failed to rename: {error}")
-                    },
-                )
-            })?;
+            self.held_root()
+                .rename_noclobber(&request.from.to_path_buf(), &request.to.to_path_buf())
+                .map_err(|error| {
+                    crate::mutation::MutationFailure::operation(
+                        if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            PATH_CONFLICT
+                        } else {
+                            "io_error"
+                        },
+                        if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            format!("Target already exists: {to}")
+                        } else {
+                            format!("Failed to rename: {error}")
+                        },
+                    )
+                })?;
 
             if request.update_refs {
                 for (path, content) in legacy_simulations {
                     if prepare_record_parent_no_follow(self, &path).is_ok() {
-                        let _ = atomic_write_in_prepared_parent(
-                            &path.under(&self.root),
-                            content.as_bytes(),
-                        );
+                        let _ = self
+                            .held_root()
+                            .atomic_write(&path.to_path_buf(), content.as_bytes());
                     }
                 }
             }

@@ -367,10 +367,11 @@ impl Collection {
             {
                 return error;
             }
-            if let Err(error) =
-                crate::operations::ensure_no_symlink_components(&self.root, path, self.spec_profile)
+            if let Err(error) = self
+                .held_root()
+                .ensure_no_symlink_components(std::path::Path::new(path))
             {
-                return error;
+                return op_error(PATH_TRAVERSAL, &error.to_string());
             }
         }
 

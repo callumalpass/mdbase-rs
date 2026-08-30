@@ -267,9 +267,13 @@ impl Collection {
             }
         };
 
-        // Check existence
-        let full_path = path.under(&self.root);
-        if full_path.exists() {
+        // Check existence through the held collection capability. An inspection
+        // failure is treated as occupied so creation cannot bypass the boundary.
+        if self
+            .held_root()
+            .entry_exists(&path.to_path_buf())
+            .unwrap_or(true)
+        {
             return Err(crate::mutation::MutationFailure::operation(
                 PATH_CONFLICT,
                 format!("File already exists: {}", path.as_str()),
