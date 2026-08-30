@@ -69,7 +69,7 @@ fn timestamp_from_ns(value: i64) -> Option<String> {
 }
 
 impl Collection {
-    pub fn batch_update(
+    pub(crate) fn batch_update_legacy(
         &self,
         input: &serde_json::Value,
         simulate_io_error: Option<&str>,
@@ -550,7 +550,7 @@ impl Collection {
     }
 
     /// Batch delete files matching a where clause (§12.4, §12.7).
-    pub fn batch_delete(
+    pub(crate) fn batch_delete_legacy(
         &self,
         input: &serde_json::Value,
         simulate_io_error: Option<&str>,
@@ -654,7 +654,7 @@ impl Collection {
                 }
             }
 
-            let deleted = self.delete(&serde_json::json!({"path": path}));
+            let deleted = self.delete_legacy(&serde_json::json!({"path": path}));
             if deleted.get("error").is_some() {
                 failed += 1;
                 details.push(serde_json::json!({ "path": path, "status": "failed" }));
@@ -766,7 +766,7 @@ impl Collection {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 mod snapshot_batch_tests {
     use super::*;
 

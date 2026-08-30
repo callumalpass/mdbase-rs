@@ -33,13 +33,13 @@ pub trait CollectionProvider: Send + Sync {
     /// Execute through the compatibility entry point while hosts migrate to
     /// explicit operation contexts.
     fn execute(&self, request: &OperationRequest) -> Result<OperationResult, ProviderError> {
-        self.execute_with_context(request, &OperationContext::legacy())
+        self.execute_with_context(request, &OperationContext::internal())
     }
 
     /// Refresh through the compatibility entry point while hosts migrate to
     /// explicit operation contexts.
     fn refresh(&self) -> Result<(), ProviderError> {
-        self.refresh_with_context(&OperationContext::legacy())
+        self.refresh_with_context(&OperationContext::internal())
     }
 }
 
@@ -143,7 +143,7 @@ impl FilesystemProvider {
     /// the capture. External filesystem writers are detected by the ordinary
     /// opaque revisions and by a subsequent capture before cutover.
     pub fn snapshot(&self) -> Result<CollectionSnapshot, ProviderError> {
-        self.snapshot_with_context(&OperationContext::legacy())
+        self.snapshot_with_context(&OperationContext::internal())
     }
 
     /// Capture a snapshot while honoring the caller's operation boundary.
@@ -158,7 +158,7 @@ impl FilesystemProvider {
 
     /// Materialize one record at the provider's read boundary.
     pub fn snapshot_record(&self, path: &str) -> Result<CollectionSnapshotRecord, ProviderError> {
-        self.snapshot_record_with_context(path, &OperationContext::legacy())
+        self.snapshot_record_with_context(path, &OperationContext::internal())
     }
 
     /// Materialize one record while honoring the caller's operation boundary.
@@ -184,7 +184,7 @@ impl FilesystemProvider {
     where
         E: From<ProviderError>,
     {
-        self.with_collection_context(&OperationContext::legacy(), operation)
+        self.with_collection_context(&OperationContext::internal(), operation)
     }
 
     /// Execute one compound exclusive operation with an explicit boundary.
@@ -235,7 +235,7 @@ impl FilesystemProvider {
     where
         E: From<ProviderError>,
     {
-        self.with_collection_read_context(&OperationContext::legacy(), operation)
+        self.with_collection_read_context(&OperationContext::internal(), operation)
     }
 
     /// Execute one compound read operation with an explicit boundary.
@@ -486,7 +486,7 @@ impl FilesystemProvider {
         &self,
         generation: &super::CollectionGeneration,
     ) -> Result<(), ProviderError> {
-        let context = OperationContext::legacy();
+        let context = OperationContext::internal();
         let _guard = self.write_lock(&context)?;
         let collection = self.current_collection()?;
         crate::cache::runtime::rebuild(collection.as_ref(), generation).map_err(cache_error)?;
@@ -507,10 +507,23 @@ impl FilesystemProvider {
         context.check()?;
         self.with_collection_boundary_context(context, |collection| {
             context.check()?;
-            let settlement = OperationContext::legacy();
+            let settlement = OperationContext::internal();
             crate::transactions::reset_runtime_support_for_fork(collection, &settlement)
                 .map_err(super::filesystem::transaction_error)?;
             super::feed::reset_for_fork(collection)
+        })
+    }
+
+    /// Count valid version-2 runtime journals without exposing journal contents.
+    /// Operators should record a zero result before the 0.5.0 compatibility removal.
+    pub fn legacy_journal_inventory(
+        &self,
+        context: &OperationContext,
+    ) -> Result<super::LegacyJournalInventory, ProviderError> {
+        context.check()?;
+        self.with_collection_boundary_context(context, |collection| {
+            crate::transactions::legacy_runtime_journal_inventory(collection, context)
+                .map_err(super::filesystem::transaction_error)
         })
     }
 

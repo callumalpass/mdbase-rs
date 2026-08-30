@@ -127,7 +127,7 @@ pub(crate) struct QueryExecution {
 pub(crate) type QueryEvaluation = Result<QueryExecution, Vec<Diagnostic>>;
 
 pub(crate) fn execute_typed(collection: &Collection, query: Query) -> QueryEvaluation {
-    let context = crate::runtime::OperationContext::legacy();
+    let context = crate::runtime::OperationContext::internal();
     execute_model_profiled_cancellable(
         collection,
         query,

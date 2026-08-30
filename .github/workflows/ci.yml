@@ -29,6 +29,8 @@ jobs:
       - name: Enforce architecture and debt budgets
         run: cargo run --locked -p mdbase-architecture-check -- .
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo check --locked -p mdbase --no-default-features --all-targets
+      - run: ./scripts/check-legacy-feature-boundary.sh
       - run: cargo test --locked -p mdbase-runtime --no-default-features
       - run: cargo test --locked -p mdbase-runtime --no-default-features --features sqlite
       - run: cargo check --locked -p mdbase-runtime --no-default-features --features postgres

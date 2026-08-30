@@ -10,7 +10,8 @@ description = "Transport-neutral command model and profiling workloads for mdbas
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
-mdbase = { version = "0.4.0-rc.4", path = "../.." }
+# The backfill command remains an explicitly selected 0.4.x compatibility edge.
+mdbase = { version = "0.4.0-rc.4", path = "../..", features = ["legacy-collection-mutation"] }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

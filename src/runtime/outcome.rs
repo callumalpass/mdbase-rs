@@ -469,9 +469,12 @@ pub struct ExecutionOutcome {
     pub operation: CanonicalOperationOutcome,
     /// Ephemeral v0.3 compatibility projection for coordinated host migration.
     ///
-    /// This field is never journaled and will be removed after Connect consumes
-    /// `operation` exclusively.
-    #[deprecated(note = "use operation; removal tracked after the Connect Phase 4 migration")]
+    /// This field is never journaled and is removed in 0.5.0 after the 0.4.x
+    /// Connect compatibility window.
+    #[deprecated(
+        since = "0.4.0",
+        note = "use operation (or operation.to_v03() only at a wire edge); removed in 0.5.0 after the 0.4.x Connect compatibility window"
+    )]
     pub result: crate::v03::OperationResult,
     /// Runtime generation observed or produced.
     pub generation: CollectionGeneration,
@@ -501,6 +504,21 @@ impl ExecutionOutcome {
             commit_id,
             change_event,
         }
+    }
+}
+
+/// Privacy-safe inventory of journals that still require the version-2
+/// compatibility decoder. No transaction IDs, paths, claims, or payloads are exposed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyJournalInventory {
+    /// Number of valid version-2 runtime journals under the held collection authority.
+    pub version_2: usize,
+}
+
+impl LegacyJournalInventory {
+    /// True when the collection has crossed the fixture-zero removal gate.
+    pub fn is_zero(self) -> bool {
+        self.version_2 == 0
     }
 }
 
@@ -661,8 +679,12 @@ pub enum PreparationOutcome {
 pub struct CommitRejection {
     /// Typed canonical operation failure.
     pub operation: CanonicalOperationOutcome,
-    /// Ephemeral v0.3 compatibility projection; never persisted.
-    #[deprecated(note = "use operation; removal tracked after the Connect Phase 4 migration")]
+    /// Ephemeral v0.3 compatibility projection; never persisted. Removed in
+    /// 0.5.0 after the 0.4.x Connect compatibility window.
+    #[deprecated(
+        since = "0.4.0",
+        note = "use operation (or operation.to_v03() only at a wire edge); removed in 0.5.0 after the 0.4.x Connect compatibility window"
+    )]
     pub result: crate::v03::OperationResult,
 }
 

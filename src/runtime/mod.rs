@@ -96,10 +96,10 @@ pub use outcome::{
     ChangeFeedOwnerId, ChangeFeedTransfer, ChangeFeedTransferId, ChangeFeedTransferIntent,
     ChangeFeedTransferReceipt, ChangeOrigin, ChangePage, ChangePageCursor, ChangeSet,
     ChangeWatermark, CollectionGeneration, CommitAttempt, CommitId, CommitRejection,
-    CursorReleaseOutcome, DurableCommitState, ExecutionOutcome, HostClaimId, PreparationOutcome,
-    PreparedMutation, ReadCursor, ReadPage, RebuildReason, RecordChange, RecordChangeKind,
-    ResourceChange, ResourceChangeKind, RuntimeChangeEvent, RuntimeChangeEventPage,
-    RuntimeMeasurements,
+    CursorReleaseOutcome, DurableCommitState, ExecutionOutcome, HostClaimId,
+    LegacyJournalInventory, PreparationOutcome, PreparedMutation, ReadCursor, ReadPage,
+    RebuildReason, RecordChange, RecordChangeKind, ResourceChange, ResourceChangeKind,
+    RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeMeasurements,
 };
 pub use projection::{
     PreparedSemanticProjection, RecordResolutionKey, RecordResolutionKeyKind, SemanticFileFacts,

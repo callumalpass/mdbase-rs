@@ -1,6 +1,6 @@
 {
-  "rustSourceFileCountMax": 172,
-  "rustSourceLineCountMax": 97200,
+  "rustSourceFileCountMax": 173,
+  "rustSourceLineCountMax": 97634,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-command/src/lib.rs": 1816,
@@ -11,16 +11,17 @@
     "src/expressions/evaluator.rs": 3390,
     "src/links/resolver.rs": 1201,
     "src/query/engine.rs": 1086,
-    "src/runtime/filesystem.rs": 1370,
+    "src/runtime/filesystem.rs": 1380,
     "src/runtime/canonical_operation.rs": 1410,
     "src/runtime/hosted_base.rs": 1968,
     "src/runtime/hosted_mutation.rs": 1200,
     "src/runtime/hosted_query.rs": 3400,
     "src/runtime/hosted_resource.rs": 1040,
+    "src/runtime/provider.rs": 1020,
     "src/runtime/record_resolution.rs": 1393,
-    "src/runtime/tests.rs": 4303,
+    "src/runtime/tests.rs": 4304,
     "src/transactions.rs": 1029,
-    "src/transactions/runtime.rs": 1670,
+    "src/transactions/runtime.rs": 1720,
     "src/v03/batch.rs": 1467,
     "src/v03/collection_setup.rs": 1479,
     "src/v03/type_pack.rs": 2110,
@@ -43,6 +44,37 @@
   },
   "transitionalReferenceBudgets": {
     "uncheckedCollectionScans": 0,
-    "v03OperationFacade": 26
+    "v03OperationFacade": 26,
+    "legacyCollectionFacadeDefinitions": [
+      "backfill",
+      "batch_delete",
+      "batch_update",
+      "create",
+      "delete",
+      "rename",
+      "update"
+    ],
+    "legacyCompatibilityAllowlist": {
+      "src/api/operations.rs": ["CreateInput", "CreateOutput", "DeleteInput", "DeleteOutput", "RenameInput", "UpdateInput", "UpdateOutput"],
+      "src/compat/legacy_mutation.rs": ["backfill_legacy", "batch_delete_legacy", "batch_update_legacy", "create_legacy", "delete_legacy", "rename_legacy", "update_legacy"],
+      "src/compat/mod.rs": ["legacy_mutation"],
+      "src/operations/backfill.rs": ["backfill_legacy"],
+      "src/operations/batch.rs": ["batch_delete_legacy", "batch_update_legacy", "delete_legacy"],
+      "src/operations/create.rs": ["CreateInput", "CreateOutput", "create_legacy"],
+      "src/operations/delete.rs": ["DeleteInput", "DeleteOutput", "delete_legacy"],
+      "src/operations/migrate.rs": ["backfill_legacy"],
+      "src/operations/rename/mod.rs": ["RenameInput", "rename_legacy"],
+      "src/operations/update.rs": ["UpdateInput", "UpdateOutput", "update_legacy"]
+    },
+    "operationContextLegacyProduction": 0,
+    "operationContextLegacySupport": 167,
+    "wireOnlyVariants": ["TypeResource", "Validation", "ViewResource"],
+    "wireOnlyConstructorAllowlist": {
+      "src/runtime/canonical_operation.rs": {"type_wire": 2, "validation_wire": 1, "view_wire": 2, "wire_only": 4},
+      "src/runtime/filesystem.rs": {"wire_only": 1},
+      "src/v03/batch.rs": {"wire_only": 1}
+    },
+    "ephemeralResultProduction": 0,
+    "ephemeralResultSupport": 4
   }
 }

@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-collection-mutation")]
+
 //! Conformance test runner for mdbase.
 //!
 //! Reads YAML test files from ~/projects/mdbase-spec/tests/ and executes

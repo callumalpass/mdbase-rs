@@ -291,7 +291,7 @@ pub(crate) fn load_record_no_follow(
     load_record_no_follow_cancellable(
         collection,
         rel_path,
-        OperationContext::legacy().cancellation(),
+        OperationContext::internal().cancellation(),
     )
 }
 

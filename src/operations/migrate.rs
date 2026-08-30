@@ -150,7 +150,8 @@ impl Collection {
                     if dry_run {
                         backfill_input.insert("dry_run".to_string(), serde_json::Value::Bool(true));
                     }
-                    let backfill_result = self.backfill(&serde_json::Value::Object(backfill_input));
+                    let backfill_result =
+                        self.backfill_legacy(&serde_json::Value::Object(backfill_input));
                     if backfill_result.get("error").is_some() {
                         return op_error(MIGRATION_FAILED, "Migration failed");
                     }

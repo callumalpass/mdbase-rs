@@ -4274,18 +4274,19 @@ fn held_authority_never_adopts_a_replacement_root_across_refresh_snapshot_cache_
     assert!(!root.join("transaction.md").exists());
     assert!(!root.join(".mdbase").exists());
 
-    let created = collection.create(&serde_json::json!({"path": "created.md", "body": "held"}));
+    let created =
+        collection.create_legacy(&serde_json::json!({"path": "created.md", "body": "held"}));
     assert!(created.get("error").is_none(), "{created:?}");
     assert!(held.join("created.md").is_file());
     assert!(!root.join("created.md").exists());
     let updated =
-        collection.update(&serde_json::json!({"path": "authority.md", "body": "updated"}));
+        collection.update_legacy(&serde_json::json!({"path": "authority.md", "body": "updated"}));
     assert!(updated.get("error").is_none(), "{updated:?}");
     assert_eq!(
         fs::read_to_string(held.join("authority.md")).unwrap(),
         "updated"
     );
-    let deleted = collection.delete(&serde_json::json!({"path": "authority.md"}));
+    let deleted = collection.delete_legacy(&serde_json::json!({"path": "authority.md"}));
     assert!(deleted.get("error").is_none(), "{deleted:?}");
     assert!(!held.join("authority.md").exists());
     assert_eq!(

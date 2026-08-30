@@ -7,8 +7,7 @@ use crate::mutation::{PlannedDelete, PreparationOptions, PreparedDelete};
 use crate::Collection;
 
 impl Collection {
-    /// Legacy JSON delete edge. Canonical callers use the typed mutation service.
-    pub fn delete(&self, input: &serde_json::Value) -> serde_json::Value {
+    pub(crate) fn delete_legacy(&self, input: &serde_json::Value) -> serde_json::Value {
         #[cfg(test)]
         crate::mutation::probe_legacy_parse();
         let input = match DeleteInput::parse(input) {

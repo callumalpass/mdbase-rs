@@ -21,7 +21,7 @@ pub(crate) fn execute_profiled(
     collection: &Collection,
     input: &Value,
 ) -> (OperationResult, QueryPerformance) {
-    let context = crate::runtime::OperationContext::legacy();
+    let context = crate::runtime::OperationContext::internal();
     execute_wire_profiled_cancellable(collection, input, context.cancellation(), false)
         .expect("the context-free compatibility context is active")
 }

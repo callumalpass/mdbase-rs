@@ -7,7 +7,7 @@ pub(super) mod hooks;
 mod link_rewrite;
 mod planner;
 mod publication;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 mod tests;
 
 pub(crate) use planner::ReferenceRewritePlan;
@@ -27,8 +27,7 @@ use crate::Collection;
 use hooks::apply_injected_root_replacement;
 
 impl Collection {
-    /// Legacy JSON rename edge. Canonical callers use the typed mutation service.
-    pub fn rename(&self, input: &serde_json::Value) -> serde_json::Value {
+    pub(crate) fn rename_legacy(&self, input: &serde_json::Value) -> serde_json::Value {
         #[cfg(test)]
         crate::mutation::probe_legacy_parse();
         let input = match RenameInput::parse(input) {

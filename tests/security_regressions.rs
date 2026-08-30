@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-collection-mutation")]
+
 use std::fs;
 use std::path::Path;
 

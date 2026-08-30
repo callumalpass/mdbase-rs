@@ -64,7 +64,7 @@ impl Collection {
     /// Long-running hosts should normally call [`super::FilesystemProvider::snapshot`],
     /// which also holds the provider's read gate for the full capture.
     pub fn snapshot(&self) -> Result<CollectionSnapshot, ProviderError> {
-        self.snapshot_with_context(&super::OperationContext::legacy())
+        self.snapshot_with_context(&super::OperationContext::internal())
     }
 
     /// Capture with caller-owned cancellation, deadline, and finite budgets.
@@ -82,7 +82,7 @@ impl Collection {
         collection_snapshot(
             self,
             InvalidRecordPolicy::Observe,
-            &super::OperationContext::legacy(),
+            &super::OperationContext::internal(),
         )
     }
 
@@ -103,7 +103,7 @@ impl Collection {
     /// wire format. Typed `read` remains strict, but transport layers do not
     /// reimplement parsing policy.
     pub fn snapshot_record(&self, path: &str) -> Result<CollectionSnapshotRecord, ProviderError> {
-        self.snapshot_record_with_context(path, &super::OperationContext::legacy())
+        self.snapshot_record_with_context(path, &super::OperationContext::internal())
     }
 
     pub fn snapshot_record_with_context(

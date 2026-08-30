@@ -69,6 +69,15 @@ impl FilesystemRuntime {
         )
     }
 
+    /// Count valid version-2 runtime journals without exposing journal contents.
+    /// A zero result is the operator-facing gate for removing the decoder in 0.5.0.
+    pub fn legacy_journal_inventory(
+        &self,
+        context: &OperationContext,
+    ) -> Result<super::LegacyJournalInventory, ProviderError> {
+        self.provider.legacy_journal_inventory(context)
+    }
+
     pub fn open_observed(
         root: impl AsRef<Path>,
         debounce: Duration,
@@ -82,12 +91,12 @@ impl FilesystemRuntime {
         )?);
         let initial_generation = CollectionGeneration::initial();
         let reconciled = provider.with_collection_boundary_context(
-            &OperationContext::legacy(),
+            &OperationContext::internal(),
             |collection| {
                 super::feed::reconcile(
                     collection,
                     initial_generation.clone(),
-                    &OperationContext::legacy(),
+                    &OperationContext::internal(),
                 )
             },
         )?;
@@ -145,7 +154,7 @@ impl FilesystemRuntime {
     }
 
     pub fn execute(&self, request: &OperationRequest) -> Result<OperationResult, ProviderError> {
-        self.execute_with_context(request, &OperationContext::legacy())
+        self.execute_with_context(request, &OperationContext::internal())
     }
 
     /// Compatibility wrapper which serializes the typed runtime result exactly
@@ -163,7 +172,7 @@ impl FilesystemRuntime {
         &self,
         request: &OperationRequest,
     ) -> Result<ExecutionOutcome, ProviderError> {
-        self.execute_typed_with_context(request, &OperationContext::legacy())
+        self.execute_typed_with_context(request, &OperationContext::internal())
     }
 
     /// Execute the compatibility-decoded request and return the closed typed
@@ -556,7 +565,7 @@ impl FilesystemRuntime {
                 if !plan.needs_commit {
                     return Ok(plan.baseline);
                 }
-                let settlement = OperationContext::legacy();
+                let settlement = OperationContext::internal();
                 for commit_id in plan.commits {
                     transactions::ack_runtime_change_event(collection, &commit_id, &settlement)
                         .map_err(transaction_error)?;
@@ -591,7 +600,7 @@ impl FilesystemRuntime {
                 // Once acknowledgement starts it owns settlement. Marking each
                 // transaction first is crash-safe because the durable feed still
                 // retains the event until its own final atomic acknowledgement.
-                let settlement = OperationContext::legacy();
+                let settlement = OperationContext::internal();
                 for commit_id in commits {
                     transactions::ack_runtime_change_event(collection, &commit_id, &settlement)
                         .map_err(transaction_error)?;
@@ -689,7 +698,7 @@ impl FilesystemRuntime {
     /// Complete a full watcher comparison before accepting benchmark or host
     /// traffic. Normal mutations use the incremental synchronization path.
     pub fn synchronize(&self) -> Result<(), ProviderError> {
-        self.synchronize_with_context(&OperationContext::legacy())
+        self.synchronize_with_context(&OperationContext::internal())
     }
 
     /// Complete a full comparison within an explicit operation boundary.
@@ -731,7 +740,7 @@ impl FilesystemRuntime {
 
     #[cfg(test)]
     pub(crate) fn synchronize_paths_for_test(&self, paths: &[&str]) -> Result<(), ProviderError> {
-        self.synchronize_reconciliation(Some(paths), &OperationContext::legacy())
+        self.synchronize_reconciliation(Some(paths), &OperationContext::internal())
     }
 
     #[cfg(test)]
@@ -971,7 +980,7 @@ impl FilesystemRuntime {
         {
             // Committing is already durable. Internal settlement ownership can
             // no longer be cancelled by the application deadline.
-            let mut active = self.settlement_lock(&OperationContext::legacy())?;
+            let mut active = self.settlement_lock(&OperationContext::internal())?;
             if active.is_some() {
                 return Ok(CommitAttempt::SettlementPending { commit_id });
             }
@@ -987,7 +996,7 @@ impl FilesystemRuntime {
         let spawned = std::thread::Builder::new()
             .name("mdbase-settlement".to_string())
             .spawn(move || {
-                let settlement_context = OperationContext::legacy();
+                let settlement_context = OperationContext::internal();
                 let result =
                     provider.with_collection_boundary_context(&settlement_context, |collection| {
                         let resolution =
@@ -1048,8 +1057,9 @@ impl FilesystemRuntime {
         &self,
         resolution: &RuntimeResolution,
     ) -> Result<CommitAttempt, ProviderError> {
-        self.provider
-            .with_collection_boundary_context(&OperationContext::legacy(), |collection| {
+        self.provider.with_collection_boundary_context(
+            &OperationContext::internal(),
+            |collection| {
                 finish_resolution_inside(
                     collection,
                     self.provider.as_ref(),
@@ -1058,7 +1068,8 @@ impl FilesystemRuntime {
                     self.order.as_ref(),
                     resolution,
                 )
-            })
+            },
+        )
     }
 
     fn cursor_lock(

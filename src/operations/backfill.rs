@@ -78,8 +78,7 @@ fn apply_injected_backfill_replacement(path: &std::path::Path) {
 }
 
 impl Collection {
-    /// Backfill missing defaults/generated values across files (§12.8).
-    pub fn backfill(&self, input: &serde_json::Value) -> serde_json::Value {
+    pub(crate) fn backfill_legacy(&self, input: &serde_json::Value) -> serde_json::Value {
         let type_filter = input.get("type").and_then(|v| v.as_str());
         let where_clause = input.get("where");
         let dry_run = input
@@ -428,7 +427,7 @@ impl Collection {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 mod tests {
     use super::inject_backfill_replacement;
     use crate::Collection;

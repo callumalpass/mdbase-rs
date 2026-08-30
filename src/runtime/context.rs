@@ -289,7 +289,7 @@ impl OperationContext {
     }
 
     pub(crate) fn current_or_legacy() -> Self {
-        Self::current().unwrap_or_else(Self::legacy)
+        Self::current().unwrap_or_else(Self::internal)
     }
 
     pub(crate) fn next_wait(&self) -> Result<Duration, ProviderError> {
@@ -297,12 +297,18 @@ impl OperationContext {
         Ok(self.deadline.remaining().min(CANCELLATION_POLL))
     }
 
-    /// Context used only by context-free compatibility entry points.
-    pub(crate) fn legacy() -> Self {
+    /// Bounded context for internal lifecycle work that has no external caller.
+    pub(crate) fn internal() -> Self {
         Self::new(
             &OperationCancellation::new(),
             OperationDeadline::after(LEGACY_DEADLINE),
         )
+    }
+
+    /// Context retained only for test/support inventory.
+    #[cfg(test)]
+    pub(crate) fn legacy() -> Self {
+        Self::internal()
     }
 }
 

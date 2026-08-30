@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-collection-mutation")]
+
 use mdbase::Collection;
 use serde_json::json;
 use std::{fs, path::Path};

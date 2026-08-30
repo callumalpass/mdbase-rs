@@ -15,8 +15,7 @@ use crate::operations::{
 use crate::Collection;
 
 impl Collection {
-    /// Create a file (§12.1).
-    pub fn create(&self, input: &serde_json::Value) -> serde_json::Value {
+    pub(crate) fn create_legacy(&self, input: &serde_json::Value) -> serde_json::Value {
         let parsed = CreateInput::parse(input);
         let request = CreateRequest {
             path: parsed

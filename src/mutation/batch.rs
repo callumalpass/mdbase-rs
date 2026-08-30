@@ -307,7 +307,7 @@ fn execute_items_direct_context(
         operations,
         options,
         dry_run,
-        &OperationContext::legacy(),
+        &OperationContext::internal(),
     )
 }
 

@@ -252,7 +252,7 @@ fn delete_probe_matrix_counts_real_boundaries() {
     let root = fixture();
     let collection = Collection::open(root.path()).unwrap();
     crate::mutation::reset_mutation_path_probes();
-    let legacy = collection.delete(&json!({"path": "target.md", "dry_run": true}));
+    let legacy = collection.delete_legacy(&json!({"path": "target.md", "dry_run": true}));
     assert_eq!(legacy["would_delete"], true);
     assert_eq!(
         crate::mutation::mutation_path_probes(),

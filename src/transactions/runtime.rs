@@ -415,6 +415,35 @@ pub(crate) fn ack_runtime_change_event(
     update_ack(collection, id, context, false)
 }
 
+pub(crate) fn legacy_runtime_journal_inventory(
+    collection: &Collection,
+    context: &OperationContext,
+) -> Result<crate::runtime::LegacyJournalInventory, TransactionError> {
+    context_check(context)?;
+    let _lock = WriteLock::acquire_context(collection, context)?;
+    let mut inventory = crate::runtime::LegacyJournalInventory::default();
+    for directory in transaction_directories(collection)? {
+        context_check(context)?;
+        let path = directory.join(JOURNAL_FILE);
+        let bytes = match collection.held_root().read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error(collection.root.join(&path), source)),
+        };
+        let value = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
+        if value.get("version").and_then(serde_json::Value::as_u64)
+            != Some(u64::from(LEGACY_RUNTIME_JOURNAL_VERSION))
+        {
+            continue;
+        }
+        let journal = decode_runtime_journal(value)?;
+        validate_journal(collection, &directory, &journal)?;
+        inventory.version_2 += 1;
+    }
+    Ok(inventory)
+}
+
 pub(crate) fn list_unacked_runtime_events(
     collection: &Collection,
     context: &OperationContext,
@@ -1597,6 +1626,11 @@ mod tests {
             )
             .unwrap();
 
+        let inventory =
+            legacy_runtime_journal_inventory(&collection, &OperationContext::legacy()).unwrap();
+        assert_eq!(inventory.version_2, 1);
+        assert!(!inventory.is_zero());
+
         let resolved = resolve_runtime_commit(&collection, &id, &OperationContext::legacy())
             .unwrap()
             .unwrap();
@@ -1608,6 +1642,17 @@ mod tests {
             crate::runtime::CanonicalOperationValue::Update(None)
         ));
         assert_eq!(recovered.to_v03(), expected_v03);
+    }
+
+    #[test]
+    fn new_runtime_journal_fixture_satisfies_version_two_zero_gate() {
+        let (_root, collection) = collection();
+        let _id = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
+        assert!(
+            legacy_runtime_journal_inventory(&collection, &OperationContext::legacy(),)
+                .unwrap()
+                .is_zero()
+        );
     }
 
     /// Settlement runs after the commit lock is released, so for a window the

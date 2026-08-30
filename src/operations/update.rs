@@ -74,8 +74,7 @@ fn apply_injected_publication_replacement(path: &std::path::Path) {
 }
 
 impl Collection {
-    /// Update a file (§12.3).
-    pub fn update(&self, input: &serde_json::Value) -> serde_json::Value {
+    pub(crate) fn update_legacy(&self, input: &serde_json::Value) -> serde_json::Value {
         let parsed = match UpdateInput::parse(input) {
             Ok(parsed) => parsed,
             Err(error) => return error,
@@ -518,7 +517,7 @@ fn planned_update_output(planned: PlannedRecord) -> serde_json::Value {
     .into_json()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 mod tests {
     use super::inject_publication_replacement;
     use crate::Collection;
