@@ -81,12 +81,12 @@ fn runtime(
         .prepare(&request, &claim, &OperationContext::legacy())
         .unwrap()
     {
-        PreparationOutcome::NoMutation(outcome) => (outcome.result, None),
+        PreparationOutcome::NoMutation(outcome) => (outcome.operation.to_v03(), None),
         PreparationOutcome::Prepared(prepared) => match runtime
             .commit(&prepared, &OperationContext::legacy())
             .unwrap()
         {
-            CommitAttempt::Committed(outcome) => (outcome.result.clone(), Some(outcome)),
+            CommitAttempt::Committed(outcome) => (outcome.operation.to_v03(), Some(outcome)),
             other => panic!("expected committed runtime rename: {other:?}"),
         },
     }

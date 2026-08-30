@@ -9,16 +9,19 @@ use crate::mutation::{
     collect_collection_files, collect_collection_files_context, shadow_collection,
     shadow_collection_context, ShadowCollection,
 };
-use crate::runtime::{CollectionSnapshot, OperationContext, ProviderError};
+use crate::runtime::{
+    CanonicalOperationOutcome, CollectionSnapshot, OperationContext, OperationKind, ProviderError,
+};
 use crate::Collection;
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RuntimeSinglePreparation {
-    NoMutation(OperationResult),
+    NoMutation(CanonicalOperationOutcome),
     Prepared(Box<RuntimeMutationPlan>),
 }
 
 pub(crate) struct RuntimeMutationPlan {
-    pub(crate) result: OperationResult,
+    pub(crate) operation: CanonicalOperationOutcome,
     pub(crate) baseline: crate::transactions::FileBaseline,
     pub(crate) desired: crate::transactions::FileBaseline,
     pub(crate) before: CollectionSnapshot,
@@ -43,41 +46,106 @@ pub(crate) fn prepare_single_runtime(
     let before = collection.snapshot()?;
     context.check()?;
     let shadow = shadow_collection_context(collection, context)?;
+    let typed_operation = operation.parse::<OperationKind>()?;
     let shadow_input = match adapt_mtime_precondition(collection, &shadow.collection, input) {
         Ok(input) => input,
         Err(diagnostic) => {
-            return Ok(RuntimeSinglePreparation::NoMutation(failed(vec![
-                *diagnostic,
-            ])))
+            return Ok(RuntimeSinglePreparation::NoMutation(
+                CanonicalOperationOutcome::invalid(typed_operation, vec![(*diagnostic).into()]),
+            ))
         }
     };
     context.check()?;
-    let result = if operation == "rename" {
-        super::mutation_adapter::prepare_runtime_rename(&shadow.collection, &shadow_input)
+    let outcome = if operation == "rename" {
+        prepare_runtime_rename_typed(collection, &shadow.collection, &shadow_input)?
     } else {
         let shadow_operations = Operations::new(&shadow.collection)
             .map_err(|diagnostic| ProviderError::CollectionOpen(diagnostic.message.clone()))?;
-        execute_non_record_runtime_operation(&shadow_operations, operation, &shadow_input)
+        CanonicalOperationOutcome::wire_only(
+            typed_operation,
+            execute_non_record_runtime_operation(&shadow_operations, operation, &shadow_input),
+        )
     };
     context.check()?;
-    if !result.valid {
-        return Ok(RuntimeSinglePreparation::NoMutation(result));
+    if !outcome.valid {
+        return Ok(RuntimeSinglePreparation::NoMutation(outcome));
     }
     let desired = collect_collection_files_context(&shadow.collection, context)?;
     if desired == shadow.baseline {
-        return Ok(RuntimeSinglePreparation::NoMutation(result));
+        return Ok(RuntimeSinglePreparation::NoMutation(outcome));
     }
     let after = shadow.collection.snapshot()?;
     context.check()?;
     Ok(RuntimeSinglePreparation::Prepared(Box::new(
         RuntimeMutationPlan {
-            result,
+            operation: outcome,
             baseline: shadow.baseline,
             desired,
             before,
             after,
         },
     )))
+}
+
+fn prepare_runtime_rename_typed(
+    _authority: &Collection,
+    working_set: &Collection,
+    input: &Value,
+) -> Result<CanonicalOperationOutcome, ProviderError> {
+    if input.get("simulate_before_ref_update").is_some()
+        || input.get("last_known_ref_mtimes").is_some()
+    {
+        return Ok(CanonicalOperationOutcome::invalid(
+            OperationKind::Rename,
+            vec![crate::api::Diagnostic {
+                severity: crate::api::Severity::Error,
+                code: crate::api::DiagnosticCode::new("invalid_request"),
+                message: "Internal concurrency simulation fields are not accepted by canonical operations.".to_string(),
+                path: None,
+                field: None,
+                type_name: None,
+                schema_location: None,
+                details: None,
+            }],
+        ));
+    }
+    let (request, options, last_known_mtime) =
+        match super::mutation_adapter::decode_rename(working_set, input) {
+            Ok(decoded) => decoded,
+            Err(diagnostics) => {
+                return Ok(CanonicalOperationOutcome::invalid(
+                    OperationKind::Rename,
+                    diagnostics.into_iter().map(Into::into).collect(),
+                ))
+            }
+        };
+    let planned =
+        match crate::mutation::plan_rename(working_set, request, options, last_known_mtime) {
+            Ok(planned) => planned,
+            Err(error) => {
+                return Ok(CanonicalOperationOutcome::failure(
+                    OperationKind::Rename,
+                    error,
+                ))
+            }
+        };
+    let (valid, result, mut diagnostics) = crate::mutation::rename_result(working_set, planned)
+        .map_err(|error| ProviderError::Transaction {
+            code: "typed_outcome_projection_failed",
+            message: error.to_string(),
+        })?;
+    for diagnostic in &mut diagnostics {
+        if diagnostic.severity == crate::api::Severity::Error {
+            diagnostic.code =
+                crate::api::DiagnosticCode::new(crate::errors::RENAME_REF_UPDATE_FAILED);
+        }
+    }
+    Ok(CanonicalOperationOutcome::record_mutation(
+        OperationKind::Rename,
+        valid,
+        result,
+        diagnostics,
+    ))
 }
 
 fn execute_non_record_runtime_operation(
@@ -137,99 +205,92 @@ fn prepare_sparse_runtime(
     input: &Value,
     context: &OperationContext,
 ) -> Result<RuntimeSinglePreparation, ProviderError> {
+    let kind = operation.parse::<OperationKind>()?;
     let input_path = input.get("path").and_then(Value::as_str);
     let shadow = sparse_shadow_collection(collection, input_path, context)?;
     let shadow_input = match adapt_mtime_precondition(collection, &shadow.collection, input) {
         Ok(input) => input,
         Err(diagnostic) => {
-            return Ok(RuntimeSinglePreparation::NoMutation(failed(vec![
-                *diagnostic,
-            ])))
+            return Ok(RuntimeSinglePreparation::NoMutation(
+                CanonicalOperationOutcome::invalid(kind, vec![(*diagnostic).into()]),
+            ))
         }
     };
     context.check()?;
-    let (result, delete_plan) = if operation == "delete" {
-        let (request, options) = match super::mutation_adapter::decode_delete(&shadow_input) {
-            Ok(decoded) => decoded,
-            Err(diagnostics) => {
-                return Ok(RuntimeSinglePreparation::NoMutation(failed(diagnostics)))
-            }
-        };
-        match crate::mutation::plan_delete(collection, &shadow.collection, request, options) {
-            Ok(planned) => (
-                super::operations::planned_delete_result(&planned),
-                Some(planned),
-            ),
-            Err(error) => (super::operations::typed_error_result(error), None),
-        }
-    } else {
-        let shadow_operations = Operations::new(&shadow.collection)
-            .map_err(|diagnostic| ProviderError::CollectionOpen(diagnostic.message.clone()))?;
-        (
-            shadow_operations.execute_staged_mutation(operation, &shadow_input),
-            None,
-        )
-    };
+    let (outcome, delete_plan) =
+        prepare_sparse_typed(collection, &shadow.collection, kind, &shadow_input)?;
     context.check()?;
-    if !result.valid {
-        return Ok(RuntimeSinglePreparation::NoMutation(result));
-    }
-    if input
-        .get("dry_run")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    if !outcome.valid
+        || input
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     {
-        return Ok(RuntimeSinglePreparation::NoMutation(result));
+        return Ok(RuntimeSinglePreparation::NoMutation(outcome));
     }
 
-    let path = result
-        .result
-        .get("path")
-        .or_else(|| input.get("path"))
-        .and_then(Value::as_str)
+    let path = delete_plan
+        .as_ref()
+        .map(|planned| planned.path.as_str())
+        .or_else(|| outcome.record().map(|record| record.path.as_str()))
         .ok_or_else(|| {
             ProviderError::CollectionOpen(
-                "sparse mutation result did not identify its record path".to_string(),
+                "sparse mutation outcome did not identify its record path".to_string(),
             )
         })?
         .to_string();
-    let mut baseline = if operation == "delete" {
+    let mut baseline = if kind == OperationKind::Delete {
         shadow.baseline.clone()
     } else {
         crate::transactions::FileBaseline::new()
     };
-    if operation != "delete" {
+    if kind != OperationKind::Delete {
         if let Ok(bytes) = fs::read(collection.root.join(&path)) {
             baseline.insert(path.clone(), bytes);
         }
     }
-    if operation == "create" && baseline.contains_key(&path) && input_path != Some(path.as_str()) {
-        return Ok(RuntimeSinglePreparation::NoMutation(failed(vec![
-            Diagnostic::error(
-                "path_conflict",
-                format!("File already exists: {path}"),
-                Some(path),
+    if kind == OperationKind::Create
+        && baseline.contains_key(&path)
+        && input_path != Some(path.as_str())
+    {
+        return Ok(RuntimeSinglePreparation::NoMutation(
+            CanonicalOperationOutcome::invalid(
+                kind,
+                vec![crate::api::Diagnostic {
+                    severity: crate::api::Severity::Error,
+                    code: crate::api::DiagnosticCode::new("path_conflict"),
+                    message: format!("File already exists: {path}"),
+                    path: Some(path),
+                    field: None,
+                    type_name: None,
+                    schema_location: None,
+                    details: None,
+                }],
             ),
-        ])));
+        ));
     }
     let mut desired = crate::transactions::FileBaseline::new();
     if let Ok(bytes) = fs::read(shadow.collection.root.join(&path)) {
         desired.insert(path.clone(), bytes);
     }
     if baseline == desired {
-        return Ok(RuntimeSinglePreparation::NoMutation(result));
+        return Ok(RuntimeSinglePreparation::NoMutation(outcome));
     }
 
-    if matches!(operation, "create" | "update") && collection.settings.default_validation == "error"
+    if matches!(kind, OperationKind::Create | OperationKind::Update)
+        && collection.settings.default_validation == "error"
     {
-        let frontmatter = result
-            .result
-            .get("frontmatter")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let type_names = collection.determine_types_for_path(&frontmatter, Some(&path));
+        let frontmatter = outcome
+            .record()
+            .map(|record| &record.frontmatter)
+            .ok_or_else(|| {
+                ProviderError::CollectionOpen(
+                    "record mutation outcome omitted frontmatter".to_string(),
+                )
+            })?;
+        let type_names = collection.determine_types_for_path(frontmatter, Some(&path));
         let issues = collection
-            .check_uniqueness_indexed(&frontmatter, &type_names, &path)
+            .check_uniqueness_indexed(frontmatter, &type_names, &path)
             .map_err(|error| ProviderError::Transaction {
                 code: "cache_maintenance_failed",
                 message: error.to_string(),
@@ -238,13 +299,20 @@ fn prepare_sparse_runtime(
         if !issues.is_empty() {
             let diagnostics = issues
                 .into_iter()
-                .map(|issue| {
-                    let mut diagnostic = Diagnostic::error(&issue.code, issue.message, issue.path);
-                    diagnostic.field = issue.field;
-                    diagnostic
+                .map(|issue| crate::api::Diagnostic {
+                    severity: crate::api::Severity::Error,
+                    code: crate::api::DiagnosticCode::new(issue.code),
+                    message: issue.message,
+                    path: issue.path,
+                    field: issue.field,
+                    type_name: None,
+                    schema_location: None,
+                    details: None,
                 })
                 .collect();
-            return Ok(RuntimeSinglePreparation::NoMutation(failed(diagnostics)));
+            return Ok(RuntimeSinglePreparation::NoMutation(
+                CanonicalOperationOutcome::invalid(kind, diagnostics),
+            ));
         }
     }
 
@@ -256,13 +324,86 @@ fn prepare_sparse_runtime(
     context.check()?;
     Ok(RuntimeSinglePreparation::Prepared(Box::new(
         RuntimeMutationPlan {
-            result,
+            operation: outcome,
             baseline,
             desired,
             before,
             after,
         },
     )))
+}
+
+fn prepare_sparse_typed(
+    authority: &Collection,
+    working_set: &Collection,
+    kind: OperationKind,
+    input: &Value,
+) -> Result<
+    (
+        CanonicalOperationOutcome,
+        Option<crate::mutation::PlannedDelete>,
+    ),
+    ProviderError,
+> {
+    let invalid = |diagnostics: Vec<Diagnostic>| {
+        CanonicalOperationOutcome::invalid(kind, diagnostics.into_iter().map(Into::into).collect())
+    };
+    let projected = match kind {
+        OperationKind::Create => {
+            let (request, options) = match super::mutation_adapter::decode_create(input) {
+                Ok(decoded) => decoded,
+                Err(diagnostics) => return Ok((invalid(diagnostics), None)),
+            };
+            let planned = match crate::mutation::staged_create(working_set, request, options) {
+                Ok(planned) => planned,
+                Err(error) => return Ok((CanonicalOperationOutcome::failure(kind, error), None)),
+            };
+            crate::mutation::record_result(working_set, planned)
+        }
+        OperationKind::Update => {
+            let (request, options) = match super::mutation_adapter::decode_update(input) {
+                Ok(decoded) => decoded,
+                Err(diagnostics) => return Ok((invalid(diagnostics), None)),
+            };
+            let planned = match crate::mutation::staged_update(working_set, request, options) {
+                Ok(planned) => planned,
+                Err(error) => return Ok((CanonicalOperationOutcome::failure(kind, error), None)),
+            };
+            crate::mutation::record_result(working_set, planned)
+        }
+        OperationKind::Delete => {
+            let (request, options) = match super::mutation_adapter::decode_delete(input) {
+                Ok(decoded) => decoded,
+                Err(diagnostics) => return Ok((invalid(diagnostics), None)),
+            };
+            let planned =
+                match crate::mutation::plan_delete(authority, working_set, request, options) {
+                    Ok(planned) => planned,
+                    Err(error) => {
+                        return Ok((CanonicalOperationOutcome::failure(kind, error), None))
+                    }
+                };
+            let projected = crate::mutation::delete_result(planned.clone());
+            let (valid, result, diagnostics) = projected.map_err(typed_projection_error)?;
+            return Ok((
+                CanonicalOperationOutcome::record_mutation(kind, valid, result, diagnostics),
+                Some(planned),
+            ));
+        }
+        _ => unreachable!("only sparse record mutations are decoded here"),
+    };
+    let (valid, result, diagnostics) = projected.map_err(typed_projection_error)?;
+    Ok((
+        CanonicalOperationOutcome::record_mutation(kind, valid, result, diagnostics),
+        None,
+    ))
+}
+
+fn typed_projection_error(error: crate::api::MdbaseError) -> ProviderError {
+    ProviderError::Transaction {
+        code: "typed_outcome_projection_failed",
+        message: error.to_string(),
+    }
 }
 
 fn planned_delete_snapshot(

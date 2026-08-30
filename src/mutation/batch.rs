@@ -400,7 +400,7 @@ fn evaluate_item(
     }
 }
 
-fn record_result(
+pub(crate) fn record_result(
     collection: &Collection,
     planned: PlannedRecord,
 ) -> Result<(bool, BatchOperationResult, Vec<Diagnostic>), MdbaseError> {
@@ -417,7 +417,7 @@ fn record_result(
     ))
 }
 
-fn delete_result(
+pub(crate) fn delete_result(
     planned: PlannedDelete,
 ) -> Result<(bool, BatchOperationResult, Vec<Diagnostic>), MdbaseError> {
     let result = if planned.deleted {
@@ -428,13 +428,13 @@ fn delete_result(
             deleted: false,
             dry_run: true,
             would_delete: true,
-            broken_links: planned.broken_links,
+            broken_links: crate::api::reference_evidence(planned.broken_links),
         })
     };
     Ok((true, result, Vec::new()))
 }
 
-fn rename_result(
+pub(crate) fn rename_result(
     collection: &Collection,
     planned: PlannedRename,
 ) -> Result<(bool, BatchOperationResult, Vec<Diagnostic>), MdbaseError> {
@@ -456,7 +456,7 @@ fn rename_result(
     if planned.dry_run {
         let partial_updates =
             (!planned.reference_failures.is_empty()).then_some(BatchRenamePartialUpdates {
-                failed: planned.reference_failures,
+                failed: crate::api::reference_evidence(planned.reference_failures),
             });
         return Ok((
             valid,
@@ -465,7 +465,7 @@ fn rename_result(
                 to: planned.to,
                 dry_run: true,
                 would_rename: true,
-                references_affected: planned.references_affected,
+                references_affected: crate::api::reference_evidence(planned.references_affected),
                 partial_updates,
             }),
             diagnostics,
@@ -474,7 +474,7 @@ fn rename_result(
     let outcome = super::service::project_planned_record(collection, planned.destination.clone())?;
     let partial_updates =
         (!planned.reference_failures.is_empty()).then_some(BatchRenamePartialUpdates {
-            failed: planned.reference_failures.clone(),
+            failed: crate::api::reference_evidence(planned.reference_failures.clone()),
         });
     let result = planned.result(outcome.value);
     Ok((

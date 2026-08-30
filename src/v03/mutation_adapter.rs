@@ -3,39 +3,6 @@ use serde_json::Value;
 use super::operations::{collect_diagnostics, diagnostic_from_value, typed_error_result};
 use super::{Diagnostic, OperationResult};
 
-pub(super) fn prepare_runtime_rename(
-    collection: &crate::Collection,
-    input: &Value,
-) -> OperationResult {
-    if input.get("simulate_before_ref_update").is_some()
-        || input.get("last_known_ref_mtimes").is_some()
-    {
-        return OperationResult {
-            valid: false,
-            result: serde_json::json!({}),
-            diagnostics: vec![Diagnostic::error(
-                "invalid_request",
-                "Internal concurrency simulation fields are not accepted by canonical operations.",
-                None,
-            )],
-        };
-    }
-    let (request, options, last_known_mtime) = match decode_rename(collection, input) {
-        Ok(decoded) => decoded,
-        Err(diagnostics) => {
-            return OperationResult {
-                valid: false,
-                result: serde_json::json!({}),
-                diagnostics,
-            }
-        }
-    };
-    match crate::mutation::plan_rename(collection, request, options, last_known_mtime) {
-        Ok(planned) => planned_rename_result(collection, planned),
-        Err(error) => typed_error_result(error),
-    }
-}
-
 pub(super) fn planned_rename_result(
     collection: &crate::Collection,
     planned: crate::mutation::PlannedRename,

@@ -35,7 +35,7 @@ fn collection() -> tempfile::TempDir {
 }
 
 fn runtime_query_paths(runtime: &FilesystemRuntime) -> BTreeSet<String> {
-    runtime
+    let outcome = runtime
         .read(
             &OperationRequest::new(
                 OperationKind::Query,
@@ -43,18 +43,19 @@ fn runtime_query_paths(runtime: &FilesystemRuntime) -> BTreeSet<String> {
             ),
             &OperationContext::legacy(),
         )
-        .unwrap()
-        .result
-        .result["results"]
-        .as_array()
-        .unwrap()
+        .unwrap();
+    let CanonicalOperationValue::Query(Some(query)) = &outcome.operation.value else {
+        panic!("expected typed query outcome")
+    };
+    query
+        .records
         .iter()
         .filter_map(|record| record["path"].as_str().map(str::to_string))
         .collect()
 }
 
 fn runtime_query_revision(runtime: &FilesystemRuntime, path: &str) -> String {
-    runtime
+    let outcome = runtime
         .read(
             &OperationRequest::new(
                 OperationKind::Query,
@@ -62,11 +63,12 @@ fn runtime_query_revision(runtime: &FilesystemRuntime, path: &str) -> String {
             ),
             &OperationContext::legacy(),
         )
-        .unwrap()
-        .result
-        .result["results"]
-        .as_array()
-        .unwrap()
+        .unwrap();
+    let CanonicalOperationValue::Query(Some(query)) = &outcome.operation.value else {
+        panic!("expected typed query outcome")
+    };
+    query
+        .records
         .iter()
         .find(|record| record["path"] == path)
         .unwrap()["file"]["revision"]
@@ -499,8 +501,11 @@ fn runtime_public_batch_rejects_partial_before_item_decode_or_shadow() {
     let PreparationOutcome::NoMutation(outcome) = outcome else {
         panic!("partial runtime batch must be rejected without preparation")
     };
-    assert!(!outcome.result.valid);
-    assert_eq!(outcome.result.diagnostics[0].code, "invalid_request");
+    assert!(!outcome.operation.valid);
+    assert_eq!(
+        outcome.operation.to_v03().diagnostics[0].code,
+        "invalid_request"
+    );
     assert_eq!(runtime.current_generation().unwrap(), before);
     assert!(!directory.path().join("must-not-stage.md").exists());
     assert_eq!(
@@ -558,18 +563,25 @@ fn runtime_atomic_batch_commits_multiple_renames_reference_updates_and_replays_c
         CommitAttempt::Committed(outcome) => outcome,
         other => panic!("expected committed batch: {other:?}"),
     };
-    assert!(committed.result.valid, "{:?}", committed.result.diagnostics);
-    assert_eq!(committed.result.result["succeeded"], 2);
-    for item in committed.result.result["operations"].as_array().unwrap() {
+    assert!(
+        committed.operation.valid,
+        "{:?}",
+        committed.operation.to_v03().diagnostics
+    );
+    assert_eq!(committed.operation.to_v03().result["succeeded"], 2);
+    for item in committed.operation.to_v03().result["operations"]
+        .as_array()
+        .unwrap()
+    {
         assert!(item["result"]["file"]["size"].as_u64().unwrap() > 0);
         assert!(!item["result"]["file"]["mtime"].as_str().unwrap().is_empty());
     }
     assert_eq!(
-        committed.result.result["operations"][0]["result"]["document"],
+        committed.operation.to_v03().result["operations"][0]["result"]["document"],
         "one\n"
     );
     assert_eq!(
-        committed.result.result["operations"][0]["result"]["file"]["size"],
+        committed.operation.to_v03().result["operations"][0]["result"]["file"]["size"],
         4
     );
     assert_eq!(
@@ -722,7 +734,7 @@ fn runtime_atomic_batch_cancel_cas_claim_and_prepared_reopen_are_durable() {
         other => panic!("expected atomic CAS rejection: {other:?}"),
     };
     assert_eq!(
-        rejection.result.diagnostics[0].code,
+        rejection.operation.to_v03().diagnostics[0].code,
         "concurrent_modification"
     );
     assert!(!directory.path().join("cas-sibling.md").exists());
@@ -823,7 +835,7 @@ fn runtime_prepare_is_durable_but_does_not_change_canonical_files() {
         CommitAttempt::Committed(outcome) => outcome,
         other => panic!("expected a committed mutation, got {other:?}"),
     };
-    assert!(outcome.result.valid);
+    assert!(outcome.operation.valid);
     assert_eq!(outcome.generation.sequence(), 1);
     assert_eq!(outcome.commit_id.as_ref(), Some(prepared.commit_id()));
     assert_eq!(
@@ -879,13 +891,13 @@ fn runtime_create_update_replay_committed_facts_after_reopen_and_postcommit_path
         CommitAttempt::Committed(outcome) => outcome,
         other => panic!("expected committed create: {other:?}"),
     };
-    assert_eq!(created.result.result["document"], "planned");
+    assert_eq!(created.operation.to_v03().result["document"], "planned");
     assert_eq!(
-        created.result.result["revision"],
+        created.operation.to_v03().result["revision"],
         crate::v03::revision(b"planned")
     );
-    assert_eq!(created.result.result["file"]["size"], 7);
-    assert_ne!(created.result.result["file"]["mtime"], "");
+    assert_eq!(created.operation.to_v03().result["file"]["size"], 7);
+    assert_ne!(created.operation.to_v03().result["file"]["mtime"], "");
     assert_eq!(
         fs::read(directory.path().join("runtime-facts.md")).unwrap(),
         b"external replacement"
@@ -945,13 +957,13 @@ fn runtime_create_update_replay_committed_facts_after_reopen_and_postcommit_path
         CommitAttempt::Committed(outcome) => outcome,
         other => panic!("expected committed update: {other:?}"),
     };
-    assert_eq!(updated.result.result["document"], "after");
+    assert_eq!(updated.operation.to_v03().result["document"], "after");
     assert_eq!(
-        updated.result.result["revision"],
+        updated.operation.to_v03().result["revision"],
         crate::v03::revision(b"after")
     );
-    assert_eq!(updated.result.result["file"]["size"], 5);
-    assert_ne!(updated.result.result["file"]["mtime"], "");
+    assert_eq!(updated.operation.to_v03().result["file"]["size"], 5);
+    assert_ne!(updated.operation.to_v03().result["file"]["mtime"], "");
     assert!(!directory.path().join("runtime-facts.md").exists());
     let update_commit_id = prepared.commit_id().clone();
     drop(runtime);
@@ -1022,18 +1034,19 @@ fn runtime_rename_replays_planned_facts_and_exact_changes_after_reopen() {
         CommitAttempt::Committed(outcome) => outcome,
         other => panic!("expected committed rename: {other:?}"),
     };
-    assert_eq!(renamed.result.result["from"], "source.md");
-    assert_eq!(renamed.result.result["to"], "renamed.md");
-    let planned_document = renamed.result.result["document"].as_str().unwrap();
+    assert_eq!(renamed.operation.to_v03().result["from"], "source.md");
+    assert_eq!(renamed.operation.to_v03().result["to"], "renamed.md");
+    let renamed_wire = renamed.operation.to_v03();
+    let planned_document = renamed_wire.result["document"].as_str().unwrap();
     assert_eq!(
-        renamed.result.result["file"]["size"],
+        renamed.operation.to_v03().result["file"]["size"],
         planned_document.len()
     );
     assert_eq!(
-        renamed.result.result["revision"],
+        renamed.operation.to_v03().result["revision"],
         crate::v03::revision(planned_document.as_bytes())
     );
-    assert_ne!(renamed.result.result["file"]["mtime"], "");
+    assert_ne!(renamed.operation.to_v03().result["file"]["mtime"], "");
     assert!(planned_document.contains("[[renamed]]"));
     let ChangeSet::Exact(changes) = &renamed.changes else {
         panic!("runtime rename must retain exact changes")
@@ -1129,8 +1142,11 @@ fn runtime_delete_uses_sparse_stage_and_replays_planned_result_after_reopen() {
         CommitAttempt::Committed(outcome) => outcome,
         other => panic!("expected committed delete: {other:?}"),
     };
-    assert_eq!(deleted.result.result["path"], "runtime-delete.md");
-    assert_eq!(deleted.result.result["deleted"], true);
+    assert_eq!(
+        deleted.operation.to_v03().result["path"],
+        "runtime-delete.md"
+    );
+    assert_eq!(deleted.operation.to_v03().result["deleted"], true);
     let ChangeSet::Exact(changes) = &deleted.changes else {
         panic!("runtime delete must retain one exact change")
     };
@@ -1202,11 +1218,11 @@ fn runtime_delete_dry_run_missing_and_stale_are_generation_neutral() {
         let PreparationOutcome::NoMutation(outcome) = outcome else {
             panic!("dry-run and rejected deletes must not stage a transaction")
         };
-        assert_eq!(outcome.result.valid, valid);
+        assert_eq!(outcome.operation.valid, valid);
         if let Some(code) = code {
-            assert_eq!(outcome.result.diagnostics[0].code, code);
+            assert_eq!(outcome.operation.to_v03().diagnostics[0].code, code);
         } else {
-            assert_eq!(outcome.result.result["would_delete"], true);
+            assert_eq!(outcome.operation.to_v03().result["would_delete"], true);
         }
         assert_eq!(outcome.generation, generation);
         assert!(matches!(outcome.changes, ChangeSet::None));
@@ -1276,9 +1292,12 @@ fn runtime_sparse_mutations_reject_invalid_revisions_with_direct_wire_parity() {
             let PreparationOutcome::NoMutation(outcome) = prepared else {
                 panic!("invalid revision must not prepare {operation}")
             };
-            assert!(!outcome.result.valid);
-            assert_eq!(outcome.result.result, direct_result.result);
-            assert_eq!(outcome.result.diagnostics, direct_result.diagnostics);
+            assert!(!outcome.operation.valid);
+            assert_eq!(outcome.operation.to_v03().result, direct_result.result);
+            assert_eq!(
+                outcome.operation.to_v03().diagnostics,
+                direct_result.diagnostics
+            );
             assert_eq!(outcome.generation, generation);
             assert!(matches!(outcome.changes, ChangeSet::None));
             assert_eq!(
@@ -1367,7 +1386,7 @@ fn runtime_delete_backlinks_survive_planning_but_commit_conflicts_reject() {
         panic!("delete preview must not stage")
     };
     assert_eq!(
-        preview.result.result["broken_links"],
+        preview.operation.to_v03().result["broken_links"],
         json!([{"path": "ref.md"}])
     );
 
@@ -1393,7 +1412,7 @@ fn runtime_delete_backlinks_survive_planning_but_commit_conflicts_reject() {
         panic!("commit-time replacement must reject")
     };
     assert_eq!(
-        rejection.result.diagnostics[0].code,
+        rejection.operation.to_v03().diagnostics[0].code,
         "concurrent_modification"
     );
     assert_eq!(
@@ -1430,7 +1449,11 @@ fn runtime_commits_type_resources_without_a_host_side_mutation_path() {
         CommitAttempt::Committed(outcome) => outcome,
         other => panic!("expected a committed type mutation, got {other:?}"),
     };
-    assert!(outcome.result.valid, "{:?}", outcome.result.diagnostics);
+    assert!(
+        outcome.operation.valid,
+        "{:?}",
+        outcome.operation.to_v03().diagnostics
+    );
     assert!(directory.path().join("_types/project.md").is_file());
     let ChangeSet::Exact(changes) = outcome.changes else {
         panic!("type mutation must return exact resource changes")
@@ -1544,9 +1567,9 @@ fn runtime_cancel_and_commit_time_conflict_are_durable_final_states() {
         CommitAttempt::RejectedBeforeCommit { rejection } => rejection,
         other => panic!("expected a durable rejection, got {other:?}"),
     };
-    assert!(!rejection.result.valid);
+    assert!(!rejection.operation.valid);
     assert_eq!(
-        rejection.result.diagnostics[0].code,
+        rejection.operation.to_v03().diagnostics[0].code,
         "concurrent_modification"
     );
     assert!(matches!(
@@ -1824,7 +1847,10 @@ fn collection_fork_resets_host_claims_and_feed_without_touching_markdown() {
             &OperationContext::legacy(),
         )
         .unwrap();
-    assert_eq!(read.result.result["frontmatter"]["title"], "Committed");
+    assert_eq!(
+        read.operation.to_v03().result["frontmatter"]["title"],
+        "Committed"
+    );
 }
 
 #[test]
@@ -2204,7 +2230,7 @@ fn runtime_read_cursor_pins_generation_replays_and_expires_on_release() {
         .open_read(&query, &OperationContext::legacy())
         .unwrap();
     assert_eq!(
-        first.outcome.result.result["results"]
+        first.outcome.operation.to_v03().result["results"]
             .as_array()
             .unwrap()
             .len(),
@@ -2257,7 +2283,7 @@ fn runtime_read_cursor_pins_generation_replays_and_expires_on_release() {
     assert_eq!(second, replay);
     assert_eq!(second.outcome.generation, pinned_generation);
     assert_eq!(
-        second.outcome.result.result["meta"]["total_count"],
+        second.outcome.operation.to_v03().result["meta"]["total_count"],
         serde_json::json!(3)
     );
     let next = second.next.expect("the pinned third record remains");
@@ -2389,8 +2415,8 @@ fn runtime_recovers_every_durable_commit_crash_boundary() {
                 &OperationContext::legacy(),
             )
             .unwrap();
-        assert!(read.result.valid, "crash point {point}: {read:?}");
-        assert_eq!(read.result.result["body"], "durable body\n");
+        assert!(read.operation.valid, "crash point {point}: {read:?}");
+        assert_eq!(read.operation.to_v03().result["body"], "durable body\n");
     }
 }
 
@@ -2721,9 +2747,9 @@ fn public_runtime_prepare_rejects_erased_authority_without_staging_or_generation
     let PreparationOutcome::NoMutation(outcome) = prepared else {
         panic!("authority-erasing public runtime request must not stage a mutation")
     };
-    assert!(!outcome.result.valid);
+    assert!(!outcome.operation.valid);
     assert_eq!(
-        outcome.result.diagnostics[0].code,
+        outcome.operation.to_v03().diagnostics[0].code,
         "type_membership_authority_changed"
     );
     assert_eq!(
@@ -2775,12 +2801,12 @@ fn runtime_uniqueness_uses_the_generation_bound_index() {
     let PreparationOutcome::NoMutation(outcome) = outcome else {
         panic!("duplicate identity must be rejected before durable prepare")
     };
-    assert!(!outcome.result.valid);
+    assert!(!outcome.operation.valid);
     assert!(outcome
-        .result
+        .operation
         .diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == "duplicate_id"));
+        .any(|diagnostic| diagnostic.code.as_str() == "duplicate_id"));
     assert!(!directory.path().join("candidate.md").exists());
 }
 
@@ -2822,8 +2848,14 @@ fn runtime_query_omits_unneeded_bodies_from_resident_records() {
             &OperationContext::legacy(),
         )
         .unwrap();
-    assert!(query.result.valid, "{:?}", query.result.diagnostics);
-    assert!(query.result.result["results"][0].get("body").is_none());
+    assert!(
+        query.operation.valid,
+        "{:?}",
+        query.operation.to_v03().diagnostics
+    );
+    assert!(query.operation.to_v03().result["results"][0]
+        .get("body")
+        .is_none());
 }
 
 #[test]
@@ -2966,8 +2998,13 @@ fn runtime_reconciliation_keeps_all_classified_invalid_query_stubs() {
             &OperationContext::legacy(),
         )
         .unwrap();
-    assert!(query.result.valid, "{:?}", query.result.diagnostics);
-    let results = query.result.result["results"].as_array().unwrap();
+    assert!(
+        query.operation.valid,
+        "{:?}",
+        query.operation.to_v03().diagnostics
+    );
+    let query_wire = query.operation.to_v03();
+    let results = query_wire.result["results"].as_array().unwrap();
     let paths = results
         .iter()
         .filter_map(|record| record["path"].as_str())
@@ -2994,7 +3031,7 @@ fn runtime_reconciliation_keeps_all_classified_invalid_query_stubs() {
             .starts_with("sha256:"));
     }
     let reasons = query
-        .result
+        .operation
         .diagnostics
         .iter()
         .map(|diagnostic| {

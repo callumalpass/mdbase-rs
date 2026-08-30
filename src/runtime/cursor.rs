@@ -1,14 +1,12 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ChangeSet, CollectionGeneration, ExecutionOutcome, OperationContext, ProviderError, ReadCursor,
-    ReadPage,
+    CanonicalOperationOutcome, CanonicalOperationValue, ChangeSet, CollectionGeneration,
+    ExecutionOutcome, OperationContext, ProviderError, ReadCursor, ReadPage,
 };
-use crate::v03::OperationResult;
 
 const MAX_ACTIVE_CURSORS: usize = 32;
 const MAX_CURSOR_BYTES: usize = 32 * 1024 * 1024;
@@ -26,8 +24,8 @@ pub(crate) struct CursorStore {
 
 struct PinnedRead {
     generation: CollectionGeneration,
-    template: OperationResult,
-    results: Vec<Value>,
+    template: CanonicalOperationOutcome,
+    results: Vec<crate::api::ProjectedValue>,
     page_items: usize,
     retained_bytes: usize,
     created: Instant,
@@ -55,21 +53,17 @@ impl CursorStore {
         let page_items = page_items
             .unwrap_or(DEFAULT_PAGE_ITEMS)
             .clamp(1, MAX_PAGE_ITEMS);
-        let Some(results) = outcome
-            .result
-            .result
-            .get_mut("results")
-            .and_then(Value::as_array_mut)
-            .map(std::mem::take)
-        else {
+        let CanonicalOperationValue::Query(Some(query)) = &mut outcome.operation.value else {
             return Ok(ReadPage {
                 outcome,
                 next: None,
             });
         };
+        let results = std::mem::take(&mut query.records);
         if results.len() <= page_items {
-            outcome.result.result["results"] = Value::Array(results);
-            set_has_more(&mut outcome.result, false);
+            query.records = results;
+            query.has_more = false;
+            set_has_more(&mut query.meta, false);
             return Ok(ReadPage {
                 outcome,
                 next: None,
@@ -90,7 +84,7 @@ impl CursorStore {
         let id = uuid::Uuid::new_v4().to_string();
         let generation = outcome.generation.clone();
         let now = Instant::now();
-        let template = outcome.result.clone();
+        let template = outcome.operation.clone();
         self.retained_bytes += retained_bytes;
         self.entries.insert(
             id.clone(),
@@ -124,21 +118,22 @@ impl CursorStore {
         let end = next_index
             .saturating_add(pinned.page_items)
             .min(pinned.results.len());
-        let mut result = pinned.template.clone();
-        result.result["results"] = Value::Array(pinned.results[next_index..end].to_vec());
-        set_has_more(&mut result, end < pinned.results.len());
+        let mut operation = pinned.template.clone();
+        let CanonicalOperationValue::Query(Some(query)) = &mut operation.value else {
+            return Err(ProviderError::Transaction {
+                code: "cursor_state_invalid",
+                message: "pinned read no longer contains a typed query".to_string(),
+            });
+        };
+        query.records = pinned.results[next_index..end].to_vec();
+        query.has_more = end < pinned.results.len();
+        set_has_more(&mut query.meta, query.has_more);
         pinned.last_access = Instant::now();
         let generation = pinned.generation.clone();
         let next = (end < pinned.results.len()).then(|| self.issue(&id, end));
         context.check()?;
         Ok(ReadPage {
-            outcome: ExecutionOutcome {
-                result,
-                generation,
-                changes: ChangeSet::None,
-                commit_id: None,
-                change_event: None,
-            },
+            outcome: ExecutionOutcome::new(operation, generation, ChangeSet::None, None, None),
             next,
         })
     }
@@ -245,8 +240,8 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-fn set_has_more(result: &mut OperationResult, has_more: bool) {
-    if let Some(meta) = result.result.get_mut("meta").and_then(Value::as_object_mut) {
-        meta.insert("has_more".to_string(), Value::Bool(has_more));
+fn set_has_more(meta: &mut serde_json::Value, has_more: bool) {
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert("has_more".to_string(), serde_json::Value::Bool(has_more));
     }
 }

@@ -9,6 +9,7 @@ mod api;
 mod batch;
 #[cfg(feature = "hosted-storage-benchmark")]
 mod benchmark;
+mod canonical_operation;
 mod catalog;
 mod context;
 mod cursor;
@@ -38,6 +39,10 @@ pub use api::CollectionRuntime;
 pub use benchmark::{
     BenchmarkDiagnostic, BenchmarkFileFacts, BenchmarkProjection, CandidateExpression,
     CandidateTruth, CompiledCandidate, ProjectionRelationship, QueryRequirements,
+};
+pub use canonical_operation::{
+    CanonicalDeleteValue, CanonicalOperationOutcome, CanonicalOperationValue, CanonicalQueryValue,
+    CanonicalRenamePreflightValue, CanonicalRenameValue, WireOnlyOperationValue,
 };
 pub use catalog::{
     CanonicalRecordInput, CatalogError, CatalogInput, CompiledCatalog, ResolvedTypeResource,

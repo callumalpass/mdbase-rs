@@ -157,6 +157,43 @@ fn check_architecture(root: &Path) -> Result<String, Vec<String>> {
             failures.push(format!("{relative} has {lines} lines; budget is {maximum}"));
         }
 
+        let typed_runtime_caller = matches!(
+            relative.as_str(),
+            "src/runtime/batch.rs"
+                | "src/runtime/cursor.rs"
+                | "src/runtime/filesystem.rs"
+                | "src/runtime/outcome.rs"
+                | "src/runtime/tests.rs"
+                | "src/transactions/runtime.rs"
+        );
+        if typed_runtime_caller && source.contains(".result.result") {
+            failures.push(format!(
+                "{relative} accesses nested OperationResult JSON; semantic runtime callers must match typed outcomes"
+            ));
+        }
+        if matches!(
+            relative.as_str(),
+            "src/runtime/batch.rs" | "src/runtime/cursor.rs" | "src/runtime/filesystem.rs"
+        ) && (source.contains("recover_v03") || source.contains("from_v03"))
+        {
+            failures.push(format!(
+                "{relative} converts v0.3 results in a typed execution path; only journal recovery may decode old outcomes"
+            ));
+        }
+        if relative == "src/runtime/canonical_operation.rs"
+            && [
+                "pub records: Vec<Value>",
+                "pub meta: Value",
+                "pub references_affected: Vec<Value>",
+            ]
+            .iter()
+            .any(|forbidden| source.contains(forbidden))
+        {
+            failures.push(
+                "canonical migrated outcomes expose an unclassified JSON Value domain".to_string(),
+            );
+        }
+
         // The checker names the debt it detects; do not count those names as product debt.
         if !relative.starts_with("crates/mdbase-architecture-check/") {
             let allowances = match_count(&patterns.dead_code, &source);

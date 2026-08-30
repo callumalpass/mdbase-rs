@@ -13,8 +13,9 @@ pub(crate) mod service;
 pub(crate) mod shadow;
 
 pub(crate) use batch::{
-    aggregate_partial, batch, batch_wire, execute_partial_item, prepare_runtime_batch,
-    BatchExecution, BatchWireOptions, RuntimeBatchPreparation,
+    aggregate_partial, batch, batch_wire, delete_result, execute_partial_item,
+    prepare_runtime_batch, record_result, rename_result, BatchExecution, BatchWireOptions,
+    RuntimeBatchPreparation,
 };
 pub(crate) use lifecycle::LifecycleEvent;
 pub(crate) use membership::ResolvedWriteMembership;
