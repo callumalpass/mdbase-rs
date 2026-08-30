@@ -14,7 +14,6 @@ use super::{
 };
 use crate::v03::OperationResult;
 use crate::Collection;
-use walkdir::WalkDir;
 
 /// Provider-neutral execution boundary for one authoritative collection.
 ///
@@ -52,6 +51,7 @@ pub trait CollectionProvider: Send + Sync {
 /// visible to the next request.
 pub struct FilesystemProvider {
     root: PathBuf,
+    authority: crate::collection_root::CollectionRoot,
     coordinated: bool,
     operation_gate: RuntimeGate,
     observer: Arc<dyn RuntimeObserver>,
@@ -105,13 +105,15 @@ impl FilesystemProvider {
                 return Err(error);
             }
         };
+        let authority = collection.held_root().clone();
         let stamp = CollectionStamp::load(
-            &root,
+            &authority,
             &collection.settings.types_folder,
             &collection.settings.contracts_folder,
         );
         Ok(Self {
             root,
+            authority,
             coordinated,
             operation_gate: RuntimeGate::new(),
             observer,
@@ -393,7 +395,7 @@ impl FilesystemProvider {
                 .read()
                 .map_err(|_| ProviderError::LockPoisoned)?;
             let current = CollectionStamp::load(
-                &self.root,
+                &self.authority,
                 &cached.collection.settings.types_folder,
                 &cached.collection.settings.contracts_folder,
             );
@@ -407,16 +409,19 @@ impl FilesystemProvider {
             .write()
             .map_err(|_| ProviderError::LockPoisoned)?;
         let current = CollectionStamp::load(
-            &self.root,
+            &self.authority,
             &cached.collection.settings.types_folder,
             &cached.collection.settings.contracts_folder,
         );
         if current == cached.stamp {
             return Ok(cached.collection.clone());
         }
-        let collection = open_collection(&self.root)?;
+        let collection = cached
+            .collection
+            .reopen_held(true)
+            .map_err(|error| ProviderError::CollectionOpen(error_message(&error)))?;
         let stamp = CollectionStamp::load(
-            &self.root,
+            &self.authority,
             &collection.settings.types_folder,
             &collection.settings.contracts_folder,
         );
@@ -426,9 +431,17 @@ impl FilesystemProvider {
     }
 
     fn reload_collection(&self) -> Result<(), ProviderError> {
-        let collection = open_collection(&self.root)?;
+        let existing = self
+            .collection_cache
+            .read()
+            .map_err(|_| ProviderError::LockPoisoned)?
+            .collection
+            .clone();
+        let collection = existing
+            .reopen_held(true)
+            .map_err(|error| ProviderError::CollectionOpen(error_message(&error)))?;
         let stamp = CollectionStamp::load(
-            &self.root,
+            &self.authority,
             &collection.settings.types_folder,
             &collection.settings.contracts_folder,
         );
@@ -740,32 +753,21 @@ struct CollectionStamp {
 }
 
 impl CollectionStamp {
-    fn load(root: &Path, types_folder: &str, contracts_folder: &str) -> Self {
-        let config_revision = std::fs::read(root.join("mdbase.yaml"))
+    fn load(
+        root: &crate::collection_root::CollectionRoot,
+        types_folder: &str,
+        contracts_folder: &str,
+    ) -> Self {
+        let config_revision = root
+            .read("mdbase.yaml")
             .ok()
             .map(|bytes| crate::v03::revision(&bytes));
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for control_root in [root.join(types_folder), root.join(contracts_folder)] {
-            for entry in WalkDir::new(&control_root)
-                .sort_by_file_name()
-                .follow_links(false)
-                .into_iter()
-                .flatten()
-                .filter(|entry| entry.file_type().is_file())
-            {
-                entry
-                    .path()
-                    .strip_prefix(root)
-                    .unwrap_or(entry.path())
-                    .hash(&mut hasher);
-                if let Ok(metadata) = entry.metadata() {
-                    metadata.len().hash(&mut hasher);
-                    metadata
-                        .modified()
-                        .ok()
-                        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|duration| duration.as_nanos())
-                        .hash(&mut hasher);
+        for folder in [types_folder, contracts_folder] {
+            for relative in root.files_recursive(Path::new(folder)).unwrap_or_default() {
+                relative.hash(&mut hasher);
+                if let Ok(bytes) = root.read(&relative) {
+                    bytes.hash(&mut hasher);
                 }
             }
         }

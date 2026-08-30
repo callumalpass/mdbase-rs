@@ -95,10 +95,6 @@ impl Collection {
     }
 
     pub(crate) fn rename_root_path_is_current(&self) -> bool {
-        let held = self
-            .root_capability()
-            .and_then(|directory| same_file::Handle::from_file(directory.into_std_file()));
-        let current = same_file::Handle::from_path(&self.root);
-        matches!((held, current), (Ok(held), Ok(current)) if held == current)
+        self.held_root().display_identity_is_current()
     }
 }

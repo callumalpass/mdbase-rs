@@ -1175,7 +1175,7 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         write(
             &source.path().join("mdbase.yaml"),
-            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n  exclude: [.git/**, private/**]\nx-obsidian:\n  bases:\n    include: [views/*.base, private/*.base]\n",
         );
         write(
             &source.path().join("_types/note.md"),
@@ -1192,6 +1192,15 @@ mod tests {
             "spec_version: 0.3.0\n",
         );
         write(&source.path().join("nested/hidden.md"), "must not copy");
+        write(
+            &source.path().join("views/configured.base"),
+            "filters: []\n",
+        );
+        write(&source.path().join("unconfigured.base"), "filters: []\n");
+        write(
+            &source.path().join("private/excluded.base"),
+            "filters: []\n",
+        );
 
         let collection = Collection::open(source.path()).unwrap();
         let shadow = shadow_collection(&collection).unwrap();
@@ -1200,6 +1209,9 @@ mod tests {
         assert!(root.join("_types/note.md").is_file());
         assert!(root.join("visible.md").is_file());
         assert!(root.join("schema.json").is_file());
+        assert!(root.join("views/configured.base").is_file());
+        assert!(!root.join("unconfigured.base").exists());
+        assert!(!root.join("private/excluded.base").exists());
         assert!(!root.join(".git").exists());
         assert!(!root.join("nested").exists());
     }

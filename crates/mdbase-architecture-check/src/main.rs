@@ -200,6 +200,36 @@ fn check_architecture(root: &Path) -> Result<String, Vec<String>> {
                 "{relative} infers hosted semantics from OperationResult JSON instead of typed outcomes or canonical changes"
             ));
         }
+        // Collection authority is acquired exactly once. Display paths remain
+        // public API/diagnostic data and must not become a second authority.
+        if relative != "src/collection_root.rs"
+            && !relative.starts_with("crates/mdbase-architecture-check/")
+            && (source.contains("open_ambient_dir") || source.contains("ambient_authority()"))
+        {
+            failures.push(format!(
+                "{relative} acquires ambient filesystem authority outside CollectionRoot"
+            ));
+        }
+        if matches!(
+            relative.as_str(),
+            "src/runtime/provider.rs" | "src/runtime/snapshot.rs" | "src/mutation/shadow.rs"
+        ) && source.contains("self.root.join")
+        {
+            failures.push(format!(
+                "{relative} turns the collection display path back into authority"
+            ));
+        }
+        if matches!(
+            relative.as_str(),
+            "src/runtime/provider.rs" | "src/runtime/snapshot.rs" | "src/mutation/shadow.rs"
+        ) && (source.contains("Collection::open(&self.root)")
+            || source.contains("open_collection(&self.root)"))
+        {
+            failures.push(format!(
+                "{relative} reopens collection authority through the ambient root name"
+            ));
+        }
+
         if relative == "src/runtime/canonical_operation.rs"
             && [
                 "pub records: Vec<Value>",

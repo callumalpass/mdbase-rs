@@ -114,12 +114,16 @@ impl Collection {
     /// Try to open the cache database. Returns `None` if the DB file doesn't
     /// exist or can't be opened.
     fn try_open_cache(&self) -> Result<Option<Connection>, CacheError> {
-        let db_path = self.root.join(&self.settings.cache_folder).join("cache.db");
+        let db_path = self
+            .held_root()
+            .cache_storage_path()
+            .join(&self.settings.cache_folder)
+            .join("cache.db");
         if !db_path.exists() {
             return Ok(None);
         }
         Ok(Some(sqlite::open_cache_db(
-            &self.root,
+            self.held_root().cache_storage_path(),
             &self.settings.cache_folder,
         )?))
     }
@@ -326,7 +330,11 @@ impl Collection {
         let total_started = Instant::now();
         let mut perf = LoadQueryPerf::default();
         let open_started = Instant::now();
-        let mut conn = sqlite::open_cache_db(&self.root, &self.settings.cache_folder).ok()?;
+        let mut conn = sqlite::open_cache_db(
+            self.held_root().cache_storage_path(),
+            &self.settings.cache_folder,
+        )
+        .ok()?;
         perf.try_open_cache_ms = elapsed_ms(open_started);
         perf.cache_used = true;
 
@@ -719,9 +727,12 @@ impl Collection {
             let backlinks_start = Instant::now();
             let all_files_arc = Arc::new(all_files_data);
             let cached_backlinks = (perf.cache_used && !refresh_from_filesystem).then(|| {
-                sqlite::open_cache_db(&self.root, &self.settings.cache_folder)
-                    .map_err(CacheError::from)
-                    .and_then(|connection| indexer::load_backlinks(&connection))
+                sqlite::open_cache_db(
+                    self.held_root().cache_storage_path(),
+                    &self.settings.cache_folder,
+                )
+                .map_err(CacheError::from)
+                .and_then(|connection| indexer::load_backlinks(&connection))
             });
             let (backlinks_index, backlinks_perf) = match cached_backlinks {
                 Some(Ok(backlinks)) => (backlinks, None),

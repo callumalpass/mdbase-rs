@@ -180,6 +180,57 @@ impl DataContractRegistry {
         Ok(registry)
     }
 
+    /// Load contracts from a capability-relative resource snapshot.
+    pub(crate) fn load_held(
+        root: &crate::collection_root::CollectionRoot,
+        settings: &Settings,
+        types: &HashMap<String, TypeDef>,
+    ) -> Result<Self, DataContractLoadError> {
+        let staging = tempfile::tempdir().map_err(|error| {
+            load_error(
+                "invalid_data_contract",
+                format!("Could not stage contracts: {error}"),
+            )
+        })?;
+        let contracts = Path::new(&settings.contracts_folder);
+        let files = root.files_recursive(Path::new("")).map_err(|error| {
+            load_error(
+                "invalid_data_contract",
+                format!("Could not inspect contract resources: {error}"),
+            )
+        })?;
+        for relative in files {
+            let is_contract = relative.starts_with(contracts)
+                && relative.extension().and_then(|value| value.to_str()) == Some("md");
+            let is_schema = relative.extension().and_then(|value| value.to_str()) == Some("json");
+            if !is_contract && !is_schema {
+                continue;
+            }
+            let bytes = root.read(&relative).map_err(|error| {
+                load_error(
+                    "invalid_data_contract",
+                    format!("Could not read '{}': {error}", relative.display()),
+                )
+            })?;
+            let destination = staging.path().join(&relative);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    load_error(
+                        "invalid_data_contract",
+                        format!("Could not stage '{}': {error}", relative.display()),
+                    )
+                })?;
+            }
+            std::fs::write(destination, bytes).map_err(|error| {
+                load_error(
+                    "invalid_data_contract",
+                    format!("Could not stage '{}': {error}", relative.display()),
+                )
+            })?;
+        }
+        Self::load(staging.path(), settings, types)
+    }
+
     pub(crate) fn load_resolved(
         contracts: Vec<ResolvedRecordContract>,
         types: &HashMap<String, TypeDef>,

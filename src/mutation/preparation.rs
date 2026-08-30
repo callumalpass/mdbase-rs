@@ -60,23 +60,12 @@ pub(crate) fn prepare_update(
     _options: PreparationOptions,
 ) -> Result<PreparedUpdate, Vec<Diagnostic>> {
     let path = request.path.to_string();
-    crate::operations::ensure_no_symlink_components_diagnostic(
-        &collection.root,
-        &path,
-        collection.spec_profile,
-    )
-    .map_err(|mut error| {
-        error.path = Some(path.clone());
-        vec![error]
-    })?;
-    crate::operations::ensure_regular_record_file_diagnostic(
-        &request.path.under(&collection.root),
-        &path,
-    )
-    .map_err(|mut error| {
-        error.path = Some(path.clone());
-        vec![error]
-    })?;
+    crate::operations::ensure_no_symlink_components_held_diagnostic(collection, &path).map_err(
+        |mut error| {
+            error.path = Some(path.clone());
+            vec![error]
+        },
+    )?;
     let loaded = crate::record_load::load_record(collection, &path).map_err(|_| {
         vec![Diagnostic::error(
             "file_read_failed",
@@ -183,23 +172,12 @@ pub(crate) fn prepare_delete(
             vec![error]
         },
     )?;
-    crate::operations::ensure_no_symlink_components_diagnostic(
-        &collection.root,
-        &path,
-        collection.spec_profile,
-    )
-    .map_err(|mut error| {
-        error.path = Some(path.clone());
-        vec![error]
-    })?;
-    crate::operations::ensure_regular_record_file_diagnostic(
-        &request.path.under(&collection.root),
-        &path,
-    )
-    .map_err(|mut error| {
-        error.path = Some(path.clone());
-        vec![error]
-    })?;
+    crate::operations::ensure_no_symlink_components_held_diagnostic(collection, &path).map_err(
+        |mut error| {
+            error.path = Some(path.clone());
+            vec![error]
+        },
+    )?;
 
     let (before_revision, before_frontmatter, before_body, types, broken_links) =
         if request.check_backlinks {

@@ -7,10 +7,7 @@ use crate::api::{
 };
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json, FrontmatterState};
-use crate::operations::{
-    ensure_no_symlink_components, ensure_regular_record_file, ensure_safe_relative_path,
-    readable_record_path,
-};
+use crate::operations::{ensure_safe_relative_path, readable_record_path};
 use crate::record_load::{InvalidRecordView, RecordLoadView};
 use crate::Collection;
 use std::path::Path;
@@ -346,27 +343,28 @@ impl Collection {
         if let Err(error) = ensure_safe_relative_path(&input.path, self.spec_profile) {
             return error;
         }
+        if let Err(error) =
+            crate::operations::ensure_no_symlink_components_held_diagnostic(self, &input.path)
+        {
+            return op_error(&error.code, &error.message);
+        }
         let path = match readable_record_path(self, &input.path) {
             Ok(path) => path,
             Err(error) => return error,
         };
-        if let Err(error) =
-            ensure_no_symlink_components(&self.root, path.as_str(), self.spec_profile)
-        {
-            return error;
-        }
-
-        let full_path = path.under(&self.root);
-        if let Err(error) = ensure_regular_record_file(&full_path, path.as_str()) {
-            return error;
-        }
-
-        let content = match std::fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(_e) => return op_error(INVALID_FRONTMATTER, "File contains invalid UTF-8"),
+        let content = match self.held_root().read_string(path.to_path_buf()) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return op_error(INVALID_FRONTMATTER, "File contains invalid UTF-8")
+            }
+            Err(_) => return op_error(FILE_NOT_FOUND, "Failed to read: entity not found"),
         };
 
-        let file_metadata = std::fs::metadata(&full_path).ok();
+        let file_metadata = self
+            .held_root()
+            .open_file(&path.to_path_buf())
+            .and_then(|file| file.metadata())
+            .ok();
         let file_facts = RecordFileFacts {
             size: file_metadata
                 .as_ref()

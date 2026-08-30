@@ -368,9 +368,8 @@ impl Collection {
         let mut failed = planning_failed;
 
         for plan in plans {
-            let full_path = self.root.join(&plan.path);
             #[cfg(test)]
-            apply_injected_backfill_replacement(&full_path);
+            apply_injected_backfill_replacement(&self.root.join(&plan.path));
             let current = match crate::record_load::load_record(self, &plan.path) {
                 Ok(current) => current,
                 Err(error) => {
@@ -398,7 +397,10 @@ impl Collection {
                 }));
                 continue;
             }
-            if let Err(e) = crate::operations::atomic_write(&full_path, plan.output.as_bytes()) {
+            if let Err(e) = self
+                .held_root()
+                .atomic_write(std::path::Path::new(&plan.path), plan.output.as_bytes())
+            {
                 failed += 1;
                 details.push(serde_json::json!({
                     "path": plan.path,

@@ -3323,9 +3323,11 @@ fn invalid_maintenance_rejects_ambiguous_hints_and_repairs_exact_cache_shape() {
     );
 
     let collection = Collection::open(directory.path()).unwrap();
-    let connection =
-        crate::cache::sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)
-            .unwrap();
+    let connection = crate::cache::sqlite::open_cache_db(
+        collection.held_root().cache_storage_path(),
+        &collection.settings.cache_folder,
+    )
+    .unwrap();
     connection
         .execute(
             "UPDATE files SET frontmatter_json = '{\"bad\":true}', body = 'leak', effective_json = '{\"bad\":true}' WHERE path = 'invalid.md'",
@@ -3359,9 +3361,11 @@ fn invalid_maintenance_rejects_ambiguous_hints_and_repairs_exact_cache_shape() {
         apply(BTreeSet::from(["invalid.md".to_string()]), BTreeSet::new()),
         InvalidMaintenanceOutcome::Applied(_)
     ));
-    let connection =
-        crate::cache::sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)
-            .unwrap();
+    let connection = crate::cache::sqlite::open_cache_db(
+        collection.held_root().cache_storage_path(),
+        &collection.settings.cache_folder,
+    )
+    .unwrap();
     let canonical = connection
         .query_row(
             "SELECT frontmatter_json, body, effective_json, parse_error, failure_reason FROM files WHERE path = 'invalid.md'",
@@ -3444,7 +3448,7 @@ fn maintenance_seals_are_single_successor_epoch_and_cache_identity_bound() {
     let collection = Collection::open(directory.path()).unwrap();
     let logical_state = || {
         let connection = crate::cache::sqlite::open_cache_db_read_only_existing(
-            &collection.root,
+            collection.held_root().cache_storage_path(),
             &collection.settings.cache_folder,
         )
         .unwrap();
@@ -3494,7 +3498,7 @@ fn maintenance_seals_are_single_successor_epoch_and_cache_identity_bound() {
     ));
 
     let data_seal = make_seal(4);
-    let writer_root = collection.root.clone();
+    let writer_root = collection.held_root().cache_storage_path().to_path_buf();
     let writer_cache_folder = collection.settings.cache_folder.clone();
     crate::cache::runtime::set_seal_validation_hook(
         &collection,
@@ -3557,9 +3561,11 @@ fn maintenance_seals_are_single_successor_epoch_and_cache_identity_bound() {
     }
 
     let schema_seal = make_seal(5);
-    let connection =
-        crate::cache::sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)
-            .unwrap();
+    let connection = crate::cache::sqlite::open_cache_db(
+        collection.held_root().cache_storage_path(),
+        &collection.settings.cache_folder,
+    )
+    .unwrap();
     connection
         .execute_batch("ALTER TABLE files ADD COLUMN seal_schema_drift INTEGER;")
         .unwrap();
@@ -3669,7 +3675,10 @@ fn seal_identity_replacement_between_every_validation_boundary_is_rejected() {
             // Deliberately bypass the advisory lifecycle contract to model raw
             // Unix unlink/recreate. Official cache_clear/cache_rebuild cannot do
             // this while the seal holds its shared guard.
-            let cache_root = replacement.root.join(&replacement.settings.cache_folder);
+            let cache_root = replacement
+                .held_root()
+                .cache_storage_path()
+                .join(&replacement.settings.cache_folder);
             for name in ["cache.db", "cache.db-wal", "cache.db-shm"] {
                 match fs::remove_file(cache_root.join(name)) {
                     Ok(()) => {}
@@ -3678,7 +3687,7 @@ fn seal_identity_replacement_between_every_validation_boundary_is_rejected() {
                 }
             }
             let mut connection = crate::cache::sqlite::open_cache_db(
-                &replacement.root,
+                replacement.held_root().cache_storage_path(),
                 &replacement.settings.cache_folder,
             )
             .unwrap();
@@ -3712,9 +3721,11 @@ fn stale_invalid_maintenance_cannot_rewind_or_contaminate_successor_cache() {
         .unwrap();
 
     let collection = Collection::open(directory.path()).unwrap();
-    let connection =
-        crate::cache::sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)
-            .unwrap();
+    let connection = crate::cache::sqlite::open_cache_db(
+        collection.held_root().cache_storage_path(),
+        &collection.settings.cache_folder,
+    )
+    .unwrap();
     let old_revision = connection
         .query_row(
             "SELECT source_revision FROM files WHERE path = 'invalid.md'",
@@ -3761,9 +3772,11 @@ fn stale_invalid_maintenance_cannot_rewind_or_contaminate_successor_cache() {
 
     assert!(crate::cache::runtime::matches_generation(&collection, &successor).unwrap());
     assert!(!crate::cache::runtime::matches_generation(&collection, &expected).unwrap());
-    let connection =
-        crate::cache::sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)
-            .unwrap();
+    let connection = crate::cache::sqlite::open_cache_db(
+        collection.held_root().cache_storage_path(),
+        &collection.settings.cache_folder,
+    )
+    .unwrap();
     let revision = connection
         .query_row(
             "SELECT source_revision FROM files WHERE path = 'invalid.md'",
@@ -3788,7 +3801,7 @@ fn runtime_reverse_link_index_tracks_resolved_targets_incrementally() {
         .provider()
         .with_collection_read(|collection| {
             let connection = crate::cache::sqlite::open_cache_db(
-                &collection.root,
+                collection.held_root().cache_storage_path(),
                 &collection.settings.cache_folder,
             )
             .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
@@ -3810,7 +3823,7 @@ fn runtime_reverse_link_index_tracks_resolved_targets_incrementally() {
         .provider()
         .with_collection_read(|collection| {
             let connection = crate::cache::sqlite::open_cache_db(
-                &collection.root,
+                collection.held_root().cache_storage_path(),
                 &collection.settings.cache_folder,
             )
             .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
@@ -3961,4 +3974,125 @@ fn observer_reports_performance_when_provider_execution_fails_early() {
     assert_eq!(errors[0].stage, "open");
     assert_eq!(errors[0].code, error.code());
     assert!(errors[0].message.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn held_resource_reads_reject_hardlinks_from_opened_nofollow_handles() {
+    let config_root = collection();
+    let config = Collection::open(config_root.path()).unwrap();
+    fs::hard_link(
+        config_root.path().join("mdbase.yaml"),
+        config_root.path().join("config-link.yaml"),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::config::load_config_for_open_held(config.held_root())["valid"],
+        false
+    );
+
+    let resource_root = collection();
+    fs::write(resource_root.path().join("schema.json"), "{}\n").unwrap();
+    let resource = Collection::open(resource_root.path()).unwrap();
+    fs::hard_link(
+        resource_root.path().join("schema.json"),
+        resource_root.path().join("schema-link.json"),
+    )
+    .unwrap();
+    assert!(resource.held_root().read("schema.json").is_err());
+
+    let shadow_root = collection();
+    fs::write(shadow_root.path().join("record.md"), "record\n").unwrap();
+    let shadow = Collection::open(shadow_root.path()).unwrap();
+    fs::hard_link(
+        shadow_root.path().join("record.md"),
+        shadow_root.path().join("record-link.md"),
+    )
+    .unwrap();
+    assert!(crate::mutation::shadow::shadow_collection(&shadow).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn held_authority_never_adopts_a_replacement_root_across_refresh_snapshot_cache_and_legacy_mutation(
+) {
+    let directory = collection();
+    let root = directory.path().to_path_buf();
+    fs::write(root.join("authority.md"), "original\n").unwrap();
+    let collection = Collection::open(&root).unwrap();
+    let provider = FilesystemProvider::open(&root).unwrap();
+
+    let held = root.with_extension("held-authority");
+    let swap_root = root.clone();
+    let swap_held = held.clone();
+    crate::cache::set_cache_access_hook(&root, move || {
+        fs::rename(&swap_root, &swap_held).unwrap();
+        fs::create_dir(&swap_root).unwrap();
+        fs::write(
+            swap_root.join("mdbase.yaml"),
+            "spec_version: 0.3.0\nx-replacement: true\n",
+        )
+        .unwrap();
+        fs::write(swap_root.join("replacement-only.md"), "replacement\n").unwrap();
+    });
+
+    // The deterministic swap occurs after cache authority was acquired but
+    // immediately before SQLite access. SQLite remains in identity-bound
+    // private storage and cannot create files in the replacement collection.
+    let cache = collection.cache_rebuild();
+    assert_eq!(cache["success"], true, "{cache:?}");
+    assert!(!root.join(".mdbase").exists());
+
+    let _ = provider.refresh();
+    let snapshot = provider.snapshot().unwrap();
+    assert!(snapshot
+        .records
+        .iter()
+        .any(|record| record.path == "authority.md"));
+    assert!(!snapshot
+        .records
+        .iter()
+        .any(|record| record.path == "replacement-only.md"));
+
+    let shadow = crate::mutation::shadow::shadow_collection(&collection).unwrap();
+    assert!(shadow.baseline.contains_key("authority.md"));
+    assert!(!shadow.baseline.contains_key("replacement-only.md"));
+
+    let batch = crate::v03::batch::execute(
+        &collection,
+        &serde_json::json!({
+            "operations": [{"kind": "create", "input": {"path": "transaction.md", "body": "held"}}]
+        }),
+    );
+    assert!(batch.valid, "{batch:?}");
+    assert!(held.join("transaction.md").is_file());
+    assert!(!root.join("transaction.md").exists());
+    assert!(!root.join(".mdbase").exists());
+
+    let created = collection.create(&serde_json::json!({"path": "created.md", "body": "held"}));
+    assert!(created.get("error").is_none(), "{created:?}");
+    assert!(held.join("created.md").is_file());
+    assert!(!root.join("created.md").exists());
+    let updated =
+        collection.update(&serde_json::json!({"path": "authority.md", "body": "updated"}));
+    assert!(updated.get("error").is_none(), "{updated:?}");
+    assert_eq!(
+        fs::read_to_string(held.join("authority.md")).unwrap(),
+        "updated"
+    );
+    let deleted = collection.delete(&serde_json::json!({"path": "authority.md"}));
+    assert!(deleted.get("error").is_none(), "{deleted:?}");
+    assert!(!held.join("authority.md").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("replacement-only.md")).unwrap(),
+        "replacement\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("mdbase.yaml")).unwrap(),
+        "spec_version: 0.3.0\nx-replacement: true\n"
+    );
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+
+    fs::remove_dir_all(&root).unwrap();
+    fs::rename(&held, &root).unwrap();
 }

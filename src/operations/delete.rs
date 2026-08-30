@@ -4,9 +4,6 @@ use crate::api::operations::{DeleteInput, DeleteOutput};
 use crate::api::{DeleteRequest, Revision};
 use crate::errors::*;
 use crate::mutation::{PlannedDelete, PreparationOptions, PreparedDelete};
-use crate::operations::{
-    ensure_no_symlink_components_diagnostic, ensure_regular_record_file_diagnostic, sync_directory,
-};
 use crate::Collection;
 
 impl Collection {
@@ -81,11 +78,7 @@ impl Collection {
         } = prepared;
         let path = request.path;
         let display_path = path.to_string();
-        ensure_no_symlink_components_diagnostic(&self.root, &display_path, self.spec_profile)
-            .map_err(crate::mutation::MutationFailure::diagnostic)?;
         let full_path = path.under(&self.root);
-        ensure_regular_record_file_diagnostic(&full_path, &display_path)
-            .map_err(crate::mutation::MutationFailure::diagnostic)?;
         let loaded = crate::record_load::load_record(self, &display_path).map_err(|error| {
             crate::mutation::MutationFailure::operation(
                 if error.kind() == std::io::ErrorKind::NotFound {
@@ -126,22 +119,14 @@ impl Collection {
         }
 
         if !dry_run {
-            ensure_no_symlink_components_diagnostic(&self.root, &display_path, self.spec_profile)
-                .map_err(crate::mutation::MutationFailure::diagnostic)?;
-            std::fs::remove_file(&full_path).map_err(|error| {
-                crate::mutation::MutationFailure::operation(
-                    "io_error",
-                    format!("Failed to delete: {error}"),
-                )
-            })?;
-            if let Some(parent) = full_path.parent() {
-                sync_directory(parent).map_err(|error| {
+            self.held_root()
+                .remove_file(&path.to_path_buf())
+                .map_err(|error| {
                     crate::mutation::MutationFailure::operation(
                         "io_error",
-                        format!("Failed to make deletion durable: {error}"),
+                        format!("Failed to delete: {error}"),
                     )
                 })?;
-            }
         }
 
         Ok(PlannedDelete {

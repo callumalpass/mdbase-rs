@@ -353,7 +353,7 @@ fn failure_dry_run_and_simulation_adapter_matrix_is_ordered_and_differential() {
 
 #[cfg(unix)]
 #[test]
-fn typed_wire_and_runtime_reject_replaced_collection_roots() {
+fn typed_wire_and_runtime_keep_held_authority_when_collection_name_is_replaced() {
     use std::os::unix::fs::symlink;
 
     fn replace(root: &std::path::Path, external: &std::path::Path) -> std::path::PathBuf {
@@ -380,7 +380,8 @@ fn typed_wire_and_runtime_reject_replaced_collection_roots() {
         CollectionPath::new("source.md").unwrap(),
         CollectionPath::new("renamed.md").unwrap(),
     ));
-    assert!(typed.is_err());
+    assert!(typed.is_ok(), "{typed:?}");
+    assert!(held.join("renamed.md").exists());
     assert!(!typed_external.path().join("renamed.md").exists());
     restore(typed_root.path(), &held);
 
@@ -398,7 +399,8 @@ fn typed_wire_and_runtime_reject_replaced_collection_roots() {
         "rename",
         &json!({"from": "source.md", "to": "renamed.md"}),
     );
-    assert!(!wire.valid);
+    assert!(wire.valid, "{wire:?}");
+    assert!(held.join("renamed.md").exists());
     assert!(!wire_external.path().join("renamed.md").exists());
     restore(wire_root.path(), &held);
 
@@ -417,7 +419,8 @@ fn typed_wire_and_runtime_reject_replaced_collection_roots() {
         json!({"from": "source.md", "to": "renamed.md"}),
     );
     let runtime_result = runtime.execute(&request);
-    assert!(runtime_result.is_err() || runtime_result.is_ok_and(|result| !result.valid));
+    assert!(runtime_result.is_ok_and(|result| result.valid));
+    assert!(held.join("renamed.md").exists());
     assert!(!runtime_external.path().join("renamed.md").exists());
     restore(runtime_root.path(), &held);
 }

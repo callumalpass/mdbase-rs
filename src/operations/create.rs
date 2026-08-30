@@ -9,7 +9,7 @@ use crate::generated::derive_path;
 use crate::matching::engine::matches_rules_checked_compiled;
 use crate::mutation::{PlannedRecord, PreparedCreate};
 use crate::operations::{
-    atomic_create, ensure_no_symlink_components_diagnostic, ensure_safe_relative_path_diagnostic,
+    ensure_no_symlink_components_held_diagnostic, ensure_safe_relative_path_diagnostic,
     mutation_record_path_diagnostic,
 };
 use crate::Collection;
@@ -250,9 +250,7 @@ impl Collection {
             Ok(path) => path,
             Err(error) => return Err(crate::mutation::MutationFailure::diagnostic(error)),
         };
-        if let Err(error) =
-            ensure_no_symlink_components_diagnostic(&self.root, path.as_str(), self.spec_profile)
-        {
+        if let Err(error) = ensure_no_symlink_components_held_diagnostic(self, path.as_str()) {
             return Err(crate::mutation::MutationFailure::diagnostic(error));
         }
         let _write_lock = match crate::transactions::WriteLock::acquire(self) {
@@ -450,12 +448,10 @@ impl Collection {
             }
         };
 
-        if let Err(error) =
-            ensure_no_symlink_components_diagnostic(&self.root, path.as_str(), self.spec_profile)
+        if let Err(e) = self
+            .held_root()
+            .atomic_create(&path.to_path_buf(), content.as_bytes())
         {
-            return Err(crate::mutation::MutationFailure::diagnostic(error));
-        }
-        if let Err(e) = atomic_create(&full_path, content.as_bytes()) {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 return Err(crate::mutation::MutationFailure::operation(
                     PATH_CONFLICT,

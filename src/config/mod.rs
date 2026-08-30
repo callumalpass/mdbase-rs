@@ -12,8 +12,16 @@ pub fn load_config(collection_root: &Path) -> serde_json::Value {
 }
 
 /// Load config for collection opening, allowing forward-minor versions.
-pub(crate) fn load_config_for_open(collection_root: &Path) -> serde_json::Value {
-    load_config_internal(collection_root, true)
+pub(crate) fn load_config_for_open_held(
+    root: &crate::collection_root::CollectionRoot,
+) -> serde_json::Value {
+    match root.read_string("mdbase.yaml") {
+        Ok(content) => parse_config_document(&content, true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            error_json("missing_config", "mdbase.yaml not found")
+        }
+        Err(error) => error_json("invalid_config", &format!("Failed to read config: {error}")),
+    }
 }
 
 fn load_config_internal(collection_root: &Path, allow_future_minor: bool) -> serde_json::Value {

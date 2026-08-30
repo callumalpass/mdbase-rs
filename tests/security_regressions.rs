@@ -89,7 +89,7 @@ fn symlinks_cannot_escape_the_collection_boundary() {
     symlink(outside.join("secret.md"), root.join("secret.md")).expect("create file symlink");
 
     let collection = open_collection(&root);
-    for result in [
+    for (index, result) in [
         collection.read(&serde_json::json!({ "path": "secret.md" })),
         collection.update(&serde_json::json!({
             "path": "secret.md",
@@ -126,13 +126,16 @@ fn symlinks_cannot_escape_the_collection_boundary() {
             None,
             false,
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         assert_eq!(
             result
                 .pointer("/error/code")
                 .and_then(|value| value.as_str()),
             Some("path_traversal"),
-            "unexpected result: {result}"
+            "unexpected result at operation {index}: {result}"
         );
         assert!(
             !result.to_string().contains("never-return-this"),

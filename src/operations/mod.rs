@@ -175,6 +175,23 @@ pub(crate) fn ensure_no_symlink_components_diagnostic(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
+pub(crate) fn ensure_no_symlink_components_held_diagnostic(
+    collection: &crate::Collection,
+    relative_path: &str,
+) -> Result<(), crate::diagnostic::Diagnostic> {
+    collection
+        .held_root()
+        .ensure_no_symlink_components(Path::new(relative_path))
+        .map_err(|_| {
+            path_boundary_diagnostic(
+                collection.spec_profile,
+                "Symbolic links are not allowed in collection operation paths",
+                relative_path,
+            )
+        })
+}
+
 fn path_boundary_diagnostic(
     spec_profile: SpecProfile,
     message: &str,
@@ -304,22 +321,28 @@ pub(crate) fn open_regular_record_no_follow(
         };
         directory = next;
     }
-    let Some(metadata) = open_result_or_unavailable(directory.symlink_metadata(leaf))? else {
-        return Ok(None);
-    };
-    if !metadata.is_file() {
-        return Ok(None);
-    }
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let Some(file) = open_result_or_unavailable(directory.open_with(leaf, &options))? else {
         return Ok(None);
     };
     let file = file.into_std();
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || record_has_multiple_hard_links(&metadata) {
         return Ok(None);
     }
     Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn record_has_multiple_hard_links(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn record_has_multiple_hard_links(_metadata: &std::fs::Metadata) -> bool {
+    false
 }
 
 fn open_result_or_unavailable<T>(result: std::io::Result<T>) -> std::io::Result<Option<T>> {
@@ -488,19 +511,6 @@ pub(crate) fn ensure_regular_record_file_diagnostic(
             FILE_NOT_FOUND,
             format!("File not found: {display_path}"),
             None,
-        )),
-    }
-}
-
-pub(crate) fn ensure_regular_record_file(
-    path: &Path,
-    display_path: &str,
-) -> Result<(), serde_json::Value> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
-        Ok(_) | Err(_) => Err(op_error(
-            FILE_NOT_FOUND,
-            &format!("File not found: {display_path}"),
         )),
     }
 }

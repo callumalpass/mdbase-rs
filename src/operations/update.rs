@@ -6,10 +6,7 @@ use crate::errors::*;
 use crate::frontmatter::parser::{parse_document_for_rewrite, yaml_mapping_to_json};
 use crate::frontmatter::serializer;
 use crate::mutation::{PlannedRecord, PreparedUpdate};
-use crate::operations::{
-    atomic_write, ensure_no_symlink_components_diagnostic, ensure_regular_record_file_diagnostic,
-    mutation_record_path_diagnostic,
-};
+use crate::operations::mutation_record_path_diagnostic;
 use crate::Collection;
 
 pub(crate) struct PrevalidatedUpdate {
@@ -139,7 +136,7 @@ impl Collection {
             Err(error) => return Err(crate::mutation::MutationFailure::diagnostic(error)),
         };
         if let Err(error) =
-            ensure_no_symlink_components_diagnostic(&self.root, path.as_str(), self.spec_profile)
+            crate::operations::ensure_no_symlink_components_held_diagnostic(self, path.as_str())
         {
             return Err(crate::mutation::MutationFailure::diagnostic(error));
         }
@@ -154,11 +151,8 @@ impl Collection {
         };
 
         let new_body = new_body.as_deref();
+        #[cfg(test)]
         let full_path = path.under(&self.root);
-        if let Err(error) = ensure_regular_record_file_diagnostic(&full_path, path.as_str()) {
-            return Err(crate::mutation::MutationFailure::diagnostic(error));
-        }
-
         // Load bytes, metadata, and revision from one open handle. The loaded
         // revision is also the mandatory publication precondition, including
         // when a legacy caller omitted `if_revision`.
@@ -399,11 +393,6 @@ impl Collection {
             }
         };
 
-        if let Err(error) =
-            ensure_no_symlink_components_diagnostic(&self.root, path.as_str(), self.spec_profile)
-        {
-            return Err(crate::mutation::MutationFailure::diagnostic(error));
-        }
         #[cfg(test)]
         apply_injected_publication_replacement(&full_path);
 
@@ -426,7 +415,10 @@ impl Collection {
                 format!("File '{}' was modified during operation", path.as_str()),
             ));
         }
-        if let Err(error) = atomic_write(&full_path, output.as_bytes()) {
+        if let Err(error) = self
+            .held_root()
+            .atomic_write(&path.to_path_buf(), output.as_bytes())
+        {
             return Err(crate::mutation::MutationFailure::operation(
                 "io_error",
                 format!("Failed to write: {error}"),

@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::fs;
-use walkdir::WalkDir;
 
 use super::ProviderError;
 
@@ -117,100 +115,51 @@ fn collection_snapshot(
     invalid_policy: InvalidRecordPolicy,
 ) -> Result<WatcherSnapshot, ProviderError> {
     let root = collection.root();
-    let configuration = read_resource(
-        root.join("mdbase.yaml"),
+    let authority = collection.held_root();
+    let configuration = read_resource_held(
+        authority,
         "mdbase.yaml".to_string(),
         CollectionSnapshotResourceKind::Configuration,
     )?;
-    let report = crate::v03::inspect_collection(root);
-    if !report.valid {
-        let message = report
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.severity == "error")
-            .map(|diagnostic| diagnostic.message.as_str())
-            .unwrap_or("collection validation failed");
-        return Err(ProviderError::CollectionOpen(message.to_string()));
-    }
-
     let mut resources = vec![configuration];
-    let lock_path = root.join("mdbase.lock.yaml");
-    if lock_path.exists() {
-        resources.push(read_resource(
-            lock_path,
-            "mdbase.lock.yaml".to_string(),
-            CollectionSnapshotResourceKind::Lock,
-        )?);
-    }
-    let provision_lock_path = root.join("mdbase.provisions.yaml");
-    if provision_lock_path.exists() {
-        resources.push(read_resource(
-            provision_lock_path,
-            "mdbase.provisions.yaml".to_string(),
-            CollectionSnapshotResourceKind::Lock,
-        )?);
-    }
-    for type_file in report.types {
-        resources.push(read_resource(
-            root.join(&type_file.path),
-            type_file.path,
-            CollectionSnapshotResourceKind::Type,
-        )?);
-    }
-    let contracts_root = root.join(&collection.settings().contracts_folder);
-    if contracts_root.exists() {
-        for entry in WalkDir::new(&contracts_root)
-            .follow_links(false)
-            .sort_by_file_name()
+    for path in authority
+        .files_recursive(std::path::Path::new(""))
+        .map_err(|error| {
+            ProviderError::CollectionOpen(format!("failed to inspect resources: {error}"))
+        })?
+    {
+        let portable = path.to_string_lossy().replace('\\', "/");
+        let kind = if matches!(
+            portable.as_str(),
+            "mdbase.lock.yaml" | "mdbase.provisions.yaml"
+        ) {
+            Some(CollectionSnapshotResourceKind::Lock)
+        } else if path.starts_with(&collection.settings().types_folder)
+            && matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("md" | "yaml" | "yml")
+            )
         {
-            let entry = entry.map_err(|error| {
-                ProviderError::CollectionOpen(format!(
-                    "failed to inspect contracts folder: {error}"
-                ))
-            })?;
-            if !entry.file_type().is_file()
-                || entry.path().extension().and_then(|value| value.to_str()) != Some("md")
-            {
-                continue;
-            }
-            let path = relative_resource_path(root, entry.path())?;
-            resources.push(read_resource(
-                entry.path().to_path_buf(),
-                path,
-                CollectionSnapshotResourceKind::Contract,
-            )?);
-        }
-    }
-    for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
-        let entry = entry.map_err(|error| {
-            ProviderError::CollectionOpen(format!("failed to inspect schema resources: {error}"))
-        })?;
-        if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+            Some(CollectionSnapshotResourceKind::Type)
+        } else if path.starts_with(&collection.settings().contracts_folder)
+            && path.extension().and_then(|value| value.to_str()) == Some("md")
         {
-            continue;
+            Some(CollectionSnapshotResourceKind::Contract)
+        } else if path.extension().and_then(|value| value.to_str()) == Some("json")
+            && is_schema_resource_path(&portable)
+        {
+            Some(CollectionSnapshotResourceKind::Schema)
+        } else if path.extension().and_then(|value| value.to_str()) == Some("base")
+            && !crate::record_path::has_hidden_component(&portable)
+            && crate::views::is_configured_obsidian_source(collection, &portable)
+        {
+            Some(CollectionSnapshotResourceKind::View)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            resources.push(read_resource_held(authority, portable, kind)?);
         }
-        let path = relative_resource_path(root, entry.path())?;
-        if !is_schema_resource_path(&path) {
-            continue;
-        }
-        resources.push(read_resource(
-            entry.path().to_path_buf(),
-            path,
-            CollectionSnapshotResourceKind::Schema,
-        )?);
-    }
-    for view_file in crate::views::compatibility_source_paths(collection) {
-        let path = view_file
-            .strip_prefix(root)
-            .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        resources.push(read_resource(
-            view_file,
-            path,
-            CollectionSnapshotResourceKind::View,
-        )?);
     }
     let mut paths = collection
         .scan_collection_files_checked()
@@ -428,12 +377,12 @@ fn resource_revision(resources: &[CollectionSnapshotResource]) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn read_resource(
-    absolute: std::path::PathBuf,
+fn read_resource_held(
+    root: &crate::collection_root::CollectionRoot,
     path: String,
     kind: CollectionSnapshotResourceKind,
 ) -> Result<CollectionSnapshotResource, ProviderError> {
-    let bytes = fs::read(&absolute).map_err(|error| {
+    let bytes = root.read(std::path::Path::new(&path)).map_err(|error| {
         ProviderError::CollectionOpen(format!("failed to read {path}: {error}"))
     })?;
     let document = String::from_utf8(bytes.clone()).map_err(|error| {
@@ -445,16 +394,6 @@ fn read_resource(
         revision: crate::v03::revision(&bytes),
         document,
     })
-}
-
-fn relative_resource_path(
-    root: &std::path::Path,
-    absolute: &std::path::Path,
-) -> Result<String, ProviderError> {
-    absolute
-        .strip_prefix(root)
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))
 }
 
 fn snapshot_revision(

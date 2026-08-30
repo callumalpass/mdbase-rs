@@ -275,7 +275,7 @@ fn update_refs_flag_overrides_the_collection_default() {
 }
 
 #[test]
-fn cache_clear_uses_the_configured_cache_folder() {
+fn cache_clear_does_not_treat_the_configured_collection_path_as_cache_authority() {
     let root = tempfile::tempdir().unwrap();
     fs::write(
         root.path().join("mdbase.yaml"),
@@ -287,5 +287,8 @@ fn cache_clear_uses_the_configured_cache_folder() {
 
     let (status, result) = run(&root, &["cache", "clear"]);
     assert_eq!(status, 0, "{result:#}");
-    assert!(!root.path().join("custom-cache/cache.db").exists());
+    assert_eq!(
+        fs::read_to_string(root.path().join("custom-cache/cache.db")).unwrap(),
+        "x"
+    );
 }

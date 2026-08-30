@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -186,15 +187,20 @@ pub(crate) fn prepare_runtime_transaction(
     }
 
     let id = uuid::Uuid::new_v4().simple().to_string();
-    let directory = collection.root.join(TRANSACTIONS_DIR).join(&id);
-    fs::create_dir_all(directory.join("stage"))
-        .map_err(|source| io_error(directory.join("stage"), source))?;
+    let directory = PathBuf::from(TRANSACTIONS_DIR).join(&id);
+    collection
+        .held_root()
+        .create_dir_all(&directory.join("stage"))
+        .map_err(|source| io_error(collection.root.join(&directory).join("stage"), source))?;
     let mut staging = StagingGuard {
+        root: collection.held_root().clone(),
         directory: directory.clone(),
         durable: false,
     };
-    fs::create_dir_all(directory.join("backup"))
-        .map_err(|source| io_error(directory.join("backup"), source))?;
+    collection
+        .held_root()
+        .create_dir_all(&directory.join("backup"))
+        .map_err(|source| io_error(collection.root.join(&directory).join("backup"), source))?;
 
     let mut entries = Vec::with_capacity(changed_paths.len());
     for path in changed_paths {
@@ -206,7 +212,7 @@ pub(crate) fn prepare_runtime_transaction(
         let stage_file = match after {
             Some(bytes) => {
                 let name = format!("stage/{index}");
-                write_synced(&directory.join(&name), bytes)?;
+                write_synced(collection, &directory.join(&name), bytes)?;
                 Some(name)
             }
             None => None,
@@ -214,7 +220,7 @@ pub(crate) fn prepare_runtime_transaction(
         let backup_file = match before {
             Some(bytes) => {
                 let name = format!("backup/{index}");
-                write_synced(&directory.join(&name), bytes)?;
+                write_synced(collection, &directory.join(&name), bytes)?;
                 Some(name)
             }
             None => None,
@@ -229,8 +235,8 @@ pub(crate) fn prepare_runtime_transaction(
     }
 
     context_check(context)?;
-    sync_dir(&directory.join("stage"))?;
-    sync_dir(&directory.join("backup"))?;
+    sync_dir(collection, &directory.join("stage"))?;
+    sync_dir(collection, &directory.join("backup"))?;
     let journal = RuntimeJournal {
         version: RUNTIME_JOURNAL_VERSION,
         id: id.clone(),
@@ -252,7 +258,7 @@ pub(crate) fn prepare_runtime_transaction(
         resolution_acked: false,
         event_acked: false,
     };
-    persist_runtime_journal(&directory, &journal)?;
+    persist_runtime_journal(collection, &directory, &journal)?;
     staging.durable = true;
     Ok(RuntimePrepareOutcome::Prepared(CommitId::from_stored(id)))
 }
@@ -281,7 +287,7 @@ pub(crate) fn commit_runtime_prepared(
     let _lock = WriteLock::acquire_context(collection, context)?;
     context_check(context)?;
     let directory = transaction_directory(collection, id);
-    let mut journal = read_runtime_journal(&directory)?;
+    let mut journal = read_runtime_journal(collection, &directory)?;
     match journal.phase {
         RuntimePhase::Prepared => {}
         RuntimePhase::Committing => return Ok(RuntimeCommitAttempt::SettlementPending(id.clone())),
@@ -302,8 +308,8 @@ pub(crate) fn commit_runtime_prepared(
     if let Some(path) = first_precondition_conflict(collection, &journal)? {
         journal.phase = RuntimePhase::RejectedBeforeCommit;
         journal.operation_rejection = Some(conflict_result(&journal, &path)?);
-        release_payloads(&directory, &mut journal);
-        persist_runtime_journal(&directory, &journal)?;
+        release_payloads(collection, &directory, &mut journal);
+        persist_runtime_journal(collection, &directory, &journal)?;
         return Ok(RuntimeCommitAttempt::RejectedBeforeCommit(resolution(
             &journal,
         )?));
@@ -312,7 +318,7 @@ pub(crate) fn commit_runtime_prepared(
     journal.generation = Some(generation.clone());
     journal.watermark = Some(watermark);
     journal.phase = RuntimePhase::Committing;
-    persist_runtime_journal(&directory, &journal)?;
+    persist_runtime_journal(collection, &directory, &journal)?;
     simulate_runtime_crash(&journal.id, 1)?;
     Ok(RuntimeCommitAttempt::SettlementRequired(id.clone()))
 }
@@ -323,7 +329,7 @@ pub(crate) fn settle_runtime_commit(
 ) -> Result<RuntimeResolution, TransactionError> {
     let _lock = WriteLock::acquire(collection)?;
     let directory = transaction_directory(collection, id);
-    let mut journal = read_runtime_journal(&directory)?;
+    let mut journal = read_runtime_journal(collection, &directory)?;
     match journal.phase {
         RuntimePhase::Committing => match settle(collection, &directory, &mut journal) {
             Ok(()) => resolution(&journal),
@@ -333,7 +339,7 @@ pub(crate) fn settle_runtime_commit(
                     return Err(error);
                 }
                 journal.phase = RuntimePhase::NeedsManualRecovery;
-                let _ = persist_runtime_journal(&directory, &journal);
+                let _ = persist_runtime_journal(collection, &directory, &journal);
                 Err(error)
             }
         },
@@ -350,11 +356,11 @@ pub(crate) fn cancel_runtime_prepared(
     let _lock = WriteLock::acquire_context(collection, context)?;
     context_check(context)?;
     let directory = transaction_directory(collection, id);
-    let mut journal = read_runtime_journal(&directory)?;
+    let mut journal = read_runtime_journal(collection, &directory)?;
     if journal.phase == RuntimePhase::Prepared {
         journal.phase = RuntimePhase::CancelledBeforeCommit;
-        release_payloads(&directory, &mut journal);
-        persist_runtime_journal(&directory, &journal)?;
+        release_payloads(collection, &directory, &mut journal);
+        persist_runtime_journal(collection, &directory, &journal)?;
     }
     resolution(&journal)
 }
@@ -368,10 +374,10 @@ pub(crate) fn resolve_runtime_commit(
     let _lock = WriteLock::acquire_context(collection, context)?;
     context_check(context)?;
     let directory = transaction_directory(collection, id);
-    if !directory.exists() {
+    if collection.held_root().open_dir(&directory).is_err() {
         return Ok(None);
     }
-    read_runtime_journal(&directory).and_then(|journal| resolution(&journal).map(Some))
+    read_runtime_journal(collection, &directory).and_then(|journal| resolution(&journal).map(Some))
 }
 
 pub(crate) fn resolve_runtime_claim(
@@ -413,24 +419,15 @@ pub(crate) fn list_unacked_runtime_events(
     context_check(context)?;
     let _lock = WriteLock::acquire_context(collection, context)?;
     context_check(context)?;
-    let root = collection.root.join(TRANSACTIONS_DIR);
-    let mut directories = match fs::read_dir(&root) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => return Err(io_error(root, source)),
-    };
-    directories.sort();
+    let directories = transaction_directories(collection)?;
     let mut resolutions = Vec::new();
     for directory in directories {
         context_check(context)?;
         let path = directory.join(JOURNAL_FILE);
-        let bytes = match fs::read(&path) {
+        let bytes = match collection.held_root().read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(io_error(path, source)),
+            Err(source) => return Err(io_error(collection.root.join(&path), source)),
         };
         let value = serde_json::from_slice::<serde_json::Value>(&bytes)
             .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
@@ -457,31 +454,13 @@ pub(crate) fn reset_runtime_support_for_fork(
     context_check(context)?;
     let _lock = WriteLock::acquire_context(collection, context)?;
     context_check(context)?;
-    let root = collection.root.join(TRANSACTIONS_DIR);
-    let mut directories = match fs::read_dir(&root) {
-        Ok(entries) => entries
-            .map(|entry| {
-                entry
-                    .map(|entry| entry.path())
-                    .map_err(|source| io_error(root.clone(), source))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => return Err(io_error(root, source)),
-    };
-    directories.sort();
+    let directories = transaction_directories(collection)?;
     for directory in directories {
-        let metadata = fs::symlink_metadata(&directory)
-            .map_err(|source| io_error(directory.clone(), source))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(TransactionError::ManualRecovery(format!(
-                "'{}' is not a regular transaction directory",
-                directory.display()
-            )));
-        }
         let journal_path = directory.join(JOURNAL_FILE);
-        let bytes =
-            fs::read(&journal_path).map_err(|source| io_error(journal_path.clone(), source))?;
+        let bytes = collection
+            .held_root()
+            .read(&journal_path)
+            .map_err(|source| io_error(collection.root.join(&journal_path), source))?;
         let version = serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
             .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64));
@@ -504,9 +483,12 @@ pub(crate) fn reset_runtime_support_for_fork(
                 journal.id
             )));
         }
-        fs::remove_dir_all(&directory).map_err(|source| io_error(directory.clone(), source))?;
+        collection
+            .held_root()
+            .remove_dir_all(&directory)
+            .map_err(|source| io_error(collection.root.join(&directory), source))?;
     }
-    sync_dir(&root)?;
+    sync_dir(collection, Path::new(TRANSACTIONS_DIR))?;
     Ok(())
 }
 
@@ -520,10 +502,10 @@ fn update_ack(
     let _lock = WriteLock::acquire_context(collection, context)?;
     context_check(context)?;
     let directory = transaction_directory(collection, id);
-    if !directory.exists() {
+    if collection.held_root().open_dir(&directory).is_err() {
         return Ok(());
     }
-    let mut journal = read_runtime_journal(&directory)?;
+    let mut journal = read_runtime_journal(collection, &directory)?;
     if resolution_ack {
         journal.resolution_acked = true;
     } else {
@@ -537,9 +519,9 @@ fn update_ack(
         _ => false,
     };
     if removable {
-        cleanup_transaction(&directory);
+        cleanup_transaction(collection, &directory);
     } else {
-        persist_runtime_journal(&directory, &journal)?;
+        persist_runtime_journal(collection, &directory, &journal)?;
     }
     Ok(())
 }
@@ -569,7 +551,7 @@ pub(super) fn recover_runtime_one(
                     return Err(error);
                 }
                 journal.phase = RuntimePhase::NeedsManualRecovery;
-                let _ = persist_runtime_journal(directory, &journal);
+                let _ = persist_runtime_journal(collection, directory, &journal);
                 Err(error)
             }
         },
@@ -598,12 +580,12 @@ fn settle(
     validate_journal(collection, directory, journal)?;
     for index in 0..journal.entries.len() {
         let entry = &journal.entries[index];
-        let path = crate::api::CollectionPath::new(&entry.path)?.under(&collection.root);
-        let current = current_revision(&path)?;
+        let path = crate::api::CollectionPath::new(&entry.path)?.to_path_buf();
+        let current = current_revision(collection, &path)?;
         if current == entry.after_revision {
             if journal.applied < index + 1 {
                 journal.applied = index + 1;
-                persist_runtime_journal(directory, journal)?;
+                persist_runtime_journal(collection, directory, journal)?;
             }
             continue;
         }
@@ -616,13 +598,13 @@ fn settle(
         apply_entry(collection, directory, entry, journal.scope)?;
         simulate_runtime_crash(&journal.id, 2)?;
         journal.applied = index + 1;
-        persist_runtime_journal(directory, journal)?;
+        persist_runtime_journal(collection, directory, journal)?;
         simulate_runtime_crash(&journal.id, 3)?;
     }
     let file_facts = capture_committed_file_facts(collection, &journal.entries)?;
     journal_operation_mut(journal)?.attach_committed_file_facts(&file_facts);
     journal.phase = RuntimePhase::Committed;
-    persist_runtime_journal(directory, journal)?;
+    persist_runtime_journal(collection, directory, journal)?;
     #[cfg(test)]
     apply_post_commit_hook(collection)?;
     simulate_runtime_crash(&journal.id, 4)
@@ -651,8 +633,8 @@ fn first_precondition_conflict(
     journal: &RuntimeJournal,
 ) -> Result<Option<String>, TransactionError> {
     for entry in &journal.entries {
-        let path = crate::api::CollectionPath::new(&entry.path)?.under(&collection.root);
-        if current_revision(&path)? != entry.before_revision {
+        let path = crate::api::CollectionPath::new(&entry.path)?.to_path_buf();
+        if current_revision(collection, &path)? != entry.before_revision {
             return Ok(Some(entry.path.clone()));
         }
     }
@@ -678,16 +660,7 @@ fn first_unsettled_conflict(
     collection: &Collection,
     journal: &RuntimeJournal,
 ) -> Result<Option<String>, TransactionError> {
-    let root = collection.root.join(TRANSACTIONS_DIR);
-    let mut directories = match fs::read_dir(&root) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(io_error(root, source)),
-    };
-    directories.sort();
+    let directories = transaction_directories(collection)?;
     let claimed = journal
         .entries
         .iter()
@@ -697,10 +670,11 @@ fn first_unsettled_conflict(
         if directory.file_name().and_then(|name| name.to_str()) == Some(journal.id.as_str()) {
             continue;
         }
-        let bytes = match fs::read(directory.join(JOURNAL_FILE)) {
+        let journal_path = directory.join(JOURNAL_FILE);
+        let bytes = match collection.held_root().read(&journal_path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(io_error(directory.join(JOURNAL_FILE), source)),
+            Err(source) => return Err(io_error(collection.root.join(journal_path), source)),
         };
         let value = serde_json::from_slice::<serde_json::Value>(&bytes)
             .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
@@ -768,7 +742,7 @@ fn validate_journal(
             )));
         }
         if let Some(stage_file) = &entry.stage_file {
-            let staged = read_regular_file(&directory.join(stage_file))?;
+            let staged = read_regular_file(collection, &directory.join(stage_file))?;
             if Some(crate::v03::revision(&staged)) != entry.after_revision {
                 return Err(TransactionError::InvalidJournal(format!(
                     "staged contents for '{}' do not match the journal",
@@ -807,12 +781,7 @@ fn ensure_capacity(collection: &Collection, changes: &ChangeBatch) -> Result<(),
     if metadata.len() > MAX_RUNTIME_METADATA_BYTES {
         return Err(TransactionError::RuntimeCapacityExhausted);
     }
-    let root = collection.root.join(TRANSACTIONS_DIR);
-    let active = match fs::read_dir(&root) {
-        Ok(entries) => entries.filter_map(Result::ok).count(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(source) => return Err(io_error(root, source)),
-    };
+    let active = transaction_directories(collection)?.len();
     if active >= MAX_ACTIVE_RUNTIME_TRANSACTIONS {
         return Err(TransactionError::RuntimeCapacityExhausted);
     }
@@ -844,21 +813,13 @@ fn find_by_claim(
     collection: &Collection,
     claim: &str,
 ) -> Result<Option<RuntimeJournal>, TransactionError> {
-    let root = collection.root.join(TRANSACTIONS_DIR);
-    let mut directories = match fs::read_dir(&root) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(io_error(root, source)),
-    };
-    directories.sort();
+    let directories = transaction_directories(collection)?;
     for directory in directories {
-        let bytes = match fs::read(directory.join(JOURNAL_FILE)) {
+        let journal_path = directory.join(JOURNAL_FILE);
+        let bytes = match collection.held_root().read(&journal_path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(io_error(directory.join(JOURNAL_FILE), source)),
+            Err(source) => return Err(io_error(collection.root.join(journal_path), source)),
         };
         let value = serde_json::from_slice::<serde_json::Value>(&bytes)
             .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
@@ -904,9 +865,13 @@ fn resolution(journal: &RuntimeJournal) -> Result<RuntimeResolution, Transaction
     })
 }
 
-fn release_payloads(directory: &Path, journal: &mut RuntimeJournal) {
-    let _ = fs::remove_dir_all(directory.join("stage"));
-    let _ = fs::remove_dir_all(directory.join("backup"));
+fn release_payloads(collection: &Collection, directory: &Path, journal: &mut RuntimeJournal) {
+    let _ = collection
+        .held_root()
+        .remove_dir_all(&directory.join("stage"));
+    let _ = collection
+        .held_root()
+        .remove_dir_all(&directory.join("backup"));
     journal.changes.clear();
     journal.change_descriptor = ChangeBatch::new(Vec::new())
         .expect("an empty change batch is valid")
@@ -1035,25 +1000,42 @@ fn commit_id(journal: &RuntimeJournal) -> CommitId {
     CommitId::from_stored(journal.id.clone())
 }
 
-fn transaction_directory(collection: &Collection, id: &CommitId) -> PathBuf {
-    collection.root.join(TRANSACTIONS_DIR).join(id.as_str())
+fn transaction_directories(collection: &Collection) -> Result<Vec<PathBuf>, TransactionError> {
+    collection
+        .held_root()
+        .child_directories(Path::new(TRANSACTIONS_DIR))
+        .map_err(|source| io_error(collection.root.join(TRANSACTIONS_DIR), source))
 }
 
-fn read_runtime_journal(directory: &Path) -> Result<RuntimeJournal, TransactionError> {
+fn transaction_directory(_collection: &Collection, id: &CommitId) -> PathBuf {
+    PathBuf::from(TRANSACTIONS_DIR).join(id.as_str())
+}
+
+fn read_runtime_journal(
+    collection: &Collection,
+    directory: &Path,
+) -> Result<RuntimeJournal, TransactionError> {
     let path = directory.join(JOURNAL_FILE);
-    let bytes = fs::read(&path).map_err(|source| io_error(path, source))?;
+    let bytes = collection
+        .held_root()
+        .read(&path)
+        .map_err(|source| io_error(collection.root.join(&path), source))?;
     serde_json::from_slice(&bytes)
         .map_err(|error| TransactionError::InvalidJournal(error.to_string()))
 }
 
 fn persist_runtime_journal(
+    collection: &Collection,
     directory: &Path,
     journal: &RuntimeJournal,
 ) -> Result<(), TransactionError> {
     let bytes = serde_json::to_vec_pretty(journal)
         .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
     let path = directory.join(JOURNAL_FILE);
-    crate::operations::atomic_write(&path, &bytes).map_err(|source| io_error(path, source))
+    collection
+        .held_root()
+        .atomic_write(&path, &bytes)
+        .map_err(|source| io_error(collection.root.join(path), source))
 }
 
 fn context_check(context: &OperationContext) -> Result<(), TransactionError> {
@@ -1150,7 +1132,7 @@ mod tests {
         let (_root, collection) = collection();
         let id = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
         let directory = transaction_directory(&collection, &id);
-        let mut journal = read_runtime_journal(&directory).unwrap();
+        let mut journal = read_runtime_journal(&collection, &directory).unwrap();
         let empty = OperationResult {
             valid: true,
             result: serde_json::json!({}),
@@ -1215,8 +1197,13 @@ mod tests {
         let (_root, collection) = collection();
         let id = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
         let directory = transaction_directory(&collection, &id);
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&fs::read(directory.join(JOURNAL_FILE)).unwrap()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &collection
+                .held_root()
+                .read(directory.join(JOURNAL_FILE))
+                .unwrap(),
+        )
+        .unwrap();
         assert!(value.get("operation_outcome").is_some());
         assert!(value.get("operation_result").is_none());
         let typed: CanonicalOperationOutcome =
@@ -1224,17 +1211,20 @@ mod tests {
         value["version"] = serde_json::json!(LEGACY_RUNTIME_JOURNAL_VERSION);
         value["operation_result"] = serde_json::to_value(typed.to_v03()).unwrap();
         value.as_object_mut().unwrap().remove("operation_outcome");
-        fs::write(
-            directory.join(JOURNAL_FILE),
-            serde_json::to_vec_pretty(&value).unwrap(),
-        )
-        .unwrap();
+        collection
+            .held_root()
+            .atomic_write(
+                &directory.join(JOURNAL_FILE),
+                &serde_json::to_vec_pretty(&value).unwrap(),
+            )
+            .unwrap();
 
         let resolved = resolve_runtime_commit(&collection, &id, &OperationContext::legacy())
             .unwrap()
             .unwrap();
         assert!(matches!(resolved, RuntimeResolution::Prepared { .. }));
-        let recovered = journal_operation(&read_runtime_journal(&directory).unwrap()).unwrap();
+        let recovered =
+            journal_operation(&read_runtime_journal(&collection, &directory).unwrap()).unwrap();
         assert!(matches!(
             recovered.value,
             crate::runtime::CanonicalOperationValue::Update(None)
