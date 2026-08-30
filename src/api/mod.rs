@@ -12,6 +12,7 @@ pub(crate) use dynamic::reference_evidence;
 pub use dynamic::{ProjectedValue, QueryMetadata, ReferenceEvidence};
 pub use query::{FrontmatterMode, QueryDirection, QueryOrder, QueryRequest, QueryResult};
 pub use typed::{
+    BackfillBatchResult, BackfillDetail, BackfillRequest, BackfillResult,
     BatchDeletePreflightResult, BatchItemResult, BatchOperation, BatchOperationResult,
     BatchRenamePartialUpdates, BatchRenamePreflightResult, BatchRenameResult, BatchRequest,
     BatchResult, CreateRequest, DeletePreflightResult, DeleteRequest, DeleteResult, Diagnostic,

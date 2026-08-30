@@ -24,6 +24,37 @@ use crate::{Collection, SpecProfile};
 
 use super::{PlannedDelete, PlannedRecord, PlannedRename, PreparationOptions};
 
+#[cfg(test)]
+type PrecommitHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+fn precommit_hooks(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, PrecommitHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, PrecommitHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn inject_precommit_hook(root: &std::path::Path, hook: impl FnOnce() + Send + 'static) {
+    precommit_hooks()
+        .lock()
+        .expect("mutation precommit hook lock")
+        .insert(root.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_precommit_hook(root: &std::path::Path) {
+    let hook = precommit_hooks()
+        .lock()
+        .expect("mutation precommit hook lock")
+        .remove(root);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Complete canonical result, including failures that prevented publication.
 pub(crate) struct BatchExecution {
     pub(crate) result: BatchResult,
@@ -62,6 +93,23 @@ pub(crate) fn batch(
     collection: &Collection,
     request: BatchRequest,
 ) -> Result<OperationOutcome<BatchResult>, MdbaseError> {
+    batch_with_optional_context(collection, request, None)
+}
+
+pub(crate) fn batch_with_context(
+    collection: &Collection,
+    request: BatchRequest,
+    context: &OperationContext,
+) -> Result<OperationOutcome<BatchResult>, MdbaseError> {
+    context.check().map_err(provider_error_as_mdbase)?;
+    batch_with_optional_context(collection, request, Some(context))
+}
+
+fn batch_with_optional_context(
+    collection: &Collection,
+    request: BatchRequest,
+    context: Option<&OperationContext>,
+) -> Result<OperationOutcome<BatchResult>, MdbaseError> {
     ensure_canonical(collection)?;
     validate_request(&request)?;
     if request.allow_partial && !request.dry_run {
@@ -85,7 +133,7 @@ pub(crate) fn batch(
         request.operations,
         options,
         request.dry_run,
-        None,
+        context,
     )?;
     if execution.result.failed != 0 {
         return Err(MdbaseError::Operation {
@@ -207,6 +255,11 @@ fn execute_atomic(
         None => super::collect_collection_files(&shadow.collection)
             .map_err(|item| operation_error(vec![*item]))?,
     };
+    #[cfg(test)]
+    run_precommit_hook(collection.root());
+    if let Some(context) = context {
+        context.check().map_err(provider_error_as_mdbase)?;
+    }
     let commit = crate::transactions::commit_shadow(collection, &shadow.baseline, &desired)
         .map_err(|error| {
             operation_error(vec![CanonicalDiagnostic::error(

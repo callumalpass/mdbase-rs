@@ -1,12 +1,17 @@
 //! Delete operation (§12.4).
 
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::api::operations::{DeleteInput, DeleteOutput};
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::api::{DeleteRequest, Revision};
 use crate::errors::*;
-use crate::mutation::{PlannedDelete, PreparationOptions, PreparedDelete};
+#[cfg(feature = "legacy-collection-mutation")]
+use crate::mutation::PreparationOptions;
+use crate::mutation::{PlannedDelete, PreparedDelete};
 use crate::Collection;
 
 impl Collection {
+    #[cfg(feature = "legacy-collection-mutation")]
     pub(crate) fn delete_legacy(&self, input: &serde_json::Value) -> serde_json::Value {
         #[cfg(test)]
         crate::mutation::probe_legacy_parse();
@@ -140,6 +145,7 @@ impl Collection {
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn mutation_failure_json(diagnostics: Vec<crate::diagnostic::Diagnostic>) -> serde_json::Value {
     if diagnostics.len() == 1 {
         serde_json::json!({"error": diagnostics.into_iter().next().unwrap()})

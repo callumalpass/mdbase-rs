@@ -824,6 +824,63 @@ pub struct BatchResult {
     pub dry_run: bool,
 }
 
+/// Typed request for filling missing default and generated record fields.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BackfillRequest {
+    /// Restrict candidates to one type name.
+    pub type_name: Option<String>,
+    /// Restrict candidates with a canonical query expression.
+    pub where_expression: Option<String>,
+    /// Restrict changes to these fields. `None` preserves the all-fields mode.
+    pub fields: Option<Vec<String>>,
+    /// Plan and validate without publishing writes.
+    pub dry_run: bool,
+    /// Override whether defaults are applied; absent means enabled.
+    pub apply_defaults: Option<bool>,
+    /// Override whether generated values are applied; absent means enabled.
+    pub apply_generated: Option<bool>,
+}
+
+/// Per-record evidence emitted by a typed backfill.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BackfillDetail {
+    /// Candidate record path.
+    pub path: String,
+    /// Stable outcome label (`success`, `failed`, or `skipped`).
+    pub status: String,
+    /// Fields written by a successful mutation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_fields: Vec<String>,
+    /// Human-readable no-op or skip reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Structured failure evidence retained for CLI compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
+}
+
+/// Aggregate evidence for one typed backfill execution.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BackfillBatchResult {
+    /// Number of selected records.
+    pub total: usize,
+    /// Number of successful or already-satisfied records.
+    pub succeeded: usize,
+    /// Number of records that could not be planned or written.
+    pub failed: usize,
+    /// Number of records excluded by an explicit field filter.
+    pub skipped: usize,
+    /// Ordered per-record evidence.
+    pub details: Vec<BackfillDetail>,
+}
+
+/// Typed backfill result retaining the established CLI wire shape.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BackfillResult {
+    /// Aggregate backfill result.
+    pub batch_result: BackfillBatchResult,
+}
+
 /// Borrowed typed operation service for one loaded collection.
 pub struct TypedCollection<'a> {
     collection: &'a Collection,
@@ -893,6 +950,24 @@ impl<'a> TypedCollection<'a> {
     pub fn batch(&self, request: BatchRequest) -> MdbaseResult<OperationOutcome<BatchResult>> {
         self.require_canonical("batch")?;
         crate::mutation::batch(self.collection, request)
+    }
+
+    /// Fill missing default and generated fields in one recoverable mutation.
+    pub fn backfill(
+        &self,
+        request: BackfillRequest,
+    ) -> MdbaseResult<OperationOutcome<BackfillResult>> {
+        self.backfill_with_context(request, &crate::runtime::OperationContext::internal())
+    }
+
+    /// Fill missing fields with explicit cancellation, deadline, and capture budgets.
+    pub fn backfill_with_context(
+        &self,
+        request: BackfillRequest,
+        context: &crate::runtime::OperationContext,
+    ) -> MdbaseResult<OperationOutcome<BackfillResult>> {
+        self.require_canonical("backfill")?;
+        crate::operations::backfill::execute(self.collection, request, context)
     }
 
     /// Query canonical or read-only-compatible records.

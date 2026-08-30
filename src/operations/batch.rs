@@ -1,11 +1,15 @@
 //! Batch operations (§12.7).
 
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::errors::*;
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::frontmatter::parser::yaml_mapping_to_json;
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::frontmatter::serializer;
 use crate::query::engine::QueryEvalContext;
 use crate::Collection;
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn invalid_record_batch_detail(
     path: &str,
     invalid: crate::record_load::InvalidRecordView<'_>,
@@ -33,6 +37,7 @@ fn invalid_record_batch_detail(
     })
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn preflight_serialization(
     record: crate::record_load::ParsedRecordView<'_>,
     fields: &serde_json::Map<String, serde_json::Value>,
@@ -50,6 +55,7 @@ fn preflight_serialization(
     Ok(())
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn serialization_failure_detail(path: &str, error: &impl std::fmt::Display) -> serde_json::Value {
     serde_json::json!({
         "path": path,
@@ -69,6 +75,7 @@ fn timestamp_from_ns(value: i64) -> Option<String> {
 }
 
 impl Collection {
+    #[cfg(feature = "legacy-collection-mutation")]
     pub(crate) fn batch_update_legacy(
         &self,
         input: &serde_json::Value,
@@ -344,6 +351,7 @@ impl Collection {
     }
 
     /// Batch update with explicit update list (validate-all-then-execute).
+    #[cfg(feature = "legacy-collection-mutation")]
     pub(crate) fn batch_update_explicit(
         &self,
         updates: &[serde_json::Value],
@@ -550,6 +558,7 @@ impl Collection {
     }
 
     /// Batch delete files matching a where clause (§12.4, §12.7).
+    #[cfg(feature = "legacy-collection-mutation")]
     pub(crate) fn batch_delete_legacy(
         &self,
         input: &serde_json::Value,

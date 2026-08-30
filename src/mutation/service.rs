@@ -43,7 +43,7 @@ fn increment(update: impl FnOnce(&mut MutationPathProbes)) {
 pub(crate) fn probe_request_value() {
     increment(|value| value.request_value_constructions += 1);
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 pub(crate) fn probe_legacy_parse() {
     increment(|value| value.legacy_request_parses += 1);
 }

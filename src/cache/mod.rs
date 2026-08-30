@@ -127,7 +127,7 @@ fn cache_access_hooks() -> &'static std::sync::Mutex<CacheAccessHooks> {
     HOOKS.get_or_init(Default::default)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 pub(crate) fn set_cache_access_hook(root: &std::path::Path, hook: impl FnOnce() + Send + 'static) {
     cache_access_hooks()
         .lock()

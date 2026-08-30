@@ -247,6 +247,7 @@ fn fixture_with_path_type(name: &str, bytes: &[u8]) -> tempfile::TempDir {
     root
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 #[test]
 fn delete_probe_matrix_counts_real_boundaries() {
     let root = fixture();

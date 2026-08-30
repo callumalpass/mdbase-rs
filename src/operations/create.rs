@@ -1,7 +1,11 @@
 //! Create operation (§12.1).
 
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::api::operations::{CreateInput, CreateOutput};
-use crate::api::{CollectionPath, CreateRequest, Revision};
+#[cfg(feature = "legacy-collection-mutation")]
+use crate::api::CreateRequest;
+#[cfg(feature = "legacy-collection-mutation")]
+use crate::api::{CollectionPath, Revision};
 use crate::errors::*;
 use crate::frontmatter;
 use crate::frontmatter::serializer;
@@ -15,6 +19,7 @@ use crate::operations::{
 use crate::Collection;
 
 impl Collection {
+    #[cfg(feature = "legacy-collection-mutation")]
     pub(crate) fn create_legacy(&self, input: &serde_json::Value) -> serde_json::Value {
         let parsed = CreateInput::parse(input);
         let request = CreateRequest {
@@ -488,6 +493,7 @@ impl Collection {
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn mutation_failure_json(failure: crate::mutation::MutationFailure) -> serde_json::Value {
     match failure.kind {
         crate::mutation::MutationFailureKind::Operation if failure.diagnostics.len() == 1 => {
@@ -501,6 +507,7 @@ fn mutation_failure_json(failure: crate::mutation::MutationFailure) -> serde_jso
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn planned_create_output(planned: PlannedRecord) -> serde_json::Value {
     CreateOutput {
         path: planned.path.to_string(),

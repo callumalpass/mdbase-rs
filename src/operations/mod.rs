@@ -229,6 +229,7 @@ pub(crate) fn mutation_record_path_diagnostic(
     })
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 pub(crate) fn mutation_record_path(
     collection: &Collection,
     path: &str,

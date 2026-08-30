@@ -12,10 +12,14 @@ mod tests;
 
 pub(crate) use planner::ReferenceRewritePlan;
 
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::api::operations::RenameInput;
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::api::{RenameRequest, Revision};
 use crate::errors::*;
-use crate::mutation::{PlannedRecord, PlannedRename, PreparationOptions, PreparedRename};
+#[cfg(feature = "legacy-collection-mutation")]
+use crate::mutation::PreparationOptions;
+use crate::mutation::{PlannedRecord, PlannedRename, PreparedRename};
 use crate::operations::{
     atomic_rename_noclobber, atomic_write_in_prepared_parent,
     ensure_no_symlink_components_diagnostic, ensure_regular_record_file_diagnostic,
@@ -27,6 +31,7 @@ use crate::Collection;
 use hooks::apply_injected_root_replacement;
 
 impl Collection {
+    #[cfg(feature = "legacy-collection-mutation")]
     pub(crate) fn rename_legacy(&self, input: &serde_json::Value) -> serde_json::Value {
         #[cfg(test)]
         crate::mutation::probe_legacy_parse();
@@ -304,6 +309,7 @@ fn planned_body(bytes: &[u8], fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn planned_legacy_result(planned: &PlannedRename) -> serde_json::Value {
     let mut result = if planned.dry_run {
         serde_json::json!({
@@ -344,6 +350,7 @@ fn planned_legacy_result(planned: &PlannedRename) -> serde_json::Value {
     result
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn mutation_failure_json(diagnostics: Vec<crate::diagnostic::Diagnostic>) -> serde_json::Value {
     if diagnostics.len() == 1 {
         serde_json::json!({"error": diagnostics.into_iter().next().unwrap()})

@@ -275,6 +275,120 @@ fn update_refs_flag_overrides_the_collection_default() {
 }
 
 #[test]
+fn canonical_backfill_preserves_cli_wire_and_uses_recoverable_typed_mutation() {
+    let root = cli_collection();
+    fs::write(
+        root.path().join("_types/task.md"),
+        r#"---
+kind: mdbase.type
+name: task
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [type, title]
+    properties:
+      type: { const: task }
+      title: { type: string }
+      status: { type: string }
+collection:
+  read_defaults:
+    status: open
+---
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("mdbase.yaml"),
+        "spec_version: 0.3.0\nsettings:\n  timezone: UTC\n  validation: error\n  write_defaults: true\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("tasks")).unwrap();
+    fs::write(
+        root.path().join("tasks/backfill.md"),
+        "---\ntype: task\ntitle: Backfill\n---\n",
+    )
+    .unwrap();
+
+    let (status, preview) = run(&root, &["backfill", "--type", "task", "--dry-run"]);
+    assert_eq!(status, 0, "{preview:#}");
+    assert_eq!(
+        preview,
+        serde_json::json!({
+            "batch_result": {
+                "total": 1,
+                "succeeded": 1,
+                "failed": 0,
+                "skipped": 0,
+                "details": [],
+            }
+        })
+    );
+    assert!(!fs::read_to_string(root.path().join("tasks/backfill.md"))
+        .unwrap()
+        .contains("status:"));
+
+    let (status, applied) = run(&root, &["backfill", "--type", "task"]);
+    assert_eq!(status, 0, "{applied:#}");
+    assert_eq!(
+        applied,
+        serde_json::json!({
+            "batch_result": {
+                "total": 1,
+                "succeeded": 1,
+                "failed": 0,
+                "skipped": 0,
+                "details": [{
+                    "path": "tasks/backfill.md",
+                    "status": "success",
+                    "changed_fields": ["status"],
+                }],
+            }
+        })
+    );
+    let persisted = fs::read_to_string(root.path().join("tasks/backfill.md")).unwrap();
+    assert!(persisted.contains("status:"), "{applied:#}\n{persisted}");
+}
+
+#[test]
+fn backfill_selector_and_profile_failures_preserve_exact_cli_contract() {
+    let canonical = cli_collection();
+    let (status, malformed) = run(&canonical, &["backfill"]);
+    assert_eq!(status, 1);
+    assert_eq!(
+        malformed,
+        serde_json::json!({
+            "error": {
+                "code": "invalid_request",
+                "message": "backfill requires 'type' or 'where'",
+            }
+        })
+    );
+
+    let legacy = tempfile::tempdir().unwrap();
+    fs::write(legacy.path().join("mdbase.yaml"), "spec_version: 0.2.0\n").unwrap();
+    let (status, migration) = run(&legacy, &["backfill", "--type", "task"]);
+    assert_eq!(status, 1);
+    assert_eq!(
+        migration,
+        serde_json::json!({
+            "valid": false,
+            "result": {},
+            "diagnostics": [{
+                "severity": "error",
+                "code": "migration_required",
+                "message": "operation 'backfill' requires migrating this v0.2 collection to v0.3",
+                "path": null,
+                "field": null,
+                "type_name": null,
+                "schema_location": null,
+                "details": null,
+            }],
+        })
+    );
+}
+
+#[test]
 fn cache_clear_does_not_treat_the_configured_collection_path_as_cache_authority() {
     let root = tempfile::tempdir().unwrap();
     fs::write(

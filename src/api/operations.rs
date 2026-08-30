@@ -1,3 +1,4 @@
+#[cfg(feature = "legacy-collection-mutation")]
 use std::collections::HashMap;
 
 use crate::errors::*;
@@ -24,6 +25,7 @@ impl ReadInput {
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 #[derive(Debug, Clone)]
 pub struct CreateInput {
     pub type_name: Option<String>,
@@ -33,6 +35,7 @@ pub struct CreateInput {
     pub if_revision: Option<String>,
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 impl CreateInput {
     pub fn parse(input: &serde_json::Value) -> Self {
         #[cfg(test)]
@@ -70,6 +73,7 @@ impl CreateInput {
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 #[derive(Debug, Clone)]
 pub struct UpdateInput {
     pub path: String,
@@ -80,6 +84,7 @@ pub struct UpdateInput {
     pub if_revision: Option<String>,
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 impl UpdateInput {
     pub fn parse(input: &serde_json::Value) -> Result<Self, serde_json::Value> {
         #[cfg(test)]
@@ -134,6 +139,7 @@ impl UpdateInput {
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 #[derive(Debug, Clone)]
 pub struct DeleteInput {
     pub path: String,
@@ -143,6 +149,7 @@ pub struct DeleteInput {
     pub if_revision: Option<String>,
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 impl DeleteInput {
     pub fn parse(input: &serde_json::Value) -> Result<Self, serde_json::Value> {
         let path = input
@@ -173,12 +180,14 @@ impl DeleteInput {
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 #[derive(Debug, Clone)]
 pub struct SimulatedRefWrite {
     pub path: String,
     pub content: String,
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 #[derive(Debug, Clone)]
 pub struct RenameInput {
     pub from: String,
@@ -191,6 +200,7 @@ pub struct RenameInput {
     pub last_known_ref_mtimes: HashMap<String, u64>,
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 impl RenameInput {
     pub fn parse(input: &serde_json::Value) -> Result<Self, serde_json::Value> {
         let from = input
@@ -250,6 +260,7 @@ impl RenameInput {
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 #[derive(Debug, Clone)]
 pub struct CreateOutput {
     pub path: String,
@@ -260,6 +271,7 @@ pub struct CreateOutput {
     pub warnings: Vec<serde_json::Value>,
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 impl CreateOutput {
     pub fn into_json(self) -> serde_json::Value {
         let mut result = serde_json::json!({
@@ -276,6 +288,7 @@ impl CreateOutput {
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 #[derive(Debug, Clone)]
 pub struct UpdateOutput {
     pub path: String,
@@ -284,6 +297,7 @@ pub struct UpdateOutput {
     pub warnings: Vec<serde_json::Value>,
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 impl UpdateOutput {
     pub fn into_json(self) -> serde_json::Value {
         let mut result = serde_json::json!({
@@ -298,6 +312,7 @@ impl UpdateOutput {
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 #[derive(Debug, Clone)]
 pub struct DeleteOutput {
     pub path: String,
@@ -306,6 +321,7 @@ pub struct DeleteOutput {
     pub broken_links: Vec<serde_json::Value>,
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 impl DeleteOutput {
     pub fn into_json(self) -> serde_json::Value {
         let mut result = serde_json::json!({

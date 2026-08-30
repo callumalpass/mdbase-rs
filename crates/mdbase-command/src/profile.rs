@@ -1,5 +1,8 @@
 use clap::{Args as ClapArgs, ValueEnum};
-use mdbase::api::ReadRequest;
+use mdbase::api::{
+    CollectionPath, CreateRequest, DeleteRequest, MdbaseError, MdbaseResult, OperationOutcome,
+    ReadRequest, RenameRequest, UpdateRequest,
+};
 use mdbase::frontmatter::parser::json_to_yaml_mapping;
 use mdbase::frontmatter::serializer::serialize_document;
 use mdbase::runtime::{FilesystemRuntime, OperationKind, OperationRequest};
@@ -1210,6 +1213,23 @@ fn ensure_v03_success(result: &mdbase::v03::OperationResult) -> Result<(), Strin
     }
 }
 
+fn ensure_typed_success<T>(result: MdbaseResult<OperationOutcome<T>>) -> Result<(), String> {
+    result.map(|_| ()).map_err(|error| match error {
+        MdbaseError::Operation { diagnostics }
+        | MdbaseError::PartialBatch { diagnostics, .. }
+        | MdbaseError::LossyMigration { diagnostics } => diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; "),
+        error => error.to_string(),
+    })
+}
+
+fn profile_path(path: &str) -> Result<CollectionPath, String> {
+    CollectionPath::new(path).map_err(|error| error.to_string())
+}
+
 fn profile_update(
     collection: &Collection,
     task_paths: &[String],
@@ -1228,11 +1248,13 @@ fn profile_update(
             "status": status,
             "points": (i % 13) as i64,
         });
-        let result = collection.update(&json!({
-            "path": path,
-            "fields": fields,
-        }));
-        ensure_success(&result)
+        let request = UpdateRequest::new(profile_path(path)?, fields);
+        ensure_typed_success(
+            collection
+                .typed()
+                .map_err(|error| error.to_string())?
+                .update(request),
+        )
     })
 }
 
@@ -1282,12 +1304,13 @@ fn profile_rename(
         } else {
             (source_b, source_a)
         };
-        let result = collection.rename(&json!({
-            "from": from,
-            "to": to,
-            "update_refs": true,
-        }));
-        ensure_success(&result)?;
+        let request = RenameRequest::new(profile_path(from)?, profile_path(to)?);
+        ensure_typed_success(
+            collection
+                .typed()
+                .map_err(|error| error.to_string())?
+                .rename(request),
+        )?;
         using_a = !using_a;
         Ok(())
     })
@@ -1298,17 +1321,20 @@ fn profile_create(collection: &Collection, iterations: usize) -> Result<Operatio
         .map(|i| format!("scratch/create-{i:06}.md"))
         .collect();
     run_timed("create", iterations, |i| {
-        let result = collection.create(&json!({
-            "path": create_paths[i],
-            "type": "task",
-            "fields": {
+        let request = CreateRequest::new(profile_path(&create_paths[i])?)
+            .with_type("task")
+            .with_frontmatter(json!({
                 "title": format!("Created Task {i:06}"),
                 "status": STATUS_CYCLE[i % STATUS_CYCLE.len()],
                 "priority": ((i % 5) + 1) as i64,
                 "points": (i % 13) as i64,
-            }
-        }));
-        ensure_success(&result)
+            }));
+        ensure_typed_success(
+            collection
+                .typed()
+                .map_err(|error| error.to_string())?
+                .create(request),
+        )
     })
 }
 
@@ -1318,22 +1344,30 @@ fn profile_delete(collection: &Collection, iterations: usize) -> Result<Operatio
         .collect();
 
     for (i, path) in delete_paths.iter().enumerate() {
-        let created = collection.create(&json!({
-            "path": path,
-            "type": "task",
-            "fields": {
+        let request = CreateRequest::new(profile_path(path)?)
+            .with_type("task")
+            .with_frontmatter(json!({
                 "title": format!("Delete Task {i:06}"),
                 "status": "open",
                 "priority": 3,
                 "points": 1,
-            }
-        }));
-        ensure_success(&created)?;
+            }));
+        ensure_typed_success(
+            collection
+                .typed()
+                .map_err(|error| error.to_string())?
+                .create(request),
+        )?;
     }
 
     run_timed("delete", iterations, |i| {
-        let result = collection.delete(&json!({ "path": delete_paths[i] }));
-        ensure_success(&result)
+        let request = DeleteRequest::new(profile_path(&delete_paths[i])?);
+        ensure_typed_success(
+            collection
+                .typed()
+                .map_err(|error| error.to_string())?
+                .delete(request),
+        )
     })
 }
 

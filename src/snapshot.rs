@@ -126,7 +126,7 @@ impl AuthoritativeCollectionSnapshot {
     }
 
     pub(crate) fn entry(&self, path: &str) -> Option<&AuthoritativeCollectionSnapshotEntry> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-collection-mutation"))]
         SNAPSHOT_ENTRY_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
         self.path_to_index
             .get(path)
@@ -134,7 +134,7 @@ impl AuthoritativeCollectionSnapshot {
     }
 
     pub(crate) fn resolved_files_data(&self) -> Vec<ResolvedFileData> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-collection-mutation"))]
         SNAPSHOT_RESOLVED_PROJECTIONS.with(|builds| builds.set(builds.get() + 1));
         self.entries
             .iter()
@@ -189,24 +189,24 @@ impl AuthoritativeCollectionSnapshot {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 thread_local! {
     static SNAPSHOT_ENTRY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SNAPSHOT_RESOLVED_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 pub(crate) fn reset_snapshot_projection_counters_for_test() {
     SNAPSHOT_ENTRY_LOOKUPS.with(|value| value.set(0));
     SNAPSHOT_RESOLVED_PROJECTIONS.with(|value| value.set(0));
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 pub(crate) fn snapshot_entry_lookups_for_test() -> usize {
     SNAPSHOT_ENTRY_LOOKUPS.with(std::cell::Cell::get)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 pub(crate) fn snapshot_resolved_projections_for_test() -> usize {
     SNAPSHOT_RESOLVED_PROJECTIONS.with(std::cell::Cell::get)
 }

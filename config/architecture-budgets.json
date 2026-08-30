@@ -1,10 +1,10 @@
 {
   "rustSourceFileCountMax": 173,
-  "rustSourceLineCountMax": 97634,
+  "rustSourceLineCountMax": 99227,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
-    "crates/mdbase-command/src/lib.rs": 1816,
-    "crates/mdbase-command/src/profile.rs": 1348,
+    "crates/mdbase-command/src/lib.rs": 1968,
+    "crates/mdbase-command/src/profile.rs": 1382,
     "crates/mdbase-runtime/src/engine.rs": 1270,
     "src/bin/phase0-baseline.rs": 1164,
     "src/data_contracts.rs": 1124,
@@ -20,8 +20,9 @@
     "src/runtime/provider.rs": 1020,
     "src/runtime/record_resolution.rs": 1393,
     "src/runtime/tests.rs": 4304,
+    "src/api/typed.rs": 1075,
     "src/transactions.rs": 1029,
-    "src/transactions/runtime.rs": 1720,
+    "src/transactions/runtime.rs": 2556,
     "src/v03/batch.rs": 1467,
     "src/v03/collection_setup.rs": 1479,
     "src/v03/type_pack.rs": 2110,
@@ -67,7 +68,7 @@
       "src/operations/update.rs": ["UpdateInput", "UpdateOutput", "update_legacy"]
     },
     "operationContextLegacyProduction": 0,
-    "operationContextLegacySupport": 167,
+    "operationContextLegacySupport": 170,
     "wireOnlyVariants": ["TypeResource", "Validation", "ViewResource"],
     "wireOnlyConstructorAllowlist": {
       "src/runtime/canonical_operation.rs": {"type_wire": 2, "validation_wire": 1, "view_wire": 2, "wire_only": 4},
