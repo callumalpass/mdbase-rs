@@ -38,6 +38,8 @@ root; the NT API preserves handle-relative resolution. Unsupported operations
 and all other failures fail closed; there is no remove-then-rename fallback.
 Capability readers on Windows share deletion so concurrent held-authority reads
 do not prevent this atomic replacement; lock handles remain deliberately exclusive.
+Transient antivirus/indexer sharing denials receive a bounded 100 ms retry, while
+persistent denial and every other error still fail closed.
 
 The file is synced before publication. Parent directories are synced after
 publication on Unix. Windows directory handles do not provide the same portable

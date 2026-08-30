@@ -436,22 +436,31 @@ fn atomic_replace(
             buffer.as_mut_ptr().cast::<u8>().add(header),
             name_bytes,
         );
-        let status = NtSetInformationFile(
-            source.as_raw_handle(),
-            &mut status_block,
-            info.cast(),
-            u32::try_from(size).map_err(|_| std::io::ErrorKind::InvalidInput)?,
-            FileRenameInformationEx,
-        );
-        if status < 0 {
+        let size = u32::try_from(size).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+        for attempt in 0..=20 {
+            let status = NtSetInformationFile(
+                source.as_raw_handle(),
+                &mut status_block,
+                info.cast(),
+                size,
+                FileRenameInformationEx,
+            );
+            if status >= 0 {
+                return Ok(());
+            }
+            let dos_error = RtlNtStatusToDosError(status) as i32;
+            // Virus scanners and indexers can briefly hold a destination
+            // without delete sharing. Retry that bounded transient only.
+            if attempt < 20 && matches!(dos_error, 5 | 32 | 33) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
             // Unsupported handle-relative replacement and every other failure
             // are fail-closed; never emulate this with remove-then-rename.
-            return Err(std::io::Error::from_raw_os_error(
-                RtlNtStatusToDosError(status) as i32,
-            ));
+            return Err(std::io::Error::from_raw_os_error(dos_error));
         }
+        unreachable!("bounded replacement loop returns on its final attempt")
     }
-    Ok(())
 }
 
 #[cfg(windows)]
