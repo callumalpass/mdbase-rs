@@ -4217,7 +4217,7 @@ fn held_resource_reads_reject_hardlinks_from_opened_nofollow_handles() {
     assert!(crate::mutation::shadow::shadow_collection(&shadow).is_err());
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legacy-collection-mutation"))]
 #[test]
 fn held_authority_never_adopts_a_replacement_root_across_refresh_snapshot_cache_and_legacy_mutation(
 ) {

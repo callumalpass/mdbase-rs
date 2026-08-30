@@ -21,7 +21,8 @@ use crate::runtime::{
 };
 use crate::{v03::OperationResult, Collection};
 
-const RUNTIME_JOURNAL_VERSION: u32 = 3;
+const RUNTIME_JOURNAL_VERSION: u32 = 4;
+const PHASE4_RUNTIME_JOURNAL_VERSION: u32 = 3;
 const LEGACY_RUNTIME_JOURNAL_VERSION: u32 = 2;
 const MAX_ACTIVE_RUNTIME_TRANSACTIONS: usize = 128;
 const MAX_RUNTIME_CHANGE_ITEMS: usize = 100_000;
@@ -62,6 +63,24 @@ enum RuntimePhase {
     NeedsManualRecovery,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TransitionRole {
+    Direct,
+    RenameSource,
+    RenameDestination,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct TransitionEvidence {
+    path: String,
+    before_revision: Option<String>,
+    after_revision: Option<String>,
+    operation: OperationKind,
+    change_index: usize,
+    role: TransitionRole,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct RuntimeJournal {
     version: u32,
@@ -78,6 +97,8 @@ struct RuntimeJournal {
     operation_result: Option<OperationResult>,
     change_descriptor: ChangeBatchDescriptor,
     changes: Vec<CanonicalChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    transition_evidence: Vec<TransitionEvidence>,
     event_id: ChangeEventId,
     generation: Option<CollectionGeneration>,
     watermark: Option<ChangeWatermark>,
@@ -239,7 +260,7 @@ pub(crate) fn prepare_runtime_transaction(
     context_check(context)?;
     sync_dir(collection, &directory.join("stage"))?;
     sync_dir(collection, &directory.join("backup"))?;
-    let journal = RuntimeJournal {
+    let mut journal = RuntimeJournal {
         version: RUNTIME_JOURNAL_VERSION,
         id: id.clone(),
         scope,
@@ -252,6 +273,7 @@ pub(crate) fn prepare_runtime_transaction(
         operation_result: None,
         change_descriptor: changes.descriptor().clone(),
         changes: changes.items().to_vec(),
+        transition_evidence: Vec::new(),
         event_id: event_id.clone(),
         generation: None,
         watermark: None,
@@ -260,6 +282,7 @@ pub(crate) fn prepare_runtime_transaction(
         resolution_acked: false,
         event_acked: false,
     };
+    journal.transition_evidence = expected_transition_evidence(&journal)?;
     validate_journal_operation_family(&journal)?;
     persist_runtime_journal(collection, &directory, &journal)?;
     staging.durable = true;
@@ -735,7 +758,7 @@ fn validate_journal(
 ) -> Result<(), TransactionError> {
     if !matches!(
         journal.version,
-        LEGACY_RUNTIME_JOURNAL_VERSION | RUNTIME_JOURNAL_VERSION
+        LEGACY_RUNTIME_JOURNAL_VERSION | PHASE4_RUNTIME_JOURNAL_VERSION | RUNTIME_JOURNAL_VERSION
     ) || directory.file_name().and_then(|name| name.to_str()) != Some(&journal.id)
         || journal.applied > journal.entries.len()
     {
@@ -762,9 +785,17 @@ fn validate_journal(
             .before_revision
             .as_ref()
             .map(|_| format!("backup/{index}"));
-        if entry.stage_file.as_deref() != expected_stage.as_deref()
-            || entry.backup_file.as_deref() != expected_backup.as_deref()
-        {
+        let payloads_released = matches!(
+            journal.phase,
+            RuntimePhase::Committed
+                | RuntimePhase::RejectedBeforeCommit
+                | RuntimePhase::CancelledBeforeCommit
+        );
+        let stage_matches = entry.stage_file.as_deref() == expected_stage.as_deref()
+            || (payloads_released && entry.stage_file.is_none());
+        let backup_matches = entry.backup_file.as_deref() == expected_backup.as_deref()
+            || (payloads_released && entry.backup_file.is_none());
+        if !stage_matches || !backup_matches {
             return Err(TransactionError::InvalidJournal(format!(
                 "payload paths for '{}' do not match its journal position",
                 entry.path
@@ -833,48 +864,622 @@ fn validate_journal_operation_family(journal: &RuntimeJournal) -> Result<(), Tra
         }
     }
 
-    let exact = match journal.scope {
-        TransactionScope::Records => match kind {
-            OperationKind::Create => journal.changes.iter().all(|change| {
-                matches!(change, CanonicalChange::Record(record) if record.kind == RecordChangeKind::Created)
-            }),
-            OperationKind::Update => journal.changes.iter().all(|change| {
-                matches!(change, CanonicalChange::Record(record) if record.kind == RecordChangeKind::Updated)
-            }),
-            OperationKind::Delete => journal.changes.iter().all(|change| {
-                matches!(change, CanonicalChange::Record(record) if record.kind == RecordChangeKind::Deleted)
-            }),
-            OperationKind::Rename => {
-                let renamed = journal.changes.iter().filter(|change| {
-                    matches!(change, CanonicalChange::Record(record) if record.kind == RecordChangeKind::Renamed)
-                }).count();
-                renamed == 1 && journal.changes.iter().all(|change| {
-                    matches!(change, CanonicalChange::Record(record) if matches!(record.kind, RecordChangeKind::Renamed | RecordChangeKind::Updated))
-                })
-            }
-            OperationKind::Batch => journal
-                .changes
+    let terminal = matches!(
+        journal.phase,
+        RuntimePhase::Committed
+            | RuntimePhase::RejectedBeforeCommit
+            | RuntimePhase::CancelledBeforeCommit
+    );
+    let synthesized_entries;
+    let physical_entries =
+        if journal.entries.is_empty() && terminal && !journal.transition_evidence.is_empty() {
+            synthesized_entries = journal
+                .transition_evidence
                 .iter()
-                .all(|change| matches!(change, CanonicalChange::Record(_))),
-            _ => false,
-        },
-        TransactionScope::Resources => validate_resource_operation(kind, &journal.changes),
-        TransactionScope::SystemMigration => false,
-    };
-    if !exact {
+                .map(|evidence| JournalEntry {
+                    path: evidence.path.clone(),
+                    before_revision: evidence.before_revision.clone(),
+                    after_revision: evidence.after_revision.clone(),
+                    stage_file: None,
+                    backup_file: None,
+                })
+                .collect::<Vec<_>>();
+            synthesized_entries.as_slice()
+        } else {
+            journal.entries.as_slice()
+        };
+    let expected = expected_transition_evidence_for(
+        journal.scope,
+        operation,
+        kind,
+        &journal.changes,
+        physical_entries,
+    );
+    let Some(mut expected) = expected else {
         return Err(TransactionError::InvalidJournal(
             "canonical operation does not match the transaction change family".to_string(),
         ));
+    };
+    sort_transition_evidence(&mut expected);
+    let mut stored = journal.transition_evidence.clone();
+    sort_transition_evidence(&mut stored);
+    match journal.version {
+        RUNTIME_JOURNAL_VERSION if stored == expected && !stored.is_empty() => Ok(()),
+        // Phase 4 v3 always retained physical entries until terminal cleanup.
+        // It may be read only while those exact entries still prove the full
+        // transition; stripped terminal v3 journals are deliberately rejected.
+        PHASE4_RUNTIME_JOURNAL_VERSION
+            if journal.transition_evidence.is_empty() && !journal.entries.is_empty() =>
+        {
+            Ok(())
+        }
+        _ => Err(TransactionError::InvalidJournal(
+            "runtime transition evidence is missing or does not match canonical changes"
+                .to_string(),
+        )),
     }
-    Ok(())
 }
 
-fn validate_resource_operation(kind: OperationKind, changes: &[CanonicalChange]) -> bool {
-    changes.iter().all(|change| {
-        let CanonicalChange::Resource(resource) = change else {
-            return false;
+fn sort_transition_evidence(evidence: &mut [TransitionEvidence]) {
+    evidence.sort_by(|left, right| {
+        (
+            &left.path,
+            &left.before_revision,
+            &left.after_revision,
+            format!("{:?}", left.operation),
+            left.change_index,
+            left.role,
+        )
+            .cmp(&(
+                &right.path,
+                &right.before_revision,
+                &right.after_revision,
+                format!("{:?}", right.operation),
+                right.change_index,
+                right.role,
+            ))
+    });
+}
+
+fn expected_transition_evidence(
+    journal: &RuntimeJournal,
+) -> Result<Vec<TransitionEvidence>, TransactionError> {
+    let operation = journal.operation_outcome.as_ref().ok_or_else(|| {
+        TransactionError::InvalidJournal("canonical operation outcome missing".to_string())
+    })?;
+    let Some(kind) = operation.operation_kind() else {
+        return Err(TransactionError::InvalidJournal(
+            "canonical operation kind missing".to_string(),
+        ));
+    };
+    expected_transition_evidence_for(
+        journal.scope,
+        operation,
+        kind,
+        &journal.changes,
+        &journal.entries,
+    )
+    .ok_or_else(|| {
+        TransactionError::InvalidJournal(
+            "canonical changes do not exactly match physical transitions".to_string(),
+        )
+    })
+}
+
+fn expected_transition_evidence_for(
+    scope: TransactionScope,
+    operation: &CanonicalOperationOutcome,
+    kind: OperationKind,
+    changes: &[CanonicalChange],
+    entries: &[JournalEntry],
+) -> Option<Vec<TransitionEvidence>> {
+    match scope {
+        TransactionScope::Records => record_transition_evidence(operation, kind, changes, entries),
+        TransactionScope::Resources => resource_transition_evidence(kind, changes, entries),
+        TransactionScope::SystemMigration => None,
+    }
+}
+
+fn record_transition_evidence(
+    operation: &CanonicalOperationOutcome,
+    kind: OperationKind,
+    changes: &[CanonicalChange],
+    entries: &[JournalEntry],
+) -> Option<Vec<TransitionEvidence>> {
+    let records = changes
+        .iter()
+        .map(|change| match change {
+            CanonicalChange::Record(record) => Some(record),
+            CanonicalChange::Resource(_) => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    let records = records?;
+    if entries.is_empty() {
+        return None;
+    }
+
+    let rename_primary = records
+        .iter()
+        .filter(|record| record.kind != RecordChangeKind::Updated)
+        .count();
+    if kind == OperationKind::Rename && rename_primary != 1 {
+        return None;
+    }
+
+    let mut consumed = vec![false; entries.len()];
+    let mut evidence = Vec::with_capacity(entries.len());
+    for (change_index, record) in records.into_iter().enumerate() {
+        if !canonical_record_shape(record) {
+            return None;
+        }
+        let before_consumed = consumed.clone();
+        let mapping = if kind == OperationKind::Batch {
+            unique_batch_item_kind(operation, record.path.as_str()).unwrap_or(OperationKind::Batch)
+        } else {
+            kind
         };
-        match kind {
+        let accepted = match (kind, record.kind) {
+            (OperationKind::Create, RecordChangeKind::Created) => {
+                consume_created(record, entries, &mut consumed, false)
+            }
+            (OperationKind::Update, RecordChangeKind::Created) => {
+                consume_created(record, entries, &mut consumed, true)
+            }
+            (OperationKind::Update, RecordChangeKind::Updated) => {
+                consume_updated(record, entries, &mut consumed)
+            }
+            (OperationKind::Update, RecordChangeKind::Deleted) => {
+                consume_update_to_invalid(record, entries, &mut consumed)
+            }
+            (OperationKind::Delete, RecordChangeKind::Deleted) => {
+                consume_deleted(record, entries, &mut consumed)
+            }
+            (OperationKind::Rename, RecordChangeKind::Renamed) => {
+                rename_paths_for_record(operation, kind, record).is_some_and(|(from, to)| {
+                    record
+                        .from
+                        .as_ref()
+                        .is_some_and(|path| path.as_str() == from)
+                        && record.path.as_str() == to
+                        && consume_renamed(record, entries, &mut consumed)
+                })
+            }
+            (OperationKind::Rename, RecordChangeKind::Created) => {
+                rename_paths_for_record(operation, kind, record).is_some_and(|(from, to)| {
+                    record.path.as_str() == to
+                        && consume_rename_created(record, from, entries, &mut consumed)
+                })
+            }
+            (OperationKind::Rename, RecordChangeKind::Deleted) => {
+                rename_paths_for_record(operation, kind, record).is_some_and(|(from, to)| {
+                    record.path.as_str() == from
+                        && consume_rename_deleted(record, to, entries, &mut consumed)
+                })
+            }
+            (OperationKind::Rename, RecordChangeKind::Updated) => {
+                consume_updated(record, entries, &mut consumed)
+            }
+            (OperationKind::Batch, RecordChangeKind::Created) => {
+                match unique_batch_item_kind(operation, record.path.as_str()) {
+                    Some(OperationKind::Rename) => rename_paths_for_record(operation, kind, record)
+                        .is_some_and(|(from, to)| {
+                            record.path.as_str() == to
+                                && consume_rename_created(record, from, entries, &mut consumed)
+                        }),
+                    Some(OperationKind::Update) => {
+                        consume_created(record, entries, &mut consumed, true)
+                    }
+                    _ => consume_created(record, entries, &mut consumed, false),
+                }
+            }
+            (OperationKind::Batch, RecordChangeKind::Updated) => {
+                consume_updated(record, entries, &mut consumed)
+            }
+            (OperationKind::Batch, RecordChangeKind::Deleted) => {
+                match unique_batch_item_kind(operation, record.path.as_str()) {
+                    Some(OperationKind::Rename) => rename_paths_for_record(operation, kind, record)
+                        .is_some_and(|(from, to)| {
+                            record.path.as_str() == from
+                                && consume_rename_deleted(record, to, entries, &mut consumed)
+                        }),
+                    Some(OperationKind::Update) => {
+                        consume_update_to_invalid(record, entries, &mut consumed)
+                    }
+                    _ => consume_deleted(record, entries, &mut consumed),
+                }
+            }
+            (OperationKind::Batch, RecordChangeKind::Renamed) => {
+                rename_paths_for_record(operation, kind, record).is_some_and(|(from, to)| {
+                    record
+                        .from
+                        .as_ref()
+                        .is_some_and(|path| path.as_str() == from)
+                        && record.path.as_str() == to
+                        && consume_renamed(record, entries, &mut consumed)
+                })
+            }
+            _ => false,
+        };
+        if !accepted {
+            return None;
+        }
+        for (index, was_consumed) in before_consumed.into_iter().enumerate() {
+            if !was_consumed && consumed[index] {
+                let entry = &entries[index];
+                let role = match record.kind {
+                    RecordChangeKind::Renamed => {
+                        if record
+                            .from
+                            .as_ref()
+                            .is_some_and(|from| from.as_str() == entry.path)
+                        {
+                            TransitionRole::RenameSource
+                        } else {
+                            TransitionRole::RenameDestination
+                        }
+                    }
+                    RecordChangeKind::Created if kind == OperationKind::Rename => {
+                        if entry.path == record.path.as_str() {
+                            TransitionRole::RenameDestination
+                        } else {
+                            TransitionRole::RenameSource
+                        }
+                    }
+                    RecordChangeKind::Deleted if kind == OperationKind::Rename => {
+                        if entry.path == record.path.as_str() {
+                            TransitionRole::RenameSource
+                        } else {
+                            TransitionRole::RenameDestination
+                        }
+                    }
+                    _ => TransitionRole::Direct,
+                };
+                evidence.push(TransitionEvidence {
+                    path: entry.path.clone(),
+                    before_revision: entry.before_revision.clone(),
+                    after_revision: entry.after_revision.clone(),
+                    operation: mapping,
+                    change_index,
+                    role,
+                });
+            }
+        }
+    }
+    consumed.into_iter().all(|entry| entry).then_some(evidence)
+}
+
+fn canonical_record_shape(record: &crate::runtime::RecordChange) -> bool {
+    match record.kind {
+        RecordChangeKind::Created => {
+            record.from.is_none()
+                && record.before_revision.is_none()
+                && record.after_revision.is_some()
+        }
+        RecordChangeKind::Updated => {
+            record.from.is_none()
+                && record.before_revision.is_some()
+                && record.after_revision.is_some()
+        }
+        RecordChangeKind::Deleted => {
+            record.from.is_none()
+                && record.before_revision.is_some()
+                && record.after_revision.is_none()
+        }
+        RecordChangeKind::Renamed => {
+            record.before_revision.is_some()
+                && record.after_revision.is_some()
+                && record
+                    .from
+                    .as_ref()
+                    .is_some_and(|from| from != &record.path)
+        }
+    }
+}
+
+fn consume_one(
+    entries: &[JournalEntry],
+    consumed: &mut [bool],
+    predicate: impl Fn(&JournalEntry) -> bool,
+) -> bool {
+    let matches = entries
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| !consumed[*index] && predicate(entry))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if let [index] = matches.as_slice() {
+        consumed[*index] = true;
+        true
+    } else {
+        false
+    }
+}
+
+fn consume_created(
+    record: &crate::runtime::RecordChange,
+    entries: &[JournalEntry],
+    consumed: &mut [bool],
+    repair: bool,
+) -> bool {
+    let after = record
+        .after_revision
+        .as_ref()
+        .expect("checked shape")
+        .as_str();
+    consume_one(entries, consumed, |entry| {
+        entry.path == record.path.as_str()
+            && entry.before_revision.is_some() == repair
+            && entry.after_revision.as_deref() == Some(after)
+    })
+}
+
+fn consume_updated(
+    record: &crate::runtime::RecordChange,
+    entries: &[JournalEntry],
+    consumed: &mut [bool],
+) -> bool {
+    let before = record
+        .before_revision
+        .as_ref()
+        .expect("checked shape")
+        .as_str();
+    let after = record
+        .after_revision
+        .as_ref()
+        .expect("checked shape")
+        .as_str();
+    consume_one(entries, consumed, |entry| {
+        entry.path == record.path.as_str()
+            && entry.before_revision.as_deref() == Some(before)
+            && entry.after_revision.as_deref() == Some(after)
+    })
+}
+
+fn consume_deleted(
+    record: &crate::runtime::RecordChange,
+    entries: &[JournalEntry],
+    consumed: &mut [bool],
+) -> bool {
+    let before = record
+        .before_revision
+        .as_ref()
+        .expect("checked shape")
+        .as_str();
+    consume_one(entries, consumed, |entry| {
+        entry.path == record.path.as_str()
+            && entry.before_revision.as_deref() == Some(before)
+            && entry.after_revision.is_none()
+    })
+}
+
+fn consume_update_to_invalid(
+    record: &crate::runtime::RecordChange,
+    entries: &[JournalEntry],
+    consumed: &mut [bool],
+) -> bool {
+    let before = record
+        .before_revision
+        .as_ref()
+        .expect("checked shape")
+        .as_str();
+    consume_one(entries, consumed, |entry| {
+        entry.path == record.path.as_str()
+            && entry.before_revision.as_deref() == Some(before)
+            && entry.after_revision.is_some()
+    })
+}
+
+fn consume_renamed(
+    record: &crate::runtime::RecordChange,
+    entries: &[JournalEntry],
+    consumed: &mut [bool],
+) -> bool {
+    let from = record.from.as_ref().expect("checked shape").as_str();
+    let before = record
+        .before_revision
+        .as_ref()
+        .expect("checked shape")
+        .as_str();
+    let after = record
+        .after_revision
+        .as_ref()
+        .expect("checked shape")
+        .as_str();
+    let mut trial = consumed.to_vec();
+    let source = consume_one(entries, &mut trial, |entry| {
+        entry.path == from
+            && entry.before_revision.as_deref() == Some(before)
+            && entry.after_revision.is_none()
+    });
+    let destination = consume_one(entries, &mut trial, |entry| {
+        entry.path == record.path.as_str()
+            && entry.before_revision.is_none()
+            && entry.after_revision.as_deref() == Some(after)
+    });
+    if source && destination {
+        consumed.copy_from_slice(&trial);
+        true
+    } else {
+        false
+    }
+}
+
+fn consume_rename_created(
+    record: &crate::runtime::RecordChange,
+    from: &str,
+    entries: &[JournalEntry],
+    consumed: &mut [bool],
+) -> bool {
+    let revision = record
+        .after_revision
+        .as_ref()
+        .expect("checked shape")
+        .as_str();
+    let mut trial = consumed.to_vec();
+    let destination = consume_one(entries, &mut trial, |entry| {
+        entry.path == record.path.as_str()
+            && entry.before_revision.is_none()
+            && entry.after_revision.as_deref() == Some(revision)
+    });
+    let source = consume_one(entries, &mut trial, |entry| {
+        entry.path == from
+            && entry.before_revision.as_deref() == Some(revision)
+            && entry.after_revision.is_none()
+    });
+    if source && destination {
+        consumed.copy_from_slice(&trial);
+        true
+    } else {
+        false
+    }
+}
+
+fn consume_rename_deleted(
+    record: &crate::runtime::RecordChange,
+    to: &str,
+    entries: &[JournalEntry],
+    consumed: &mut [bool],
+) -> bool {
+    let revision = record
+        .before_revision
+        .as_ref()
+        .expect("checked shape")
+        .as_str();
+    let mut trial = consumed.to_vec();
+    let source = consume_one(entries, &mut trial, |entry| {
+        entry.path == record.path.as_str()
+            && entry.before_revision.as_deref() == Some(revision)
+            && entry.after_revision.is_none()
+    });
+    let destination = consume_one(entries, &mut trial, |entry| {
+        entry.path == to
+            && entry.before_revision.is_none()
+            && entry.after_revision.as_deref() == Some(revision)
+    });
+    if source && destination {
+        consumed.copy_from_slice(&trial);
+        true
+    } else {
+        false
+    }
+}
+
+fn unique_batch_item_kind(
+    operation: &CanonicalOperationOutcome,
+    path: &str,
+) -> Option<OperationKind> {
+    let CanonicalOperationValue::Batch(Some(batch)) = operation.value() else {
+        return None;
+    };
+    let matches = batch
+        .operations
+        .iter()
+        .filter(|item| item.valid && batch_item_affects_path(item, path))
+        .filter_map(|item| match item.kind.as_str() {
+            "create" => Some(OperationKind::Create),
+            "update" => Some(OperationKind::Update),
+            "delete" => Some(OperationKind::Delete),
+            "rename" => Some(OperationKind::Rename),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [kind] => Some(*kind),
+        _ => None,
+    }
+}
+
+fn batch_item_affects_path(item: &crate::api::BatchItemResult, path: &str) -> bool {
+    match &item.result {
+        crate::api::BatchOperationResult::Record(record) => record.path.as_str() == path,
+        crate::api::BatchOperationResult::Delete(result) => result.path.as_str() == path,
+        crate::api::BatchOperationResult::Rename(result) => {
+            result.result.from.as_str() == path || result.result.to.as_str() == path
+        }
+        _ => false,
+    }
+}
+
+fn rename_paths_for_record<'a>(
+    operation: &'a CanonicalOperationOutcome,
+    kind: OperationKind,
+    record: &crate::runtime::RecordChange,
+) -> Option<(&'a str, &'a str)> {
+    match (kind, operation.value()) {
+        (
+            OperationKind::Rename,
+            CanonicalOperationValue::Rename(Some(crate::runtime::CanonicalRenameValue::Renamed(
+                result,
+            ))),
+        ) => Some((result.result.from.as_str(), result.result.to.as_str())),
+        (OperationKind::Batch, CanonicalOperationValue::Batch(Some(batch))) => {
+            let matches = batch
+                .operations
+                .iter()
+                .filter(|item| item.valid && item.kind == "rename")
+                .filter_map(|item| match &item.result {
+                    crate::api::BatchOperationResult::Rename(result)
+                        if match record.kind {
+                            RecordChangeKind::Created => {
+                                result.result.to.as_str() == record.path.as_str()
+                            }
+                            RecordChangeKind::Deleted => {
+                                result.result.from.as_str() == record.path.as_str()
+                            }
+                            RecordChangeKind::Renamed => record.from.as_ref().is_some_and(|from| {
+                                from == &result.result.from && record.path == result.result.to
+                            }),
+                            RecordChangeKind::Updated => false,
+                        } =>
+                    {
+                        Some((result.result.from.as_str(), result.result.to.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [paths] => Some(*paths),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn resource_transition_evidence(
+    kind: OperationKind,
+    changes: &[CanonicalChange],
+    entries: &[JournalEntry],
+) -> Option<Vec<TransitionEvidence>> {
+    if entries.is_empty() {
+        return None;
+    }
+    let mut consumed = vec![false; entries.len()];
+    let mut evidence = Vec::with_capacity(entries.len());
+    for (change_index, change) in changes.iter().enumerate() {
+        let CanonicalChange::Resource(resource) = change else {
+            return None;
+        };
+        if resource.before_revision.is_none() && resource.after_revision.is_none() {
+            return None;
+        }
+        let before_consumed = consumed.clone();
+        if !consume_one(entries, &mut consumed, |entry| {
+            entry.path == resource.path.as_str()
+                && entry.before_revision.as_deref()
+                    == resource
+                        .before_revision
+                        .as_ref()
+                        .map(|revision| revision.as_str())
+                && entry.after_revision.as_deref()
+                    == resource
+                        .after_revision
+                        .as_ref()
+                        .map(|revision| revision.as_str())
+        }) {
+            return None;
+        }
+        let family = match kind {
             OperationKind::CreateViewSource => {
                 resource.kind == ResourceChangeKind::ViewSource
                     && resource.before_revision.is_none()
@@ -902,8 +1507,25 @@ fn validate_resource_operation(kind: OperationKind, changes: &[CanonicalChange])
             }
             OperationKind::ApplyTypePack | OperationKind::ApplyCollectionSetup => true,
             _ => false,
+        };
+        if !family {
+            return None;
         }
-    })
+        for (index, was_consumed) in before_consumed.into_iter().enumerate() {
+            if !was_consumed && consumed[index] {
+                let entry = &entries[index];
+                evidence.push(TransitionEvidence {
+                    path: entry.path.clone(),
+                    before_revision: entry.before_revision.clone(),
+                    after_revision: entry.after_revision.clone(),
+                    operation: kind,
+                    change_index,
+                    role: TransitionRole::Direct,
+                });
+            }
+        }
+    }
+    consumed.into_iter().all(|entry| entry).then_some(evidence)
 }
 
 fn ensure_capacity(collection: &Collection, changes: &ChangeBatch) -> Result<(), TransactionError> {
@@ -1018,9 +1640,13 @@ fn journal_operation(
     journal: &RuntimeJournal,
 ) -> Result<CanonicalOperationOutcome, TransactionError> {
     match journal.version {
-        RUNTIME_JOURNAL_VERSION => journal.operation_outcome.clone().ok_or_else(|| {
-            TransactionError::InvalidJournal("v3 runtime operation outcome missing".to_string())
-        }),
+        PHASE4_RUNTIME_JOURNAL_VERSION | RUNTIME_JOURNAL_VERSION => {
+            journal.operation_outcome.clone().ok_or_else(|| {
+                TransactionError::InvalidJournal(
+                    "canonical runtime operation outcome missing".to_string(),
+                )
+            })
+        }
         LEGACY_RUNTIME_JOURNAL_VERSION => {
             let result = journal.operation_result.clone().ok_or_else(|| {
                 TransactionError::InvalidJournal("v2 runtime operation result missing".to_string())
@@ -1044,6 +1670,7 @@ fn journal_operation_mut(
         journal.operation_outcome = Some(journal_operation(journal)?);
         journal.operation_result = None;
         journal.version = RUNTIME_JOURNAL_VERSION;
+        journal.transition_evidence = expected_transition_evidence(journal)?;
     }
     journal.operation_outcome.as_mut().ok_or_else(|| {
         TransactionError::InvalidJournal("runtime operation outcome missing".to_string())
@@ -1054,9 +1681,11 @@ fn journal_rejection(
     journal: &RuntimeJournal,
 ) -> Result<CanonicalOperationOutcome, TransactionError> {
     match journal.version {
-        RUNTIME_JOURNAL_VERSION => journal.operation_rejection.clone().ok_or_else(|| {
-            TransactionError::InvalidJournal("v3 commit rejection missing".to_string())
-        }),
+        PHASE4_RUNTIME_JOURNAL_VERSION | RUNTIME_JOURNAL_VERSION => {
+            journal.operation_rejection.clone().ok_or_else(|| {
+                TransactionError::InvalidJournal("canonical commit rejection missing".to_string())
+            })
+        }
         LEGACY_RUNTIME_JOURNAL_VERSION => {
             let rejection = journal.rejection.clone().ok_or_else(|| {
                 TransactionError::InvalidJournal("v2 commit rejection missing".to_string())
@@ -1123,6 +1752,7 @@ fn runtime_journal_version(value: &serde_json::Value) -> bool {
     matches!(
         value.get("version").and_then(serde_json::Value::as_u64),
         Some(version) if version == u64::from(LEGACY_RUNTIME_JOURNAL_VERSION)
+            || version == u64::from(PHASE4_RUNTIME_JOURNAL_VERSION)
             || version == u64::from(RUNTIME_JOURNAL_VERSION)
     )
 }
@@ -1152,7 +1782,7 @@ fn decode_runtime_journal(
         Some(LEGACY_RUNTIME_JOURNAL_VERSION) => {
             legacy && !canonical && !canonical_rejection && legacy_rejection == rejected
         }
-        Some(RUNTIME_JOURNAL_VERSION) => {
+        Some(PHASE4_RUNTIME_JOURNAL_VERSION | RUNTIME_JOURNAL_VERSION) => {
             canonical && !legacy && !legacy_rejection && canonical_rejection == rejected
         }
         _ => false,
@@ -1171,7 +1801,7 @@ fn decode_runtime_journal(
 /// recover only the apply form; generic public outcome serde never guesses.
 fn recover_phase4_definition_discriminators(value: &mut serde_json::Value) {
     if value.get("version").and_then(serde_json::Value::as_u64)
-        != Some(u64::from(RUNTIME_JOURNAL_VERSION))
+        != Some(u64::from(PHASE4_RUNTIME_JOURNAL_VERSION))
         || value.get("scope").and_then(serde_json::Value::as_str) != Some("resources")
         || !value
             .get("changes")
@@ -1424,6 +2054,11 @@ mod tests {
         write_journal_value(&collection, &id, &wrong_change_family);
         assert!(read_runtime_journal(&collection, &directory).is_err());
 
+        let mut missing_transition_evidence = original.clone();
+        missing_transition_evidence["entries"] = serde_json::json!([]);
+        write_journal_value(&collection, &id, &missing_transition_evidence);
+        assert!(read_runtime_journal(&collection, &directory).is_err());
+
         let mut wire = original.clone();
         wire["operation_outcome"] = serde_json::to_value(
             CanonicalOperationOutcome::validation_wire(OperationResult {
@@ -1454,12 +2089,220 @@ mod tests {
     }
 
     #[test]
+    fn malicious_entry_bijection_fixtures_fail_closed() {
+        let (_root, collection) = collection();
+        let id = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
+        let directory = transaction_directory(&collection, &id);
+        let fresh = || read_runtime_journal(&collection, &directory).unwrap();
+
+        let mut extra = fresh();
+        extra.entries.push(JournalEntry {
+            path: "extra.md".to_string(),
+            before_revision: None,
+            after_revision: Some(crate::v03::revision(b"extra\n")),
+            stage_file: None,
+            backup_file: None,
+        });
+        assert!(validate_journal_operation_family(&extra).is_err());
+
+        let mut duplicate = fresh();
+        let entry = &duplicate.entries[0];
+        duplicate.entries.push(JournalEntry {
+            path: entry.path.clone(),
+            before_revision: entry.before_revision.clone(),
+            after_revision: entry.after_revision.clone(),
+            stage_file: entry.stage_file.clone(),
+            backup_file: entry.backup_file.clone(),
+        });
+        assert!(validate_journal_operation_family(&duplicate).is_err());
+
+        let mut create_over_existing = fresh();
+        create_over_existing.operation_outcome = Some(CanonicalOperationOutcome::invalid(
+            OperationKind::Create,
+            Vec::new(),
+        ));
+        create_over_existing.changes = vec![CanonicalChange::Record(RecordChange {
+            kind: RecordChangeKind::Created,
+            path: crate::api::CollectionPath::new("a.md").unwrap(),
+            from: None,
+            before_revision: None,
+            after_revision: crate::api::Revision::parse(crate::v03::revision(b"new-a\n")).ok(),
+            before_types: CanonicalTypeSet::new([]),
+            after_types: CanonicalTypeSet::new([]),
+            changed_fields: CanonicalFieldChangeSet::new([]).unwrap(),
+            body_changed: true,
+        })];
+        assert!(validate_journal_operation_family(&create_over_existing).is_err());
+
+        let mut rename_over_destination = fresh();
+        let old_revision = crate::v03::revision(b"old-a\n");
+        let new_revision = crate::v03::revision(b"new-a\n");
+        rename_over_destination.operation_outcome = Some(CanonicalOperationOutcome::invalid(
+            OperationKind::Rename,
+            Vec::new(),
+        ));
+        rename_over_destination.entries = vec![
+            JournalEntry {
+                path: "a.md".to_string(),
+                before_revision: Some(old_revision.clone()),
+                after_revision: None,
+                stage_file: None,
+                backup_file: None,
+            },
+            JournalEntry {
+                path: "destination.md".to_string(),
+                before_revision: Some(crate::v03::revision(b"occupied\n")),
+                after_revision: Some(new_revision.clone()),
+                stage_file: None,
+                backup_file: None,
+            },
+        ];
+        rename_over_destination.changes = vec![CanonicalChange::Record(RecordChange {
+            kind: RecordChangeKind::Renamed,
+            path: crate::api::CollectionPath::new("destination.md").unwrap(),
+            from: Some(crate::api::CollectionPath::new("a.md").unwrap()),
+            before_revision: crate::api::Revision::parse(old_revision).ok(),
+            after_revision: crate::api::Revision::parse(new_revision).ok(),
+            before_types: CanonicalTypeSet::new([]),
+            after_types: CanonicalTypeSet::new([]),
+            changed_fields: CanonicalFieldChangeSet::new([]).unwrap(),
+            body_changed: false,
+        })];
+        assert!(validate_journal_operation_family(&rename_over_destination).is_err());
+
+        let mut stripped_terminal = fresh();
+        stripped_terminal.phase = RuntimePhase::CancelledBeforeCommit;
+        stripped_terminal.entries.clear();
+        stripped_terminal.transition_evidence.clear();
+        assert!(validate_journal_operation_family(&stripped_terminal).is_err());
+    }
+
+    #[test]
+    fn rename_evidence_rejects_equal_revision_source_path_substitution() {
+        let (root, collection) = collection();
+        let runtime = crate::runtime::FilesystemRuntime::open(
+            root.path(),
+            std::time::Duration::from_millis(5),
+        )
+        .unwrap();
+        let prepared = runtime
+            .prepare(
+                &crate::runtime::OperationRequest::new(
+                    OperationKind::Rename,
+                    serde_json::json!({"from": "a.md", "to": "renamed.md"}),
+                ),
+                &HostClaimId::generate(),
+                &OperationContext::legacy(),
+            )
+            .unwrap();
+        let crate::runtime::PreparationOutcome::Prepared(prepared) = prepared else {
+            panic!("rename must prepare")
+        };
+        let directory = transaction_directory(&collection, prepared.commit_id());
+        let mut journal = read_runtime_journal(&collection, &directory).unwrap();
+        let source = journal
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path == "a.md")
+            .unwrap();
+        source.path = "same-revision-other.md".to_string();
+        let source_evidence = journal
+            .transition_evidence
+            .iter_mut()
+            .find(|evidence| evidence.role == TransitionRole::RenameSource)
+            .unwrap();
+        source_evidence.path = "same-revision-other.md".to_string();
+        assert!(validate_journal_operation_family(&journal).is_err());
+    }
+
+    #[test]
+    fn update_repair_keeps_update_identity_when_canonical_record_is_created() {
+        let (_root, collection) = collection();
+        let path = "invalid.md";
+        let invalid = b"invalid\xffbytes\n";
+        let repaired = b"---\ntitle: Repaired\n---\nBody\n";
+        let baseline: FileBaseline = BTreeMap::from([(path.to_string(), invalid.to_vec())]);
+        let desired: FileBaseline = BTreeMap::from([(path.to_string(), repaired.to_vec())]);
+        let changes = ChangeBatch::new(vec![CanonicalChange::Record(RecordChange {
+            kind: RecordChangeKind::Created,
+            path: crate::api::CollectionPath::new(path).unwrap(),
+            from: None,
+            before_revision: None,
+            after_revision: Some(
+                crate::api::Revision::parse(crate::v03::revision(repaired)).unwrap(),
+            ),
+            before_types: CanonicalTypeSet::new([]),
+            after_types: CanonicalTypeSet::new([]),
+            changed_fields: CanonicalFieldChangeSet::new([]).unwrap(),
+            body_changed: true,
+        })])
+        .unwrap();
+        let claim = HostClaimId::generate();
+        let operation = CanonicalOperationOutcome::invalid(OperationKind::Update, Vec::new());
+        let prepared = prepare_runtime_transaction(
+            &collection,
+            RuntimePrepareInput {
+                baseline: &baseline,
+                desired: &desired,
+                claim: &claim,
+                mutation_digest: claim.as_str(),
+                operation: &operation,
+                changes: &changes,
+                event_id: &ChangeEventId::generate(),
+            },
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+        let RuntimePrepareOutcome::Prepared(id) = prepared else {
+            panic!("repair must prepare")
+        };
+        let journal =
+            read_runtime_journal(&collection, &transaction_directory(&collection, &id)).unwrap();
+        assert_eq!(
+            journal
+                .operation_outcome
+                .as_ref()
+                .and_then(CanonicalOperationOutcome::operation_kind),
+            Some(OperationKind::Update)
+        );
+
+        // The same canonical change cannot relabel an ordinary create as an
+        // update: physical before-presence is the required repair evidence.
+        let absent: FileBaseline = BTreeMap::new();
+        let claim = HostClaimId::generate();
+        let rejected = prepare_runtime_transaction(
+            &collection,
+            RuntimePrepareInput {
+                baseline: &absent,
+                desired: &desired,
+                claim: &claim,
+                mutation_digest: claim.as_str(),
+                operation: &operation,
+                changes: &changes,
+                event_id: &ChangeEventId::generate(),
+            },
+            &OperationContext::legacy(),
+        );
+        assert!(matches!(rejected, Err(TransactionError::InvalidJournal(_))));
+    }
+
+    #[test]
     fn definition_journals_preserve_apply_and_reject_assess_or_swapped_rejection() {
         let (_root, collection) = collection();
         let id = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
         let directory = transaction_directory(&collection, &id);
         let mut journal = read_runtime_journal(&collection, &directory).unwrap();
         journal.scope = TransactionScope::Resources;
+        // Model a Phase 4 v3 journal whose physical transition is retained.
+        journal.version = PHASE4_RUNTIME_JOURNAL_VERSION;
+        journal.entries = vec![JournalEntry {
+            path: "resource.bin".to_string(),
+            before_revision: None,
+            after_revision: Some("sha256:after".to_string()),
+            stage_file: None,
+            backup_file: None,
+        }];
+        journal.transition_evidence.clear();
         journal.changes = vec![CanonicalChange::Resource(crate::runtime::ResourceChange {
             kind: ResourceChangeKind::Other,
             path: crate::api::CollectionPath::new("resource.bin").unwrap(),
@@ -1486,6 +2329,11 @@ mod tests {
         assert!(validate_journal_operation_family(&journal).is_err());
 
         let mut phase4 = journal_value(&collection, &id);
+        phase4["version"] = serde_json::json!(PHASE4_RUNTIME_JOURNAL_VERSION);
+        phase4
+            .as_object_mut()
+            .unwrap()
+            .remove("transition_evidence");
         phase4["scope"] = serde_json::json!("resources");
         phase4["changes"] = serde_json::json!([{
             "target": "resource",

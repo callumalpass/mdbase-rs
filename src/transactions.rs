@@ -40,6 +40,21 @@ fn post_commit_replacements() -> &'static std::sync::Mutex<PostCommitReplacement
 }
 
 #[cfg(test)]
+fn crash_after_applied() -> &'static std::sync::Mutex<BTreeMap<PathBuf, usize>> {
+    static CRASHES: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, usize>>> =
+        std::sync::OnceLock::new();
+    CRASHES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn inject_commit_crash_after(root: &Path, applied: usize) {
+    crash_after_applied()
+        .lock()
+        .expect("commit crash hook lock")
+        .insert(root.to_path_buf(), applied);
+}
+
+#[cfg(test)]
 fn deferred_cleanup_roots() -> &'static std::sync::Mutex<BTreeSet<PathBuf>> {
     static ROOTS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<PathBuf>>> =
         std::sync::OnceLock::new();
@@ -263,12 +278,19 @@ pub(crate) fn commit_shadow(
     baseline: &FileBaseline,
     desired: &FileBaseline,
 ) -> Result<CommitOutcome, TransactionError> {
+    #[cfg(test)]
+    let fail_after_applied = crash_after_applied()
+        .lock()
+        .expect("commit crash hook lock")
+        .remove(collection.root());
+    #[cfg(not(test))]
+    let fail_after_applied = None;
     commit_shadow_controlled(
         collection,
         baseline,
         desired,
         TransactionScope::Records,
-        None,
+        fail_after_applied,
     )
 }
 
@@ -467,7 +489,7 @@ fn recover_one(collection: &Collection, directory: &Path) -> Result<bool, Transa
     let version = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64));
-    if matches!(version, Some(2 | 3)) {
+    if matches!(version, Some(2..=4)) {
         return runtime::recover_runtime_one(collection, directory, &bytes);
     }
     let mut journal: Journal = serde_json::from_slice(&bytes)

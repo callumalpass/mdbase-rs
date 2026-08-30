@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use super::ProviderError;
 use crate::{diagnostic::Diagnostic, v03::OperationResult};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
     Read,
