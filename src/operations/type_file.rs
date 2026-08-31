@@ -469,12 +469,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(results.iter().filter(|result| result.valid).count(), 1);
-        assert!(results.iter().filter(|result| !result.valid).all(|result| {
-            result
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "path_conflict")
-        }));
+        assert!(
+            results.iter().filter(|result| !result.valid).all(|result| {
+                result
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "path_conflict")
+            }),
+            "unexpected create outcomes: {results:#?}"
+        );
         let persisted = fs::read_to_string(directory.path().join("_types/shared.md")).unwrap();
         let winning_document = results.iter().find(|result| result.valid).unwrap().result
             ["document"]
