@@ -14,6 +14,49 @@ use crate::runtime::{
 };
 use crate::Collection;
 
+#[cfg(test)]
+struct SparsePreparationPause {
+    root: std::path::PathBuf,
+    entered: std::sync::Arc<std::sync::Barrier>,
+    release: std::sync::Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+static SPARSE_PREPARATION_PAUSE: std::sync::Mutex<Option<SparsePreparationPause>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_sparse_preparation_pause(
+    root: &Path,
+    entered: std::sync::Arc<std::sync::Barrier>,
+    release: std::sync::Arc<std::sync::Barrier>,
+) {
+    *SPARSE_PREPARATION_PAUSE.lock().unwrap() = Some(SparsePreparationPause {
+        root: root.to_path_buf(),
+        entered,
+        release,
+    });
+}
+
+#[cfg(test)]
+fn pause_sparse_preparation(root: &Path) {
+    let pause = {
+        let mut configured = SPARSE_PREPARATION_PAUSE.lock().unwrap();
+        if configured
+            .as_ref()
+            .is_some_and(|candidate| candidate.root == root)
+        {
+            configured.take()
+        } else {
+            None
+        }
+    };
+    if let Some(pause) = pause {
+        pause.entered.wait();
+        pause.release.wait();
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum RuntimeSinglePreparation {
     NoMutation(CanonicalOperationOutcome),
@@ -208,6 +251,8 @@ fn prepare_sparse_runtime(
     let kind = operation.parse::<OperationKind>()?;
     let input_path = input.get("path").and_then(Value::as_str);
     let shadow = sparse_shadow_collection(collection, input_path, context)?;
+    #[cfg(test)]
+    pause_sparse_preparation(&collection.root);
     let shadow_input = match adapt_mtime_precondition(collection, &shadow.collection, input) {
         Ok(input) => input,
         Err(diagnostic) => {
@@ -239,12 +284,13 @@ fn prepare_sparse_runtime(
             )
         })?
         .to_string();
-    let mut baseline = if kind == OperationKind::Delete {
-        shadow.baseline.clone()
-    } else {
-        crate::transactions::FileBaseline::new()
-    };
-    if kind != OperationKind::Delete {
+    // The shadow and its baseline are one preparation snapshot. Re-reading the
+    // authority here can pair a stale conditional result from the shadow with
+    // newer baseline bytes, allowing a stale writer to pass commit-time
+    // validation. Only a derived create can target a path that was unknown
+    // when the sparse shadow was copied.
+    let mut baseline = shadow.baseline.clone();
+    if input_path != Some(path.as_str()) {
         if let Ok(bytes) = fs::read(collection.root.join(&path)) {
             baseline.insert(path.clone(), bytes);
         }

@@ -103,14 +103,34 @@ pub(crate) struct RuntimePrepareInput<'a> {
     pub event_id: &'a ChangeEventId,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum RuntimeCommitAttempt {
     Committed(RuntimeResolution),
     RejectedBeforeCommit(RuntimeResolution),
     AlreadyCancelled,
-    SettlementRequired(CommitId),
-    SettlementPending(CommitId),
+    SettlementRequired(RuntimeSettlement),
+    SettlementPending(RuntimeSettlement),
     NeedsManualRecovery(CommitId),
+}
+
+pub(crate) struct RuntimeSettlement {
+    commit_id: CommitId,
+    write_lock: Option<WriteLock>,
+}
+
+impl RuntimeSettlement {
+    pub(crate) fn commit_id(&self) -> &CommitId {
+        &self.commit_id
+    }
+}
+
+impl std::fmt::Debug for RuntimeSettlement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeSettlement")
+            .field("commit_id", &self.commit_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -278,13 +298,18 @@ pub(crate) fn commit_runtime_prepared(
     context: &OperationContext,
 ) -> Result<RuntimeCommitAttempt, TransactionError> {
     context_check(context)?;
-    let _lock = WriteLock::acquire_context(collection, context)?;
+    let write_lock = WriteLock::acquire_context(collection, context)?;
     context_check(context)?;
     let directory = transaction_directory(collection, id);
     let mut journal = read_runtime_journal(&directory)?;
     match journal.phase {
         RuntimePhase::Prepared => {}
-        RuntimePhase::Committing => return Ok(RuntimeCommitAttempt::SettlementPending(id.clone())),
+        RuntimePhase::Committing => {
+            return Ok(RuntimeCommitAttempt::SettlementPending(RuntimeSettlement {
+                commit_id: id.clone(),
+                write_lock: Some(write_lock),
+            }))
+        }
         RuntimePhase::Committed => {
             return Ok(RuntimeCommitAttempt::Committed(resolution(&journal)?))
         }
@@ -314,22 +339,27 @@ pub(crate) fn commit_runtime_prepared(
     journal.phase = RuntimePhase::Committing;
     persist_runtime_journal(&directory, &journal)?;
     simulate_runtime_crash(&journal.id, 1)?;
-    Ok(RuntimeCommitAttempt::SettlementRequired(id.clone()))
+    Ok(RuntimeCommitAttempt::SettlementRequired(
+        RuntimeSettlement {
+            commit_id: id.clone(),
+            write_lock: Some(write_lock),
+        },
+    ))
 }
 
 pub(crate) fn settle_runtime_commit(
     collection: &Collection,
-    id: &CommitId,
+    settlement: &mut RuntimeSettlement,
 ) -> Result<RuntimeResolution, TransactionError> {
-    let _lock = WriteLock::acquire(collection)?;
-    let directory = transaction_directory(collection, id);
+    let directory = transaction_directory(collection, settlement.commit_id());
     let mut journal = read_runtime_journal(&directory)?;
-    match journal.phase {
+    let result = match journal.phase {
         RuntimePhase::Committing => match settle(collection, &directory, &mut journal) {
             Ok(()) => resolution(&journal),
             Err(error) => {
                 #[cfg(test)]
                 if matches!(error, TransactionError::SimulatedCrash) {
+                    settlement.write_lock.take();
                     return Err(error);
                 }
                 journal.phase = RuntimePhase::NeedsManualRecovery;
@@ -338,7 +368,9 @@ pub(crate) fn settle_runtime_commit(
             }
         },
         _ => resolution(&journal),
-    }
+    };
+    settlement.write_lock.take();
+    result
 }
 
 pub(crate) fn cancel_runtime_prepared(
@@ -1066,9 +1098,12 @@ fn context_check(context: &OperationContext) -> Result<(), TransactionError> {
 mod tests {
     use super::*;
     use crate::runtime::{
-        CanonicalFieldChangeSet, CanonicalTypeSet, RecordChange, RecordChangeKind,
+        CanonicalFieldChangeSet, CanonicalTypeSet, OperationDeadline, RecordChange,
+        RecordChangeKind,
     };
+    use crate::OperationCancellation;
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     fn collection() -> (tempfile::TempDir, Collection) {
         let root = tempfile::tempdir().unwrap();
@@ -1241,54 +1276,88 @@ mod tests {
         ));
     }
 
-    /// Settlement runs after the commit lock is released, so for a window the
-    /// working tree still shows the old revision of a path that is already
-    /// committed. A second writer that checked only the working tree committed
-    /// too, and then could not settle: its path matched neither its before nor
-    /// its intended revision, which was reported as `manual_recovery_required`
-    /// and stranded the journal so every later open of the collection failed.
+    fn short_context(cancellation: &OperationCancellation) -> OperationContext {
+        OperationContext::new(
+            cancellation,
+            OperationDeadline::after(Duration::from_millis(25)),
+        )
+    }
+
+    /// A durable commit keeps the cross-process write boundary until canonical
+    /// settlement finishes. Otherwise two conditional writers can both take a
+    /// commit point against the same old revision and leave one journal needing
+    /// manual recovery.
     #[test]
-    fn a_committed_but_unsettled_path_rejects_the_next_writer_before_its_commit_point() {
-        let (_root, collection) = collection();
+    fn a_committed_but_unsettled_path_blocks_the_next_writer_before_its_commit_point() {
+        let (root, collection) = collection();
         let first = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
         let second = prepare(&collection, "a.md", b"old-a\n", b"other-a\n");
 
-        // The first writer commits and does not settle: the working tree still
-        // reads `old-a`, which is exactly the stale view that misled the second.
-        assert!(matches!(
-            commit(&collection, &first),
-            RuntimeCommitAttempt::SettlementRequired(_)
-        ));
+        let mut settlement = match commit(&collection, &first) {
+            RuntimeCommitAttempt::SettlementRequired(settlement) => settlement,
+            other => panic!("the first writer must take the commit point, got {other:?}"),
+        };
         assert_eq!(fs::read(collection.root.join("a.md")).unwrap(), b"old-a\n");
 
+        let cancellation = OperationCancellation::new();
+        let blocked = commit_runtime_prepared(
+            &collection,
+            &second,
+            &CollectionGeneration::initial(),
+            ChangeWatermark::from_stored(1),
+            &short_context(&cancellation),
+        );
+        assert!(matches!(
+            blocked,
+            Err(TransactionError::OperationBoundary {
+                code: "operation_deadline"
+            })
+        ));
+
+        settle_runtime_commit(&collection, &mut settlement).unwrap();
         match commit(&collection, &second) {
             RuntimeCommitAttempt::RejectedBeforeCommit(_) => {}
-            other => panic!("the second writer must lose cleanly, got {other:?}"),
+            other => panic!("the stale second writer must lose cleanly, got {other:?}"),
         }
-
-        // The loser took no commit point, so the winner still settles and the
-        // collection stays openable rather than requiring manual recovery.
-        settle_runtime_commit(&collection, &first).unwrap();
         assert_eq!(fs::read(collection.root.join("a.md")).unwrap(), b"new-a\n");
         drop(collection);
-        Collection::open(_root.path()).expect("the collection must remain openable");
+        Collection::open(root.path()).expect("the collection must remain openable");
     }
 
-    /// The rejection is specific to paths a committed transaction owns, so an
-    /// unrelated path still commits while settlement is outstanding.
+    /// The collection write boundary also serializes unrelated paths while a
+    /// live commit settles; once settlement finishes, the unrelated writer can
+    /// proceed normally.
     #[test]
-    fn an_unsettled_transaction_does_not_block_an_unrelated_path() {
+    fn a_live_settlement_temporarily_blocks_an_unrelated_path() {
         let (root, collection) = collection();
         fs::write(root.path().join("b.md"), "old-b\n").unwrap();
         let first = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
         let second = prepare(&collection, "b.md", b"old-b\n", b"new-b\n");
+        let mut first_settlement = match commit(&collection, &first) {
+            RuntimeCommitAttempt::SettlementRequired(settlement) => settlement,
+            other => panic!("the first writer must take the commit point, got {other:?}"),
+        };
+
+        let cancellation = OperationCancellation::new();
         assert!(matches!(
-            commit(&collection, &first),
-            RuntimeCommitAttempt::SettlementRequired(_)
+            commit_runtime_prepared(
+                &collection,
+                &second,
+                &CollectionGeneration::initial(),
+                ChangeWatermark::from_stored(1),
+                &short_context(&cancellation),
+            ),
+            Err(TransactionError::OperationBoundary {
+                code: "operation_deadline"
+            })
         ));
-        assert!(matches!(
-            commit(&collection, &second),
-            RuntimeCommitAttempt::SettlementRequired(_)
-        ));
+
+        settle_runtime_commit(&collection, &mut first_settlement).unwrap();
+        let mut second_settlement = match commit(&collection, &second) {
+            RuntimeCommitAttempt::SettlementRequired(settlement) => settlement,
+            other => panic!("the unrelated writer must proceed after settlement, got {other:?}"),
+        };
+        settle_runtime_commit(&collection, &mut second_settlement).unwrap();
+        assert_eq!(fs::read(collection.root.join("b.md")).unwrap(), b"new-b\n");
     }
 }
