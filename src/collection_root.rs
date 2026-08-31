@@ -248,10 +248,20 @@ impl CollectionRoot {
             // concurrent creator; removing the temporary name leaves one link.
             match dir.hard_link(&temp, &dir, leaf) {
                 Ok(()) => dir.remove_file(&temp),
-                Err(_) if dir.symlink_metadata(leaf).is_ok() => {
-                    Err(std::io::ErrorKind::AlreadyExists.into())
+                Err(error) => {
+                    let conflict = (0..=20).any(|attempt| {
+                        let exists = dir.symlink_metadata(leaf).is_ok();
+                        if !exists && attempt < 20 {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        exists
+                    });
+                    if conflict {
+                        Err(std::io::ErrorKind::AlreadyExists.into())
+                    } else {
+                        Err(error)
+                    }
                 }
-                Err(error) => Err(error),
             }
         } else {
             atomic_replace(&file, &dir, &temp, leaf)
