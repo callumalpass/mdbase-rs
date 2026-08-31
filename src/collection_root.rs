@@ -125,23 +125,7 @@ impl CollectionRoot {
     }
 
     pub(crate) fn read(&self, relative: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
-        let relative = relative.as_ref();
-        #[cfg(windows)]
-        let mut file = {
-            let mut attempt = 0;
-            loop {
-                match self.open_file(relative) {
-                    Ok(file) => break file,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && attempt < 20 => {
-                        attempt += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        };
-        #[cfg(not(windows))]
-        let mut file = self.open_file(relative)?;
+        let mut file = self.open_file(relative.as_ref())?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         Ok(bytes)
