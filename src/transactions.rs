@@ -468,6 +468,13 @@ fn commit_shadow_controlled(
 
 /// Recover every durable transaction before a collection becomes available.
 pub(crate) fn recover_pending(collection: &Collection) -> Result<bool, TransactionError> {
+    match collection.held_root().open_dir(Path::new(TRANSACTIONS_DIR)) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(io_error(collection.root.join(TRANSACTIONS_DIR), source));
+        }
+    }
     let _write_lock = WriteLock::acquire(collection)?;
     let directories = collection
         .held_root()
