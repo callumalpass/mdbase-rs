@@ -1,15 +1,14 @@
 //! Update operation (§12.3).
 
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::api::operations::{UpdateInput, UpdateOutput};
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::api::{CollectionPath, Revision, UpdateRequest};
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document_for_rewrite, yaml_mapping_to_json};
 use crate::frontmatter::serializer;
 use crate::mutation::{PlannedRecord, PreparedUpdate};
-use crate::operations::{
-    atomic_write, ensure_no_symlink_components_diagnostic, ensure_regular_record_file_diagnostic,
-    mutation_record_path_diagnostic,
-};
+use crate::operations::mutation_record_path_diagnostic;
 use crate::Collection;
 
 pub(crate) struct PrevalidatedUpdate {
@@ -17,7 +16,7 @@ pub(crate) struct PrevalidatedUpdate {
     pub raw_frontmatter: serde_json::Map<String, serde_json::Value>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 fn injected_publication_replacements(
 ) -> &'static std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>> {
     static REPLACEMENTS: std::sync::OnceLock<
@@ -26,7 +25,7 @@ fn injected_publication_replacements(
     REPLACEMENTS.get_or_init(Default::default)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 fn injected_prevalidated_replacements(
 ) -> &'static std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>> {
     static REPLACEMENTS: std::sync::OnceLock<
@@ -35,7 +34,7 @@ fn injected_prevalidated_replacements(
     REPLACEMENTS.get_or_init(Default::default)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 pub(crate) fn inject_prevalidated_replacement(
     path: &std::path::Path,
     replacement: std::path::PathBuf,
@@ -46,7 +45,7 @@ pub(crate) fn inject_prevalidated_replacement(
         .insert(path.to_path_buf(), replacement);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 fn apply_injected_prevalidated_replacement(path: &std::path::Path) {
     let replacement = injected_prevalidated_replacements()
         .lock()
@@ -57,7 +56,7 @@ fn apply_injected_prevalidated_replacement(path: &std::path::Path) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 fn inject_publication_replacement(path: &std::path::Path, replacement: std::path::PathBuf) {
     injected_publication_replacements()
         .lock()
@@ -65,7 +64,7 @@ fn inject_publication_replacement(path: &std::path::Path, replacement: std::path
         .insert(path.to_path_buf(), replacement);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 fn apply_injected_publication_replacement(path: &std::path::Path) {
     let replacement = injected_publication_replacements()
         .lock()
@@ -77,8 +76,8 @@ fn apply_injected_publication_replacement(path: &std::path::Path) {
 }
 
 impl Collection {
-    /// Update a file (§12.3).
-    pub fn update(&self, input: &serde_json::Value) -> serde_json::Value {
+    #[cfg(feature = "legacy-collection-mutation")]
+    pub(crate) fn update_legacy(&self, input: &serde_json::Value) -> serde_json::Value {
         let parsed = match UpdateInput::parse(input) {
             Ok(parsed) => parsed,
             Err(error) => return error,
@@ -90,6 +89,7 @@ impl Collection {
         }
     }
 
+    #[cfg(feature = "legacy-collection-mutation")]
     pub(crate) fn update_prevalidated(
         &self,
         input: &serde_json::Value,
@@ -139,7 +139,7 @@ impl Collection {
             Err(error) => return Err(crate::mutation::MutationFailure::diagnostic(error)),
         };
         if let Err(error) =
-            ensure_no_symlink_components_diagnostic(&self.root, path.as_str(), self.spec_profile)
+            crate::operations::ensure_no_symlink_components_held_diagnostic(self, path.as_str())
         {
             return Err(crate::mutation::MutationFailure::diagnostic(error));
         }
@@ -154,15 +154,12 @@ impl Collection {
         };
 
         let new_body = new_body.as_deref();
+        #[cfg(all(test, feature = "legacy-collection-mutation"))]
         let full_path = path.under(&self.root);
-        if let Err(error) = ensure_regular_record_file_diagnostic(&full_path, path.as_str()) {
-            return Err(crate::mutation::MutationFailure::diagnostic(error));
-        }
-
         // Load bytes, metadata, and revision from one open handle. The loaded
         // revision is also the mandatory publication precondition, including
         // when a legacy caller omitted `if_revision`.
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-collection-mutation"))]
         if prevalidated.is_some() {
             apply_injected_prevalidated_replacement(&full_path);
         }
@@ -281,7 +278,7 @@ impl Collection {
             && (has_generated
                 || (validate_collection && self.settings.default_validation == "error"))
         {
-            match self.capture_collection_snapshot(&crate::OperationCancellation::new()) {
+            match self.capture_collection_snapshot_current() {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) => {
                     return Err(crate::mutation::MutationFailure::operation(
@@ -399,12 +396,7 @@ impl Collection {
             }
         };
 
-        if let Err(error) =
-            ensure_no_symlink_components_diagnostic(&self.root, path.as_str(), self.spec_profile)
-        {
-            return Err(crate::mutation::MutationFailure::diagnostic(error));
-        }
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-collection-mutation"))]
         apply_injected_publication_replacement(&full_path);
 
         // Reopen once at the publication boundary and compare a byte revision,
@@ -426,7 +418,10 @@ impl Collection {
                 format!("File '{}' was modified during operation", path.as_str()),
             ));
         }
-        if let Err(error) = atomic_write(&full_path, output.as_bytes()) {
+        if let Err(error) = self
+            .held_root()
+            .atomic_write(&path.to_path_buf(), output.as_bytes())
+        {
             return Err(crate::mutation::MutationFailure::operation(
                 "io_error",
                 format!("Failed to write: {error}"),
@@ -475,6 +470,7 @@ impl Collection {
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn legacy_prepared_update(input: UpdateInput) -> PreparedUpdate {
     let legacy_path = input.path;
     let path = CollectionPath::new(&legacy_path)
@@ -499,6 +495,7 @@ fn legacy_prepared_update(input: UpdateInput) -> PreparedUpdate {
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn mutation_failure_json(failure: crate::mutation::MutationFailure) -> serde_json::Value {
     match failure.kind {
         crate::mutation::MutationFailureKind::Operation if failure.diagnostics.len() == 1 => {
@@ -512,6 +509,7 @@ fn mutation_failure_json(failure: crate::mutation::MutationFailure) -> serde_jso
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn planned_update_output(planned: PlannedRecord) -> serde_json::Value {
     UpdateOutput {
         path: planned.path.to_string(),
@@ -526,7 +524,7 @@ fn planned_update_output(planned: PlannedRecord) -> serde_json::Value {
     .into_json()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 mod tests {
     use super::inject_publication_replacement;
     use crate::Collection;

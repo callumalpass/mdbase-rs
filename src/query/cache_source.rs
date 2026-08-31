@@ -114,12 +114,16 @@ impl Collection {
     /// Try to open the cache database. Returns `None` if the DB file doesn't
     /// exist or can't be opened.
     fn try_open_cache(&self) -> Result<Option<Connection>, CacheError> {
-        let db_path = self.root.join(&self.settings.cache_folder).join("cache.db");
+        let db_path = self
+            .held_root()
+            .cache_storage_path()
+            .join(&self.settings.cache_folder)
+            .join("cache.db");
         if !db_path.exists() {
             return Ok(None);
         }
         Ok(Some(sqlite::open_cache_db(
-            &self.root,
+            self.held_root().cache_storage_path(),
             &self.settings.cache_folder,
         )?))
     }
@@ -131,8 +135,8 @@ impl Collection {
         &self,
         conn: &mut Connection,
         cancellation: &OperationCancellation,
-    ) -> Result<Vec<PathBuf>, CacheError> {
-        let disk_files = self.scan_collection_files_checked()?;
+    ) -> Result<Vec<String>, CacheError> {
+        let disk_files = self.scan_collection_relative_paths_checked()?;
 
         // Cache refresh errors deliberately fall back to disk. Treating
         // cancellation as an ordinary cache error would therefore continue
@@ -142,7 +146,7 @@ impl Collection {
             return Err(CacheError::Cancelled);
         }
 
-        let changes = staleness::find_changes(conn, &self.root, &disk_files)?;
+        let changes = staleness::find_changes(conn, self, &disk_files)?;
 
         if changes.stale.is_empty() && changes.deleted.is_empty() {
             return Ok(disk_files);
@@ -152,7 +156,7 @@ impl Collection {
         // only the uncommon cache-write section, then recompute against the
         // winning transaction so two refreshers cannot apply stale deltas.
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changes = staleness::find_changes(&transaction, &self.root, &disk_files)?;
+        let changes = staleness::find_changes(&transaction, self, &disk_files)?;
 
         // Remove deleted files from cache
         for rel_path in &changes.deleted {
@@ -163,16 +167,11 @@ impl Collection {
         }
 
         // Re-index stale/new files
-        for abs_path in &changes.stale {
+        for rel_path in &changes.stale {
             if cancellation.is_cancelled() {
                 return Err(CacheError::Cancelled);
             }
-            let rel_path = abs_path
-                .strip_prefix(&self.root)
-                .map_err(|_| CacheError::OutsideRoot(abs_path.display().to_string()))?
-                .to_string_lossy()
-                .replace('\\', "/");
-            indexer::reindex_file(&transaction, self, &rel_path)?;
+            indexer::reindex_file(&transaction, self, rel_path)?;
         }
 
         if !changes.stale.is_empty() || !changes.deleted.is_empty() {
@@ -326,7 +325,11 @@ impl Collection {
         let total_started = Instant::now();
         let mut perf = LoadQueryPerf::default();
         let open_started = Instant::now();
-        let mut conn = sqlite::open_cache_db(&self.root, &self.settings.cache_folder).ok()?;
+        let mut conn = sqlite::open_cache_db(
+            self.held_root().cache_storage_path(),
+            &self.settings.cache_folder,
+        )
+        .ok()?;
         perf.try_open_cache_ms = elapsed_ms(open_started);
         perf.cache_used = true;
 
@@ -560,10 +563,11 @@ impl Collection {
         profile: bool,
         include_link_graph: bool,
     ) -> Result<(CollectionSnapshot, Option<LoadQueryPerf>), SnapshotError> {
+        let context = crate::runtime::OperationContext::current_or_legacy();
         self.load_query_data_profiled_cancellable(
             profile,
             include_link_graph,
-            &OperationCancellation::new(),
+            context.cancellation(),
         )
     }
 
@@ -651,12 +655,26 @@ impl Collection {
                                 perf.cache_used = true;
                                 cached_records = Some(records);
                             }
+                            Err(CacheError::Cancelled)
+                            | Err(CacheError::Scan(
+                                crate::snapshot::CollectionScanError::Cancelled,
+                            )) => return Err(SnapshotError::Cancelled),
+                            Err(CacheError::Scan(
+                                crate::snapshot::CollectionScanError::Provider(error),
+                            )) => return Err(SnapshotError::Provider(error)),
                             Err(error) => {
                                 perf.cache_fallback = true;
                                 coordinated_cache_error = Some(error.to_string());
                             }
                         }
                     }
+                    Err(CacheError::Cancelled)
+                    | Err(CacheError::Scan(crate::snapshot::CollectionScanError::Cancelled)) => {
+                        return Err(SnapshotError::Cancelled)
+                    }
+                    Err(CacheError::Scan(crate::snapshot::CollectionScanError::Provider(
+                        error,
+                    ))) => return Err(SnapshotError::Provider(error)),
                     Err(error) => {
                         perf.cache_fallback = true;
                         coordinated_cache_error = Some(error.to_string());
@@ -719,13 +737,20 @@ impl Collection {
             let backlinks_start = Instant::now();
             let all_files_arc = Arc::new(all_files_data);
             let cached_backlinks = (perf.cache_used && !refresh_from_filesystem).then(|| {
-                sqlite::open_cache_db(&self.root, &self.settings.cache_folder)
-                    .map_err(CacheError::from)
-                    .and_then(|connection| indexer::load_backlinks(&connection))
+                sqlite::open_cache_db(
+                    self.held_root().cache_storage_path(),
+                    &self.settings.cache_folder,
+                )
+                .map_err(CacheError::from)
+                .and_then(|connection| indexer::load_backlinks(&connection))
             });
             let (backlinks_index, backlinks_perf) = match cached_backlinks {
                 Some(Ok(backlinks)) => (backlinks, None),
-                _ => self.build_backlinks_index_profiled(&all_files_arc, profile),
+                _ => self
+                    .build_backlinks_index_profiled(&all_files_arc, profile)
+                    .map_err(|error| {
+                        SnapshotError::Cache(format!("{}: {}", error.code, error.message))
+                    })?,
             };
             cancellation.check().map_err(|_| SnapshotError::Cancelled)?;
             let backlinks_arc = Arc::new(backlinks_index);

@@ -23,16 +23,17 @@ The compatibility-only `execute` and `execute_with_context` methods call the
 single `CanonicalOperationOutcome::to_v03` adapter. During the coordinated
 Connect migration, `ExecutionOutcome.result` and `CommitRejection.result`
 remain deprecated, ephemeral projections populated by that same adapter. They
-are deliberately absent from version-3 journals. Remove both fields once the
-Connect Phase 4 consumer migration lands. New Connect code should use
+are deliberately absent from canonical version-3 and current version-4 journals. Remove
+both fields once the Connect Phase 4 consumer migration lands. New Connect code should use
 `operation` and must not decode `OperationResult.result` or infer shapes.
 
 `prepare_typed` (and the compatibility-named `prepare` alias), commit,
 commit/claim resolution, cancellation replay, and read cursors all carry the
-same typed outcome alongside generation and canonical `ChangeSet`. Runtime
-journal version 3 persists that outcome. New journals do not write
-`OperationResult`; version 2 journals remain backward-readable through one
-explicit legacy discriminator recovery path. Version-2 record operations are
+same typed outcome alongside generation and canonical `ChangeSet`. Current runtime journal
+version 4 persists that outcome with authenticated transition evidence. Phase-4 version 3
+remains readable only with its exact retained physical-entry evidence. New journals do not
+write `OperationResult`; version 2 journals remain backward-readable through one explicit
+legacy discriminator recovery path. Version-2 record operations are
 identified only from exact result/change evidence. Ambiguous cleaned failures
 and all resource journals become non-semantic `LegacyRecoveredV03` values;
 resource paths are never guessed. Settlement upgrades a recovered version-2

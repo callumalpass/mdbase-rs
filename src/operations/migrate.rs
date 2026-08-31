@@ -2,7 +2,7 @@
 
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
-use crate::operations::{ensure_no_symlink_components, ensure_safe_relative_path};
+use crate::operations::ensure_safe_relative_path;
 use crate::Collection;
 
 impl Collection {
@@ -26,62 +26,43 @@ impl Collection {
             if let Err(error) = ensure_safe_relative_path(p, self.spec_profile) {
                 return error;
             }
-            if let Err(error) = ensure_no_symlink_components(&self.root, p, self.spec_profile) {
-                return error;
+            if let Err(error) = self
+                .held_root()
+                .ensure_no_symlink_components(std::path::Path::new(p))
+            {
+                return op_error(PATH_TRAVERSAL, &error.to_string());
             }
-            self.root.join(p)
+            std::path::PathBuf::from(p)
         } else {
-            if let Err(error) = ensure_no_symlink_components(
-                &self.root,
-                &self.settings.migrations_folder,
-                self.spec_profile,
-            ) {
-                return error;
+            let migrations_dir = std::path::Path::new(&self.settings.migrations_folder);
+            if let Err(error) = self
+                .held_root()
+                .ensure_no_symlink_components(migrations_dir)
+            {
+                return op_error(PATH_TRAVERSAL, &error.to_string());
             }
-            let migrations_dir = self.root.join(&self.settings.migrations_folder);
             let mut found: Option<std::path::PathBuf> = None;
-            if migrations_dir.exists() {
-                let mut stack = vec![migrations_dir];
-                while let Some(dir) = stack.pop() {
-                    let entries = match std::fs::read_dir(&dir) {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-                    for entry in entries.flatten() {
-                        let entry_path = entry.path();
-                        let Ok(file_type) = entry.file_type() else {
-                            continue;
-                        };
-                        if file_type.is_symlink() {
-                            continue;
-                        }
-                        if file_type.is_dir() {
-                            stack.push(entry_path);
-                        } else if file_type.is_file() {
-                            let ext = entry_path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .unwrap_or("");
-                            if ext != "md" && ext != "yaml" && ext != "yml" {
-                                continue;
-                            }
-                            let content = match std::fs::read_to_string(&entry_path) {
-                                Ok(c) => c,
-                                Err(_) => continue,
-                            };
-                            let doc = parse_document(&content);
-                            if let Some(serde_yaml::Value::Mapping(m)) = doc.frontmatter {
-                                let fm = yaml_mapping_to_json(&m);
-                                if let Some(manifest_id) = fm.get("id").and_then(|v| v.as_str()) {
-                                    if Some(manifest_id) == id {
-                                        found = Some(entry_path);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if found.is_some() {
+            let entries = self
+                .held_root()
+                .files_recursive(migrations_dir)
+                .unwrap_or_default();
+            for entry_path in entries {
+                let ext = entry_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or("");
+                if ext != "md" && ext != "yaml" && ext != "yml" {
+                    continue;
+                }
+                let content = match self.held_root().read_string(&entry_path) {
+                    Ok(content) => content,
+                    Err(_) => continue,
+                };
+                let doc = parse_document(&content);
+                if let Some(serde_yaml::Value::Mapping(mapping)) = doc.frontmatter {
+                    let frontmatter = yaml_mapping_to_json(&mapping);
+                    if frontmatter.get("id").and_then(|value| value.as_str()) == id {
+                        found = Some(entry_path);
                         break;
                     }
                 }
@@ -92,7 +73,7 @@ impl Collection {
             }
         };
 
-        let content = match std::fs::read_to_string(&manifest_path) {
+        let content = match self.held_root().read_string(&manifest_path) {
             Ok(c) => c,
             Err(e) => {
                 return op_error(
@@ -150,7 +131,8 @@ impl Collection {
                     if dry_run {
                         backfill_input.insert("dry_run".to_string(), serde_json::Value::Bool(true));
                     }
-                    let backfill_result = self.backfill(&serde_json::Value::Object(backfill_input));
+                    let backfill_result =
+                        self.backfill_legacy(&serde_json::Value::Object(backfill_input));
                     if backfill_result.get("error").is_some() {
                         return op_error(MIGRATION_FAILED, "Migration failed");
                     }

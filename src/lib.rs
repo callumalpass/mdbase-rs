@@ -15,6 +15,7 @@ pub mod api;
 pub mod cache;
 pub mod cancellation;
 pub(crate) mod cel;
+mod collection_root;
 pub(crate) mod compat;
 pub mod config;
 pub mod data_contracts;
@@ -45,10 +46,12 @@ pub mod watch;
 pub use cancellation::{OperationCancellation, OperationCancelled, OperationStopReason};
 pub use snapshot::{CollectionDiscoveryCause, CollectionSnapshotError};
 
+#[cfg(all(test, unix))]
+pub(crate) use snapshot::replace_descendant_on_scan_for_test;
 #[cfg(test)]
 pub(crate) use snapshot::{
-    cancel_scan_after_entries_for_test, replace_descendant_on_scan_for_test,
-    reset_snapshot_scan_calls_for_test, snapshot_scan_calls_for_test,
+    cancel_scan_after_entries_for_test, reset_snapshot_scan_calls_for_test,
+    snapshot_scan_calls_for_test,
 };
 
 use std::collections::HashMap;
@@ -158,8 +161,9 @@ impl CollectionResources {
 
 /// A loaded mdbase collection.
 pub struct Collection {
+    /// Stable display path retained for public compatibility. Never use it as authority.
     pub(crate) root: PathBuf,
-    root_capability: cap_std::fs::Dir,
+    pub(crate) authority: collection_root::CollectionRoot,
     pub(crate) spec_profile: SpecProfile,
     pub(crate) settings: Settings,
     /// Namespaced collection configuration retained for optional adapters.
@@ -177,11 +181,11 @@ impl Collection {
     }
 
     pub(crate) fn root_capability(&self) -> std::io::Result<cap_std::fs::Dir> {
-        self.root_capability.try_clone()
+        self.authority.dir()
     }
 
-    pub(crate) fn capability_for_root(root: &Path) -> std::io::Result<cap_std::fs::Dir> {
-        cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+    pub(crate) fn held_root(&self) -> &collection_root::CollectionRoot {
+        &self.authority
     }
 
     /// Immutable runtime settings loaded with this collection.
@@ -236,16 +240,28 @@ impl Collection {
         root: &Path,
         recover_pending_transactions: bool,
     ) -> Result<Self, serde_json::Value> {
-        let root_capability =
-            cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority()).map_err(
-                |error| {
-                    crate::errors::op_error(
-                        crate::errors::INVALID_CONFIG,
-                        &format!("collection root could not be opened: {error}"),
-                    )
-                },
-            )?;
-        let config_result = config::load_config_for_open(root);
+        let authority = collection_root::CollectionRoot::acquire(root).map_err(|error| {
+            crate::errors::op_error(
+                crate::errors::INVALID_CONFIG,
+                &format!("collection root could not be opened: {error}"),
+            )
+        })?;
+        Self::open_held(authority, recover_pending_transactions)
+    }
+
+    pub(crate) fn reopen_held(
+        &self,
+        recover_pending_transactions: bool,
+    ) -> Result<Self, serde_json::Value> {
+        Self::open_held(self.authority.clone(), recover_pending_transactions)
+    }
+
+    fn open_held(
+        authority: collection_root::CollectionRoot,
+        recover_pending_transactions: bool,
+    ) -> Result<Self, serde_json::Value> {
+        let root = authority.display_path();
+        let config_result = config::load_config_for_open_held(&authority);
         if config_result.get("valid") != Some(&serde_json::Value::Bool(true)) {
             return Err(config_result);
         }
@@ -364,11 +380,16 @@ impl Collection {
                 ));
             }
             *folder = normalized.to_string();
-            crate::operations::ensure_no_symlink_components(
-                root,
-                normalized.as_str(),
-                spec_profile,
-            )?;
+            match authority.open_dir(&normalized.to_path_buf()) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(crate::errors::op_error(
+                        crate::errors::PATH_TRAVERSAL,
+                        &format!("settings.{label} is not a no-follow directory: {error}"),
+                    ));
+                }
+            }
         }
 
         // Recovery must precede type loading. A system migration may have
@@ -379,12 +400,7 @@ impl Collection {
         let recovered = if recover_pending_transactions {
             let recovery_collection = Collection {
                 root: root.to_path_buf(),
-                root_capability: root_capability.try_clone().map_err(|error| {
-                    crate::errors::op_error(
-                        crate::errors::INVALID_CONFIG,
-                        &format!("collection root capability could not be cloned: {error}"),
-                    )
-                })?,
+                authority: authority.clone(),
                 spec_profile,
                 settings: settings.clone(),
                 config_extensions: config_extensions.clone(),
@@ -406,12 +422,12 @@ impl Collection {
             false
         };
         if recovered {
-            return Self::open_with_recovery(root, recover_pending_transactions);
+            return Self::open_held(authority, recover_pending_transactions);
         }
 
-        // Load types
-        let load_result = loader::load_types_with_warnings(
-            root,
+        // Load types from the held capability, never from the display path.
+        let load_result = loader::load_types_with_warnings_held(
+            &authority,
             &settings.types_folder,
             &settings.migrations_folder,
         )
@@ -451,20 +467,21 @@ impl Collection {
             })
         })?;
 
-        let data_contracts = data_contracts::DataContractRegistry::load(root, &settings, &types)
-            .map_err(|error| {
-                serde_json::json!({
-                    "valid": false,
-                    "error": {
-                        "code": error.code,
-                        "message": error.message,
-                    }
-                })
-            })?;
+        let data_contracts =
+            data_contracts::DataContractRegistry::load_held(&authority, &settings, &types)
+                .map_err(|error| {
+                    serde_json::json!({
+                        "valid": false,
+                        "error": {
+                            "code": error.code,
+                            "message": error.message,
+                        }
+                    })
+                })?;
 
         let collection = Collection {
             root: root.to_path_buf(),
-            root_capability,
+            authority,
             spec_profile,
             settings,
             config_extensions,

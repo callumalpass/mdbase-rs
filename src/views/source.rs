@@ -1,6 +1,5 @@
 //! Revision-safe access to complete saved-view source documents.
 
-use std::fs;
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -9,10 +8,7 @@ use super::execute::is_configured_obsidian_source;
 use super::model::ObsidianBaseDocument;
 use crate::diagnostic::Diagnostic;
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to_json};
-use crate::operations::{
-    atomic_create, atomic_write, ensure_no_symlink_components, ensure_revision,
-    ensure_safe_relative_path, sync_directory,
-};
+use crate::operations::ensure_safe_relative_path;
 use crate::v03::{self, OperationResult};
 use crate::Collection;
 
@@ -45,8 +41,10 @@ pub(super) fn create(collection: &Collection, input: &Value) -> OperationResult 
     if let Err(diagnostics) = validate_document(collection, &path, document, false) {
         return failed_many(diagnostics);
     }
-    let full_path = collection.root.join(&path);
-    match atomic_create(&full_path, document.as_bytes()) {
+    match collection
+        .held_root()
+        .atomic_create(Path::new(&path), document.as_bytes())
+    {
         Ok(()) => source_result(collection, &path),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             failed(Diagnostic::error(
@@ -78,15 +76,21 @@ pub(super) fn update(collection: &Collection, input: &Value) -> OperationResult 
     if let Err(diagnostics) = validate_document(collection, &path, document, true) {
         return failed_many(diagnostics);
     }
-    let full_path = collection.root.join(&path);
-    if let Err(error) = ensure_revision(
-        &full_path,
+    let current = match collection.held_root().read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => return failed(io_diagnostic(&path, error)),
+    };
+    if let Err(error) = ensure_revision_bytes(
+        &current,
         &path,
         input.get("if_revision").and_then(Value::as_str),
     ) {
         return legacy_failure(error, &path);
     }
-    match atomic_write(&full_path, document.as_bytes()) {
+    match collection
+        .held_root()
+        .atomic_write(Path::new(&path), document.as_bytes())
+    {
         Ok(()) => source_result(collection, &path),
         Err(error) => failed(io_diagnostic(&path, error)),
     }
@@ -104,21 +108,18 @@ pub(super) fn delete(collection: &Collection, input: &Value) -> OperationResult 
     if let Err(diagnostic) = validate_existing_path(collection, &path) {
         return failed(*diagnostic);
     }
-    let full_path = collection.root.join(&path);
-    if let Err(error) = ensure_revision(
-        &full_path,
+    let current = match collection.held_root().read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => return failed(io_diagnostic(&path, error)),
+    };
+    if let Err(error) = ensure_revision_bytes(
+        &current,
         &path,
         input.get("if_revision").and_then(Value::as_str),
     ) {
         return legacy_failure(error, &path);
     }
-    match fs::remove_file(&full_path).and_then(|()| {
-        full_path
-            .parent()
-            .map(sync_directory)
-            .transpose()
-            .map(|_| ())
-    }) {
+    match collection.held_root().remove_file(Path::new(&path)) {
         Ok(()) => OperationResult {
             valid: true,
             result: json!({ "path": path, "deleted": true }),
@@ -221,21 +222,18 @@ fn slug(value: &str) -> String {
 }
 
 fn validate_existing_path(collection: &Collection, path: &str) -> DiagnosticResult<()> {
-    if !collection.root.join(path).is_file() {
-        return Err(Box::new(Diagnostic::error(
-            "view_not_found",
-            format!("Saved-view source '{path}' does not exist."),
-            Some(path.to_string()),
-        )));
-    }
-    validate_document(
-        collection,
-        path,
-        &fs::read_to_string(collection.root.join(path))
-            .map_err(|error| io_diagnostic(path, error))?,
-        true,
-    )
-    .map_err(|diagnostics| {
+    let document = collection.held_root().read_string(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Diagnostic::error(
+                "view_not_found",
+                format!("Saved-view source '{path}' does not exist."),
+                Some(path.to_string()),
+            )
+        } else {
+            io_diagnostic(path, error)
+        }
+    })?;
+    validate_document(collection, path, &document, true).map_err(|diagnostics| {
         Box::new(diagnostics.into_iter().next().unwrap_or_else(|| {
             Diagnostic::error(
                 "invalid_view",
@@ -256,12 +254,10 @@ fn validate_safe_path(collection: &Collection, path: &str) -> DiagnosticResult<S
     })?;
     ensure_safe_relative_path(normalized.as_str(), collection.spec_profile)
         .map_err(|error| Box::new(legacy_diagnostic(error, path)))?;
-    ensure_no_symlink_components(
-        &collection.root,
-        normalized.as_str(),
-        collection.spec_profile,
-    )
-    .map_err(|error| Box::new(legacy_diagnostic(error, path)))?;
+    collection
+        .held_root()
+        .ensure_no_symlink_components(Path::new(normalized.as_str()))
+        .map_err(|error| Box::new(io_diagnostic(path, error)))?;
     match Path::new(normalized.as_str())
         .extension()
         .and_then(|value| value.to_str())
@@ -301,7 +297,9 @@ fn validate_document(
             }),
         Some("md") => {
             if require_existing_kind {
-                let current = fs::read_to_string(collection.root.join(path))
+                let current = collection
+                    .held_root()
+                    .read_string(path)
                     .map_err(|error| vec![io_diagnostic(path, error)])?;
                 validate_canonical_document(path, &current)?;
             }
@@ -342,7 +340,7 @@ fn validate_canonical_document(path: &str, document: &str) -> Result<(), Vec<Dia
 }
 
 fn source_result(collection: &Collection, path: &str) -> OperationResult {
-    let bytes = match fs::read(collection.root.join(path)) {
+    let bytes = match collection.held_root().read(path) {
         Ok(bytes) => bytes,
         Err(error) => return failed(io_diagnostic(path, error)),
     };
@@ -415,6 +413,19 @@ fn legacy_diagnostic(error: Value, path: &str) -> Diagnostic {
 
 fn legacy_failure(error: Value, path: &str) -> OperationResult {
     failed(legacy_diagnostic(error, path))
+}
+
+fn ensure_revision_bytes(bytes: &[u8], path: &str, expected: Option<&str>) -> Result<(), Value> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if v03::revision(bytes) != expected {
+        return Err(crate::errors::op_error(
+            crate::errors::CONCURRENT_MODIFICATION,
+            &format!("File '{path}' was modified externally"),
+        ));
+    }
+    Ok(())
 }
 
 fn failed(diagnostic: Diagnostic) -> OperationResult {

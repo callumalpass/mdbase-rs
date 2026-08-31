@@ -81,17 +81,17 @@ use crate::types::compiled::CompiledComputed;
 use crate::Collection;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 thread_local! {
     static COMPUTED_FIELD_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 pub(crate) fn reset_computed_field_evaluations_for_test() {
     COMPUTED_FIELD_EVALUATIONS.with(|value| value.set(0));
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 pub(crate) fn computed_field_evaluations_for_test() -> usize {
     COMPUTED_FIELD_EVALUATIONS.with(std::cell::Cell::get)
 }
@@ -105,7 +105,7 @@ impl Collection {
         path: &str,
         body: Option<&str>,
     ) -> serde_json::Value {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-collection-mutation"))]
         COMPUTED_FIELD_EVALUATIONS.with(|value| value.set(value.get() + 1));
         let mut ordered_types = type_names.to_vec();
         ordered_types.sort();

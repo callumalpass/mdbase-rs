@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-collection-mutation")]
+
 use std::fs;
 use std::path::Path;
 
@@ -506,7 +508,7 @@ fn delete_dry_run_reports_backlinks_without_removing_the_file() {
 }
 
 #[test]
-fn query_types_works_when_cache_file_types_rows_are_missing() {
+fn query_types_works_after_identity_bound_cache_rebuild() {
     let tmp = TempDir::new().expect("tempdir");
     write_file(
         &tmp.path().join("mdbase.yaml"),
@@ -521,12 +523,6 @@ fn query_types_works_when_cache_file_types_rows_are_missing() {
     let collection = open_collection(tmp.path());
     let rebuild = collection.cache_rebuild();
     assert_eq!(rebuild.get("success").and_then(|v| v.as_bool()), Some(true));
-
-    // Simulate an old/partial cache: files row exists but file_types rows are missing.
-    let db_path = tmp.path().join(".mdbase").join("cache.db");
-    let conn = rusqlite::Connection::open(&db_path).expect("open cache db");
-    conn.execute("DELETE FROM file_types", [])
-        .expect("clear file_types rows");
 
     let result = collection.query(&serde_json::json!({
         "query": {

@@ -1,9 +1,16 @@
 use std::path::PathBuf;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 use std::path::Path;
 
+use crate::runtime::{OperationContext, ProviderError};
 use crate::{Collection, OperationCancellation};
+
+struct ScanState<'a> {
+    records_only: bool,
+    context: Option<&'a OperationContext>,
+    discovered: u64,
+}
 
 impl Collection {
     /// Scan all Markdown files in the collection.
@@ -13,7 +20,15 @@ impl Collection {
     pub(crate) fn scan_collection_files_checked(
         &self,
     ) -> Result<Vec<PathBuf>, crate::snapshot::CollectionScanError> {
-        self.scan_collection_files_checked_cancellable(&OperationCancellation::new())
+        let context = OperationContext::current_or_legacy();
+        self.scan_collection_files_checked_cancellable(context.cancellation())
+    }
+
+    pub(crate) fn scan_collection_relative_paths_checked(
+        &self,
+    ) -> Result<Vec<String>, crate::snapshot::CollectionScanError> {
+        let context = OperationContext::current_or_legacy();
+        self.scan_collection_relative_paths_checked_cancellable(context.cancellation())
     }
 
     pub(crate) fn scan_collection_files_checked_cancellable(
@@ -28,14 +43,39 @@ impl Collection {
         &self,
         cancellation: &OperationCancellation,
     ) -> Result<Vec<String>, crate::snapshot::CollectionScanError> {
+        if let Some(context) = OperationContext::current() {
+            return self
+                .scan_collection_relative_paths_mode_context(&context, true)
+                .map_err(crate::snapshot::CollectionScanError::Provider);
+        }
         self.scan_collection_relative_paths_mode(cancellation, true)
     }
 
+    #[allow(dead_code)] // retained by the explicit-token compatibility capture
     pub(crate) fn scan_collection_all_relative_paths_checked_cancellable(
         &self,
         cancellation: &OperationCancellation,
     ) -> Result<Vec<String>, crate::snapshot::CollectionScanError> {
+        if let Some(context) = OperationContext::current() {
+            return self
+                .scan_collection_relative_paths_mode_context(&context, false)
+                .map_err(crate::snapshot::CollectionScanError::Provider);
+        }
         self.scan_collection_relative_paths_mode(cancellation, false)
+    }
+
+    pub(crate) fn scan_collection_all_relative_paths_context(
+        &self,
+        context: &OperationContext,
+    ) -> Result<Vec<String>, ProviderError> {
+        self.scan_collection_relative_paths_mode_context(context, false)
+    }
+
+    pub(crate) fn scan_collection_relative_paths_context(
+        &self,
+        context: &OperationContext,
+    ) -> Result<Vec<String>, ProviderError> {
+        self.scan_collection_relative_paths_mode_context(context, true)
     }
 
     fn scan_collection_relative_paths_mode(
@@ -52,10 +92,53 @@ impl Collection {
             }
         })?;
         let mut files = Vec::new();
-        self.scan_dir_recursive_checked(&root, "", &mut files, cancellation, records_only)?;
+        let mut state = ScanState {
+            records_only,
+            context: None,
+            discovered: 0,
+        };
+        self.scan_dir_recursive_checked(&root, "", &mut files, cancellation, 0, &mut state)?;
         cancellation
             .check()
             .map_err(|_| crate::snapshot::CollectionScanError::Cancelled)?;
+        files.sort();
+        Ok(files)
+    }
+
+    fn scan_collection_relative_paths_mode_context(
+        &self,
+        context: &OperationContext,
+        records_only: bool,
+    ) -> Result<Vec<String>, ProviderError> {
+        #[cfg(test)]
+        SNAPSHOT_SCAN_CALLS.with(|calls| calls.set(calls.get() + 1));
+        context.check()?;
+        let root = self.root_capability().map_err(|error| {
+            ProviderError::CollectionOpen(format!("failed to read collection directory: {error}"))
+        })?;
+        let mut files = Vec::new();
+        let mut state = ScanState {
+            records_only,
+            context: Some(context),
+            discovered: 0,
+        };
+        self.scan_dir_recursive_checked(
+            &root,
+            "",
+            &mut files,
+            context.cancellation(),
+            0,
+            &mut state,
+        )
+        .map_err(|error| match error {
+            crate::snapshot::CollectionScanError::Provider(error) => error,
+            crate::snapshot::CollectionScanError::Cancelled => context
+                .check()
+                .err()
+                .unwrap_or(ProviderError::OperationCancelled),
+            other => ProviderError::CollectionOpen(other.to_string()),
+        })?;
+        context.check()?;
         files.sort();
         Ok(files)
     }
@@ -66,7 +149,8 @@ impl Collection {
         prefix: &str,
         files: &mut Vec<String>,
         cancellation: &OperationCancellation,
-        records_only: bool,
+        depth: u64,
+        state: &mut ScanState<'_>,
     ) -> Result<(), crate::snapshot::CollectionScanError> {
         use crate::snapshot::CollectionScanError;
         use cap_fs_ext::DirExt;
@@ -74,6 +158,11 @@ impl Collection {
         cancellation
             .check()
             .map_err(|_| CollectionScanError::Cancelled)?;
+        if let Some(context) = state.context {
+            context
+                .check_depth(depth)
+                .map_err(CollectionScanError::Provider)?;
+        }
         let display_directory = if prefix.is_empty() {
             self.root.clone()
         } else {
@@ -142,17 +231,51 @@ impl Collection {
                         });
                     }
                 }
+                let child_depth = depth.checked_add(1).ok_or({
+                    CollectionScanError::Provider(ProviderError::CaptureLimitExceeded(
+                        crate::runtime::CaptureLimitExceeded {
+                            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                            limit: u64::MAX,
+                            attempted: u64::MAX,
+                        },
+                    ))
+                })?;
                 self.scan_dir_recursive_checked(
                     &child,
                     &relative,
                     files,
                     cancellation,
-                    records_only,
+                    child_depth,
+                    state,
                 )?;
             } else if file_type.is_file()
-                && (self.validate_record_path(&relative).is_ok()
-                    || (!records_only && self.validate_file_path(&relative).is_ok()))
+                && (self.validate_record_path_after_traversal(&relative).is_ok()
+                    || (!state.records_only
+                        && self.validate_file_path_after_traversal(&relative).is_ok()))
             {
+                state.discovered = state.discovered.checked_add(1).ok_or({
+                    CollectionScanError::Provider(ProviderError::CaptureLimitExceeded(
+                        crate::runtime::CaptureLimitExceeded {
+                            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                            limit: u64::MAX,
+                            attempted: u64::MAX,
+                        },
+                    ))
+                })?;
+                if let Some(context) = state.context {
+                    context
+                        .check_entries(state.discovered)
+                        .map_err(CollectionScanError::Provider)?;
+                }
+                files.try_reserve(1).map_err(|_| {
+                    CollectionScanError::Provider(ProviderError::CaptureLimitExceeded(
+                        crate::runtime::CaptureLimitExceeded {
+                            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                            limit: usize::MAX as u64,
+                            attempted: u64::MAX,
+                        },
+                    ))
+                })?;
                 files.push(relative);
             }
         }

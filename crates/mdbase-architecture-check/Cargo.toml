@@ -8,7 +8,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+proc-macro2 = "1"
 regex = "1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+syn = { version = "2", features = ["full", "visit"] }
 walkdir = "2"

@@ -8,7 +8,11 @@ use serde_json::{json, Value};
 use crate::frontmatter::parser::{
     parse_document_layout, yaml_mapping_to_json, FrontmatterState, ParsedDocumentLayout,
 };
+use crate::runtime::{OperationContext, ProviderError};
 use crate::{Collection, OperationCancellation};
+
+/// Metadata captured from a file already opened through `CollectionRoot`.
+pub(crate) type FileMetadata = std::fs::Metadata;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvalidRecordReason {
@@ -282,7 +286,16 @@ pub(crate) fn load_record_no_follow(
     collection: &Collection,
     rel_path: &str,
 ) -> std::io::Result<Option<RecordLoadOutcome>> {
-    load_record_no_follow_cancellable(collection, rel_path, &OperationCancellation::new())
+    if let Some(context) = OperationContext::current() {
+        return load_record_no_follow_context(collection, rel_path, &context)
+            .map_err(std::io::Error::other);
+    }
+    // Intentional context-free compatibility seam.
+    load_record_no_follow_cancellable(
+        collection,
+        rel_path,
+        OperationContext::internal().cancellation(),
+    )
 }
 
 pub(crate) fn load_record_no_follow_cancellable(
@@ -294,6 +307,25 @@ pub(crate) fn load_record_no_follow_cancellable(
     SNAPSHOT_RECORD_LOADS.with(|loads| loads.set(loads.get() + 1));
     crate::operations::open_regular_record_no_follow(collection, rel_path)?
         .map(|file| load_open_record(collection, file, rel_path, cancellation))
+        .transpose()
+}
+
+/// Budgeted record load used by canonical runtime paths.
+pub(crate) fn load_record_no_follow_context(
+    collection: &Collection,
+    rel_path: &str,
+    context: &OperationContext,
+) -> Result<Option<RecordLoadOutcome>, ProviderError> {
+    #[cfg(test)]
+    SNAPSHOT_RECORD_LOADS.with(|loads| loads.set(loads.get() + 1));
+    context.check()?;
+    crate::operations::open_regular_record_no_follow(collection, rel_path)
+        .map_err(|error| {
+            ProviderError::CollectionOpen(format!(
+                "failed to open collection record '{rel_path}': {error}"
+            ))
+        })?
+        .map(|file| load_open_record_context(collection, file, rel_path, context))
         .transpose()
 }
 
@@ -317,6 +349,70 @@ fn load_open_record(
         maybe_cancel_read_for_test(cancellation);
     }
     cancellation.check().map_err(|_| cancelled_io())?;
+    finish_open_record(collection, file, rel_path, before, bytes)
+}
+
+fn load_open_record_context(
+    collection: &Collection,
+    mut file: std::fs::File,
+    rel_path: &str,
+    context: &OperationContext,
+) -> Result<RecordLoadOutcome, ProviderError> {
+    let before = file.metadata().map_err(record_provider_error(rel_path))?;
+    context.check_file_bytes(before.len())?;
+    let capacity =
+        usize::try_from(before.len()).map_err(|_| crate::runtime::CaptureLimitExceeded {
+            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+            limit: usize::MAX as u64,
+            attempted: before.len(),
+        })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|_| {
+        ProviderError::CaptureLimitExceeded(crate::runtime::CaptureLimitExceeded {
+            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+            limit: usize::MAX as u64,
+            attempted: before.len(),
+        })
+    })?;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        context.check()?;
+        let read = file
+            .read(&mut chunk)
+            .map_err(record_provider_error(rel_path))?;
+        if read == 0 {
+            break;
+        }
+        let attempted = u64::try_from(bytes.len())
+            .ok()
+            .and_then(|value| value.checked_add(read as u64))
+            .ok_or({
+                ProviderError::CaptureLimitExceeded(crate::runtime::CaptureLimitExceeded {
+                    kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                    limit: u64::MAX,
+                    attempted: u64::MAX,
+                })
+            })?;
+        context.check_file_bytes(attempted)?;
+        context.charge_read(read as u64)?;
+        context.charge_retained(read as u64)?;
+        bytes.extend_from_slice(&chunk[..read]);
+        #[cfg(test)]
+        maybe_cancel_read_for_test(context.cancellation());
+        context.check()?;
+    }
+    context.check()?;
+    finish_open_record(collection, file, rel_path, before, bytes)
+        .map_err(record_provider_error(rel_path))
+}
+
+fn finish_open_record(
+    collection: &Collection,
+    file: std::fs::File,
+    rel_path: &str,
+    before: std::fs::Metadata,
+    bytes: Vec<u8>,
+) -> std::io::Result<RecordLoadOutcome> {
     let after = file.metadata()?;
     if before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
@@ -329,6 +425,14 @@ fn load_open_record(
     }
     let facts = facts(&bytes, &after);
     Ok(classify_bytes(collection, rel_path, bytes, facts))
+}
+
+fn record_provider_error(path: &str) -> impl FnOnce(std::io::Error) -> ProviderError + '_ {
+    move |error| {
+        ProviderError::CollectionOpen(format!(
+            "failed to read collection record '{path}': {error}"
+        ))
+    }
 }
 
 fn cancelled_io() -> std::io::Error {

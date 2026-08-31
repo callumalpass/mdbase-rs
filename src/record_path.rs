@@ -38,11 +38,31 @@ impl Collection {
         &self,
         path: impl AsRef<str>,
     ) -> Result<CollectionPath, RecordPathError> {
+        self.validate_record_path_mode(path, true)
+    }
+
+    pub(crate) fn validate_record_path_after_traversal(
+        &self,
+        path: impl AsRef<str>,
+    ) -> Result<CollectionPath, RecordPathError> {
+        self.validate_record_path_mode(path, false)
+    }
+
+    fn validate_record_path_mode(
+        &self,
+        path: impl AsRef<str>,
+        check_nested: bool,
+    ) -> Result<CollectionPath, RecordPathError> {
         let path = CollectionPath::new(path)?;
         if has_hidden_component(path.as_str()) {
             return Err(RecordPathError::HiddenComponent);
         }
-        if self.is_excluded(path.as_str()) {
+        let excluded = if check_nested {
+            self.is_excluded(path.as_str())
+        } else {
+            self.is_excluded_without_nested_collection(path.as_str())
+        };
+        if excluded {
             return Err(RecordPathError::Reserved);
         }
         if !self.is_valid_extension(path.as_str()) {

@@ -25,8 +25,8 @@ pub(crate) enum CacheError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Scan(#[from] crate::snapshot::CollectionScanError),
-    #[error("collection path is outside the configured root: {0}")]
-    OutsideRoot(String),
+    #[error("relationship resolution failed: {0}")]
+    Resolution(String),
     #[error("collection operation cancelled")]
     Cancelled,
 }
@@ -39,16 +39,21 @@ impl Collection {
     /// command reports failure instead of claiming that an incomplete index is
     /// healthy.
     pub fn cache_rebuild(&self) -> serde_json::Value {
+        #[cfg(test)]
+        run_cache_access_hook(&self.root);
         let result = sqlite::lock_cache_lifecycle_exclusive(
-            &self.root,
+            self.held_root().cache_storage_path(),
             &self.settings.cache_folder,
             Duration::from_secs(1),
         )
         .map_err(CacheError::from)
         .and_then(|_lifecycle| {
-            sqlite::open_cache_db(&self.root, &self.settings.cache_folder)
-                .map_err(CacheError::from)
-                .and_then(|mut connection| indexer::reindex_all(&mut connection, self))
+            sqlite::open_cache_db(
+                self.held_root().cache_storage_path(),
+                &self.settings.cache_folder,
+            )
+            .map_err(CacheError::from)
+            .and_then(|mut connection| indexer::reindex_all(&mut connection, self))
         });
         match result {
             Ok(()) => serde_json::json!({ "success": true }),
@@ -65,9 +70,14 @@ impl Collection {
     /// Clear the cache (S13.3.5, S13.8).
     /// Removes the SQLite database file from disk.
     pub fn cache_clear(&self) -> serde_json::Value {
-        let cache_root = self.root.join(&self.settings.cache_folder);
+        #[cfg(test)]
+        run_cache_access_hook(&self.root);
+        let cache_root = self
+            .held_root()
+            .cache_storage_path()
+            .join(&self.settings.cache_folder);
         let _lifecycle = match sqlite::lock_cache_lifecycle_exclusive(
-            &self.root,
+            self.held_root().cache_storage_path(),
             &self.settings.cache_folder,
             Duration::from_secs(1),
         ) {
@@ -102,6 +112,32 @@ impl Collection {
             }
         }
         serde_json::json!({ "success": true })
+    }
+}
+
+#[cfg(test)]
+type CacheAccessHooks = std::collections::BTreeMap<std::path::PathBuf, Box<dyn FnOnce() + Send>>;
+
+#[cfg(test)]
+fn cache_access_hooks() -> &'static std::sync::Mutex<CacheAccessHooks> {
+    static HOOKS: std::sync::OnceLock<std::sync::Mutex<CacheAccessHooks>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
+pub(crate) fn set_cache_access_hook(root: &std::path::Path, hook: impl FnOnce() + Send + 'static) {
+    cache_access_hooks()
+        .lock()
+        .unwrap()
+        .insert(root.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_cache_access_hook(root: &std::path::Path) {
+    let hook = cache_access_hooks().lock().unwrap().remove(root);
+    if let Some(hook) = hook {
+        hook();
     }
 }
 

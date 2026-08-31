@@ -6,7 +6,6 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use walkdir::WalkDir;
 
 use crate::api::{
     Diagnostic, DiagnosticCode, MdbaseError, MdbaseResult, ReadRequest, Revision, Severity,
@@ -97,7 +96,7 @@ pub(crate) fn migrate(
         )
         .collect::<BTreeSet<_>>();
     for path in changed_paths {
-        match fs::read(collection.root.join(&path)) {
+        match collection.held_root().read(&path) {
             Ok(bytes) => {
                 baseline.insert(path, bytes);
             }
@@ -145,7 +144,19 @@ fn canonical_config(
     collection: &Collection,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> MdbaseResult<Vec<u8>> {
-    let original = read_yaml_json(&collection.root.join("mdbase.yaml"), "mdbase.yaml")?;
+    let original = read_yaml_json_bytes(
+        &collection
+            .held_root()
+            .read("mdbase.yaml")
+            .map_err(|error| {
+                operation_error(
+                    "migration_plan_failed",
+                    &format!("Could not read legacy YAML: {error}"),
+                    Some("mdbase.yaml"),
+                )
+            })?,
+        "mdbase.yaml",
+    )?;
     let mut record_extensions = vec![Value::String("md".to_string())];
     record_extensions.extend(
         collection
@@ -565,7 +576,7 @@ fn verify_equivalent_reads(collection: &Collection, desired: &FileBaseline) -> M
         )
     })?;
     copy_for_verification(
-        &collection.root,
+        collection,
         temporary.path(),
         &collection.settings.types_folder,
     )?;
@@ -598,7 +609,7 @@ fn verify_equivalent_reads(collection: &Collection, desired: &FileBaseline) -> M
     let legacy_api = collection.typed()?;
     let canonical_api = canonical.typed()?;
     let paths = collection
-        .scan_collection_files_checked()
+        .scan_collection_relative_paths_checked()
         .map_err(|error| {
             operation_error(
                 "migration_verification_failed",
@@ -606,13 +617,8 @@ fn verify_equivalent_reads(collection: &Collection, desired: &FileBaseline) -> M
                 None,
             )
         })?;
-    for absolute in &paths {
-        let path = absolute
-            .strip_prefix(&collection.root)
-            .expect("scanner only returns paths below the collection root")
-            .to_string_lossy()
-            .replace('\\', "/");
-        let request = ReadRequest::new(&path)?;
+    for path in &paths {
+        let request = ReadRequest::new(path)?;
         let legacy = legacy_api.read(request.clone())?.value;
         let canonical = canonical_api.read(request)?.value;
         if legacy.frontmatter != canonical.frontmatter
@@ -623,72 +629,60 @@ fn verify_equivalent_reads(collection: &Collection, desired: &FileBaseline) -> M
             return Err(operation_error(
                 "migration_verification_failed",
                 "Canonical read does not match the v0.2 compatibility read.",
-                Some(&path),
+                Some(path),
             ));
         }
     }
     Ok(paths.len())
 }
 
-fn copy_for_verification(source: &Path, target: &Path, types_folder: &str) -> MdbaseResult<()> {
-    for entry in WalkDir::new(source).sort_by_file_name() {
-        let entry = entry.map_err(|error| {
+fn copy_for_verification(
+    collection: &Collection,
+    target: &Path,
+    types_folder: &str,
+) -> MdbaseResult<()> {
+    let paths = collection
+        .held_root()
+        .files_recursive(Path::new(""))
+        .map_err(|error| {
             operation_error(
                 "migration_verification_failed",
                 &format!("Could not inspect the source collection: {error}"),
                 None,
             )
         })?;
-        let relative = entry
-            .path()
-            .strip_prefix(source)
-            .expect("walkdir entry is below its root");
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
+    for relative in paths {
         let logical = relative.to_string_lossy().replace('\\', "/");
-        if logical == ".mdbase"
-            || logical.starts_with(".mdbase/")
-            || logical == types_folder
+        if logical.starts_with(".mdbase/")
             || logical.starts_with(&format!("{types_folder}/"))
             || logical == "mdbase.yaml"
         {
             continue;
         }
-        if entry.file_type().is_symlink() {
-            return Err(operation_error(
-                "migration_verification_failed",
-                "Symbolic links cannot be copied into the isolated verifier.",
-                Some(&logical),
-            ));
-        }
-        let destination = target.join(relative);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&destination).map_err(|error| {
+        let destination = target.join(&relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
                 operation_error(
                     "migration_verification_failed",
                     &format!("Could not prepare the verifier: {error}"),
                     Some(&logical),
                 )
             })?;
-        } else if entry.file_type().is_file() {
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent).map_err(|error| {
-                    operation_error(
-                        "migration_verification_failed",
-                        &format!("Could not prepare the verifier: {error}"),
-                        Some(&logical),
-                    )
-                })?;
-            }
-            fs::copy(entry.path(), &destination).map_err(|error| {
-                operation_error(
-                    "migration_verification_failed",
-                    &format!("Could not copy a record for verification: {error}"),
-                    Some(&logical),
-                )
-            })?;
         }
+        let bytes = collection.held_root().read(&relative).map_err(|error| {
+            operation_error(
+                "migration_verification_failed",
+                &format!("Could not copy a record for verification: {error}"),
+                Some(&logical),
+            )
+        })?;
+        fs::write(&destination, bytes).map_err(|error| {
+            operation_error(
+                "migration_verification_failed",
+                &format!("Could not copy a record for verification: {error}"),
+                Some(&logical),
+            )
+        })?;
     }
     Ok(())
 }
@@ -744,15 +738,8 @@ fn yaml_bytes(value: &Value, frontmatter: bool) -> MdbaseResult<Vec<u8>> {
     })
 }
 
-fn read_yaml_json(path: &Path, label: &str) -> MdbaseResult<Value> {
-    let bytes = fs::read(path).map_err(|error| {
-        operation_error(
-            "migration_plan_failed",
-            &format!("Could not read legacy YAML: {error}"),
-            Some(label),
-        )
-    })?;
-    let yaml: serde_yaml::Value = serde_yaml::from_slice(&bytes).map_err(|error| {
+fn read_yaml_json_bytes(bytes: &[u8], label: &str) -> MdbaseResult<Value> {
+    let yaml: serde_yaml::Value = serde_yaml::from_slice(bytes).map_err(|error| {
         operation_error(
             "migration_plan_failed",
             &format!("Could not parse legacy YAML: {error}"),

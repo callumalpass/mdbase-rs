@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-collection-mutation")]
+
 //! Conformance test runner for mdbase.
 //!
 //! Reads YAML test files from ~/projects/mdbase-spec/tests/ and executes
@@ -1304,7 +1306,7 @@ fn execute_operation(
                 let all_files = collection
                     .build_all_files_data()
                     .expect("collection snapshot");
-                let backlinks_index = collection.build_backlinks_index(&all_files);
+                let backlinks_index = collection.build_backlinks_index(&all_files).unwrap();
                 let all_files_arc = std::sync::Arc::new(all_files);
                 let backlinks_arc = std::sync::Arc::new(backlinks_index);
                 let types_arc = std::sync::Arc::new(collection.types().clone());

@@ -1,7 +1,11 @@
 //! Create operation (§12.1).
 
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::api::operations::{CreateInput, CreateOutput};
-use crate::api::{CollectionPath, CreateRequest, Revision};
+#[cfg(feature = "legacy-collection-mutation")]
+use crate::api::CreateRequest;
+#[cfg(feature = "legacy-collection-mutation")]
+use crate::api::{CollectionPath, Revision};
 use crate::errors::*;
 use crate::frontmatter;
 use crate::frontmatter::serializer;
@@ -9,14 +13,14 @@ use crate::generated::derive_path;
 use crate::matching::engine::matches_rules_checked_compiled;
 use crate::mutation::{PlannedRecord, PreparedCreate};
 use crate::operations::{
-    atomic_create, ensure_no_symlink_components_diagnostic, ensure_safe_relative_path_diagnostic,
+    ensure_no_symlink_components_held_diagnostic, ensure_safe_relative_path_diagnostic,
     mutation_record_path_diagnostic,
 };
 use crate::Collection;
 
 impl Collection {
-    /// Create a file (§12.1).
-    pub fn create(&self, input: &serde_json::Value) -> serde_json::Value {
+    #[cfg(feature = "legacy-collection-mutation")]
+    pub(crate) fn create_legacy(&self, input: &serde_json::Value) -> serde_json::Value {
         let parsed = CreateInput::parse(input);
         let request = CreateRequest {
             path: parsed
@@ -148,7 +152,7 @@ impl Collection {
             })
         });
         let operation_snapshot = if has_generated || self.settings.default_validation == "error" {
-            match self.capture_collection_snapshot(&crate::OperationCancellation::new()) {
+            match self.capture_collection_snapshot_current() {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) => {
                     return Err(crate::mutation::MutationFailure::operation(
@@ -250,9 +254,7 @@ impl Collection {
             Ok(path) => path,
             Err(error) => return Err(crate::mutation::MutationFailure::diagnostic(error)),
         };
-        if let Err(error) =
-            ensure_no_symlink_components_diagnostic(&self.root, path.as_str(), self.spec_profile)
-        {
+        if let Err(error) = ensure_no_symlink_components_held_diagnostic(self, path.as_str()) {
             return Err(crate::mutation::MutationFailure::diagnostic(error));
         }
         let _write_lock = match crate::transactions::WriteLock::acquire(self) {
@@ -265,9 +267,13 @@ impl Collection {
             }
         };
 
-        // Check existence
-        let full_path = path.under(&self.root);
-        if full_path.exists() {
+        // Check existence through the held collection capability. An inspection
+        // failure is treated as occupied so creation cannot bypass the boundary.
+        if self
+            .held_root()
+            .entry_exists(&path.to_path_buf())
+            .unwrap_or(true)
+        {
             return Err(crate::mutation::MutationFailure::operation(
                 PATH_CONFLICT,
                 format!("File already exists: {}", path.as_str()),
@@ -450,12 +456,10 @@ impl Collection {
             }
         };
 
-        if let Err(error) =
-            ensure_no_symlink_components_diagnostic(&self.root, path.as_str(), self.spec_profile)
+        if let Err(e) = self
+            .held_root()
+            .atomic_create(&path.to_path_buf(), content.as_bytes())
         {
-            return Err(crate::mutation::MutationFailure::diagnostic(error));
-        }
-        if let Err(e) = atomic_create(&full_path, content.as_bytes()) {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 return Err(crate::mutation::MutationFailure::operation(
                     PATH_CONFLICT,
@@ -493,6 +497,7 @@ impl Collection {
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn mutation_failure_json(failure: crate::mutation::MutationFailure) -> serde_json::Value {
     match failure.kind {
         crate::mutation::MutationFailureKind::Operation if failure.diagnostics.len() == 1 => {
@@ -506,6 +511,7 @@ fn mutation_failure_json(failure: crate::mutation::MutationFailure) -> serde_jso
     }
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn planned_create_output(planned: PlannedRecord) -> serde_json::Value {
     CreateOutput {
         path: planned.path.to_string(),

@@ -21,8 +21,9 @@ pub(crate) fn execute_profiled(
     collection: &Collection,
     input: &Value,
 ) -> (OperationResult, QueryPerformance) {
-    execute_wire_profiled_cancellable(collection, input, &OperationCancellation::new(), false)
-        .expect("a fresh cancellation token cannot be cancelled")
+    let context = crate::runtime::OperationContext::internal();
+    execute_wire_profiled_cancellable(collection, input, context.cancellation(), false)
+        .expect("the context-free compatibility context is active")
 }
 
 pub(crate) fn execute_cancellable(

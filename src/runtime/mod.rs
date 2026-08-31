@@ -40,17 +40,21 @@ pub use benchmark::{
     BenchmarkDiagnostic, BenchmarkFileFacts, BenchmarkProjection, CandidateExpression,
     CandidateTruth, CompiledCandidate, ProjectionRelationship, QueryRequirements,
 };
+pub(crate) use canonical_operation::LegacyRecoveredV03Value;
 pub use canonical_operation::{
     CanonicalCollectionSetupAppliedValue, CanonicalCollectionSetupConflictValue,
-    CanonicalCollectionSetupValue, CanonicalDeleteValue, CanonicalOperationOutcome,
-    CanonicalOperationValue, CanonicalQueryValue, CanonicalRenamePreflightValue,
-    CanonicalRenameValue, CanonicalTypePackValue, DefinitionResultExtensions,
-    WireOnlyOperationValue,
+    CanonicalCollectionSetupValue, CanonicalDeleteValue, CanonicalOperationFamily,
+    CanonicalOperationOutcome, CanonicalOperationValue, CanonicalOutcomeState, CanonicalQueryValue,
+    CanonicalRenamePreflightValue, CanonicalRenameValue, CanonicalResourceOperationValue,
+    CanonicalTypePackValue, DefinitionResultExtensions,
 };
 pub use catalog::{
     CanonicalRecordInput, CatalogError, CatalogInput, CompiledCatalog, ResolvedTypeResource,
 };
-pub use context::{OperationContext, OperationDeadline};
+pub use context::{
+    CaptureLimitExceeded, CaptureLimitKind, CaptureLimits, CaptureLimitsBuilder, OperationContext,
+    OperationDeadline,
+};
 pub use filesystem::FilesystemRuntime;
 pub use hosted_base::{
     HostedBaseEvaluation, HostedBaseGroupAccumulator, HostedBasePlan, HostedBasePlanning,
@@ -92,9 +96,10 @@ pub use outcome::{
     ChangeFeedOwnerId, ChangeFeedTransfer, ChangeFeedTransferId, ChangeFeedTransferIntent,
     ChangeFeedTransferReceipt, ChangeOrigin, ChangePage, ChangePageCursor, ChangeSet,
     ChangeWatermark, CollectionGeneration, CommitAttempt, CommitId, CommitRejection,
-    DurableCommitState, ExecutionOutcome, HostClaimId, PreparationOutcome, PreparedMutation,
-    ReadCursor, ReadPage, RebuildReason, RecordChange, RecordChangeKind, ResourceChange,
-    ResourceChangeKind, RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeMeasurements,
+    CursorReleaseOutcome, DurableCommitState, ExecutionOutcome, HostClaimId,
+    LegacyJournalInventory, PreparationOutcome, PreparedMutation, ReadCursor, ReadPage,
+    RebuildReason, RecordChange, RecordChangeKind, ResourceChange, ResourceChangeKind,
+    RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeMeasurements,
 };
 pub use projection::{
     PreparedSemanticProjection, RecordResolutionKey, RecordResolutionKeyKind, SemanticFileFacts,
@@ -106,8 +111,9 @@ pub(crate) use record_resolution::{
     select_resolution_candidate, RankedResolution, RankedResolutionCandidate,
 };
 pub use record_resolution::{
-    OccurrenceResolutionLookup, RecordResolutionPlan, ResolutionCandidate, ResolutionLookupKey,
-    ResolvedRecordStructure, ResolvedStructuralOccurrence, MAX_RESOLUTION_CANDIDATES,
+    OccurrenceResolutionLookup, RecordResolutionPlan, ResolutionCandidate,
+    ResolutionCandidateIdentity, ResolutionLookupKey, ResolutionReason, ResolvedRecordStructure,
+    ResolvedStructuralOccurrence, MAX_RESOLUTION_ALTERNATIVES, MAX_RESOLUTION_CANDIDATES,
     MAX_RESOLUTION_LOOKUPS, MAX_STRUCTURAL_OCCURRENCES,
 };
 pub use record_structure::{
@@ -136,6 +142,8 @@ pub enum ProviderError {
     OperationCancelled,
     #[error("collection operation deadline elapsed before its durable boundary")]
     OperationDeadline,
+    #[error(transparent)]
+    CaptureLimitExceeded(#[from] CaptureLimitExceeded),
     #[error("collection generation sequence is exhausted")]
     GenerationExhausted,
     #[error("collection change watermark is exhausted")]
@@ -180,6 +188,7 @@ impl ProviderError {
             Self::LockPoisoned => "operation_lock_unavailable",
             Self::OperationCancelled => "operation_cancelled",
             Self::OperationDeadline => "operation_deadline",
+            Self::CaptureLimitExceeded(_) => "capture_limit_exceeded",
             Self::GenerationExhausted => "generation_exhausted",
             Self::WatermarkExhausted => "change_watermark_exhausted",
             Self::InvalidChangeSet(_) => "invalid_change_set",

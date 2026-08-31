@@ -503,10 +503,11 @@ impl Collection {
             {
                 return error;
             }
-            if let Err(error) =
-                crate::operations::ensure_no_symlink_components(&self.root, path, self.spec_profile)
+            if let Err(error) = self
+                .held_root()
+                .ensure_no_symlink_components(std::path::Path::new(path))
             {
-                return error;
+                return crate::errors::op_error(PATH_TRAVERSAL, &error.to_string());
             }
             if input.get("frontmatter").is_none() {
                 let root = match self.root_capability() {
@@ -532,9 +533,7 @@ impl Collection {
             }
         }
 
-        let collection_snapshot = match self
-            .capture_collection_snapshot(&crate::OperationCancellation::new())
-        {
+        let collection_snapshot = match self.capture_collection_snapshot_current() {
             Ok(snapshot) => snapshot,
             Err(error)
                 if path

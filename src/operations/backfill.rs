@@ -40,6 +40,37 @@ fn invalid_record_detail(
     })
 }
 
+#[cfg(test)]
+type PlanningHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+fn planning_hooks(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, PlanningHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, PlanningHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn inject_planning_hook(root: &std::path::Path, hook: impl FnOnce() + Send + 'static) {
+    planning_hooks()
+        .lock()
+        .expect("backfill planning hook lock")
+        .insert(root.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_planning_hook(root: &std::path::Path) {
+    let hook = planning_hooks()
+        .lock()
+        .expect("backfill planning hook lock")
+        .remove(root);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 struct BackfillPlan {
     path: String,
     expected_revision: String,
@@ -49,7 +80,7 @@ struct BackfillPlan {
     changed_fields: Vec<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 fn injected_backfill_replacements(
 ) -> &'static std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>> {
     static REPLACEMENTS: std::sync::OnceLock<
@@ -58,7 +89,7 @@ fn injected_backfill_replacements(
     REPLACEMENTS.get_or_init(Default::default)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 pub(crate) fn inject_backfill_replacement(path: &std::path::Path, replacement: std::path::PathBuf) {
     injected_backfill_replacements()
         .lock()
@@ -66,7 +97,7 @@ pub(crate) fn inject_backfill_replacement(path: &std::path::Path, replacement: s
         .insert(path.to_path_buf(), replacement);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 fn apply_injected_backfill_replacement(path: &std::path::Path) {
     if let Some(replacement) = injected_backfill_replacements()
         .lock()
@@ -78,8 +109,19 @@ fn apply_injected_backfill_replacement(path: &std::path::Path) {
 }
 
 impl Collection {
-    /// Backfill missing defaults/generated values across files (§12.8).
-    pub fn backfill(&self, input: &serde_json::Value) -> serde_json::Value {
+    pub(crate) fn backfill_legacy(&self, input: &serde_json::Value) -> serde_json::Value {
+        self.backfill_contextual(input, None, &mut Vec::new())
+    }
+
+    fn backfill_contextual(
+        &self,
+        input: &serde_json::Value,
+        context: Option<&crate::runtime::OperationContext>,
+        typed_diagnostics: &mut Vec<crate::api::Diagnostic>,
+    ) -> serde_json::Value {
+        if let Some(error) = context.and_then(|context| context.check().err()) {
+            return op_error(error.code(), &error.to_string());
+        }
         let type_filter = input.get("type").and_then(|v| v.as_str());
         let where_clause = input.get("where");
         let dry_run = input
@@ -113,8 +155,7 @@ impl Collection {
             .map(|t| vec![t.to_lowercase()])
             .unwrap_or_default();
 
-        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
-        {
+        let snapshot = match self.capture_collection_snapshot_current() {
             Ok(snapshot) => snapshot,
             Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
         };
@@ -144,6 +185,11 @@ impl Collection {
         let mut generated = crate::generated::GeneratedValueContext::from_snapshot(self, &snapshot);
 
         for path in &matching_paths {
+            #[cfg(test)]
+            run_planning_hook(self.root());
+            if let Some(error) = context.and_then(|context| context.check().err()) {
+                return op_error(error.code(), &error.to_string());
+            }
             let Some(entry) = snapshot.entry(path) else {
                 return op_error(
                     "collection_snapshot_failed",
@@ -207,22 +253,30 @@ impl Collection {
             if apply_defaults {
                 for type_name in &type_names {
                     if let Some(type_def) = self.types.get(type_name) {
-                        for (field_name, field_def) in &type_def.fields {
-                            if field_def.default.is_none() {
+                        let defaults =
+                            type_def
+                                .read_defaults
+                                .iter()
+                                .map(|(field_name, value)| (field_name.clone(), value.clone()))
+                                .chain(type_def.fields.iter().filter_map(
+                                    |(field_name, field_def)| {
+                                        field_def
+                                            .default
+                                            .clone()
+                                            .map(|value| (field_name.clone(), value))
+                                    },
+                                ));
+                        for (field_name, value) in defaults {
+                            if fields_filter
+                                .as_ref()
+                                .is_some_and(|filter| !filter.contains(&field_name))
+                                || working.contains_key(&field_name)
+                            {
                                 continue;
                             }
-                            if let Some(ref filter) = fields_filter {
-                                if !filter.contains(field_name) {
-                                    continue;
-                                }
-                            }
-                            if working.contains_key(field_name) {
-                                continue;
-                            }
-                            let val = field_def.default.clone().unwrap();
-                            working.insert(field_name.clone(), val.clone());
-                            changes.insert(field_name.clone(), val);
-                            change_kinds.insert(field_name.clone(), ChangeKind::Default);
+                            working.insert(field_name.clone(), value.clone());
+                            changes.insert(field_name.clone(), value);
+                            change_kinds.insert(field_name, ChangeKind::Default);
                         }
                     }
                 }
@@ -251,6 +305,7 @@ impl Collection {
             let mut write_obj = raw_obj.clone();
             for (field, value) in &changes {
                 if change_kinds.get(field) == Some(&ChangeKind::Default)
+                    && self.spec_profile() == crate::SpecProfile::V02
                     && !self.settings.write_defaults
                 {
                     continue;
@@ -367,10 +422,60 @@ impl Collection {
         let mut succeeded = noop_success;
         let mut failed = planning_failed;
 
+        if let Some(context) = context {
+            if !plans.is_empty() {
+                let operations = plans
+                    .iter()
+                    .map(|plan| {
+                        let mut request = crate::api::UpdateRequest::replace_document(
+                            crate::api::CollectionPath::new(&plan.path)
+                                .expect("snapshot paths are canonical collection paths"),
+                            plan.output.clone(),
+                        );
+                        request.if_revision = Some(
+                            crate::api::Revision::parse(plan.expected_revision.clone())
+                                .expect("snapshot revisions are opaque non-empty tokens"),
+                        );
+                        crate::api::BatchOperation::Update(request)
+                    })
+                    .collect::<Vec<_>>();
+                let request = crate::api::BatchRequest {
+                    operations,
+                    allow_partial: false,
+                    dry_run: false,
+                };
+                match crate::mutation::batch_with_context(self, request, context) {
+                    Ok(outcome) => typed_diagnostics.extend(outcome.diagnostics),
+                    Err(error) => {
+                        if let Some(diagnostic) = error.diagnostics().first() {
+                            return op_error(diagnostic.code.as_str(), &diagnostic.message);
+                        }
+                        return op_error("backfill_failed", &error.to_string());
+                    }
+                }
+            }
+            succeeded += plans.len();
+            details.extend(plans.into_iter().map(|plan| {
+                serde_json::json!({
+                    "path": plan.path,
+                    "status": "success",
+                    "changed_fields": plan.changed_fields,
+                })
+            }));
+            return serde_json::json!({
+                "batch_result": {
+                    "total": total,
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "skipped": skipped,
+                    "details": details,
+                }
+            });
+        }
+
         for plan in plans {
-            let full_path = self.root.join(&plan.path);
-            #[cfg(test)]
-            apply_injected_backfill_replacement(&full_path);
+            #[cfg(all(test, feature = "legacy-collection-mutation"))]
+            apply_injected_backfill_replacement(&self.root.join(&plan.path));
             let current = match crate::record_load::load_record(self, &plan.path) {
                 Ok(current) => current,
                 Err(error) => {
@@ -398,7 +503,10 @@ impl Collection {
                 }));
                 continue;
             }
-            if let Err(e) = crate::operations::atomic_write(&full_path, plan.output.as_bytes()) {
+            if let Err(e) = self
+                .held_root()
+                .atomic_write(std::path::Path::new(&plan.path), plan.output.as_bytes())
+            {
                 failed += 1;
                 details.push(serde_json::json!({
                     "path": plan.path,
@@ -427,7 +535,239 @@ impl Collection {
     }
 }
 
+pub(crate) fn execute(
+    collection: &Collection,
+    request: crate::api::BackfillRequest,
+    context: &crate::runtime::OperationContext,
+) -> crate::api::MdbaseResult<crate::api::OperationOutcome<crate::api::BackfillResult>> {
+    if request.type_name.is_none() && request.where_expression.is_none() {
+        return Err(crate::api::MdbaseError::Operation {
+            diagnostics: vec![crate::api::Diagnostic {
+                severity: crate::api::Severity::Error,
+                code: crate::api::DiagnosticCode::new(INVALID_REQUEST),
+                message: "backfill requires 'type' or 'where'".to_string(),
+                path: None,
+                field: None,
+                type_name: None,
+                schema_location: None,
+                details: None,
+            }],
+        });
+    }
+    let mut input = serde_json::Map::new();
+    if let Some(value) = request.type_name {
+        input.insert("type".to_string(), serde_json::Value::String(value));
+    }
+    if let Some(value) = request.where_expression {
+        input.insert("where".to_string(), serde_json::Value::String(value));
+    }
+    if let Some(fields) = request.fields {
+        input.insert(
+            "fields".to_string(),
+            serde_json::Value::Array(fields.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+    if request.dry_run {
+        input.insert("dry_run".to_string(), serde_json::Value::Bool(true));
+    }
+    if request.apply_defaults.is_some() || request.apply_generated.is_some() {
+        let mut apply = serde_json::Map::new();
+        if let Some(value) = request.apply_defaults {
+            apply.insert("defaults".to_string(), serde_json::Value::Bool(value));
+        }
+        if let Some(value) = request.apply_generated {
+            apply.insert("generated".to_string(), serde_json::Value::Bool(value));
+        }
+        input.insert("apply".to_string(), serde_json::Value::Object(apply));
+    }
+
+    let input = serde_json::Value::Object(input);
+    let mut diagnostics = Vec::new();
+    let value =
+        context.scope(|| collection.backfill_contextual(&input, Some(context), &mut diagnostics));
+    if let Some(error) = value.get("error") {
+        let code = error
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("backfill_failed");
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Backfill failed.");
+        return Err(crate::api::MdbaseError::Operation {
+            diagnostics: vec![crate::api::Diagnostic {
+                severity: crate::api::Severity::Error,
+                code: crate::api::DiagnosticCode::new(code),
+                message: message.to_string(),
+                path: None,
+                field: None,
+                type_name: None,
+                schema_location: None,
+                details: Some(error.clone()),
+            }],
+        });
+    }
+    let result =
+        serde_json::from_value(value).map_err(|error| crate::api::MdbaseError::InvalidResult {
+            message: format!("could not decode typed backfill result: {error}"),
+        })?;
+    Ok(crate::api::OperationOutcome {
+        value: result,
+        diagnostics,
+    })
+}
+
 #[cfg(test)]
+mod typed_tests {
+    use super::inject_planning_hook;
+    use crate::api::BackfillRequest;
+    use crate::runtime::{OperationContext, OperationDeadline};
+    use crate::{Collection, OperationCancellation};
+    use std::fs;
+    use std::time::Duration;
+
+    fn fixture() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        fs::create_dir(root.path().join("_types")).unwrap();
+        fs::write(
+            root.path().join("_types/task.md"),
+            r#"---
+kind: mdbase.type
+name: task
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [type, title]
+    properties:
+      type: { const: task }
+      title: { type: string }
+      status: { type: string }
+collection:
+  read_defaults:
+    status: open
+---
+"#,
+        )
+        .unwrap();
+        for name in ["a", "b"] {
+            fs::write(
+                root.path().join(format!("{name}.md")),
+                format!("---\ntype: task\ntitle: {name}\n---\n{name}\n"),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    fn request() -> BackfillRequest {
+        BackfillRequest {
+            type_name: Some("task".to_string()),
+            ..BackfillRequest::default()
+        }
+    }
+
+    fn context(token: &OperationCancellation) -> OperationContext {
+        OperationContext::new(token, OperationDeadline::after(Duration::from_secs(30)))
+    }
+
+    fn assert_not_backfilled(root: &std::path::Path, name: &str) {
+        assert!(!fs::read_to_string(root.join(format!("{name}.md")))
+            .unwrap()
+            .contains("status:"));
+    }
+
+    #[test]
+    fn cancellation_during_planning_writes_nothing() {
+        let root = fixture();
+        let collection = Collection::open(root.path()).unwrap();
+        let token = OperationCancellation::new();
+        let cancel = token.clone();
+        inject_planning_hook(root.path(), move || cancel.cancel());
+
+        let error = collection
+            .typed()
+            .unwrap()
+            .backfill_with_context(request(), &context(&token))
+            .unwrap_err();
+        assert_eq!(error.diagnostics()[0].code.as_str(), "operation_cancelled");
+        assert_not_backfilled(root.path(), "a");
+        assert_not_backfilled(root.path(), "b");
+    }
+
+    #[test]
+    fn cancellation_immediately_precommit_writes_nothing() {
+        let root = fixture();
+        let collection = Collection::open(root.path()).unwrap();
+        let token = OperationCancellation::new();
+        let cancel = token.clone();
+        crate::mutation::inject_precommit_hook(root.path(), move || cancel.cancel());
+
+        let error = collection
+            .typed()
+            .unwrap()
+            .backfill_with_context(request(), &context(&token))
+            .unwrap_err();
+        assert_eq!(error.diagnostics()[0].code.as_str(), "operation_cancelled");
+        assert_not_backfilled(root.path(), "a");
+        assert_not_backfilled(root.path(), "b");
+    }
+
+    #[test]
+    fn conflict_rolls_back_every_planned_record() {
+        let root = fixture();
+        let collection = Collection::open(root.path()).unwrap();
+        let conflicted = root.path().join("a.md");
+        crate::mutation::inject_precommit_hook(root.path(), move || {
+            fs::write(&conflicted, "external\n").unwrap();
+        });
+
+        let error = collection.typed().unwrap().backfill(request()).unwrap_err();
+        assert_eq!(
+            error.diagnostics()[0].code.as_str(),
+            "concurrent_modification"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("a.md")).unwrap(),
+            "external\n"
+        );
+        assert_not_backfilled(root.path(), "b");
+    }
+
+    #[test]
+    fn interrupted_commit_recovers_the_complete_backfill() {
+        let root = fixture();
+        let collection = Collection::open(root.path()).unwrap();
+        crate::transactions::inject_commit_crash_after(root.path(), 1);
+        let error = collection.typed().unwrap().backfill(request()).unwrap_err();
+        assert_eq!(error.diagnostics()[0].code.as_str(), "simulated_crash");
+        drop(collection);
+
+        let recovered = Collection::open(root.path()).unwrap();
+        drop(recovered);
+        for name in ["a", "b"] {
+            assert!(fs::read_to_string(root.path().join(format!("{name}.md")))
+                .unwrap()
+                .contains("status:"));
+        }
+    }
+
+    #[test]
+    fn cleanup_deferred_is_returned_as_a_typed_warning() {
+        let root = fixture();
+        let collection = Collection::open(root.path()).unwrap();
+        crate::transactions::inject_cleanup_deferred(root.path());
+
+        let outcome = collection.typed().unwrap().backfill(request()).unwrap();
+        assert!(outcome.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "transaction_cleanup_deferred"
+                && diagnostic.severity == crate::api::Severity::Warning
+        }));
+    }
+}
+
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 mod tests {
     use super::inject_backfill_replacement;
     use crate::Collection;

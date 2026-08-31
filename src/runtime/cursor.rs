@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use super::{
-    CanonicalOperationOutcome, CanonicalOperationValue, ChangeSet, CollectionGeneration,
-    ExecutionOutcome, OperationContext, ProviderError, ReadCursor, ReadPage,
+    CanonicalOperationOutcome, ChangeSet, CollectionGeneration, ExecutionOutcome, OperationContext,
+    ProviderError, ReadCursor, ReadPage,
 };
 
 const MAX_ACTIVE_CURSORS: usize = 32;
@@ -53,14 +53,20 @@ impl CursorStore {
         let page_items = page_items
             .unwrap_or(DEFAULT_PAGE_ITEMS)
             .clamp(1, MAX_PAGE_ITEMS);
-        let CanonicalOperationValue::Query(Some(query)) = &mut outcome.operation.value else {
+        let Some(query) = outcome.operation.query_value_mut() else {
             return Ok(ReadPage {
                 outcome,
                 next: None,
             });
         };
         let results = std::mem::take(&mut query.records);
+        let retained_u64 = if results.is_empty() {
+            0
+        } else {
+            measured_json_bytes(&results, context.capture_limits().max_retained_bytes)?
+        };
         if results.len() <= page_items {
+            context.charge_retained(retained_u64)?;
             query.records = results;
             query.has_more = false;
             set_has_more(&mut query.meta, false);
@@ -69,23 +75,33 @@ impl CursorStore {
                 next: None,
             });
         }
-        let retained_bytes = serde_json::to_vec(&results)
-            .map_err(|error| ProviderError::Transaction {
-                code: "cursor_serialization_failed",
-                message: error.to_string(),
-            })?
-            .len();
+        let retained_bytes =
+            usize::try_from(retained_u64).map_err(|_| crate::runtime::CaptureLimitExceeded {
+                kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                limit: usize::MAX as u64,
+                attempted: retained_u64,
+            })?;
+        let store_bytes = self
+            .retained_bytes
+            .checked_add(retained_bytes)
+            .ok_or(ProviderError::CursorCapacityExhausted)?;
         if self.entries.len() >= MAX_ACTIVE_CURSORS
             || retained_bytes > MAX_CURSOR_BYTES
-            || self.retained_bytes.saturating_add(retained_bytes) > MAX_CURSOR_BYTES
+            || store_bytes > MAX_CURSOR_BYTES
         {
             return Err(ProviderError::CursorCapacityExhausted);
         }
+        // Reserve while holding the store lock, before charging the operation.
+        // A failed reservation or capacity check therefore consumes no meter.
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| ProviderError::CursorCapacityExhausted)?;
+        context.charge_retained(retained_u64)?;
         let id = uuid::Uuid::new_v4().to_string();
         let generation = outcome.generation.clone();
         let now = Instant::now();
         let template = outcome.operation.clone();
-        self.retained_bytes += retained_bytes;
+        self.retained_bytes = store_bytes;
         self.entries.insert(
             id.clone(),
             PinnedRead {
@@ -119,7 +135,7 @@ impl CursorStore {
             .saturating_add(pinned.page_items)
             .min(pinned.results.len());
         let mut operation = pinned.template.clone();
-        let CanonicalOperationValue::Query(Some(query)) = &mut operation.value else {
+        let Some(query) = operation.query_value_mut() else {
             return Err(ProviderError::Transaction {
                 code: "cursor_state_invalid",
                 message: "pinned read no longer contains a typed query".to_string(),
@@ -138,12 +154,15 @@ impl CursorStore {
         })
     }
 
-    pub(crate) fn release(&mut self, cursor: ReadCursor) -> Result<(), ProviderError> {
+    pub(crate) fn release(&mut self, cursor: ReadCursor) -> Result<bool, ProviderError> {
         let (id, _) = self.authenticate(&cursor)?;
-        if let Some(removed) = self.entries.remove(&id) {
+        let released = if let Some(removed) = self.entries.remove(&id) {
             self.retained_bytes = self.retained_bytes.saturating_sub(removed.retained_bytes);
-        }
-        Ok(())
+            true
+        } else {
+            false
+        };
+        Ok(released)
     }
 
     pub(crate) fn measurements(&mut self) -> (usize, usize) {
@@ -203,6 +222,55 @@ impl CursorStore {
     }
 }
 
+pub(crate) fn measured_json_bytes<T: serde::Serialize>(
+    value: &T,
+    limit: u64,
+) -> Result<u64, ProviderError> {
+    struct Counter {
+        bytes: u64,
+        limit: u64,
+        exceeded: Option<crate::runtime::CaptureLimitExceeded>,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let attempted = self
+                .bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("capture arithmetic overflow"))?;
+            if attempted > self.limit {
+                self.exceeded = Some(crate::runtime::CaptureLimitExceeded {
+                    kind: crate::runtime::CaptureLimitKind::RetainedBytes,
+                    limit: self.limit,
+                    attempted,
+                });
+                return Err(std::io::Error::other(
+                    "capture retained-byte limit exceeded",
+                ));
+            }
+            self.bytes = attempted;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter {
+        bytes: 0,
+        limit,
+        exceeded: None,
+    };
+    if let Err(error) = serde_json::to_writer(&mut counter, value) {
+        if let Some(exceeded) = counter.exceeded {
+            return Err(exceeded.into());
+        }
+        return Err(ProviderError::Transaction {
+            code: "cursor_serialization_failed",
+            message: error.to_string(),
+        });
+    }
+    Ok(counter.bytes)
+}
+
 fn cursor_signing_key() -> [u8; 32] {
     let mut key = [0_u8; 32];
     key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
@@ -243,5 +311,54 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 fn set_has_more(meta: &mut serde_json::Value, has_more: bool) {
     if let Some(meta) = meta.as_object_mut() {
         meta.insert("has_more".to_string(), serde_json::Value::Bool(has_more));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{ProjectedValue, QueryMetadata};
+    use crate::runtime::{CanonicalOperationValue, CanonicalQueryValue, OperationDeadline};
+    use serde_json::json;
+
+    #[test]
+    fn failed_store_capacity_does_not_consume_operation_meter() {
+        let generation = CollectionGeneration::initial();
+        let operation = CanonicalOperationOutcome {
+            valid: true,
+            value: CanonicalOperationValue::Query(Some(CanonicalQueryValue {
+                records: vec![
+                    ProjectedValue::new(json!({"id": 1})),
+                    ProjectedValue::new(json!({"id": 2})),
+                ],
+                total_count: Some(2),
+                has_more: false,
+                meta: QueryMetadata::new(json!({})),
+                embedded_diagnostics: Vec::new(),
+            })),
+            diagnostics: Vec::new(),
+        };
+        let outcome =
+            ExecutionOutcome::new(operation, generation.clone(), ChangeSet::None, None, None);
+        let records = match outcome.operation.value() {
+            CanonicalOperationValue::Query(Some(query)) => &query.records,
+            _ => unreachable!(),
+        };
+        let retained = measured_json_bytes(records, u64::MAX).unwrap();
+        let context = OperationContext::with_capture_limits(
+            &crate::OperationCancellation::new(),
+            OperationDeadline::after(Duration::from_secs(1)),
+            crate::runtime::CaptureLimits::builder()
+                .max_retained_bytes(retained)
+                .build(),
+        );
+        let mut store = CursorStore::new(generation.runtime_epoch());
+        store.retained_bytes = MAX_CURSOR_BYTES;
+
+        assert!(matches!(
+            store.open(outcome, Some(1), &context),
+            Err(ProviderError::CursorCapacityExhausted)
+        ));
+        context.charge_retained(retained).unwrap();
     }
 }

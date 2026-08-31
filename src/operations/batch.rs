@@ -1,11 +1,15 @@
 //! Batch operations (§12.7).
 
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::errors::*;
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::frontmatter::parser::yaml_mapping_to_json;
+#[cfg(feature = "legacy-collection-mutation")]
 use crate::frontmatter::serializer;
 use crate::query::engine::QueryEvalContext;
 use crate::Collection;
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn invalid_record_batch_detail(
     path: &str,
     invalid: crate::record_load::InvalidRecordView<'_>,
@@ -33,6 +37,7 @@ fn invalid_record_batch_detail(
     })
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn preflight_serialization(
     record: crate::record_load::ParsedRecordView<'_>,
     fields: &serde_json::Map<String, serde_json::Value>,
@@ -50,6 +55,7 @@ fn preflight_serialization(
     Ok(())
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 fn serialization_failure_detail(path: &str, error: &impl std::fmt::Display) -> serde_json::Value {
     serde_json::json!({
         "path": path,
@@ -69,7 +75,8 @@ fn timestamp_from_ns(value: i64) -> Option<String> {
 }
 
 impl Collection {
-    pub fn batch_update(
+    #[cfg(feature = "legacy-collection-mutation")]
+    pub(crate) fn batch_update_legacy(
         &self,
         input: &serde_json::Value,
         simulate_io_error: Option<&str>,
@@ -113,8 +120,7 @@ impl Collection {
         }
 
         // Select and preflight from one authoritative generation.
-        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
-        {
+        let snapshot = match self.capture_collection_snapshot_current() {
             Ok(snapshot) => snapshot,
             Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
         };
@@ -256,7 +262,10 @@ impl Collection {
 
         // Build backlinks index for skip_dependents checking
         let bl_index_for_skip = if skip_dependents {
-            Some(self.build_backlinks_index_for_snapshot(&snapshot))
+            match self.build_backlinks_index_for_snapshot(&snapshot) {
+                Ok(index) => Some(index),
+                Err(error) => return op_error(&error.code, &error.message),
+            }
         } else {
             None
         };
@@ -342,6 +351,7 @@ impl Collection {
     }
 
     /// Batch update with explicit update list (validate-all-then-execute).
+    #[cfg(feature = "legacy-collection-mutation")]
     pub(crate) fn batch_update_explicit(
         &self,
         updates: &[serde_json::Value],
@@ -357,15 +367,15 @@ impl Collection {
             {
                 return error;
             }
-            if let Err(error) =
-                crate::operations::ensure_no_symlink_components(&self.root, path, self.spec_profile)
+            if let Err(error) = self
+                .held_root()
+                .ensure_no_symlink_components(std::path::Path::new(path))
             {
-                return error;
+                return op_error(PATH_TRAVERSAL, &error.to_string());
             }
         }
 
-        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
-        {
+        let snapshot = match self.capture_collection_snapshot_current() {
             Ok(snapshot) => snapshot,
             Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
         };
@@ -549,7 +559,8 @@ impl Collection {
     }
 
     /// Batch delete files matching a where clause (§12.4, §12.7).
-    pub fn batch_delete(
+    #[cfg(feature = "legacy-collection-mutation")]
+    pub(crate) fn batch_delete_legacy(
         &self,
         input: &serde_json::Value,
         simulate_io_error: Option<&str>,
@@ -583,8 +594,7 @@ impl Collection {
             return op_error("invalid_input", "batch_delete requires 'where'");
         }
 
-        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
-        {
+        let snapshot = match self.capture_collection_snapshot_current() {
             Ok(snapshot) => snapshot,
             Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
         };
@@ -609,7 +619,10 @@ impl Collection {
         // Check backlinks before deletion
         let mut broken_links: Vec<serde_json::Value> = Vec::new();
         if check_backlinks {
-            let bl_index = self.build_backlinks_index_for_snapshot(&snapshot);
+            let bl_index = match self.build_backlinks_index_for_snapshot(&snapshot) {
+                Ok(index) => index,
+                Err(error) => return op_error(&error.code, &error.message),
+            };
             for path in &matching_paths {
                 if let Some(sources) = bl_index.get(path) {
                     for source in sources {
@@ -651,7 +664,7 @@ impl Collection {
                 }
             }
 
-            let deleted = self.delete(&serde_json::json!({"path": path}));
+            let deleted = self.delete_legacy(&serde_json::json!({"path": path}));
             if deleted.get("error").is_some() {
                 failed += 1;
                 details.push(serde_json::json!({ "path": path, "status": "failed" }));
@@ -703,7 +716,10 @@ impl Collection {
         let (all_files_arc, backlinks_arc) = if needs_link_graph {
             let resolved_files = std::sync::Arc::new(snapshot.resolved_files_data());
             let backlinks = std::sync::Arc::new(
-                self.build_backlinks_index_for_snapshot_files(snapshot, &resolved_files),
+                self.build_backlinks_index_for_snapshot_files(snapshot, &resolved_files)
+                    .map_err(|error| crate::CollectionSnapshotError::CacheUnavailable {
+                        reason: format!("{}: {}", error.code, error.message),
+                    })?,
             );
             (Some(resolved_files), Some(backlinks))
         } else {
@@ -760,7 +776,7 @@ impl Collection {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 mod snapshot_batch_tests {
     use super::*;
 

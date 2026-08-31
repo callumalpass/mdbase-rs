@@ -2,7 +2,6 @@ use std::fs;
 use std::path::Path;
 
 use serde_json::{json, Value};
-use walkdir::WalkDir;
 
 use super::{Diagnostic, OperationResult, Operations};
 use crate::mutation::{
@@ -86,7 +85,7 @@ pub(crate) fn prepare_single_runtime(
         return prepare_sparse_runtime(collection, operation, input, context);
     }
 
-    let before = collection.snapshot()?;
+    let before = collection.snapshot_with_context(context)?;
     context.check()?;
     let shadow = shadow_collection_context(collection, context)?;
     let typed_operation = operation.parse::<OperationKind>()?;
@@ -117,7 +116,7 @@ pub(crate) fn prepare_single_runtime(
     if desired == shadow.baseline {
         return Ok(RuntimeSinglePreparation::NoMutation(outcome));
     }
-    let after = shadow.collection.snapshot()?;
+    let after = shadow.collection.snapshot_with_context(context)?;
     context.check()?;
     Ok(RuntimeSinglePreparation::Prepared(Box::new(
         RuntimeMutationPlan {
@@ -251,6 +250,9 @@ fn prepare_sparse_runtime(
     let kind = operation.parse::<OperationKind>()?;
     let input_path = input.get("path").and_then(Value::as_str);
     let shadow = sparse_shadow_collection(collection, input_path, context)?;
+    let captured_before = input_path
+        .map(|path| targeted_snapshot(&shadow.collection, path, context))
+        .transpose()?;
     #[cfg(test)]
     pause_sparse_preparation(&collection.root);
     let shadow_input = match adapt_mtime_precondition(collection, &shadow.collection, input) {
@@ -290,10 +292,9 @@ fn prepare_sparse_runtime(
     // validation. Only a derived create can target a path that was unknown
     // when the sparse shadow was copied.
     let mut baseline = shadow.baseline.clone();
-    if input_path != Some(path.as_str()) {
-        if let Ok(bytes) = fs::read(collection.root.join(&path)) {
-            baseline.insert(path.clone(), bytes);
-        }
+    if input_path != Some(path.as_str()) && collection.held_root().exists_file(Path::new(&path)) {
+        let bytes = read_held_bounded(collection, Path::new(&path), context)?;
+        baseline.insert(path.clone(), bytes);
     }
     if kind == OperationKind::Create
         && baseline.contains_key(&path)
@@ -316,7 +317,8 @@ fn prepare_sparse_runtime(
         ));
     }
     let mut desired = crate::transactions::FileBaseline::new();
-    if let Ok(bytes) = fs::read(shadow.collection.root.join(&path)) {
+    if shadow.collection.held_root().exists_file(Path::new(&path)) {
+        let bytes = read_held_bounded(&shadow.collection, Path::new(&path), context)?;
         desired.insert(path.clone(), bytes);
     }
     if baseline == desired {
@@ -362,11 +364,14 @@ fn prepare_sparse_runtime(
         }
     }
 
-    let before = delete_plan
-        .as_ref()
-        .map(planned_delete_snapshot)
-        .unwrap_or_else(|| targeted_snapshot(collection, &path))?;
-    let after = targeted_snapshot(&shadow.collection, &path)?;
+    let before = if let Some(planned) = delete_plan.as_ref() {
+        planned_delete_snapshot(planned)?
+    } else if input_path == Some(path.as_str()) {
+        captured_before.expect("an explicit sparse path has a captured snapshot")
+    } else {
+        targeted_snapshot(collection, &path, context)?
+    };
+    let after = targeted_snapshot(&shadow.collection, &path, context)?;
     context.check()?;
     Ok(RuntimeSinglePreparation::Prepared(Box::new(
         RuntimeMutationPlan {
@@ -475,8 +480,9 @@ fn planned_delete_snapshot(
 fn targeted_snapshot(
     collection: &Collection,
     path: &str,
+    context: &OperationContext,
 ) -> Result<CollectionSnapshot, ProviderError> {
-    let records = match collection.snapshot_record(path) {
+    let records = match collection.snapshot_record_with_context(path, context) {
         Ok(record) => vec![record],
         Err(ProviderError::CollectionOpen(_)) => Vec::new(),
         Err(error) => return Err(error),
@@ -500,13 +506,21 @@ fn sparse_shadow_collection(
     context.check()?;
     let directory =
         tempfile::tempdir().map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-    copy_sparse_controls(collection, directory.path(), context)?;
+    let mut captured_entries = 0_u64;
+    let mut resource_entries = 0_u64;
+    copy_sparse_controls(
+        collection,
+        directory.path(),
+        context,
+        &mut captured_entries,
+        &mut resource_entries,
+    )?;
     let mut baseline = crate::transactions::FileBaseline::new();
     if let Some(target) = target {
-        let source = collection.root.join(target);
-        if source.is_file() {
-            let bytes = fs::read(&source)
-                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+        if collection.held_root().exists_file(Path::new(target)) {
+            captured_entries = checked_capture_increment(captured_entries)?;
+            context.check_entries(captured_entries)?;
+            let bytes = read_held_bounded(collection, Path::new(target), context)?;
             let destination = directory.path().join(target);
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)
@@ -531,11 +545,17 @@ fn copy_sparse_controls(
     collection: &Collection,
     destination: &Path,
     context: &OperationContext,
+    captured_entries: &mut u64,
+    resource_entries: &mut u64,
 ) -> Result<(), ProviderError> {
     for relative in ["mdbase.yaml", "mdbase.lock.yaml"] {
-        let source = collection.root.join(relative);
-        if source.is_file() {
-            fs::copy(&source, destination.join(relative))
+        if collection.held_root().exists_file(Path::new(relative)) {
+            *captured_entries = checked_capture_increment(*captured_entries)?;
+            *resource_entries = checked_capture_increment(*resource_entries)?;
+            context.check_entries(*captured_entries)?;
+            context.check_resource_entries(*resource_entries)?;
+            let bytes = read_held_bounded(collection, Path::new(relative), context)?;
+            fs::write(destination.join(relative), bytes)
                 .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
         }
     }
@@ -544,32 +564,97 @@ fn copy_sparse_controls(
         collection.settings.contracts_folder.as_str(),
         "_schemas",
     ] {
-        let source = collection.root.join(folder);
-        if !source.is_dir() {
-            continue;
-        }
-        for entry in WalkDir::new(&source).follow_links(false) {
+        let paths = collection
+            .held_root()
+            .files_recursive(Path::new(folder))
+            .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+        for relative in paths {
             context.check()?;
-            let entry = entry.map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-            let relative = entry
-                .path()
-                .strip_prefix(&collection.root)
-                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-            let target = destination.join(relative);
-            if entry.file_type().is_dir() {
-                fs::create_dir_all(&target)
-                    .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-            } else if entry.file_type().is_file() {
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-                }
-                fs::copy(entry.path(), &target)
+            *captured_entries = checked_capture_increment(*captured_entries)?;
+            *resource_entries = checked_capture_increment(*resource_entries)?;
+            context.check_entries(*captured_entries)?;
+            context.check_resource_entries(*resource_entries)?;
+            context.check_depth(relative.components().count().saturating_sub(1) as u64)?;
+            let target = destination.join(&relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
                     .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
             }
+            let bytes = read_held_bounded(collection, &relative, context)?;
+            fs::write(&target, bytes)
+                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
         }
     }
     Ok(())
+}
+
+fn checked_capture_increment(value: u64) -> Result<u64, ProviderError> {
+    value.checked_add(1).ok_or({
+        ProviderError::CaptureLimitExceeded(crate::runtime::CaptureLimitExceeded {
+            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+            limit: u64::MAX,
+            attempted: u64::MAX,
+        })
+    })
+}
+
+fn read_held_bounded(
+    collection: &Collection,
+    relative: &Path,
+    context: &OperationContext,
+) -> Result<Vec<u8>, ProviderError> {
+    use std::io::Read;
+    context.check()?;
+    let mut file = collection
+        .held_root()
+        .open_file(relative)
+        .map_err(|error| {
+            ProviderError::CollectionOpen(format!(
+                "failed to open '{}': {error}",
+                relative.display()
+            ))
+        })?;
+    let size = file
+        .metadata()
+        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?
+        .len();
+    context.check_file_bytes(size)?;
+    let capacity = usize::try_from(size).map_err(|_| crate::runtime::CaptureLimitExceeded {
+        kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+        limit: usize::MAX as u64,
+        attempted: size,
+    })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| crate::runtime::CaptureLimitExceeded {
+            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+            limit: usize::MAX as u64,
+            attempted: size,
+        })?;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        context.check()?;
+        let read = file
+            .read(&mut chunk)
+            .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        let attempted = (bytes.len() as u64).checked_add(read as u64).ok_or(
+            crate::runtime::CaptureLimitExceeded {
+                kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                limit: u64::MAX,
+                attempted: u64::MAX,
+            },
+        )?;
+        context.check_file_bytes(attempted)?;
+        context.charge_read(read as u64)?;
+        context.charge_retained(read as u64)?;
+        bytes.extend_from_slice(&chunk[..read]);
+        context.check()?;
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn execute_wire_mutation(
@@ -866,13 +951,17 @@ fn validate_authoritative_mtime(
                 None,
             )]
         })?;
-    let current = modified_millis(&collection.root.join(path)).ok_or_else(|| {
-        vec![Diagnostic::error(
-            "concurrent_modification",
-            format!("File '{path}' no longer matches the requested modification time."),
-            Some(path.to_string()),
-        )]
-    })?;
+    let current = collection
+        .held_root()
+        .modified_millis(Path::new(path))
+        .ok()
+        .ok_or_else(|| {
+            vec![Diagnostic::error(
+                "concurrent_modification",
+                format!("File '{path}' no longer matches the requested modification time."),
+                Some(path.to_string()),
+            )]
+        })?;
     if current != expected {
         return Err(vec![Diagnostic::error(
             "concurrent_modification",
@@ -938,13 +1027,17 @@ fn adapt_mtime_precondition(
                 None,
             ))
         })?;
-    let current = modified_millis(&collection.root.join(path)).ok_or_else(|| {
-        Box::new(Diagnostic::error(
-            "concurrent_modification",
-            format!("File '{path}' no longer matches the requested modification time."),
-            Some(path.to_string()),
-        ))
-    })?;
+    let current = collection
+        .held_root()
+        .modified_millis(Path::new(path))
+        .ok()
+        .ok_or_else(|| {
+            Box::new(Diagnostic::error(
+                "concurrent_modification",
+                format!("File '{path}' no longer matches the requested modification time."),
+                Some(path.to_string()),
+            ))
+        })?;
     if current != expected {
         return Err(Box::new(Diagnostic::error(
             "concurrent_modification",
@@ -952,29 +1045,23 @@ fn adapt_mtime_precondition(
             Some(path.to_string()),
         )));
     }
-    let shadow_mtime = modified_millis(&shadow.root.join(path)).ok_or_else(|| {
-        Box::new(Diagnostic::error(
-            "batch_preflight_failed",
-            format!("Preflight record '{path}' is unavailable."),
-            Some(path.to_string()),
-        ))
-    })?;
+    let shadow_mtime = shadow
+        .held_root()
+        .modified_millis(Path::new(path))
+        .ok()
+        .ok_or_else(|| {
+            Box::new(Diagnostic::error(
+                "batch_preflight_failed",
+                format!("Preflight record '{path}' is unavailable."),
+                Some(path.to_string()),
+            ))
+        })?;
     let mut adapted = input.as_object().cloned().unwrap_or_default();
     adapted.insert(
         "last_known_mtime".to_string(),
         Value::Number(shadow_mtime.into()),
     );
     Ok(Value::Object(adapted))
-}
-
-fn modified_millis(path: &Path) -> Option<u64> {
-    fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
 
 fn invalid_request(message: &str) -> OperationResult {
@@ -1100,11 +1187,20 @@ mod tests {
             let typed = typed_collection.typed().unwrap().batch(request).unwrap();
             let wire = execute(&wire_collection, &wire_input);
             assert!(wire.valid, "{wire:#?}");
-            assert_eq!(
-                serde_json::to_value(&typed.value).unwrap(),
-                wire.result,
-                "dry_run={dry_run}"
-            );
+            let mut typed_value = serde_json::to_value(&typed.value).unwrap();
+            let mut wire_value = wire.result.clone();
+            // These independent fixtures can commit on opposite sides of a
+            // wall-clock second. Verify the timestamp shape separately and
+            // compare every deterministic typed/wire field exactly.
+            for value in [&mut typed_value, &mut wire_value] {
+                for operation in value["operations"].as_array_mut().unwrap() {
+                    if let Some(mtime) = operation["result"]["file"]["mtime"].as_str() {
+                        assert!(!mtime.is_empty());
+                        operation["result"]["file"]["mtime"] = json!("<mtime>");
+                    }
+                }
+            }
+            assert_eq!(typed_value, wire_value, "dry_run={dry_run}");
             assert_eq!(
                 typed.diagnostics,
                 wire.diagnostics
@@ -1221,7 +1317,7 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         write(
             &source.path().join("mdbase.yaml"),
-            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n  exclude: [.git/**, private/**]\nx-obsidian:\n  bases:\n    include: [views/*.base, private/*.base]\n",
         );
         write(
             &source.path().join("_types/note.md"),
@@ -1238,6 +1334,15 @@ mod tests {
             "spec_version: 0.3.0\n",
         );
         write(&source.path().join("nested/hidden.md"), "must not copy");
+        write(
+            &source.path().join("views/configured.base"),
+            "filters: []\n",
+        );
+        write(&source.path().join("unconfigured.base"), "filters: []\n");
+        write(
+            &source.path().join("private/excluded.base"),
+            "filters: []\n",
+        );
 
         let collection = Collection::open(source.path()).unwrap();
         let shadow = shadow_collection(&collection).unwrap();
@@ -1246,6 +1351,9 @@ mod tests {
         assert!(root.join("_types/note.md").is_file());
         assert!(root.join("visible.md").is_file());
         assert!(root.join("schema.json").is_file());
+        assert!(root.join("views/configured.base").is_file());
+        assert!(!root.join("unconfigured.base").exists());
+        assert!(!root.join("private/excluded.base").exists());
         assert!(!root.join(".git").exists());
         assert!(!root.join("nested").exists());
     }

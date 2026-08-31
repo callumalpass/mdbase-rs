@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-collection-mutation")]
+
 use mdbase::Collection;
 use serde_json::json;
 use std::{fs, path::Path};
@@ -184,7 +186,7 @@ fn ordinary_explicit_update_cannot_change_to_equal_implicit_authority() {
 fn batch_authority_failure_commits_neither_failed_record_nor_sibling() {
     let root = fixture("kind");
     authority_erasing_type(root.path());
-    write(root.path(), "_types/aux.md", "---\nkind: mdbase.type\nname: aux\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\n---\n");
+    write(root.path(), "_types/auxiliary.md", "---\nkind: mdbase.type\nname: aux\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\n---\n");
     let collection = Collection::open(root.path()).unwrap();
     let result = collection.v03_operations().unwrap().batch(&json!({
         "operations": [
@@ -333,7 +335,7 @@ fn implicit_throwing_errors_are_complete_sorted_and_explicit_repairs_skip_them()
 #[test]
 fn persistence_prefers_secondary_key_over_scalar_shape_change() {
     let root = fixture("kind, types");
-    write(root.path(), "_types/aux.md", "---\nkind: mdbase.type\nname: aux\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\n---\n");
+    write(root.path(), "_types/auxiliary.md", "---\nkind: mdbase.type\nname: aux\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\n---\n");
     write(root.path(), "_types/note.md", "---\nkind: mdbase.type\nname: note\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    required: [title]\nimplements:\n  - contract: example.note\n    version: 1.0.0\n    fields: {}\n---\n");
     let collection = Collection::open(root.path()).unwrap();
     let result = collection.v03_operations().unwrap().create(&json!({
@@ -348,7 +350,7 @@ fn persistence_prefers_secondary_key_over_scalar_shape_change() {
 #[test]
 fn occupied_scalar_without_a_secondary_key_fails_before_write() {
     let root = fixture("kind");
-    write(root.path(), "_types/aux.md", "---\nkind: mdbase.type\nname: aux\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\n---\n");
+    write(root.path(), "_types/auxiliary.md", "---\nkind: mdbase.type\nname: aux\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\n---\n");
     let collection = Collection::open(root.path()).unwrap();
     let result = collection.v03_operations().unwrap().create(&json!({
         "path":"blocked.md", "type":"note", "frontmatter":{"kind":"aux","title":"ok"}
@@ -423,7 +425,7 @@ implements:
     );
     write(
         root.path(),
-        "_types/aux.md",
+        "_types/auxiliary.md",
         r#"---
 kind: mdbase.type
 name: aux

@@ -18,7 +18,7 @@ impl Collection {
         source_path: &str,
         source_id: Option<&str>,
         resolution_index: &crate::links::resolver::LinkResolutionIndex,
-    ) -> bool {
+    ) -> Result<bool, crate::runtime::CatalogError> {
         let mut changed = false;
 
         // Process line by line, skipping fenced code blocks and inline code
@@ -55,7 +55,7 @@ impl Collection {
                     source_path,
                     source_id,
                     resolution_index,
-                );
+                )?;
                 if new_line != line {
                     changed = true;
                 }
@@ -88,7 +88,7 @@ impl Collection {
         if changed {
             *body = result;
         }
-        changed
+        Ok(changed)
     }
 
     /// Replace link references in a single line (outside code blocks).
@@ -106,7 +106,7 @@ impl Collection {
         source_path: &str,
         source_id: Option<&str>,
         resolution_index: &crate::links::resolver::LinkResolutionIndex,
-    ) -> String {
+    ) -> Result<String, crate::runtime::CatalogError> {
         let mut result = String::with_capacity(line.len());
         let chars: Vec<char> = line.chars().collect();
         let len = chars.len();
@@ -166,7 +166,7 @@ impl Collection {
                             source_path,
                             source_id,
                             resolution_index,
-                        ) {
+                        )? {
                             let new_inner = self.rewrite_wikilink_inner(
                                 &inner,
                                 from_stem,
@@ -225,7 +225,7 @@ impl Collection {
                                 source_path,
                                 source_id,
                                 resolution_index,
-                            )
+                            )?
                         {
                             let text_part: String =
                                 chars[link_start..paren_start - 1].iter().collect();
@@ -271,7 +271,7 @@ impl Collection {
                         source_path,
                         source_id,
                         resolution_index,
-                    ) {
+                    )? {
                         let new_inner = self.rewrite_wikilink_inner(
                             &inner,
                             from_stem,
@@ -332,7 +332,7 @@ impl Collection {
                             source_path,
                             source_id,
                             resolution_index,
-                        )
+                        )?
                     {
                         let text_part: String = chars[link_start..paren_start - 1].iter().collect();
                         let (_, anchor) = if let Some(hp) = href.find('#') {
@@ -360,7 +360,7 @@ impl Collection {
             i += 1;
         }
 
-        result
+        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -374,20 +374,59 @@ impl Collection {
         source_path: &str,
         source_id: Option<&str>,
         resolution_index: &crate::links::resolver::LinkResolutionIndex,
-    ) -> bool {
+    ) -> Result<bool, crate::runtime::CatalogError> {
         if self.is_stable_configured_id_wikilink(link, source_id) {
-            return false;
+            return Ok(false);
         }
         if !self.link_resolves_to(link, from, from_stem, from_no_ext, source_dir) {
-            return false;
+            return Ok(false);
         }
         match self.simple_wikilink_resolution(link, source_path, &[], resolution_index) {
-            None => true,
-            Some(crate::links::resolver::LinkResolution::Resolved(path)) => path == from,
-            Some(
+            None => Ok(true),
+            Some(Ok(crate::links::resolver::LinkResolution::Resolved { path, .. })) => {
+                Ok(path == from)
+            }
+            Some(Ok(
                 crate::links::resolver::LinkResolution::Missing
                 | crate::links::resolver::LinkResolution::Ambiguous(_),
-            ) => false,
+            )) => Ok(false),
+            Some(Err(error)) => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod selector_failure_tests {
+    use super::*;
+
+    #[test]
+    fn body_rewrite_propagates_selector_failure() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        let mut index = crate::links::resolver::LinkResolutionIndex::default();
+        index
+            .basename_lower_to_paths
+            .insert("target".to_string(), vec!["target.md".to_string()]);
+        let mut body = "[[target]]".to_string();
+
+        let error = collection
+            .update_body_links(
+                &mut body,
+                "target.md",
+                "renamed.md",
+                "target",
+                "renamed",
+                "target",
+                "renamed",
+                "",
+                "../unsafe-source.md",
+                None,
+                &index,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "invalid_resolution_candidate");
+        assert_eq!(body, "[[target]]");
     }
 }

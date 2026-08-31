@@ -7,7 +7,7 @@ fn injected_reference_removals(
     REMOVALS.get_or_init(Default::default)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 pub(super) fn inject_reference_removal(path: &std::path::Path) {
     injected_reference_removals()
         .lock()
@@ -24,7 +24,7 @@ fn injected_reference_open_failures(
     FAILURES.get_or_init(Default::default)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-collection-mutation"))]
 pub(super) fn inject_reference_open_failure(path: &std::path::Path) {
     injected_reference_open_failures()
         .lock()
@@ -60,7 +60,7 @@ fn injected_root_replacements(
     REPLACEMENTS.get_or_init(Default::default)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, feature = "legacy-collection-mutation"))]
 pub(super) fn inject_root_replacement(root: &std::path::Path, target: &std::path::Path) {
     injected_root_replacements()
         .lock()
@@ -100,7 +100,7 @@ fn injected_parent_swaps() -> &'static std::sync::Mutex<
     SWAPS.get_or_init(Default::default)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, feature = "legacy-collection-mutation"))]
 pub(super) fn inject_parent_swap(
     root: &std::path::Path,
     relative_parent: &std::path::Path,

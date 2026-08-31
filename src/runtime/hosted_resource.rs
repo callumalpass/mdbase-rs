@@ -163,7 +163,7 @@ impl CompiledCatalog {
             type_plans: self.collection.type_plans.clone(),
             type_warnings: self.collection.type_warnings.clone(),
             data_contracts,
-            root_capability: Collection::capability_for_root(directory.path())
+            authority: crate::collection_root::CollectionRoot::acquire(directory.path())
                 .map_err(resource_stage_error)?,
         };
         let operations = collection
@@ -464,7 +464,7 @@ impl CompiledCatalog {
             type_plans: self.collection.type_plans.clone(),
             type_warnings: self.collection.type_warnings.clone(),
             data_contracts,
-            root_capability: Collection::capability_for_root(directory.path())
+            authority: crate::collection_root::CollectionRoot::acquire(directory.path())
                 .map_err(resource_stage_error)?,
         };
         Ok((directory, collection))

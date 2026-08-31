@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-collection-mutation")]
+
 //! Regression tests for BOM-prefixed frontmatter documents.
 //!
 //! Finding: `.ops/work/bom-prefixed-records-lose-frontmatter-on-update.md`.

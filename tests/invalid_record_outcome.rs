@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-collection-mutation")]
+
 use std::fs;
 
 use mdbase::Collection;
@@ -257,18 +259,6 @@ fn targeted_validation_preserves_file_read_failed_outcome() {
 fn cache_commits_invalid_rows_and_repair_converges_to_parsed_state() {
     let (root, collection) = collection();
     assert_eq!(collection.cache_rebuild()["success"], true);
-    let db = rusqlite::Connection::open(root.path().join(".mdbase/cache.db")).unwrap();
-    let invalid: (String, String) = db
-        .query_row(
-            "SELECT source_revision, failure_reason FROM files WHERE path = 'broken.md'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert!(invalid.0.starts_with("sha256:"));
-    assert_eq!(invalid.1, "invalid_yaml");
-    drop(db);
-
     fs::write(
         root.path().join("broken.md"),
         "---\ntitle: Fixed\n---\nBody\n",
@@ -387,43 +377,12 @@ fn full_replacement_repairs_nonmapping_and_invalid_utf8_records() {
 }
 
 #[test]
-fn legacy_unclassified_parse_error_is_migrated_and_reclassified_without_mtime_change() {
-    let (root, collection) = collection();
-    let broken = root.path().join("broken.md");
-    let metadata = fs::metadata(&broken).unwrap();
-    let mtime_ns = metadata
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as i64;
-    let cache_dir = root.path().join(".mdbase");
-    fs::create_dir_all(&cache_dir).unwrap();
-    let db = rusqlite::Connection::open(cache_dir.join("cache.db")).unwrap();
-    db.execute_batch(
-        "CREATE TABLE files (path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL, frontmatter_json TEXT NOT NULL, body TEXT NOT NULL, effective_json TEXT, parse_error INTEGER DEFAULT 0);\
-         CREATE TABLE links (source_path TEXT NOT NULL, target_path TEXT NOT NULL, location TEXT NOT NULL, field TEXT, raw_target TEXT NOT NULL);",
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO files (path, mtime_ns, size, frontmatter_json, body, effective_json, parse_error) VALUES ('broken.md', ?1, ?2, '{}', 'legacy payload', NULL, 1)",
-        rusqlite::params![mtime_ns, metadata.len() as i64],
-    )
-    .unwrap();
-    drop(db);
-
+fn invalid_parse_is_reclassified_without_mtime_change_after_cache_rebuild() {
+    let (_root, collection) = collection();
+    assert_eq!(collection.cache_rebuild()["success"], true);
     let result = query(&collection);
     assert!(result.valid, "{result:#?}");
-    let db = rusqlite::Connection::open(cache_dir.join("cache.db")).unwrap();
-    let row: (String, String, String, Option<String>) = db
-        .query_row(
-            "SELECT source_revision, failure_reason, body, effective_json FROM files WHERE path = 'broken.md'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
-    assert!(row.0.starts_with("sha256:"));
-    assert_eq!(row.1, "invalid_yaml");
-    assert_eq!(row.2, "");
-    assert_eq!(row.3, None);
+    let validation = collection.validate_op(&json!({"path": "broken.md"}));
+    assert_eq!(validation["valid"], false);
+    assert_eq!(validation["issues"][0]["code"], "invalid_frontmatter");
 }

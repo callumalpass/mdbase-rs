@@ -11,13 +11,13 @@ use sha2::{Digest, Sha256};
 use super::diff::canonical_changes;
 use super::observer::NoopObserver;
 use super::{
-    CancelOutcome, CanonicalOperationOutcome, ChangeBatch, ChangeEventIdentity, ChangeFeed,
-    ChangeFeedBaseline, ChangeFeedOwnerId, ChangeFeedTransfer, ChangeFeedTransferId,
-    ChangeFeedTransferIntent, ChangePage, ChangePageCursor, ChangeSet, ChangeWatermark,
-    CollectionGeneration, CommitAttempt, CommitId, CommitRejection, DurableCommitState,
-    ExecutionOutcome, FilesystemProvider, HostClaimId, ObserverOptions, OperationContext,
-    OperationRequest, PreparationOutcome, PreparedMutation, ProviderError, ReadCursor, ReadPage,
-    RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeObserver,
+    CancelOutcome, CanonicalOperationOutcome, CanonicalOperationValue, ChangeBatch,
+    ChangeEventIdentity, ChangeFeed, ChangeFeedBaseline, ChangeFeedOwnerId, ChangeFeedTransfer,
+    ChangeFeedTransferId, ChangeFeedTransferIntent, ChangePage, ChangePageCursor, ChangeSet,
+    ChangeWatermark, CollectionGeneration, CommitAttempt, CommitId, CommitRejection,
+    DurableCommitState, ExecutionOutcome, FilesystemProvider, HostClaimId, ObserverOptions,
+    OperationContext, OperationRequest, PreparationOutcome, PreparedMutation, ProviderError,
+    ReadCursor, ReadPage, RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeObserver,
 };
 use crate::transactions::{
     self, RuntimeCommitAttempt, RuntimePrepareOutcome, RuntimeResolution, RuntimeSettlement,
@@ -86,6 +86,15 @@ impl FilesystemRuntime {
         )
     }
 
+    /// Count valid version-2 runtime journals without exposing journal contents.
+    /// A zero result is the operator-facing gate for removing the decoder in 0.5.0.
+    pub fn legacy_journal_inventory(
+        &self,
+        context: &OperationContext,
+    ) -> Result<super::LegacyJournalInventory, ProviderError> {
+        self.provider.legacy_journal_inventory(context)
+    }
+
     pub fn open_observed(
         root: impl AsRef<Path>,
         debounce: Duration,
@@ -99,12 +108,12 @@ impl FilesystemRuntime {
         )?);
         let initial_generation = CollectionGeneration::initial();
         let reconciled = provider.with_collection_boundary_context(
-            &OperationContext::legacy(),
+            &OperationContext::internal(),
             |collection| {
                 super::feed::reconcile(
                     collection,
                     initial_generation.clone(),
-                    &OperationContext::legacy(),
+                    &OperationContext::internal(),
                 )
             },
         )?;
@@ -162,7 +171,7 @@ impl FilesystemRuntime {
     }
 
     pub fn execute(&self, request: &OperationRequest) -> Result<OperationResult, ProviderError> {
-        self.execute_with_context(request, &OperationContext::legacy())
+        self.execute_with_context(request, &OperationContext::internal())
     }
 
     /// Compatibility wrapper which serializes the typed runtime result exactly
@@ -180,7 +189,7 @@ impl FilesystemRuntime {
         &self,
         request: &OperationRequest,
     ) -> Result<ExecutionOutcome, ProviderError> {
-        self.execute_typed_with_context(request, &OperationContext::legacy())
+        self.execute_typed_with_context(request, &OperationContext::internal())
     }
 
     /// Execute the compatibility-decoded request and return the closed typed
@@ -231,6 +240,15 @@ impl FilesystemRuntime {
         request: &OperationRequest,
         context: &OperationContext,
     ) -> Result<ExecutionOutcome, ProviderError> {
+        self.read_with_result_charge(request, context, true)
+    }
+
+    fn read_with_result_charge(
+        &self,
+        request: &OperationRequest,
+        context: &OperationContext,
+        charge_query_result: bool,
+    ) -> Result<ExecutionOutcome, ProviderError> {
         if request.operation.is_mutation() {
             return Err(ProviderError::UnsupportedOperation(
                 "read requires a non-mutation operation".to_string(),
@@ -243,7 +261,7 @@ impl FilesystemRuntime {
             super::OperationKind::Read | super::OperationKind::Query => self
                 .provider
                 .with_collection_read_context(context, |collection| {
-                    Ok::<_, ProviderError>(execute_typed_read_operation(collection, request))
+                    execute_typed_read_operation(collection, request, context)
                 })?,
             _ => {
                 let result = self
@@ -253,6 +271,9 @@ impl FilesystemRuntime {
             }
         };
         let generation = self.current_generation()?;
+        if charge_query_result {
+            charge_returned_query(&operation, context)?;
+        }
         Ok(ExecutionOutcome::new(
             operation,
             generation,
@@ -282,7 +303,7 @@ impl FilesystemRuntime {
         if let Some(input) = expanded.input.as_object_mut() {
             input.remove("limit");
         }
-        let outcome = self.read(&expanded, context)?;
+        let outcome = self.read_with_result_charge(&expanded, context, false)?;
         self.cursor_lock(context)?
             .open(outcome, page_items, context)
     }
@@ -301,10 +322,11 @@ impl FilesystemRuntime {
         &self,
         cursor: ReadCursor,
         context: &OperationContext,
-    ) -> Result<(), ProviderError> {
+    ) -> Result<super::CursorReleaseOutcome, ProviderError> {
         context.check()?;
-        self.cursor_lock(context)?.release(cursor)?;
-        context.check()
+        let released = self.cursor_lock(context)?.release(cursor)?;
+        context.check()?;
+        Ok(super::CursorReleaseOutcome { released })
     }
 
     /// Validate and durably stage one exact mutation under an opaque host claim.
@@ -560,7 +582,7 @@ impl FilesystemRuntime {
                 if !plan.needs_commit {
                     return Ok(plan.baseline);
                 }
-                let settlement = OperationContext::legacy();
+                let settlement = OperationContext::internal();
                 for commit_id in plan.commits {
                     transactions::ack_runtime_change_event(collection, &commit_id, &settlement)
                         .map_err(transaction_error)?;
@@ -595,7 +617,7 @@ impl FilesystemRuntime {
                 // Once acknowledgement starts it owns settlement. Marking each
                 // transaction first is crash-safe because the durable feed still
                 // retains the event until its own final atomic acknowledgement.
-                let settlement = OperationContext::legacy();
+                let settlement = OperationContext::internal();
                 for commit_id in commits {
                     transactions::ack_runtime_change_event(collection, &commit_id, &settlement)
                         .map_err(transaction_error)?;
@@ -693,7 +715,7 @@ impl FilesystemRuntime {
     /// Complete a full watcher comparison before accepting benchmark or host
     /// traffic. Normal mutations use the incremental synchronization path.
     pub fn synchronize(&self) -> Result<(), ProviderError> {
-        self.synchronize_with_context(&OperationContext::legacy())
+        self.synchronize_with_context(&OperationContext::internal())
     }
 
     /// Complete a full comparison within an explicit operation boundary.
@@ -735,7 +757,7 @@ impl FilesystemRuntime {
 
     #[cfg(test)]
     pub(crate) fn synchronize_paths_for_test(&self, paths: &[&str]) -> Result<(), ProviderError> {
-        self.synchronize_reconciliation(Some(paths), &OperationContext::legacy())
+        self.synchronize_reconciliation(Some(paths), &OperationContext::internal())
     }
 
     #[cfg(test)]
@@ -976,7 +998,7 @@ impl FilesystemRuntime {
         {
             // Committing is already durable. Internal settlement ownership can
             // no longer be cancelled by the application deadline.
-            let mut active = self.settlement_lock(&OperationContext::legacy())?;
+            let mut active = self.settlement_lock(&OperationContext::internal())?;
             if active.is_some() {
                 return Ok(CommitAttempt::SettlementPending { commit_id });
             }
@@ -1069,8 +1091,9 @@ impl FilesystemRuntime {
         &self,
         resolution: &RuntimeResolution,
     ) -> Result<CommitAttempt, ProviderError> {
-        self.provider
-            .with_collection_boundary_context(&OperationContext::legacy(), |collection| {
+        self.provider.with_collection_boundary_context(
+            &OperationContext::internal(),
+            |collection| {
                 finish_resolution_inside(
                     collection,
                     self.provider.as_ref(),
@@ -1079,7 +1102,8 @@ impl FilesystemRuntime {
                     self.order.as_ref(),
                     resolution,
                 )
-            })
+            },
+        )
     }
 
     fn cursor_lock(
@@ -1126,7 +1150,7 @@ fn finish_owned_settlement(
     order: &Arc<Mutex<RuntimeOrder>>,
     owner: &mut RuntimeSettlement,
 ) -> Result<CommitAttempt, ProviderError> {
-    provider.with_collection_boundary_context(&OperationContext::legacy(), |collection| {
+    provider.with_collection_boundary_context(&OperationContext::internal(), |collection| {
         let resolution =
             transactions::settle_runtime_commit(collection, owner).map_err(transaction_error)?;
         finish_resolution_inside(
@@ -1246,12 +1270,13 @@ fn synchronize_known_shared(
 fn execute_typed_read_operation(
     collection: &crate::Collection,
     request: &OperationRequest,
-) -> CanonicalOperationOutcome {
+    context: &OperationContext,
+) -> Result<CanonicalOperationOutcome, ProviderError> {
     let typed = match collection.typed() {
         Ok(typed) => typed,
-        Err(error) => return CanonicalOperationOutcome::failure(request.operation, error),
+        Err(error) => return Ok(CanonicalOperationOutcome::failure(request.operation, error)),
     };
-    match request.operation {
+    let operation = match request.operation {
         super::OperationKind::Read => {
             match serde_json::from_value::<crate::api::ReadRequest>(request.input.clone()) {
                 Ok(request) => typed
@@ -1271,7 +1296,7 @@ fn execute_typed_read_operation(
         super::OperationKind::Query => {
             match crate::api::QueryRequest::decode_wire(request.input.clone()) {
                 Ok(request) => typed
-                    .query_runtime(request)
+                    .query_runtime(request, context.cancellation())
                     .map(CanonicalOperationOutcome::query)
                     .unwrap_or_else(|error| {
                         CanonicalOperationOutcome::failure(super::OperationKind::Query, error)
@@ -1285,7 +1310,29 @@ fn execute_typed_read_operation(
             }
         }
         _ => unreachable!("only migrated read operations use the typed read executor"),
+    };
+    if let Some(error) = context.capture_limit_error() {
+        return Err(error);
     }
+    context.check()?;
+    Ok(operation)
+}
+
+fn charge_returned_query(
+    operation: &CanonicalOperationOutcome,
+    context: &OperationContext,
+) -> Result<(), ProviderError> {
+    let CanonicalOperationValue::Query(Some(query)) = &operation.value else {
+        return Ok(());
+    };
+    if query.records.is_empty() {
+        return Ok(());
+    }
+    let bytes = super::cursor::measured_json_bytes(
+        &query.records,
+        context.capture_limits().max_retained_bytes,
+    )?;
+    context.charge_retained(bytes)
 }
 
 fn mutation_digest(request: &OperationRequest) -> Result<String, ProviderError> {

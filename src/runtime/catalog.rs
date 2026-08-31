@@ -175,8 +175,8 @@ impl CompiledCatalog {
             code: "catalog_root_unavailable".to_string(),
             message: error.to_string(),
         })?;
-        let root_capability =
-            Collection::capability_for_root(empty_root.path()).map_err(|error| CatalogError {
+        let authority = crate::collection_root::CollectionRoot::acquire(empty_root.path())
+            .map_err(|error| CatalogError {
                 code: "catalog_root_unavailable".to_string(),
                 message: error.to_string(),
             })?;
@@ -187,7 +187,7 @@ impl CompiledCatalog {
             contracts,
             collection: Collection {
                 root: PathBuf::new(),
-                root_capability,
+                authority,
                 spec_profile: SpecProfile::V03,
                 settings,
                 config_extensions,

@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use mdbase::api::{
-    BatchOperation, BatchRequest, CollectionPath, CreateRequest, DeleteRequest, MdbaseError,
-    MdbaseResult, OperationOutcome, QueryDirection, QueryRequest, ReadRequest, RenameRequest,
-    Revision, UpdateRequest, V02MigrationRequest,
+    BackfillRequest, BatchOperation, BatchRequest, CollectionPath, CreateRequest, DeleteRequest,
+    MdbaseError, MdbaseResult, OperationOutcome, QueryDirection, QueryRequest, ReadRequest,
+    RenameRequest, Revision, UpdateRequest, V02MigrationRequest,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -732,10 +732,6 @@ fn is_portable(command: &Command) -> bool {
     matches!(
         command,
         Command::Read { .. }
-            | Command::Create { .. }
-            | Command::Update { .. }
-            | Command::Delete { .. }
-            | Command::Rename { .. }
             | Command::Query { .. }
             | Command::Batch { .. }
             | Command::Views { .. }
@@ -1076,7 +1072,7 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
                 Ok(request)
             })();
             if dry_run {
-                typed_result(
+                delete_preflight_wire(
                     request.and_then(|request| collection.typed()?.preflight_delete(request)),
                 )
             } else {
@@ -1100,7 +1096,7 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
                 Ok(request)
             })();
             if dry_run {
-                typed_result(
+                rename_preflight_wire(
                     request.and_then(|request| collection.typed()?.preflight_rename(request)),
                 )
             } else {
@@ -1285,43 +1281,29 @@ fn execute_command(collection: &mdbase::Collection, command: Command) -> (serde_
                     operation: "backfill",
                 });
             }
-            let mut input = serde_json::Map::new();
-            if let Some(t) = file_type {
-                input.insert("type".to_string(), serde_json::Value::String(t));
-            }
-            if let Some(w) = where_clause {
-                input.insert("where".to_string(), serde_json::Value::String(w));
-            }
-            if let Some(f) = fields {
-                let field_list: Vec<serde_json::Value> = f
-                    .split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| serde_json::Value::String(s.to_string()))
-                    .collect();
-                input.insert("fields".to_string(), serde_json::Value::Array(field_list));
-            }
-            if dry_run {
-                input.insert("dry_run".to_string(), serde_json::Value::Bool(true));
-            }
-            if apply_defaults.is_some() || apply_generated.is_some() {
-                let mut apply = serde_json::Map::new();
-                if let Some(v) = apply_defaults {
-                    apply.insert("defaults".to_string(), serde_json::Value::Bool(v));
-                }
-                if let Some(v) = apply_generated {
-                    apply.insert("generated".to_string(), serde_json::Value::Bool(v));
-                }
-                input.insert("apply".to_string(), serde_json::Value::Object(apply));
-            }
-
-            let result = collection.backfill(&serde_json::Value::Object(input));
-            let exit = if result.get("error").is_some() {
-                error_to_exit_code(&result)
-            } else {
-                EXIT_SUCCESS
+            let request = BackfillRequest {
+                type_name: file_type,
+                where_expression: where_clause,
+                fields: fields.map(|fields| {
+                    fields
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|field| !field.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                }),
+                dry_run,
+                apply_defaults,
+                apply_generated,
             };
-            (result, exit)
+            match collection.typed().and_then(|typed| typed.backfill(request)) {
+                Ok(outcome) => (
+                    serde_json::to_value(outcome.value)
+                        .expect("the typed backfill result must serialize"),
+                    EXIT_SUCCESS,
+                ),
+                Err(error) => legacy_typed_error_result(error),
+            }
         }
 
         Command::Migrate { id, path, dry_run } => {
@@ -1441,6 +1423,98 @@ pub fn run_watch(
             return Ok(());
         }
     }
+}
+
+fn delete_preflight_wire(
+    result: MdbaseResult<OperationOutcome<mdbase::api::DeletePreflightResult>>,
+) -> (serde_json::Value, i32) {
+    match result {
+        Ok(outcome) => {
+            let mut value = serde_json::to_value(outcome.value)
+                .expect("typed delete preflight results serialize");
+            value["deleted"] = serde_json::Value::Bool(false);
+            value["dry_run"] = serde_json::Value::Bool(true);
+            if value["broken_links"].as_array().is_some_and(Vec::is_empty) {
+                value
+                    .as_object_mut()
+                    .expect("delete preflight results are objects")
+                    .remove("broken_links");
+            }
+            (
+                serde_json::json!({
+                    "valid": true,
+                    "result": value,
+                    "diagnostics": outcome.diagnostics,
+                }),
+                EXIT_SUCCESS,
+            )
+        }
+        Err(error) => typed_error_result(error),
+    }
+}
+
+fn rename_preflight_wire(
+    result: MdbaseResult<OperationOutcome<mdbase::api::RenamePreflightResult>>,
+) -> (serde_json::Value, i32) {
+    match result {
+        Ok(outcome) => {
+            let mut value = serde_json::to_value(outcome.value)
+                .expect("typed rename preflight results serialize");
+            value["dry_run"] = serde_json::Value::Bool(true);
+            let object = value
+                .as_object_mut()
+                .expect("rename preflight results are objects");
+            object.remove("warnings");
+            if object
+                .get("references_affected")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+            {
+                object.remove("references_affected");
+            }
+            (
+                serde_json::json!({
+                    "valid": true,
+                    "result": value,
+                    "diagnostics": outcome.diagnostics,
+                }),
+                EXIT_SUCCESS,
+            )
+        }
+        Err(error) => typed_error_result(error),
+    }
+}
+
+fn legacy_typed_error_result(error: MdbaseError) -> (serde_json::Value, i32) {
+    if let Some(details) = error
+        .diagnostics()
+        .first()
+        .and_then(|diagnostic| diagnostic.details.clone())
+        .filter(serde_json::Value::is_object)
+    {
+        let value = serde_json::json!({"error": details});
+        let exit = error_to_exit_code(&value);
+        return (value, exit);
+    }
+    let (code, message) = if let Some(diagnostic) = error.diagnostics().first() {
+        (
+            diagnostic.code.as_str().to_string(),
+            diagnostic.message.clone(),
+        )
+    } else {
+        let code = match &error {
+            MdbaseError::InvalidPath(_) => "invalid_path",
+            MdbaseError::UnsupportedProfile => "unsupported_profile",
+            MdbaseError::MigrationRequired { .. } => "migration_required",
+            MdbaseError::InvalidRequest { .. } => "invalid_request",
+            MdbaseError::InvalidResult { .. } => "invalid_result",
+            _ => "operation_failed",
+        };
+        (code.to_string(), error.to_string())
+    };
+    let value = serde_json::json!({"error": {"code": code, "message": message}});
+    let exit = error_to_exit_code(&value);
+    (value, exit)
 }
 
 fn typed_result<T: Serialize>(
@@ -1813,4 +1887,82 @@ fn error_to_exit_code(result: &serde_json::Value) -> i32 {
 /// Check if stdin is a TTY.
 fn atty_check_stdin() -> bool {
     std::io::stdin().is_terminal()
+}
+
+#[cfg(test)]
+mod wire_golden_tests {
+    use super::*;
+    use mdbase::api::{Diagnostic, DiagnosticCode, Severity};
+
+    fn diagnostic(code: &str, message: &str, details: Option<serde_json::Value>) -> Diagnostic {
+        Diagnostic {
+            severity: Severity::Error,
+            code: DiagnosticCode::new(code),
+            message: message.to_string(),
+            path: None,
+            field: None,
+            type_name: None,
+            schema_location: None,
+            details,
+        }
+    }
+
+    #[test]
+    fn structured_serialization_failure_retains_legacy_error_wire() {
+        let details = serde_json::json!({
+            "code": "validation_failed",
+            "message": "Validation failed",
+            "issues": [{
+                "code": "frontmatter_serialization_failed",
+                "message": "failed to serialize YAML frontmatter",
+                "path": "tagged.md",
+            }],
+        });
+        let error = MdbaseError::Operation {
+            diagnostics: vec![diagnostic(
+                "validation_failed",
+                "Validation failed",
+                Some(details.clone()),
+            )],
+        };
+
+        let (wire, exit) = legacy_typed_error_result(error);
+        assert_eq!(exit, EXIT_VALIDATION_ERROR);
+        assert_eq!(wire, serde_json::json!({"error": details}));
+    }
+
+    #[test]
+    fn structured_conflict_retains_canonical_diagnostic_wire_and_exit() {
+        let details = serde_json::json!({
+            "expected_revision": "sha256:expected",
+            "actual_revision": "sha256:actual",
+        });
+        let error = MdbaseError::Operation {
+            diagnostics: vec![diagnostic(
+                "concurrent_modification",
+                "File was modified externally",
+                Some(details.clone()),
+            )],
+        };
+
+        let (wire, exit) = typed_error_result(error);
+        assert_eq!(exit, EXIT_GENERAL_ERROR);
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "valid": false,
+                "result": {},
+                "diagnostics": [{
+                    "severity": "error",
+                    "code": "concurrent_modification",
+                    "message": "File was modified externally",
+                    "path": null,
+                    "field": null,
+                    "type_name": null,
+                    "schema_location": null,
+                    "details": details,
+                }],
+            })
+        );
+    }
 }

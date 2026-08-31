@@ -300,8 +300,13 @@ impl CollectionWatcher {
     }
 
     fn open_internal(root: &Path, debounce: Duration) -> Result<Self, WatchError> {
+        // Acquire collection authority exactly once. The path retained below is
+        // only the notify registration/display name; every snapshot read is
+        // rooted in this held collection even if that name is replaced.
+        let collection = Collection::open_for_observation(root)
+            .map_err(|error| WatchError::Collection(collection_error(&error)))?;
         let root = root.to_path_buf();
-        let initial = Snapshot::load(&root)?;
+        let initial = Snapshot::load(&collection)?;
         let (events_tx, events) = mpsc::channel();
         let (commands, command_rx) = mpsc::channel();
         let pending_rescans = Arc::new(AtomicUsize::new(0));
@@ -329,6 +334,7 @@ impl CollectionWatcher {
             .spawn(move || {
                 watch_loop(
                     root,
+                    collection,
                     debounce,
                     initial,
                     WorkerChannels {
@@ -698,7 +704,13 @@ struct WorkerChannels {
     epoch: Arc<WatcherEpoch>,
 }
 
-fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channels: WorkerChannels) {
+fn watch_loop(
+    root: PathBuf,
+    collection: Collection,
+    debounce: Duration,
+    mut snapshot: Snapshot,
+    channels: WorkerChannels,
+) {
     let WorkerChannels {
         inputs,
         filesystem_callback,
@@ -731,7 +743,7 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
     // registration before reporting readiness. Hosts can now treat `open` as
     // a stable boundary instead of triggering an additional full rescan.
     let mut startup_refresh_failure = None;
-    match Snapshot::load(&root) {
+    match Snapshot::load(&collection) {
         Ok(mut next) => {
             next.retain_classified_invalid(&snapshot);
             for event in snapshot.diff(&next) {
@@ -925,14 +937,14 @@ fn watch_loop(root: PathBuf, debounce: Duration, mut snapshot: Snapshot, channel
             let refresh_revision = invalidation_revision.load(Ordering::Acquire);
             let mut next = snapshot.clone();
             let refreshed = if full_rescan {
-                Snapshot::load(&root).map(|mut candidate| {
+                Snapshot::load(&collection).map(|mut candidate| {
                     candidate.retain_classified_invalid(&snapshot);
                     let diff = snapshot.diff(&candidate);
                     next = candidate;
                     diff
                 })
             } else {
-                next.refresh_paths(&root, &pending_paths)
+                next.refresh_paths(&collection, &pending_paths)
             };
             if epoch.is_exhausted() {
                 fail_pending_rescans(&mut pending_rescans);
@@ -1203,8 +1215,11 @@ struct RecordState {
 }
 
 impl Snapshot {
-    fn load(root: &Path) -> Result<Self, WatchError> {
-        let collection = Collection::open_for_observation(root)
+    fn load(held: &Collection) -> Result<Self, WatchError> {
+        // Reload configuration/resources through a clone of the already-held
+        // capability. Never reacquire through the notify display path.
+        let collection = held
+            .reopen_held(false)
             .map_err(|error| WatchError::Collection(collection_error(&error)))?;
         let observed = collection
             .snapshot_for_watcher()
@@ -1366,14 +1381,12 @@ impl Snapshot {
 
     fn refresh_paths(
         &mut self,
-        root: &Path,
+        collection: &Collection,
         paths: &BTreeSet<PathBuf>,
     ) -> Result<Vec<PendingEvent>, WatchError> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
-        let collection = Collection::open_for_observation(root)
-            .map_err(|error| WatchError::Collection(collection_error(&error)))?;
         let mut before = BTreeMap::new();
         let mut replacements = Vec::new();
         for path in paths {
@@ -1381,7 +1394,7 @@ impl Snapshot {
             if let Some(record) = self.records.get(&relative) {
                 before.insert(relative.clone(), record.clone());
             }
-            replacements.push((relative.clone(), load_record(&collection, &relative)?));
+            replacements.push((relative.clone(), load_record(collection, &relative)?));
         }
         for (path, outcome) in replacements {
             match outcome {
@@ -1813,7 +1826,8 @@ mod tests {
             "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
         )
         .unwrap();
-        let snapshot = Snapshot::load(directory.path()).unwrap();
+        let collection = Collection::open_for_observation(directory.path()).unwrap();
+        let snapshot = Snapshot::load(&collection).unwrap();
         let changed = |path: &str| {
             Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
                 .add_path(directory.path().join(path))
@@ -1894,7 +1908,8 @@ mod tests {
         assert_eq!(phase(), "committing");
         assert!(!directory.path().join("pending.md").exists());
 
-        let observed = Snapshot::load(directory.path()).unwrap();
+        let collection = Collection::open_for_observation(directory.path()).unwrap();
+        let observed = Snapshot::load(&collection).unwrap();
         assert!(observed.records.is_empty());
         assert_eq!(phase(), "committing");
         assert!(!directory.path().join("pending.md").exists());
@@ -1958,6 +1973,68 @@ mod tests {
             }
         }
         assert_eq!(observed, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_root_replacement_never_reads_or_emits_replacement_records_or_resources() {
+        let parent = tempfile::tempdir().unwrap();
+        let display = parent.path().join("collection");
+        let held_name = parent.path().join("held-original");
+        fs::create_dir(&display).unwrap();
+        fs::create_dir(display.join("_types")).unwrap();
+        fs::write(
+            display.join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(display.join("original.md"), "---\ntitle: Original\n---\n").unwrap();
+        fs::write(
+            display.join("_types/original.md"),
+            "---\nname: original\nfields: {}\n---\n",
+        )
+        .unwrap();
+        let watcher = CollectionWatcher::open(&display, Duration::from_millis(10)).unwrap();
+
+        fs::rename(&display, &held_name).unwrap();
+        fs::create_dir(&display).unwrap();
+        fs::create_dir(display.join("_types")).unwrap();
+        // Deliberately invalid replacement configuration proves a path reopen
+        // would fail before it could even inspect the replacement payloads.
+        fs::write(display.join("mdbase.yaml"), "not: [valid\n").unwrap();
+        fs::write(
+            display.join("replacement.md"),
+            "---\ntitle: Replacement\n---\nreplacement body\n",
+        )
+        .unwrap();
+        fs::write(
+            display.join("_types/replacement.md"),
+            "---\nname: replacement\nfields: {}\n---\n",
+        )
+        .unwrap();
+
+        let control = watcher.test_control();
+        control.invoke_installed_modify_callback(&display.join("replacement.md"));
+        watcher.rescan().unwrap();
+        assert!(watcher
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap()
+            .is_none());
+
+        // The original authority remains live and readable after displacement.
+        fs::write(
+            held_name.join("original.md"),
+            "---\ntitle: Held changed\n---\n",
+        )
+        .unwrap();
+        watcher.rescan().unwrap();
+        let event = watcher
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .expect("held original change event");
+        assert_eq!(event.event_type, "mdbase.record.modified");
+        assert_eq!(event.payload["path"], "original.md");
+        assert!(!event.payload.to_string().contains("Replacement"));
     }
 
     #[test]

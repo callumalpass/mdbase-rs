@@ -14,7 +14,6 @@ use super::{
 };
 use crate::v03::OperationResult;
 use crate::Collection;
-use walkdir::WalkDir;
 
 /// Provider-neutral execution boundary for one authoritative collection.
 ///
@@ -34,13 +33,13 @@ pub trait CollectionProvider: Send + Sync {
     /// Execute through the compatibility entry point while hosts migrate to
     /// explicit operation contexts.
     fn execute(&self, request: &OperationRequest) -> Result<OperationResult, ProviderError> {
-        self.execute_with_context(request, &OperationContext::legacy())
+        self.execute_with_context(request, &OperationContext::internal())
     }
 
     /// Refresh through the compatibility entry point while hosts migrate to
     /// explicit operation contexts.
     fn refresh(&self) -> Result<(), ProviderError> {
-        self.refresh_with_context(&OperationContext::legacy())
+        self.refresh_with_context(&OperationContext::internal())
     }
 }
 
@@ -52,6 +51,7 @@ pub trait CollectionProvider: Send + Sync {
 /// visible to the next request.
 pub struct FilesystemProvider {
     root: PathBuf,
+    authority: crate::collection_root::CollectionRoot,
     coordinated: bool,
     operation_gate: RuntimeGate,
     observer: Arc<dyn RuntimeObserver>,
@@ -105,13 +105,15 @@ impl FilesystemProvider {
                 return Err(error);
             }
         };
+        let authority = collection.held_root().clone();
         let stamp = CollectionStamp::load(
-            &root,
+            &authority,
             &collection.settings.types_folder,
             &collection.settings.contracts_folder,
         );
         Ok(Self {
             root,
+            authority,
             coordinated,
             operation_gate: RuntimeGate::new(),
             observer,
@@ -141,7 +143,7 @@ impl FilesystemProvider {
     /// the capture. External filesystem writers are detected by the ordinary
     /// opaque revisions and by a subsequent capture before cutover.
     pub fn snapshot(&self) -> Result<CollectionSnapshot, ProviderError> {
-        self.snapshot_with_context(&OperationContext::legacy())
+        self.snapshot_with_context(&OperationContext::internal())
     }
 
     /// Capture a snapshot while honoring the caller's operation boundary.
@@ -149,12 +151,14 @@ impl FilesystemProvider {
         &self,
         context: &OperationContext,
     ) -> Result<CollectionSnapshot, ProviderError> {
-        self.with_collection_read_context(context, Collection::snapshot)
+        self.with_collection_read_context(context, |collection| {
+            collection.snapshot_with_context(context)
+        })
     }
 
     /// Materialize one record at the provider's read boundary.
     pub fn snapshot_record(&self, path: &str) -> Result<CollectionSnapshotRecord, ProviderError> {
-        self.snapshot_record_with_context(path, &OperationContext::legacy())
+        self.snapshot_record_with_context(path, &OperationContext::internal())
     }
 
     /// Materialize one record while honoring the caller's operation boundary.
@@ -163,7 +167,9 @@ impl FilesystemProvider {
         path: &str,
         context: &OperationContext,
     ) -> Result<CollectionSnapshotRecord, ProviderError> {
-        self.with_collection_read_context(context, |collection| collection.snapshot_record(path))
+        self.with_collection_read_context(context, |collection| {
+            collection.snapshot_record_with_context(path, context)
+        })
     }
 
     /// Execute a compound provider operation against one freshly loaded
@@ -178,7 +184,7 @@ impl FilesystemProvider {
     where
         E: From<ProviderError>,
     {
-        self.with_collection_context(&OperationContext::legacy(), operation)
+        self.with_collection_context(&OperationContext::internal(), operation)
     }
 
     /// Execute one compound exclusive operation with an explicit boundary.
@@ -194,7 +200,7 @@ impl FilesystemProvider {
         context.check().map_err(E::from)?;
         let collection = self.current_collection().map_err(E::from)?;
         context.check().map_err(E::from)?;
-        let result = operation(collection.as_ref())?;
+        let result = context.scope(|| operation(collection.as_ref()))?;
         context.check().map_err(E::from)?;
         Ok(result)
     }
@@ -217,7 +223,7 @@ impl FilesystemProvider {
         context.check().map_err(E::from)?;
         let collection = self.current_collection().map_err(E::from)?;
         context.check().map_err(E::from)?;
-        operation(collection.as_ref())
+        context.scope(|| operation(collection.as_ref()))
     }
 
     /// Execute a compound read-only provider operation while allowing other
@@ -229,7 +235,7 @@ impl FilesystemProvider {
     where
         E: From<ProviderError>,
     {
-        self.with_collection_read_context(&OperationContext::legacy(), operation)
+        self.with_collection_read_context(&OperationContext::internal(), operation)
     }
 
     /// Execute one compound read operation with an explicit boundary.
@@ -245,7 +251,7 @@ impl FilesystemProvider {
         context.check().map_err(E::from)?;
         let collection = self.current_collection().map_err(E::from)?;
         context.check().map_err(E::from)?;
-        let result = operation(collection.as_ref())?;
+        let result = context.scope(|| operation(collection.as_ref()))?;
         context.check().map_err(E::from)?;
         Ok(result)
     }
@@ -297,21 +303,45 @@ impl FilesystemProvider {
         timings.open = open_started.elapsed();
         context.check()?;
         let execute_started = Instant::now();
-        let result =
-            match execute_collection(collection.as_ref(), request, context, self.coordinated) {
-                Ok(result) => result,
-                Err(error) => {
-                    timings.execute = execute_started.elapsed();
-                    return Err(self.finish_provider_error(
-                        request.operation.as_str(),
-                        "execute",
-                        started,
-                        timings,
-                        error,
-                    ));
-                }
-            };
+        let result = match context
+            .scope(|| execute_collection(collection.as_ref(), request, context, self.coordinated))
+        {
+            Ok(result) => result,
+            Err(error) => {
+                timings.execute = execute_started.elapsed();
+                return Err(self.finish_provider_error(
+                    request.operation.as_str(),
+                    "execute",
+                    started,
+                    timings,
+                    error,
+                ));
+            }
+        };
         timings.execute = execute_started.elapsed();
+        if let Some(error) = context.capture_limit_error() {
+            return Err(self.finish_provider_error(
+                request.operation.as_str(),
+                "execute",
+                started,
+                timings,
+                error,
+            ));
+        }
+        if request.operation == OperationKind::Query {
+            let records = result
+                .result
+                .get("results")
+                .and_then(Value::as_array)
+                .filter(|records| !records.is_empty());
+            if let Some(records) = records {
+                let bytes = super::cursor::measured_json_bytes(
+                    records,
+                    context.capture_limits().max_retained_bytes,
+                )?;
+                context.charge_retained(bytes)?;
+            }
+        }
         if !request.operation.is_mutation() {
             context.check()?;
         }
@@ -393,7 +423,7 @@ impl FilesystemProvider {
                 .read()
                 .map_err(|_| ProviderError::LockPoisoned)?;
             let current = CollectionStamp::load(
-                &self.root,
+                &self.authority,
                 &cached.collection.settings.types_folder,
                 &cached.collection.settings.contracts_folder,
             );
@@ -407,16 +437,19 @@ impl FilesystemProvider {
             .write()
             .map_err(|_| ProviderError::LockPoisoned)?;
         let current = CollectionStamp::load(
-            &self.root,
+            &self.authority,
             &cached.collection.settings.types_folder,
             &cached.collection.settings.contracts_folder,
         );
         if current == cached.stamp {
             return Ok(cached.collection.clone());
         }
-        let collection = open_collection(&self.root)?;
+        let collection = cached
+            .collection
+            .reopen_held(true)
+            .map_err(|error| ProviderError::CollectionOpen(error_message(&error)))?;
         let stamp = CollectionStamp::load(
-            &self.root,
+            &self.authority,
             &collection.settings.types_folder,
             &collection.settings.contracts_folder,
         );
@@ -426,9 +459,17 @@ impl FilesystemProvider {
     }
 
     fn reload_collection(&self) -> Result<(), ProviderError> {
-        let collection = open_collection(&self.root)?;
+        let existing = self
+            .collection_cache
+            .read()
+            .map_err(|_| ProviderError::LockPoisoned)?
+            .collection
+            .clone();
+        let collection = existing
+            .reopen_held(true)
+            .map_err(|error| ProviderError::CollectionOpen(error_message(&error)))?;
         let stamp = CollectionStamp::load(
-            &self.root,
+            &self.authority,
             &collection.settings.types_folder,
             &collection.settings.contracts_folder,
         );
@@ -445,7 +486,7 @@ impl FilesystemProvider {
         &self,
         generation: &super::CollectionGeneration,
     ) -> Result<(), ProviderError> {
-        let context = OperationContext::legacy();
+        let context = OperationContext::internal();
         let _guard = self.write_lock(&context)?;
         let collection = self.current_collection()?;
         crate::cache::runtime::rebuild(collection.as_ref(), generation).map_err(cache_error)?;
@@ -466,10 +507,23 @@ impl FilesystemProvider {
         context.check()?;
         self.with_collection_boundary_context(context, |collection| {
             context.check()?;
-            let settlement = OperationContext::legacy();
+            let settlement = OperationContext::internal();
             crate::transactions::reset_runtime_support_for_fork(collection, &settlement)
                 .map_err(super::filesystem::transaction_error)?;
             super::feed::reset_for_fork(collection)
+        })
+    }
+
+    /// Count valid version-2 runtime journals without exposing journal contents.
+    /// Operators should record a zero result before the 0.5.0 compatibility removal.
+    pub fn legacy_journal_inventory(
+        &self,
+        context: &OperationContext,
+    ) -> Result<super::LegacyJournalInventory, ProviderError> {
+        context.check()?;
+        self.with_collection_boundary_context(context, |collection| {
+            crate::transactions::legacy_runtime_journal_inventory(collection, context)
+                .map_err(super::filesystem::transaction_error)
         })
     }
 
@@ -740,32 +794,21 @@ struct CollectionStamp {
 }
 
 impl CollectionStamp {
-    fn load(root: &Path, types_folder: &str, contracts_folder: &str) -> Self {
-        let config_revision = std::fs::read(root.join("mdbase.yaml"))
+    fn load(
+        root: &crate::collection_root::CollectionRoot,
+        types_folder: &str,
+        contracts_folder: &str,
+    ) -> Self {
+        let config_revision = root
+            .read("mdbase.yaml")
             .ok()
             .map(|bytes| crate::v03::revision(&bytes));
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for control_root in [root.join(types_folder), root.join(contracts_folder)] {
-            for entry in WalkDir::new(&control_root)
-                .sort_by_file_name()
-                .follow_links(false)
-                .into_iter()
-                .flatten()
-                .filter(|entry| entry.file_type().is_file())
-            {
-                entry
-                    .path()
-                    .strip_prefix(root)
-                    .unwrap_or(entry.path())
-                    .hash(&mut hasher);
-                if let Ok(metadata) = entry.metadata() {
-                    metadata.len().hash(&mut hasher);
-                    metadata
-                        .modified()
-                        .ok()
-                        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|duration| duration.as_nanos())
-                        .hash(&mut hasher);
+        for folder in [types_folder, contracts_folder] {
+            for relative in root.files_recursive(Path::new(folder)).unwrap_or_default() {
+                relative.hash(&mut hasher);
+                if let Ok(bytes) = root.read(&relative) {
+                    bytes.hash(&mut hasher);
                 }
             }
         }

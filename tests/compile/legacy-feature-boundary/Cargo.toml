@@ -1,0 +1,15 @@
+[package]
+name = "legacy-feature-boundary"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["legacy"]
+legacy = ["mdbase/legacy-collection-mutation"]
+
+[dependencies]
+mdbase = { path = "../../..", default-features = false }
+serde_json = "1"
+
+[workspace]

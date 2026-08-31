@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::fs;
-use walkdir::WalkDir;
 
 use super::ProviderError;
 
@@ -66,14 +64,34 @@ impl Collection {
     /// Long-running hosts should normally call [`super::FilesystemProvider::snapshot`],
     /// which also holds the provider's read gate for the full capture.
     pub fn snapshot(&self) -> Result<CollectionSnapshot, ProviderError> {
-        Ok(collection_snapshot(self, InvalidRecordPolicy::Strict)?.snapshot)
+        self.snapshot_with_context(&super::OperationContext::internal())
+    }
+
+    /// Capture with caller-owned cancellation, deadline, and finite budgets.
+    pub fn snapshot_with_context(
+        &self,
+        context: &super::OperationContext,
+    ) -> Result<CollectionSnapshot, ProviderError> {
+        Ok(collection_snapshot(self, InvalidRecordPolicy::Strict, context)?.snapshot)
     }
 
     /// Capture watcher state without changing the public synchronization
     /// contract. Classified invalid records are reported out-of-band so the
     /// watcher can retain prior state; genuine capture failures remain errors.
     pub(crate) fn snapshot_for_watcher(&self) -> Result<WatcherSnapshot, ProviderError> {
-        collection_snapshot(self, InvalidRecordPolicy::Observe)
+        collection_snapshot(
+            self,
+            InvalidRecordPolicy::Observe,
+            &super::OperationContext::internal(),
+        )
+    }
+
+    #[allow(dead_code)] // watcher command transport does not yet carry contexts
+    pub(crate) fn snapshot_for_watcher_with_context(
+        &self,
+        context: &super::OperationContext,
+    ) -> Result<WatcherSnapshot, ProviderError> {
+        collection_snapshot(self, InvalidRecordPolicy::Observe, context)
     }
 
     /// Materialize one record for provider and synchronization boundaries.
@@ -85,11 +103,20 @@ impl Collection {
     /// wire format. Typed `read` remains strict, but transport layers do not
     /// reimplement parsing policy.
     pub fn snapshot_record(&self, path: &str) -> Result<CollectionSnapshotRecord, ProviderError> {
+        self.snapshot_record_with_context(path, &super::OperationContext::internal())
+    }
+
+    pub fn snapshot_record_with_context(
+        &self,
+        path: &str,
+        context: &super::OperationContext,
+    ) -> Result<CollectionSnapshotRecord, ProviderError> {
+        context.check()?;
         ensure_safe_relative_path(path, self.spec_profile)
             .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
         let record_path = readable_record_path(self, path)
             .map_err(|error| ProviderError::CollectionOpen(record_read_error(path, &error)))?;
-        match load_snapshot_record(self, record_path.as_str())? {
+        match load_snapshot_record(self, record_path.as_str(), context)? {
             SnapshotRecordLoad::Record(record) => Ok(record),
             SnapshotRecordLoad::InvalidUtf8 => Err(ProviderError::CollectionOpen(format!(
                 "collection record '{path}' contains invalid UTF-8"
@@ -115,116 +142,83 @@ enum InvalidRecordPolicy {
 fn collection_snapshot(
     collection: &Collection,
     invalid_policy: InvalidRecordPolicy,
+    context: &super::OperationContext,
 ) -> Result<WatcherSnapshot, ProviderError> {
-    let root = collection.root();
-    let configuration = read_resource(
-        root.join("mdbase.yaml"),
+    context.check()?;
+    let authority = collection.held_root();
+    let mut resource_entries = 1_u64;
+    context.check_resource_entries(resource_entries)?;
+    let configuration = read_resource_held(
+        authority,
         "mdbase.yaml".to_string(),
         CollectionSnapshotResourceKind::Configuration,
+        context,
     )?;
-    let report = crate::v03::inspect_collection(root);
-    if !report.valid {
-        let message = report
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.severity == "error")
-            .map(|diagnostic| diagnostic.message.as_str())
-            .unwrap_or("collection validation failed");
-        return Err(ProviderError::CollectionOpen(message.to_string()));
-    }
-
     let mut resources = vec![configuration];
-    let lock_path = root.join("mdbase.lock.yaml");
-    if lock_path.exists() {
-        resources.push(read_resource(
-            lock_path,
-            "mdbase.lock.yaml".to_string(),
-            CollectionSnapshotResourceKind::Lock,
-        )?);
-    }
-    let provision_lock_path = root.join("mdbase.provisions.yaml");
-    if provision_lock_path.exists() {
-        resources.push(read_resource(
-            provision_lock_path,
-            "mdbase.provisions.yaml".to_string(),
-            CollectionSnapshotResourceKind::Lock,
-        )?);
-    }
-    for type_file in report.types {
-        resources.push(read_resource(
-            root.join(&type_file.path),
-            type_file.path,
-            CollectionSnapshotResourceKind::Type,
-        )?);
-    }
-    let contracts_root = root.join(&collection.settings().contracts_folder);
-    if contracts_root.exists() {
-        for entry in WalkDir::new(&contracts_root)
-            .follow_links(false)
-            .sort_by_file_name()
+    for path in authority
+        .files_recursive(std::path::Path::new(""))
+        .map_err(|error| {
+            ProviderError::CollectionOpen(format!("failed to inspect resources: {error}"))
+        })?
+    {
+        context.check()?;
+        let portable = path.to_string_lossy().replace('\\', "/");
+        let kind = if matches!(
+            portable.as_str(),
+            "mdbase.lock.yaml" | "mdbase.provisions.yaml"
+        ) {
+            Some(CollectionSnapshotResourceKind::Lock)
+        } else if path.starts_with(&collection.settings().types_folder)
+            && matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("md" | "yaml" | "yml")
+            )
         {
-            let entry = entry.map_err(|error| {
-                ProviderError::CollectionOpen(format!(
-                    "failed to inspect contracts folder: {error}"
-                ))
-            })?;
-            if !entry.file_type().is_file()
-                || entry.path().extension().and_then(|value| value.to_str()) != Some("md")
-            {
-                continue;
-            }
-            let path = relative_resource_path(root, entry.path())?;
-            resources.push(read_resource(
-                entry.path().to_path_buf(),
-                path,
-                CollectionSnapshotResourceKind::Contract,
-            )?);
+            Some(CollectionSnapshotResourceKind::Type)
+        } else if path.starts_with(&collection.settings().contracts_folder)
+            && path.extension().and_then(|value| value.to_str()) == Some("md")
+        {
+            Some(CollectionSnapshotResourceKind::Contract)
+        } else if path.extension().and_then(|value| value.to_str()) == Some("json")
+            && is_schema_resource_path(&portable)
+        {
+            Some(CollectionSnapshotResourceKind::Schema)
+        } else if path.extension().and_then(|value| value.to_str()) == Some("base")
+            && !crate::record_path::has_hidden_component(&portable)
+            && crate::views::is_configured_obsidian_source(collection, &portable)
+        {
+            Some(CollectionSnapshotResourceKind::View)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            resource_entries =
+                resource_entries
+                    .checked_add(1)
+                    .ok_or(crate::runtime::CaptureLimitExceeded {
+                        kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                        limit: u64::MAX,
+                        attempted: u64::MAX,
+                    })?;
+            context.check_resource_entries(resource_entries)?;
+            resources.push(read_resource_held(authority, portable, kind, context)?);
         }
     }
-    for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
-        let entry = entry.map_err(|error| {
-            ProviderError::CollectionOpen(format!("failed to inspect schema resources: {error}"))
+    context.check()?;
+    let paths = collection.scan_collection_relative_paths_context(context)?;
+    context.check()?;
+    let mut records = Vec::new();
+    records
+        .try_reserve(paths.len())
+        .map_err(|_| crate::runtime::CaptureLimitExceeded {
+            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+            limit: usize::MAX as u64,
+            attempted: paths.len() as u64,
         })?;
-        if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
-        {
-            continue;
-        }
-        let path = relative_resource_path(root, entry.path())?;
-        if !is_schema_resource_path(&path) {
-            continue;
-        }
-        resources.push(read_resource(
-            entry.path().to_path_buf(),
-            path,
-            CollectionSnapshotResourceKind::Schema,
-        )?);
-    }
-    for view_file in crate::views::compatibility_source_paths(collection) {
-        let path = view_file
-            .strip_prefix(root)
-            .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        resources.push(read_resource(
-            view_file,
-            path,
-            CollectionSnapshotResourceKind::View,
-        )?);
-    }
-    let mut paths = collection
-        .scan_collection_files_checked()
-        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-    paths.sort();
-    let mut records = Vec::with_capacity(paths.len());
     let mut invalid_records = BTreeSet::new();
-    for absolute in paths {
-        let path = absolute
-            .strip_prefix(root)
-            .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        let record = match load_snapshot_record(collection, &path)? {
+    for path in paths {
+        context.check()?;
+        let record = match load_snapshot_record(collection, &path, context)? {
             SnapshotRecordLoad::Record(record) => {
                 if record.frontmatter_error.is_some()
                     && matches!(invalid_policy, InvalidRecordPolicy::Observe)
@@ -266,6 +260,7 @@ fn collection_snapshot(
             records.push(record);
         }
     }
+    context.check()?;
     resources[1..].sort_by(|left, right| left.path.cmp(&right.path));
 
     let spec_version = serde_yaml::from_str::<serde_yaml::Value>(&resources[0].document)
@@ -310,13 +305,10 @@ enum SnapshotRecordLoad {
 fn load_snapshot_record(
     collection: &Collection,
     path: &str,
+    context: &super::OperationContext,
 ) -> Result<SnapshotRecordLoad, ProviderError> {
     let Some(outcome) =
-        crate::record_load::load_record_no_follow(collection, path).map_err(|error| {
-            ProviderError::CollectionOpen(format!(
-                "failed to read collection record '{path}': {error}"
-            ))
-        })?
+        crate::record_load::load_record_no_follow_context(collection, path, context)?
     else {
         return Ok(SnapshotRecordLoad::Absent);
     };
@@ -428,14 +420,61 @@ fn resource_revision(resources: &[CollectionSnapshotResource]) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn read_resource(
-    absolute: std::path::PathBuf,
+fn read_resource_held(
+    root: &crate::collection_root::CollectionRoot,
     path: String,
     kind: CollectionSnapshotResourceKind,
+    context: &super::OperationContext,
 ) -> Result<CollectionSnapshotResource, ProviderError> {
-    let bytes = fs::read(&absolute).map_err(|error| {
-        ProviderError::CollectionOpen(format!("failed to read {path}: {error}"))
+    use std::io::Read;
+    context.check()?;
+    let mut file = root
+        .open_file(std::path::Path::new(&path))
+        .map_err(|error| {
+            ProviderError::CollectionOpen(format!("failed to open {path}: {error}"))
+        })?;
+    let size = file
+        .metadata()
+        .map_err(|error| {
+            ProviderError::CollectionOpen(format!("failed to inspect {path}: {error}"))
+        })?
+        .len();
+    context.check_file_bytes(size)?;
+    let capacity = usize::try_from(size).map_err(|_| crate::runtime::CaptureLimitExceeded {
+        kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+        limit: usize::MAX as u64,
+        attempted: size,
     })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| crate::runtime::CaptureLimitExceeded {
+            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+            limit: usize::MAX as u64,
+            attempted: size,
+        })?;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        context.check()?;
+        let read = file.read(&mut chunk).map_err(|error| {
+            ProviderError::CollectionOpen(format!("failed to read {path}: {error}"))
+        })?;
+        if read == 0 {
+            break;
+        }
+        let attempted = (bytes.len() as u64).checked_add(read as u64).ok_or(
+            crate::runtime::CaptureLimitExceeded {
+                kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                limit: u64::MAX,
+                attempted: u64::MAX,
+            },
+        )?;
+        context.check_file_bytes(attempted)?;
+        context.charge_read(read as u64)?;
+        context.charge_retained(read as u64)?;
+        bytes.extend_from_slice(&chunk[..read]);
+        context.check()?;
+    }
     let document = String::from_utf8(bytes.clone()).map_err(|error| {
         ProviderError::CollectionOpen(format!("{path} is not valid UTF-8: {error}"))
     })?;
@@ -445,16 +484,6 @@ fn read_resource(
         revision: crate::v03::revision(&bytes),
         document,
     })
-}
-
-fn relative_resource_path(
-    root: &std::path::Path,
-    absolute: &std::path::Path,
-) -> Result<String, ProviderError> {
-    absolute
-        .strip_prefix(root)
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))
 }
 
 fn snapshot_revision(

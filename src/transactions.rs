@@ -1,8 +1,10 @@
 //! Crash-recoverable multi-file collection transactions.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -10,19 +12,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::api::CollectionPath;
-use crate::operations::{
-    atomic_create, atomic_write, ensure_no_symlink_components, ensure_safe_relative_path,
-};
+use crate::operations::ensure_safe_relative_path;
 use crate::runtime::OperationContext;
 use crate::{Collection, SpecProfile};
 
 mod runtime;
 pub(crate) use runtime::{
     ack_runtime_change_event, ack_runtime_resolution, attach_runtime_prepared,
-    cancel_runtime_prepared, commit_runtime_prepared, list_unacked_runtime_events,
-    prepare_runtime_transaction, reset_runtime_support_for_fork, resolve_runtime_claim,
-    resolve_runtime_commit, settle_runtime_commit, RuntimeCommitAttempt, RuntimePrepareInput,
-    RuntimePrepareOutcome, RuntimeResolution, RuntimeSettlement,
+    cancel_runtime_prepared, commit_runtime_prepared, legacy_runtime_journal_inventory,
+    list_unacked_runtime_events, prepare_runtime_transaction, reset_runtime_support_for_fork,
+    resolve_runtime_claim, resolve_runtime_commit, settle_runtime_commit, RuntimeCommitAttempt,
+    RuntimePrepareInput, RuntimePrepareOutcome, RuntimeResolution, RuntimeSettlement,
 };
 #[cfg(test)]
 pub(crate) use runtime::{set_runtime_crash_point, set_runtime_settlement_delay};
@@ -37,6 +37,21 @@ fn post_commit_replacements() -> &'static std::sync::Mutex<PostCommitReplacement
     static REPLACEMENTS: std::sync::OnceLock<std::sync::Mutex<PostCommitReplacements>> =
         std::sync::OnceLock::new();
     REPLACEMENTS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn crash_after_applied() -> &'static std::sync::Mutex<BTreeMap<PathBuf, usize>> {
+    static CRASHES: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, usize>>> =
+        std::sync::OnceLock::new();
+    CRASHES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn inject_commit_crash_after(root: &Path, applied: usize) {
+    crash_after_applied()
+        .lock()
+        .expect("commit crash hook lock")
+        .insert(root.to_path_buf(), applied);
 }
 
 #[cfg(test)]
@@ -146,9 +161,14 @@ fn capture_committed_file_facts(
         .iter()
         .filter(|entry| entry.after_revision.is_some())
     {
-        let path = CollectionPath::new(&entry.path)?.under(&collection.root);
-        let file = File::open(&path).map_err(|source| io_error(path.clone(), source))?;
-        let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+        let relative = CollectionPath::new(&entry.path)?.to_path_buf();
+        let file = collection
+            .held_root()
+            .open_file(&relative)
+            .map_err(|source| io_error(collection.root.join(&relative), source))?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| io_error(collection.root.join(&relative), source))?;
         let mtime = metadata.modified().ok().map(|time| {
             let value: chrono::DateTime<chrono::Utc> = time.into();
             value.format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -258,12 +278,19 @@ pub(crate) fn commit_shadow(
     baseline: &FileBaseline,
     desired: &FileBaseline,
 ) -> Result<CommitOutcome, TransactionError> {
+    #[cfg(test)]
+    let fail_after_applied = crash_after_applied()
+        .lock()
+        .expect("commit crash hook lock")
+        .remove(collection.root());
+    #[cfg(not(test))]
+    let fail_after_applied = None;
     commit_shadow_controlled(
         collection,
         baseline,
         desired,
         TransactionScope::Records,
-        None,
+        fail_after_applied,
     )
 }
 
@@ -295,15 +322,20 @@ fn commit_shadow_controlled(
     let _write_lock = WriteLock::acquire(collection)?;
     ensure_transaction_root(collection)?;
     let id = uuid::Uuid::new_v4().simple().to_string();
-    let directory = collection.root.join(TRANSACTIONS_DIR).join(&id);
-    fs::create_dir_all(directory.join("stage"))
-        .map_err(|source| io_error(directory.join("stage"), source))?;
+    let directory = PathBuf::from(TRANSACTIONS_DIR).join(&id);
+    collection
+        .held_root()
+        .create_dir_all(&directory.join("stage"))
+        .map_err(|source| io_error(collection.root.join(&directory).join("stage"), source))?;
     let mut staging = StagingGuard {
+        root: collection.held_root().clone(),
         directory: directory.clone(),
         durable: false,
     };
-    fs::create_dir_all(directory.join("backup"))
-        .map_err(|source| io_error(directory.join("backup"), source))?;
+    collection
+        .held_root()
+        .create_dir_all(&directory.join("backup"))
+        .map_err(|source| io_error(collection.root.join(&directory).join("backup"), source))?;
 
     let paths = baseline
         .keys()
@@ -321,7 +353,7 @@ fn commit_shadow_controlled(
         let index = entries.len();
         let stage_file = after.map(|bytes| {
             let name = format!("stage/{index}");
-            write_synced(&directory.join(&name), bytes)?;
+            write_synced(collection, &directory.join(&name), bytes)?;
             Ok::<_, TransactionError>(name)
         });
         let stage_file = match stage_file {
@@ -330,7 +362,7 @@ fn commit_shadow_controlled(
         };
         let backup_file = before.map(|bytes| {
             let name = format!("backup/{index}");
-            write_synced(&directory.join(&name), bytes)?;
+            write_synced(collection, &directory.join(&name), bytes)?;
             Ok::<_, TransactionError>(name)
         });
         let backup_file = match backup_file {
@@ -347,15 +379,15 @@ fn commit_shadow_controlled(
     }
 
     if entries.is_empty() {
-        cleanup_transaction(&directory);
+        cleanup_transaction(collection, &directory);
         return Ok(CommitOutcome {
             cleanup_deferred: false,
             file_facts: BTreeMap::new(),
         });
     }
 
-    sync_dir(&directory.join("stage"))?;
-    sync_dir(&directory.join("backup"))?;
+    sync_dir(collection, &directory.join("stage"))?;
+    sync_dir(collection, &directory.join("backup"))?;
     let mut journal = Journal {
         version: 1,
         id,
@@ -364,15 +396,15 @@ fn commit_shadow_controlled(
         applied: 0,
         entries,
     };
-    persist_journal(&directory, &journal)?;
+    persist_journal(collection, &directory, &journal)?;
     staging.durable = true;
 
     if let Err(error) = recheck_preconditions(collection, &journal) {
-        cleanup_transaction(&directory);
+        cleanup_transaction(collection, &directory);
         return Err(error);
     }
     journal.phase = Phase::Committing;
-    persist_journal(&directory, &journal)?;
+    persist_journal(collection, &directory, &journal)?;
 
     let mut file_facts = BTreeMap::new();
     for index in 0..journal.entries.len() {
@@ -384,9 +416,14 @@ fn commit_shadow_controlled(
         )?;
         if journal.entries[index].after_revision.is_some() {
             let entry = &journal.entries[index];
-            let path = CollectionPath::new(&entry.path)?.under(&collection.root);
-            let file = File::open(&path).map_err(|source| io_error(path.clone(), source))?;
-            let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+            let relative = CollectionPath::new(&entry.path)?.to_path_buf();
+            let file = collection
+                .held_root()
+                .open_file(&relative)
+                .map_err(|source| io_error(collection.root.join(&relative), source))?;
+            let metadata = file
+                .metadata()
+                .map_err(|source| io_error(collection.root.join(&relative), source))?;
             let mtime = metadata.modified().ok().map(|time| {
                 let value: chrono::DateTime<chrono::Utc> = time.into();
                 value.format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -400,7 +437,7 @@ fn commit_shadow_controlled(
             );
         }
         journal.applied = index + 1;
-        persist_journal(&directory, &journal)?;
+        persist_journal(collection, &directory, &journal)?;
         #[cfg(test)]
         if _fail_after_applied == Some(journal.applied) {
             return Err(TransactionError::SimulatedCrash);
@@ -408,7 +445,7 @@ fn commit_shadow_controlled(
     }
 
     journal.phase = Phase::Committed;
-    persist_journal(&directory, &journal)?;
+    persist_journal(collection, &directory, &journal)?;
     #[cfg(test)]
     apply_post_commit_hook(collection)?;
     #[cfg(test)]
@@ -418,9 +455,10 @@ fn commit_shadow_controlled(
         .remove(&collection.root);
     #[cfg(not(test))]
     let injected_cleanup_deferred = false;
-    let cleanup_deferred = injected_cleanup_deferred || fs::remove_dir_all(&directory).is_err();
+    let cleanup_deferred =
+        injected_cleanup_deferred || collection.held_root().remove_dir_all(&directory).is_err();
     if !cleanup_deferred {
-        let _ = sync_dir(&collection.root.join(TRANSACTIONS_DIR));
+        let _ = sync_dir(collection, Path::new(TRANSACTIONS_DIR));
     }
     Ok(CommitOutcome {
         cleanup_deferred,
@@ -430,38 +468,20 @@ fn commit_shadow_controlled(
 
 /// Recover every durable transaction before a collection becomes available.
 pub(crate) fn recover_pending(collection: &Collection) -> Result<bool, TransactionError> {
-    ensure_no_symlink_components(&collection.root, TRANSACTIONS_DIR, SpecProfile::V03)
-        .map_err(|error| TransactionError::UnsafePath(error.to_string()))?;
-    let root = collection.root.join(TRANSACTIONS_DIR);
-    if !root.exists() {
-        return Ok(false);
+    match collection.held_root().open_dir(Path::new(TRANSACTIONS_DIR)) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(io_error(collection.root.join(TRANSACTIONS_DIR), source));
+        }
     }
-    // Discover transactions only while holding the same lock used to stage,
-    // commit, and clean them up. Enumerating before locking leaves a stale path
-    // if a concurrent writer completes while recovery is waiting.
     let _write_lock = WriteLock::acquire(collection)?;
-    if !root.exists() {
-        return Ok(false);
-    }
-    let mut directories = fs::read_dir(&root)
-        .map_err(|source| io_error(root.clone(), source))?
-        .map(|entry| {
-            entry
-                .map(|entry| entry.path())
-                .map_err(|source| io_error(root.clone(), source))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    directories.sort();
+    let directories = collection
+        .held_root()
+        .child_directories(Path::new(TRANSACTIONS_DIR))
+        .map_err(|source| io_error(collection.root.join(TRANSACTIONS_DIR), source))?;
     let mut changed = false;
     for directory in directories {
-        let metadata = fs::symlink_metadata(&directory)
-            .map_err(|source| io_error(directory.clone(), source))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(TransactionError::ManualRecovery(format!(
-                "'{}' is not a regular transaction directory",
-                directory.display()
-            )));
-        }
         changed |= recover_one(collection, &directory)?;
     }
     Ok(changed)
@@ -469,11 +489,14 @@ pub(crate) fn recover_pending(collection: &Collection) -> Result<bool, Transacti
 
 fn recover_one(collection: &Collection, directory: &Path) -> Result<bool, TransactionError> {
     let journal_path = directory.join(JOURNAL_FILE);
-    let bytes = fs::read(&journal_path).map_err(|source| io_error(journal_path.clone(), source))?;
+    let bytes = collection
+        .held_root()
+        .read(&journal_path)
+        .map_err(|source| io_error(collection.root.join(&journal_path), source))?;
     let version = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64));
-    if matches!(version, Some(2 | 3)) {
+    if matches!(version, Some(2..=4)) {
         return runtime::recover_runtime_one(collection, directory, &bytes);
     }
     let mut journal: Journal = serde_json::from_slice(&bytes)
@@ -513,18 +536,18 @@ fn recover_one(collection: &Collection, directory: &Path) -> Result<bool, Transa
 
     match journal.phase {
         Phase::Prepared if journal.applied == 0 => {
-            cleanup_transaction(directory);
+            cleanup_transaction(collection, directory);
             return Ok(true);
         }
         Phase::Committed => {
-            cleanup_transaction(directory);
+            cleanup_transaction(collection, directory);
             return Ok(true);
         }
         Phase::Prepared | Phase::Committing => {}
     }
     for entry in &journal.entries {
         if let Some(stage_file) = &entry.stage_file {
-            let staged = read_regular_file(&directory.join(stage_file))?;
+            let staged = read_regular_file(collection, &directory.join(stage_file))?;
             if Some(crate::v03::revision(&staged)) != entry.after_revision {
                 return Err(TransactionError::InvalidJournal(format!(
                     "staged contents for '{}' do not match the journal",
@@ -533,7 +556,7 @@ fn recover_one(collection: &Collection, directory: &Path) -> Result<bool, Transa
             }
         }
         if let Some(backup_file) = &entry.backup_file {
-            let backup = read_regular_file(&directory.join(backup_file))?;
+            let backup = read_regular_file(collection, &directory.join(backup_file))?;
             if Some(crate::v03::revision(&backup)) != entry.before_revision {
                 return Err(TransactionError::InvalidJournal(format!(
                     "backup contents for '{}' do not match the journal",
@@ -544,17 +567,14 @@ fn recover_one(collection: &Collection, directory: &Path) -> Result<bool, Transa
     }
 
     journal.phase = Phase::Committing;
-    persist_journal(directory, &journal)?;
+    persist_journal(collection, directory, &journal)?;
     for index in 0..journal.entries.len() {
         let entry = &journal.entries[index];
-        let current = current_revision(
-            &collection
-                .root
-                .join(CollectionPath::new(&entry.path)?.to_path_buf()),
-        )?;
+        let current =
+            current_revision(collection, &CollectionPath::new(&entry.path)?.to_path_buf())?;
         if current == entry.after_revision {
             journal.applied = journal.applied.max(index + 1);
-            persist_journal(directory, &journal)?;
+            persist_journal(collection, directory, &journal)?;
             continue;
         }
         if current != entry.before_revision {
@@ -565,11 +585,11 @@ fn recover_one(collection: &Collection, directory: &Path) -> Result<bool, Transa
         }
         apply_entry(collection, directory, entry, journal.scope)?;
         journal.applied = index + 1;
-        persist_journal(directory, &journal)?;
+        persist_journal(collection, directory, &journal)?;
     }
     journal.phase = Phase::Committed;
-    persist_journal(directory, &journal)?;
-    cleanup_transaction(directory);
+    persist_journal(collection, directory, &journal)?;
+    cleanup_transaction(collection, directory);
     Ok(true)
 }
 
@@ -580,8 +600,8 @@ fn recheck_preconditions(
     for entry in &journal.entries {
         let path = CollectionPath::new(&entry.path)
             .map_err(|error| TransactionError::UnsafePath(error.to_string()))?
-            .under(&collection.root);
-        let current = current_revision(&path)?;
+            .to_path_buf();
+        let current = current_revision(collection, &path)?;
         if current != entry.before_revision {
             return Err(TransactionError::ConcurrentModification(entry.path.clone()));
         }
@@ -598,11 +618,11 @@ fn apply_entry(
     validate_entry_path(collection, &entry.path, scope)?;
     let path = CollectionPath::new(&entry.path)
         .map_err(|error| TransactionError::UnsafePath(error.to_string()))?
-        .under(&collection.root);
+        .to_path_buf();
     match &entry.stage_file {
         Some(stage_file) => {
             let staged_path = directory.join(stage_file);
-            let bytes = read_regular_file(&staged_path)?;
+            let bytes = read_regular_file(collection, &staged_path)?;
             if crate::v03::revision(&bytes) != entry.after_revision.as_deref().unwrap_or_default() {
                 return Err(TransactionError::InvalidJournal(format!(
                     "staged contents for '{}' do not match the journal",
@@ -610,17 +630,17 @@ fn apply_entry(
                 )));
             }
             let result = if entry.before_revision.is_none() {
-                atomic_create(&path, &bytes)
+                collection.held_root().atomic_create(&path, &bytes)
             } else {
-                atomic_write(&path, &bytes)
+                collection.held_root().atomic_write(&path, &bytes)
             };
-            result.map_err(|source| io_error(path.clone(), source))?;
+            result.map_err(|source| io_error(collection.root.join(&path), source))?;
         }
         None => {
-            fs::remove_file(&path).map_err(|source| io_error(path.clone(), source))?;
-            if let Some(parent) = path.parent() {
-                sync_dir(parent)?;
-            }
+            collection
+                .held_root()
+                .remove_file(&path)
+                .map_err(|source| io_error(collection.root.join(&path), source))?;
         }
     }
     Ok(())
@@ -667,78 +687,78 @@ fn validate_entry_path(
             .map_err(|error| TransactionError::UnsafePath(error.to_string()))?,
     };
     ensure_safe_relative_path(logical.as_str(), SpecProfile::V03)
-        .map_err(|error| TransactionError::UnsafePath(error.to_string()))?;
-    ensure_no_symlink_components(&collection.root, logical.as_str(), SpecProfile::V03)
         .map_err(|error| TransactionError::UnsafePath(error.to_string()))
+        .map(|_| ())
 }
 
 fn ensure_transaction_root(collection: &Collection) -> Result<(), TransactionError> {
-    ensure_no_symlink_components(&collection.root, TRANSACTIONS_DIR, SpecProfile::V03)
-        .map_err(|error| TransactionError::UnsafePath(error.to_string()))?;
-    let root = collection.root.join(TRANSACTIONS_DIR);
-    fs::create_dir_all(&root).map_err(|source| io_error(root, source))
+    collection
+        .held_root()
+        .create_dir_all(Path::new(TRANSACTIONS_DIR))
+        .map(|_| ())
+        .map_err(|source| io_error(collection.root.join(TRANSACTIONS_DIR), source))
 }
 
-fn persist_journal(directory: &Path, journal: &Journal) -> Result<(), TransactionError> {
+fn persist_journal(
+    collection: &Collection,
+    directory: &Path,
+    journal: &Journal,
+) -> Result<(), TransactionError> {
     let bytes = serde_json::to_vec_pretty(journal)
         .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?;
     let path = directory.join(JOURNAL_FILE);
-    atomic_write(&path, &bytes).map_err(|source| io_error(path, source))
+    collection
+        .held_root()
+        .atomic_write(&path, &bytes)
+        .map_err(|source| io_error(collection.root.join(path), source))
 }
 
-fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), TransactionError> {
-    OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .and_then(|mut file| {
-            file.write_all(bytes)?;
-            file.sync_all()
-        })
-        .map_err(|source| io_error(path.to_path_buf(), source))
+fn write_synced(
+    collection: &Collection,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), TransactionError> {
+    collection
+        .held_root()
+        .write_new_synced(path, bytes)
+        .map_err(|source| io_error(collection.root.join(path), source))
 }
 
-fn read_regular_file(path: &Path) -> Result<Vec<u8>, TransactionError> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|source| io_error(path.to_path_buf(), source))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(TransactionError::InvalidJournal(format!(
-            "'{}' is not a regular transaction payload",
-            path.display()
-        )));
-    }
-    fs::read(path).map_err(|source| io_error(path.to_path_buf(), source))
+fn read_regular_file(collection: &Collection, path: &Path) -> Result<Vec<u8>, TransactionError> {
+    collection.held_root().read(path).map_err(|source| {
+        if source.kind() == io::ErrorKind::PermissionDenied {
+            TransactionError::InvalidJournal(format!(
+                "'{}' is not a safe regular transaction payload",
+                collection.root.join(path).display()
+            ))
+        } else {
+            io_error(collection.root.join(path), source)
+        }
+    })
 }
 
-fn current_revision(path: &Path) -> Result<Option<String>, TransactionError> {
-    match fs::read(path) {
+fn current_revision(
+    collection: &Collection,
+    path: &Path,
+) -> Result<Option<String>, TransactionError> {
+    match collection.held_root().read(path) {
         Ok(bytes) => Ok(Some(crate::v03::revision(&bytes))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(io_error(path.to_path_buf(), source)),
+        Err(source) => Err(io_error(collection.root.join(path), source)),
     }
 }
 
-#[cfg(not(windows))]
-fn sync_dir(path: &Path) -> Result<(), TransactionError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| io_error(path.to_path_buf(), source))
+fn sync_dir(collection: &Collection, path: &Path) -> Result<(), TransactionError> {
+    collection
+        .held_root()
+        .sync_dir(path)
+        .map_err(|source| io_error(collection.root.join(path), source))
 }
 
-#[cfg(windows)]
-fn sync_dir(_path: &Path) -> Result<(), TransactionError> {
-    // std::fs cannot open directory handles with FILE_FLAG_BACKUP_SEMANTICS,
-    // so the portable directory-fsync pattern fails with AccessDenied on
-    // Windows. Every transaction payload and journal file is still synced
-    // before its atomic rename; only the additional directory metadata flush
-    // is unavailable through Rust's standard library.
-    Ok(())
-}
-
-fn cleanup_transaction(directory: &Path) {
-    if fs::remove_dir_all(directory).is_ok() {
+fn cleanup_transaction(collection: &Collection, directory: &Path) {
+    if collection.held_root().remove_dir_all(directory).is_ok() {
         if let Some(parent) = directory.parent() {
-            let _ = sync_dir(parent);
+            let _ = sync_dir(collection, parent);
         }
     }
 }
@@ -752,6 +772,7 @@ pub(crate) struct WriteLock {
 }
 
 struct StagingGuard {
+    root: crate::collection_root::CollectionRoot,
     directory: PathBuf,
     durable: bool,
 }
@@ -759,7 +780,7 @@ struct StagingGuard {
 impl Drop for StagingGuard {
     fn drop(&mut self) {
         if !self.durable {
-            cleanup_transaction(&self.directory);
+            let _ = self.root.remove_dir_all(&self.directory);
         }
     }
 }
@@ -797,21 +818,11 @@ impl WriteLock {
     }
 
     fn open(collection: &Collection) -> Result<(File, PathBuf), TransactionError> {
-        ensure_no_symlink_components(
-            &collection.root,
-            ".mdbase/write.lock",
-            collection.spec_profile,
-        )
-        .map_err(|error| TransactionError::UnsafePath(error.to_string()))?;
-        let lock_directory = collection.root.join(".mdbase");
-        fs::create_dir_all(&lock_directory).map_err(|source| io_error(lock_directory, source))?;
-        let path = collection.root.join(".mdbase/write.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
+        let relative = Path::new(".mdbase/write.lock");
+        let path = collection.root.join(relative);
+        let file = collection
+            .held_root()
+            .open_lock_file(relative)
             .map_err(|source| io_error(path.clone(), source))?;
         Ok((file, path))
     }

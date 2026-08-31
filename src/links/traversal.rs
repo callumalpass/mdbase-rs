@@ -1,8 +1,11 @@
 //! asFile() traversal (§8.7).
 
-use crate::{Collection, CollectionSnapshotError, OperationCancellation};
+use crate::{Collection, CollectionSnapshotError};
 use std::collections::HashMap;
 use std::time::Instant;
+
+type BacklinksBuildResult =
+    Result<(HashMap<String, Vec<String>>, Option<BacklinksPerf>), crate::runtime::CatalogError>;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BacklinksPerf {
@@ -32,25 +35,26 @@ impl Collection {
     pub fn build_all_files_data(
         &self,
     ) -> Result<Vec<crate::expressions::evaluator::ResolvedFileData>, CollectionSnapshotError> {
-        self.capture_collection_snapshot(&OperationCancellation::new())
+        self.capture_collection_snapshot_current()
             .map(|snapshot| snapshot.resolved_files_data())
             .map_err(CollectionSnapshotError::from)
     }
 
-    /// Build backlinks index from all files data.
-    /// Returns a map: target_path -> Vec<source_path> (deduplicated).
+    /// Build a backlinks index or return the selector diagnostic. Resolution
+    /// failures are never represented as graph entries.
     pub fn build_backlinks_index(
         &self,
         all_files: &[crate::expressions::evaluator::ResolvedFileData],
-    ) -> HashMap<String, Vec<String>> {
-        self.build_backlinks_index_profiled(all_files, false).0
+    ) -> Result<HashMap<String, Vec<String>>, crate::runtime::CatalogError> {
+        self.build_backlinks_index_profiled(all_files, false)
+            .map(|(index, _)| index)
     }
 
     pub(crate) fn build_backlinks_index_profiled(
         &self,
         all_files: &[crate::expressions::evaluator::ResolvedFileData],
         profile: bool,
-    ) -> (HashMap<String, Vec<String>>, Option<BacklinksPerf>) {
+    ) -> BacklinksBuildResult {
         let resolution_index = self.build_link_resolution_index(all_files);
         self.build_backlinks_index_with_resolution(all_files, profile, &resolution_index)
     }
@@ -58,7 +62,7 @@ impl Collection {
     pub(crate) fn build_backlinks_index_for_snapshot(
         &self,
         snapshot: &crate::snapshot::AuthoritativeCollectionSnapshot,
-    ) -> HashMap<String, Vec<String>> {
+    ) -> Result<HashMap<String, Vec<String>>, crate::runtime::CatalogError> {
         let resolved_files = snapshot.resolved_files_data();
         self.build_backlinks_index_for_snapshot_files(snapshot, &resolved_files)
     }
@@ -67,10 +71,10 @@ impl Collection {
         &self,
         snapshot: &crate::snapshot::AuthoritativeCollectionSnapshot,
         resolved_files: &[crate::expressions::evaluator::ResolvedFileData],
-    ) -> HashMap<String, Vec<String>> {
+    ) -> Result<HashMap<String, Vec<String>>, crate::runtime::CatalogError> {
         let resolution_index = snapshot.link_resolution_index_from_resolved(self, resolved_files);
         self.build_backlinks_index_with_resolution(resolved_files, false, &resolution_index)
-            .0
+            .map(|(index, _)| index)
     }
 
     fn build_backlinks_index_with_resolution(
@@ -78,7 +82,7 @@ impl Collection {
         all_files: &[crate::expressions::evaluator::ResolvedFileData],
         profile: bool,
         resolution_index: &crate::links::resolver::LinkResolutionIndex,
-    ) -> (HashMap<String, Vec<String>>, Option<BacklinksPerf>) {
+    ) -> BacklinksBuildResult {
         use crate::expressions::evaluator::{
             extract_embeds_from_body, extract_links_from_body, extract_links_from_fm_value,
         };
@@ -135,7 +139,7 @@ impl Collection {
                 // Resolve the target to a file path
                 perf.resolve_calls += 1;
                 let resolved =
-                    self.resolve_link_target(target, source_path, target_types, resolution_index);
+                    self.resolve_link_target(target, source_path, target_types, resolution_index)?;
                 if let Some(resolved_path) = resolved {
                     if !seen_targets.contains(&resolved_path) {
                         seen_targets.push(resolved_path.clone());
@@ -157,9 +161,9 @@ impl Collection {
 
         perf.total_ms = elapsed_ms(total_start);
         if profile {
-            (index, Some(perf))
+            Ok((index, Some(perf)))
         } else {
-            (index, None)
+            Ok((index, None))
         }
     }
 }

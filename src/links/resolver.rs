@@ -104,8 +104,8 @@ pub(crate) fn compute_relative_path(source_dir: &str, target_path: &str) -> Stri
 use crate::errors::*;
 use crate::links::parser::{count_leading_dotdot, normalize_link_path};
 use crate::runtime::{
-    select_resolution_candidate, RankedResolution, RankedResolutionCandidate,
-    RecordResolutionKeyKind,
+    select_resolution_candidate, CatalogError, RankedResolution, RankedResolutionCandidate,
+    RecordResolutionKeyKind, ResolutionReason,
 };
 use crate::types::schema::FieldDef;
 use crate::Collection;
@@ -124,8 +124,46 @@ pub(crate) struct LinkResolutionIndex {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LinkResolution {
     Missing,
-    Resolved(String),
+    Resolved {
+        path: String,
+        reason: ResolutionReason,
+        selected_kind: RecordResolutionKeyKind,
+        candidate_count: usize,
+        candidate_digest: String,
+        alternatives: Vec<String>,
+        alternative_candidates: Vec<crate::runtime::ResolutionCandidateIdentity>,
+    },
     Ambiguous(Vec<String>),
+}
+
+fn resolution_error_json(error: &CatalogError, field: Option<&str>) -> serde_json::Value {
+    let mut issue = serde_json::json!({
+        "code": error.code,
+        "message": error.message,
+        "severity": "error",
+    });
+    if let Some(field) = field {
+        issue["field"] = serde_json::Value::String(field.to_string());
+    }
+    serde_json::json!({
+        "error": {"code": error.code, "message": error.message},
+        "issues": [issue],
+    })
+}
+
+fn selector_issue(error: CatalogError, path: &str, field: &str, type_name: &str) -> Issue {
+    Issue {
+        code: error.code,
+        message: error.message,
+        path: Some(path.to_string()),
+        field: Some(field.to_string()),
+        severity: Severity::Error,
+        expected: None,
+        actual: None,
+        type_name: Some(type_name.to_string()),
+        line: None,
+        column: None,
+    }
 }
 
 fn insert_resolution_key(index: &mut HashMap<String, Vec<String>>, key: String, path: &str) {
@@ -140,16 +178,35 @@ fn select_local_resolution(
     source_path: &str,
     kind: RecordResolutionKeyKind,
     paths: impl IntoIterator<Item = String>,
-) -> LinkResolution {
+) -> Result<LinkResolution, CatalogError> {
     let candidates = paths.into_iter().map(|path| RankedResolutionCandidate {
         record_id: path.clone(),
         path,
     });
-    match select_resolution_candidate(source_path, kind, candidates) {
-        Ok(RankedResolution::Missing) | Err(_) => LinkResolution::Missing,
-        Ok(RankedResolution::Resolved { path, .. }) => LinkResolution::Resolved(path),
-        Ok(RankedResolution::Ambiguous { paths }) => LinkResolution::Ambiguous(paths),
-    }
+    Ok(
+        match select_resolution_candidate(source_path, kind, candidates)? {
+            RankedResolution::Missing => LinkResolution::Missing,
+            RankedResolution::Resolved {
+                path,
+                reason,
+                selected_kind,
+                candidate_count,
+                candidate_digest,
+                alternatives,
+                alternative_candidates,
+                ..
+            } => LinkResolution::Resolved {
+                path,
+                reason,
+                selected_kind,
+                candidate_count,
+                candidate_digest,
+                alternatives,
+                alternative_candidates,
+            },
+            RankedResolution::Ambiguous { paths } => LinkResolution::Ambiguous(paths),
+        },
+    )
 }
 
 impl Collection {
@@ -215,8 +272,7 @@ impl Collection {
             return serde_json::json!({"error": {"code": "path_traversal", "message": "Link source path is unsafe"}});
         }
 
-        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
-        {
+        let snapshot = match self.capture_collection_snapshot_current() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return crate::errors::op_error("collection_snapshot_failed", &error.to_string())
@@ -239,6 +295,12 @@ impl Collection {
             None => return serde_json::json!({"resolved_path": serde_json::Value::Null}),
         };
         let parsed = self.parse_link(&serde_json::json!({"value": field_val}));
+        if let Some(error) = parsed.get("error") {
+            return serde_json::json!({
+                "error": error,
+                "issues": [{"code": "malformed_link", "field": field_name, "severity": "error"}]
+            });
+        }
         let Some(target) = parsed
             .pointer("/link/target")
             .and_then(serde_json::Value::as_str)
@@ -277,8 +339,9 @@ impl Collection {
             Some(target.to_string())
         } else {
             match self.resolve_simple_name(&index, target, source_path, &target_types) {
-                LinkResolution::Resolved(path) => Some(path),
-                LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
+                Ok(LinkResolution::Resolved { path, .. }) => Some(path),
+                Ok(LinkResolution::Missing | LinkResolution::Ambiguous(_)) => None,
+                Err(error) => return resolution_error_json(&error, Some(field_name)),
             }
         }
         .map(|path| normalize_collection_path(&path));
@@ -359,7 +422,7 @@ impl Collection {
         name: &str,
         source_path: &str,
         target_types: &[String],
-    ) -> LinkResolution {
+    ) -> Result<LinkResolution, CatalogError> {
         let name_lower = name.to_lowercase();
         for (kind, candidates) in [
             (
@@ -383,7 +446,7 @@ impl Collection {
                 return select_local_resolution(source_path, kind, eligible);
             }
         }
-        LinkResolution::Missing
+        Ok(LinkResolution::Missing)
     }
 
     pub(crate) fn get_field_target_types_from_frontmatter(
@@ -434,7 +497,7 @@ impl Collection {
         source_path: &str,
         target_types: &[String],
         resolution_index: &LinkResolutionIndex,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, CatalogError> {
         // Strip wikilink syntax
         let target = if target.starts_with("[[") && target.ends_with("]]") {
             let inner = &target[2..target.len() - 2];
@@ -452,7 +515,7 @@ impl Collection {
         };
 
         if target.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Handle relative paths (./foo, ../foo)
@@ -466,7 +529,9 @@ impl Collection {
             for c in joined.components() {
                 match c {
                     std::path::Component::ParentDir => {
-                        components.pop()?;
+                        if components.pop().is_none() {
+                            return Ok(None);
+                        }
                     }
                     std::path::Component::CurDir => {}
                     _ => {
@@ -490,73 +555,76 @@ impl Collection {
                 let eligible =
                     self.eligible_resolution_paths(resolution_index, paths, target_types);
                 if !eligible.is_empty() {
-                    return match select_local_resolution(
+                    return select_local_resolution(
                         source_path,
                         RecordResolutionKeyKind::Id,
                         eligible,
-                    ) {
-                        LinkResolution::Resolved(path) => Some(path),
+                    )
+                    .map(|resolution| match resolution {
+                        LinkResolution::Resolved { path, .. } => Some(path),
                         LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
-                    };
+                    });
                 }
             }
             if let Some(paths) = resolution_index.basename_lower_to_paths.get(&target_lower) {
                 let eligible =
                     self.eligible_resolution_paths(resolution_index, paths, target_types);
                 if !eligible.is_empty() {
-                    return match select_local_resolution(
+                    return select_local_resolution(
                         source_path,
                         RecordResolutionKeyKind::Basename,
                         eligible,
-                    ) {
-                        LinkResolution::Resolved(path) => Some(path),
+                    )
+                    .map(|resolution| match resolution {
+                        LinkResolution::Resolved { path, .. } => Some(path),
                         LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
-                    };
+                    });
                 }
             }
             if let Some(paths) = resolution_index.title_lower_to_paths.get(&target_lower) {
                 let eligible =
                     self.eligible_resolution_paths(resolution_index, paths, target_types);
                 if !eligible.is_empty() {
-                    return match select_local_resolution(
+                    return select_local_resolution(
                         source_path,
                         RecordResolutionKeyKind::Title,
                         eligible,
-                    ) {
-                        LinkResolution::Resolved(path) => Some(path),
+                    )
+                    .map(|resolution| match resolution {
+                        LinkResolution::Resolved { path, .. } => Some(path),
                         LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
-                    };
+                    });
                 }
             }
-            return None;
+            return Ok(None);
         }
 
         // Explicit path targets retain exact path and extension behavior.
         if resolution_index.known_paths.contains(&resolved_target) {
-            return self
+            return Ok(self
                 .eligible_resolution_paths(
                     resolution_index,
                     std::slice::from_ref(&resolved_target),
                     target_types,
                 )
                 .into_iter()
-                .next();
+                .next());
         }
         if !resolved_target.ends_with(".md") && !resolved_target.ends_with(".mdx") {
             let with_md = format!("{}.md", resolved_target);
             if resolution_index.known_paths.contains(&with_md) {
-                return self
+                return Ok(self
                     .eligible_resolution_paths(
                         resolution_index,
                         std::slice::from_ref(&with_md),
                         target_types,
                     )
                     .into_iter()
-                    .next();
+                    .next());
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Check link fields with validate_exists: true.
@@ -761,6 +829,21 @@ impl Collection {
         // not part of a filename and Markdown links resolve their URL rather
         // than their complete display syntax.
         let parsed = self.parse_link(&serde_json::json!({"value": link_str}));
+        if parsed.get("error").is_some() {
+            issues.push(Issue {
+                code: "malformed_link".to_string(),
+                message: format!("Malformed link syntax in field '{field_name}'"),
+                path: Some(path.to_string()),
+                field: Some(field_name.to_string()),
+                severity: Severity::Error,
+                expected: None,
+                actual: Some(serde_json::Value::String(link_str.to_string())),
+                type_name: Some(type_name.to_string()),
+                line: None,
+                column: None,
+            });
+            return issues;
+        }
         let target = parsed
             .get("link")
             .and_then(|link| link.get("target"))
@@ -813,14 +896,37 @@ impl Collection {
         // Resolve link target
         if field_def.validate_exists == Some(true) {
             let expected = allowed_target_types(field_def);
-            let matches =
-                self.resolve_link_matches(resolution_index, &normalized, target, path, &expected);
+            let matches = match self.resolve_link_matches(
+                resolution_index,
+                &normalized,
+                target,
+                path,
+                &expected,
+            ) {
+                Ok(matches) => matches,
+                Err(error) => {
+                    issues.push(selector_issue(error, path, field_name, type_name));
+                    return issues;
+                }
+            };
 
             if matches.is_empty() {
                 let unfiltered = if expected.is_empty() {
                     Vec::new()
                 } else {
-                    self.resolve_link_matches(resolution_index, &normalized, target, path, &[])
+                    match self.resolve_link_matches(
+                        resolution_index,
+                        &normalized,
+                        target,
+                        path,
+                        &[],
+                    ) {
+                        Ok(matches) => matches,
+                        Err(error) => {
+                            issues.push(selector_issue(error, path, field_name, type_name));
+                            return issues;
+                        }
+                    }
                 };
                 if unfiltered.len() == 1 {
                     let target_types = resolution_index
@@ -910,8 +1016,19 @@ impl Collection {
         } else if !allowed_target_types(field_def).is_empty() {
             // Even without validate_exists, check target type if we can resolve
             let expected = allowed_target_types(field_def);
-            let matches =
-                self.resolve_link_matches(resolution_index, &normalized, target, path, &expected);
+            let matches = match self.resolve_link_matches(
+                resolution_index,
+                &normalized,
+                target,
+                path,
+                &expected,
+            ) {
+                Ok(matches) => matches,
+                Err(error) => {
+                    issues.push(selector_issue(error, path, field_name, type_name));
+                    return issues;
+                }
+            };
             if matches.len() == 1 {
                 let matched_path = &matches[0];
                 let target_types = resolution_index
@@ -971,20 +1088,17 @@ impl Collection {
         original: &str,
         source_path: &str,
         target_types: &[String],
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, CatalogError> {
         let simple_name =
             !original.contains('/') && std::path::Path::new(original).extension().is_none();
         if simple_name {
-            return match self.resolve_simple_name(
-                resolution_index,
-                original,
-                source_path,
-                target_types,
-            ) {
-                LinkResolution::Missing => Vec::new(),
-                LinkResolution::Resolved(path) => vec![path],
-                LinkResolution::Ambiguous(paths) => paths,
-            };
+            return self
+                .resolve_simple_name(resolution_index, original, source_path, target_types)
+                .map(|resolution| match resolution {
+                    LinkResolution::Missing => Vec::new(),
+                    LinkResolution::Resolved { path, .. } => vec![path],
+                    LinkResolution::Ambiguous(paths) => paths,
+                });
         }
 
         let candidates = if !normalized.ends_with(".md") && !normalized.ends_with(".mdx") {
@@ -992,20 +1106,67 @@ impl Collection {
         } else {
             vec![normalized.to_string()]
         };
-        self.eligible_resolution_paths(
+        Ok(self.eligible_resolution_paths(
             resolution_index,
             &candidates
                 .into_iter()
                 .filter(|path| resolution_index.known_paths.contains(path))
                 .collect::<Vec<_>>(),
             target_types,
-        )
+        ))
     }
 }
 
 #[cfg(test)]
 mod snapshot_resolution_tests {
     use super::*;
+
+    #[test]
+    fn local_resolution_carries_the_shared_selector_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        let mut index = LinkResolutionIndex::default();
+        index.basename_lower_to_paths.insert(
+            "target".to_string(),
+            vec!["z/target.md".to_string(), "notes/target.md".to_string()],
+        );
+        let resolution = collection
+            .resolve_simple_name(&index, "target", "notes/source.md", &[])
+            .unwrap();
+        let LinkResolution::Resolved {
+            path,
+            reason,
+            selected_kind,
+            candidate_count,
+            candidate_digest,
+            alternatives,
+            alternative_candidates,
+        } = resolution
+        else {
+            panic!("expected resolved evidence");
+        };
+        assert_eq!(path, "notes/target.md");
+        assert_eq!(reason, ResolutionReason::SameDirectory);
+        assert_eq!(selected_kind, RecordResolutionKeyKind::Basename);
+        assert_eq!(candidate_count, 2);
+        assert!(candidate_digest.starts_with("sha256:"));
+        assert_eq!(alternatives, ["z/target.md"]);
+        assert_eq!(alternative_candidates.len(), 1);
+        assert_eq!(alternative_candidates[0].path, "z/target.md");
+    }
+
+    #[test]
+    fn public_resolve_reports_malformed_instead_of_missing() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        std::fs::write(root.path().join("source.md"), "---\nref: '[[broken'\n---\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        let resolved =
+            collection.resolve_link(&serde_json::json!({"path": "source.md", "field": "ref"}));
+        assert_eq!(resolved["error"]["code"], "malformed_link", "{resolved}");
+        assert!(resolved.get("resolved_path").is_none(), "{resolved}");
+    }
 
     #[test]
     fn public_resolve_scans_once_and_loads_each_discovered_record_once() {

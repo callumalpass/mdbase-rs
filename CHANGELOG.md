@@ -6,6 +6,12 @@ All notable changes to this project are documented in this file.
 
 ### Breaking
 
+- Context-free JSON `Collection` create/update/delete/rename/backfill/batch
+  methods are isolated behind the default-on `legacy-collection-mutation` 0.4.x
+  compatibility feature. They retain strict source compatibility, including
+  under `deny(deprecated)`, while rustdoc records their planned 0.5.0 removal.
+- Deprecated ephemeral `ExecutionOutcome::result` and `CommitRejection::result`
+  projections now have a 0.5.0 removal gate; typed callers use `operation`.
 - `Collection::build_all_files_data` now returns
   `Result<Vec<ResolvedFileData>, CollectionSnapshotError>` instead of silently
   treating discovery/read failures as an empty collection. This is a deliberate
@@ -24,6 +30,15 @@ All notable changes to this project are documented in this file.
   `serialize_document_with_bom` now return
   `Result<String, FrontmatterSerializationError>`. Callers must handle YAML
   emitter failures; serialization no longer panics or substitutes empty YAML.
+
+### Added
+
+- Added privacy-safe `legacy_journal_inventory` runtime/provider APIs so operators
+  can prove that no version-2 journals remain before the 0.5.0 decoder removal.
+- Added exact architecture ownership guards for the seven legacy Collection
+  facade definitions and internal compatibility allowlist, plus non-growing
+  guards for `OperationContext::legacy`, wire-only outcome variants/constructors,
+  and ephemeral runtime result projections.
 
 ### Fixed
 

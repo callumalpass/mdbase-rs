@@ -29,6 +29,17 @@ jobs:
       - name: Enforce architecture and debt budgets
         run: cargo run --locked -p mdbase-architecture-check -- .
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Strict canonical no-default lint gates
+        run: |
+          cargo clippy --locked -p mdbase --no-default-features --all-targets -- -D warnings
+          cargo clippy --locked -p mdbase-command --no-default-features --all-targets -- -D warnings
+          cargo clippy --locked -p mdbase-runtime --no-default-features --all-targets -- -D warnings
+          cargo clippy --locked -p mdbase-testbed-adapter --all-targets -- -D warnings
+      - run: ./scripts/check-legacy-feature-boundary.sh
+      - name: Reject legacy mutation feature in canonical resolved graphs
+        run: ./scripts/check-no-legacy-feature.sh
+      - run: cargo test --locked -p mdbase --no-default-features backfill
+      - run: cargo test --locked -p mdbase-command --no-default-features
       - run: cargo test --locked -p mdbase-runtime --no-default-features
       - run: cargo test --locked -p mdbase-runtime --no-default-features --features sqlite
       - run: cargo check --locked -p mdbase-runtime --no-default-features --features postgres
@@ -57,6 +68,9 @@ jobs:
         with:
           node-version: 22
       - uses: Swatinem/rust-cache@v2
+      - name: Compile every Windows target, including capability publication
+        if: runner.os == 'Windows'
+        run: cargo check --locked --workspace --all-targets --all-features
       - run: cargo test --locked --workspace --all-features
         env:
           MDBASE_SPEC_REPO_DIR: ${{ github.workspace }}/mdbase-spec

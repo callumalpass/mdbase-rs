@@ -36,19 +36,16 @@ pub(crate) fn rebuild(
     collection: &Collection,
     generation: &CollectionGeneration,
 ) -> Result<(), CacheError> {
-    let mut connection =
-        sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)?;
-    let files = collection.scan_collection_files_checked()?;
+    let mut connection = sqlite::open_cache_db(
+        collection.held_root().cache_storage_path(),
+        &collection.settings.cache_folder,
+    )?;
+    let files = collection.scan_collection_relative_paths_checked()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
         "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_values; DELETE FROM identity_values; DELETE FROM files; DELETE FROM meta;",
     )?;
-    for absolute in files {
-        let relative = absolute
-            .strip_prefix(&collection.root)
-            .map_err(|_| CacheError::OutsideRoot(absolute.display().to_string()))?
-            .to_string_lossy()
-            .replace('\\', "/");
+    for relative in files {
         indexer::reindex_file(&transaction, collection, &relative)?;
     }
     indexer::resolve_all_links(&transaction, collection)?;
@@ -99,13 +96,18 @@ pub(crate) fn apply_changes(
                         )
             });
         remove.insert(change.path.as_str().to_string());
-        if collection.root.join(change.path.as_str()).is_file() {
+        if collection
+            .held_root()
+            .exists_file(std::path::Path::new(change.path.as_str()))
+        {
             reindex.insert(change.path.as_str().to_string());
         }
     }
 
-    let mut connection =
-        sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)?;
+    let mut connection = sqlite::open_cache_db(
+        collection.held_root().cache_storage_path(),
+        &collection.settings.cache_folder,
+    )?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for path in &remove {
         indexer::remove_file(&transaction, path)?;
@@ -207,7 +209,10 @@ impl InvalidMaintenanceSeal {
     }
 
     pub(crate) fn cache_is_current(&mut self, collection: &Collection) -> Result<bool, CacheError> {
-        let db_path = sqlite::cache_db_path(&collection.root, &collection.settings.cache_folder);
+        let db_path = sqlite::cache_db_path(
+            collection.held_root().cache_storage_path(),
+            &collection.settings.cache_folder,
+        );
         if sqlite::CacheDbIdentity::capture(&db_path)? != self.cache_db_identity {
             return Ok(false);
         }
@@ -276,7 +281,10 @@ impl InvalidMaintenanceSeal {
         &self,
         collection: &Collection,
     ) -> Result<bool, CacheError> {
-        let db_path = sqlite::cache_db_path(&collection.root, &collection.settings.cache_folder);
+        let db_path = sqlite::cache_db_path(
+            collection.held_root().cache_storage_path(),
+            &collection.settings.cache_folder,
+        );
         Ok(sqlite::CacheDbIdentity::capture(&db_path)? == self.cache_db_identity)
     }
 }
@@ -348,12 +356,14 @@ pub(crate) fn apply_invalid_maintenance(
     // Official clear/recreate takes this advisory lock exclusively. Acquire the
     // shared side before opening SQLite and retain it in the seal through ack.
     let lifecycle_guard = sqlite::lock_cache_lifecycle_shared(
-        &collection.root,
+        collection.held_root().cache_storage_path(),
         &collection.settings.cache_folder,
         std::time::Duration::from_secs(1),
     )?;
-    let mut connection =
-        sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)?;
+    let mut connection = sqlite::open_cache_db(
+        collection.held_root().cache_storage_path(),
+        &collection.settings.cache_folder,
+    )?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for path in refresh {
         let Some(expectation) =
@@ -387,7 +397,7 @@ pub(crate) fn apply_invalid_maintenance(
     let data_version =
         transaction.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?;
     let cache_db_identity = sqlite::CacheDbIdentity::capture(&sqlite::cache_db_path(
-        &collection.root,
+        collection.held_root().cache_storage_path(),
         &collection.settings.cache_folder,
     ))?;
     run_maintenance_revalidation_hook(collection);
@@ -453,7 +463,10 @@ pub(crate) fn set_seal_validation_hook(
 ) {
     SEAL_VALIDATION_HOOKS.lock().unwrap().insert(
         (
-            sqlite::cache_db_path(&collection.root, &collection.settings.cache_folder),
+            sqlite::cache_db_path(
+                collection.held_root().cache_storage_path(),
+                &collection.settings.cache_folder,
+            ),
             boundary,
         ),
         Box::new(hook),
@@ -508,7 +521,10 @@ pub(crate) fn matches_generation(
     collection: &Collection,
     generation: &CollectionGeneration,
 ) -> Result<bool, CacheError> {
-    let connection = sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)?;
+    let connection = sqlite::open_cache_db(
+        collection.held_root().cache_storage_path(),
+        &collection.settings.cache_folder,
+    )?;
     let stored = connection
         .query_row(
             "SELECT value FROM meta WHERE key = ?1",
@@ -525,7 +541,10 @@ pub(crate) fn uniqueness_conflicts(
     type_names: &[String],
     exclude_path: &str,
 ) -> Result<Vec<UniqueConflict>, CacheError> {
-    let connection = sqlite::open_cache_db(&collection.root, &collection.settings.cache_folder)?;
+    let connection = sqlite::open_cache_db(
+        collection.held_root().cache_storage_path(),
+        &collection.settings.cache_folder,
+    )?;
     let mut conflicts = Vec::new();
     if let Some(value) = frontmatter
         .get(&collection.settings.id_field)

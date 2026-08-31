@@ -1143,6 +1143,12 @@ mod tests {
                     target_record_id: None,
                     target_path: None,
                     ambiguous_paths: Vec::new(),
+                    reason: None,
+                    selected_lookup: None,
+                    candidate_count: 0,
+                    candidate_digest: None,
+                    alternatives: Vec::new(),
+                    alternative_candidates: Vec::new(),
                 })
                 .collect(),
             body_tags: prepared.structure.body_tags.clone(),
@@ -1172,6 +1178,25 @@ mod tests {
                     target_record_id: Some("project:mobile".to_string()),
                     target_path: Some(target_path.to_string()),
                     ambiguous_paths: Vec::new(),
+                    reason: Some(super::super::ResolutionReason::ExactPath),
+                    selected_lookup: Some(super::super::ResolutionLookupKey {
+                        priority: 0,
+                        kind: super::super::RecordResolutionKeyKind::Path,
+                        value: target_path.to_string(),
+                    }),
+                    candidate_count: 1,
+                    candidate_digest: Some(format!(
+                        "sha256:{:x}",
+                        Sha256::digest(
+                            serde_jcs::to_vec(&(
+                                super::super::RecordResolutionKeyKind::Path,
+                                vec![("project:mobile", target_path)],
+                            ))
+                            .unwrap()
+                        )
+                    )),
+                    alternatives: Vec::new(),
+                    alternative_candidates: Vec::new(),
                 })
                 .collect(),
             body_tags: prepared.structure.body_tags.clone(),

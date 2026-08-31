@@ -144,6 +144,7 @@ pub(crate) struct PlannedRecord {
     pub include_document: bool,
 }
 
+#[cfg(feature = "legacy-collection-mutation")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MutationFailureKind {
     Operation,
@@ -153,6 +154,7 @@ pub(crate) enum MutationFailureKind {
 #[derive(Clone, Debug)]
 pub(crate) struct MutationFailure {
     pub diagnostics: Vec<Diagnostic>,
+    #[cfg(feature = "legacy-collection-mutation")]
     pub kind: MutationFailureKind,
 }
 
@@ -160,6 +162,7 @@ impl MutationFailure {
     pub(crate) fn operation(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             diagnostics: vec![Diagnostic::error(code, message, None)],
+            #[cfg(feature = "legacy-collection-mutation")]
             kind: MutationFailureKind::Operation,
         }
     }
@@ -167,22 +170,29 @@ impl MutationFailure {
     pub(crate) fn diagnostic(diagnostic: Diagnostic) -> Self {
         Self {
             diagnostics: vec![diagnostic],
+            #[cfg(feature = "legacy-collection-mutation")]
             kind: MutationFailureKind::Operation,
         }
     }
 
     pub(crate) fn diagnostics(diagnostics: Vec<Diagnostic>) -> Self {
+        #[cfg(feature = "legacy-collection-mutation")]
         let kind = if diagnostics.len() == 1 {
             MutationFailureKind::Operation
         } else {
             MutationFailureKind::Validation
         };
-        Self { diagnostics, kind }
+        Self {
+            diagnostics,
+            #[cfg(feature = "legacy-collection-mutation")]
+            kind,
+        }
     }
 
     pub(crate) fn validation(issues: &[Issue]) -> Self {
         Self {
             diagnostics: issues.iter().map(diagnostic_from_issue).collect(),
+            #[cfg(feature = "legacy-collection-mutation")]
             kind: MutationFailureKind::Validation,
         }
     }

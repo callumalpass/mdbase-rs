@@ -280,7 +280,7 @@ impl Collection {
             Ok(commit) => commit,
             Err(error) => return setup_error(error.code(), error.to_string()),
         };
-        let reopened = match Collection::open(&self.root) {
+        let reopened = match self.reopen_held(true) {
             Ok(collection) => collection,
             Err(error) => {
                 return setup_error(
@@ -390,7 +390,7 @@ fn plan_collection_setup(
     let provision_lock_path = shadow.directory.path().join(PROVISION_LOCK_PATH);
     let previous_lock_bytes = fs::read(&provision_lock_path).ok();
     let mut lock =
-        read_provision_lock(shadow.directory.path()).map_err(|diagnostic| vec![*diagnostic])?;
+        read_provision_lock(&shadow.collection).map_err(|diagnostic| vec![*diagnostic])?;
     for receipt in &receipt_configuration {
         add_contributor(
             &mut lock,
@@ -465,13 +465,16 @@ fn plan_unchanged_collection_setup(
     baseline_validation_errors: &[Diagnostic],
     provision_digest: &str,
 ) -> Result<Option<CollectionSetupPlan>, Vec<Diagnostic>> {
-    let config_bytes = fs::read(collection.root.join("mdbase.yaml")).map_err(|error| {
-        vec![Diagnostic::error(
-            "invalid_collection_setup",
-            format!("Could not read mdbase.yaml for setup assessment: {error}"),
-            Some("mdbase.yaml".to_string()),
-        )]
-    })?;
+    let config_bytes = collection
+        .held_root()
+        .read("mdbase.yaml")
+        .map_err(|error| {
+            vec![Diagnostic::error(
+                "invalid_collection_setup",
+                format!("Could not read mdbase.yaml for setup assessment: {error}"),
+                Some("mdbase.yaml".to_string()),
+            )]
+        })?;
     let mut config: serde_yaml::Value = serde_yaml::from_slice(&config_bytes).map_err(|error| {
         vec![Diagnostic::error(
             "invalid_collection_setup",
@@ -517,8 +520,8 @@ fn plan_unchanged_collection_setup(
         }
     }
 
-    let previous_lock_bytes = fs::read(collection.root.join(PROVISION_LOCK_PATH)).ok();
-    let mut lock = read_provision_lock(&collection.root).map_err(|diagnostic| vec![*diagnostic])?;
+    let previous_lock_bytes = collection.held_root().read(PROVISION_LOCK_PATH).ok();
+    let mut lock = read_provision_lock(collection).map_err(|diagnostic| vec![*diagnostic])?;
     for receipt in &receipt_configuration {
         add_contributor(
             &mut lock,
@@ -893,9 +896,8 @@ fn yaml_shape(value: &serde_yaml::Value) -> &'static str {
     }
 }
 
-fn read_provision_lock(root: &std::path::Path) -> Result<ProvisionLock, Box<Diagnostic>> {
-    let path = root.join(PROVISION_LOCK_PATH);
-    let bytes = match fs::read(&path) {
+fn read_provision_lock(collection: &Collection) -> Result<ProvisionLock, Box<Diagnostic>> {
+    let bytes = match collection.held_root().read(PROVISION_LOCK_PATH) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(ProvisionLock {
@@ -1147,6 +1149,33 @@ mod tests {
             expected_provision_digest: assessment["provision_digest"].as_str().unwrap().to_string(),
             allow_type_pack_downgrades: BTreeSet::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_root_never_receives_setup_reads_or_publication() {
+        let (directory, collection) = collection("spec_version: 0.3.0\n");
+        let original = directory.path().to_path_buf();
+        let held = original.with_extension("setup-held");
+        fs::rename(&original, &held).unwrap();
+        fs::create_dir(&original).unwrap();
+        fs::write(original.join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        fs::write(original.join("sentinel"), "replacement\n").unwrap();
+
+        let declaration = setup("dev.example.editor");
+        let assessment = collection.assess_collection_setup(&declaration);
+        assert!(assessment.valid, "{:?}", assessment.diagnostics);
+        let applied =
+            collection.apply_collection_setup(&declaration, &apply_options(&assessment.result));
+        assert!(applied.valid, "{:?}", applied.diagnostics);
+        assert!(fs::read_to_string(held.join("mdbase.yaml"))
+            .unwrap()
+            .contains("x-obsidian"));
+        assert_eq!(
+            fs::read_to_string(original.join("sentinel")).unwrap(),
+            "replacement\n"
+        );
+        assert!(!original.join(PROVISION_LOCK_PATH).exists());
     }
 
     #[test]

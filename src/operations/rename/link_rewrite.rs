@@ -9,7 +9,7 @@ impl Collection {
         source_path: &str,
         target_types: &[String],
         resolution_index: &crate::links::resolver::LinkResolutionIndex,
-    ) -> Option<crate::links::resolver::LinkResolution> {
+    ) -> Option<Result<crate::links::resolver::LinkResolution, crate::runtime::CatalogError>> {
         if !link_val.starts_with("[[") || !link_val.ends_with("]]") {
             return None;
         }
