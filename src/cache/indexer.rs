@@ -1,7 +1,7 @@
 //! File -> cache indexing.
 
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::cache::CacheError;
@@ -502,22 +502,37 @@ fn resolve_links(
     }
     drop(files);
     let resolution_index = collection.build_link_resolution_index(&resolution_records);
+    let frontmatter_by_path = resolution_records
+        .iter()
+        .map(|record| (record.path.as_str(), &record.frontmatter))
+        .collect::<HashMap<_, _>>();
 
-    let mut links = conn.prepare("SELECT rowid, source_path, raw_target FROM links")?;
+    let mut links = conn.prepare("SELECT rowid, source_path, field, raw_target FROM links")?;
     let rows = links.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
     let mut updates = Vec::new();
     for row in rows {
-        let (rowid, source, raw) = row?;
+        let (rowid, source, field, raw) = row?;
         if sources.is_some_and(|sources| !sources.contains(&source)) {
             continue;
         }
-        let resolved = collection.resolve_link_target(&raw, &source, &resolution_index);
+        let target_types = field
+            .as_deref()
+            .filter(|field| !field.is_empty())
+            .and_then(|field| {
+                frontmatter_by_path.get(source.as_str()).map(|frontmatter| {
+                    collection.get_field_target_types_from_frontmatter(&source, field, frontmatter)
+                })
+            })
+            .unwrap_or_default();
+        let resolved =
+            collection.resolve_link_target(&raw, &source, &target_types, &resolution_index);
         updates.push((rowid, raw, resolved));
     }
     drop(links);

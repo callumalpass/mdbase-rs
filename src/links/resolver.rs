@@ -12,15 +12,38 @@ fn normalize_collection_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+fn relative_path_crosses_root(target: &str, source_dir: &str) -> bool {
+    let mut depth = source_dir
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count();
+    for segment in target.split('/') {
+        match segment {
+            ".." if depth == 0 => return true,
+            ".." => depth -= 1,
+            "." | "" => {}
+            _ => depth += 1,
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod path_tests {
-    use super::normalize_collection_path;
+    use super::{normalize_collection_path, relative_path_crosses_root};
 
     #[test]
     fn collection_paths_are_platform_independent() {
         let path = normalize_collection_path(r"projects\active\note.md");
 
         assert_eq!(path, "projects/active/note.md");
+    }
+
+    #[test]
+    fn root_crossing_is_detected_after_intermediate_segments() {
+        assert!(relative_path_crosses_root("a/../../inside", ""));
+        assert!(!relative_path_crosses_root("../../inside", "a/b"));
+        assert!(relative_path_crosses_root("../../../inside", "a/b"));
     }
 }
 
@@ -81,6 +104,10 @@ pub(crate) fn compute_relative_path(source_dir: &str, target_path: &str) -> Stri
 use crate::errors::*;
 use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
 use crate::links::parser::{count_leading_dotdot, normalize_link_path};
+use crate::runtime::{
+    select_resolution_candidate, RankedResolution, RankedResolutionCandidate,
+    RecordResolutionKeyKind,
+};
 use crate::types::schema::FieldDef;
 use crate::Collection;
 use std::collections::{HashMap, HashSet};
@@ -89,25 +116,39 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LinkResolutionIndex {
     pub known_paths: HashSet<String>,
-    pub basename_lower_to_path: HashMap<String, Option<String>>,
-    pub id_lower_to_path: HashMap<String, Option<String>>,
-    pub title_lower_to_path: HashMap<String, Option<String>>,
+    pub basename_lower_to_paths: HashMap<String, Vec<String>>,
+    pub id_lower_to_paths: HashMap<String, Vec<String>>,
+    pub title_lower_to_paths: HashMap<String, Vec<String>>,
 }
 
-fn insert_unique_resolution_key(
-    index: &mut HashMap<String, Option<String>>,
-    key: String,
-    path: &str,
-) {
-    match index.entry(key) {
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(Some(path.to_string()));
-        }
-        std::collections::hash_map::Entry::Occupied(mut entry) => {
-            if entry.get().as_deref() != Some(path) {
-                entry.insert(None);
-            }
-        }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LinkResolution {
+    Missing,
+    Resolved(String),
+    Ambiguous(Vec<String>),
+}
+
+fn insert_resolution_key(index: &mut HashMap<String, Vec<String>>, key: String, path: &str) {
+    let paths = index.entry(key).or_default();
+    if !paths.iter().any(|candidate| candidate == path) {
+        paths.push(path.to_string());
+        paths.sort();
+    }
+}
+
+fn select_local_resolution(
+    source_path: &str,
+    kind: RecordResolutionKeyKind,
+    paths: impl IntoIterator<Item = String>,
+) -> LinkResolution {
+    let candidates = paths.into_iter().map(|path| RankedResolutionCandidate {
+        record_id: path.clone(),
+        path,
+    });
+    match select_resolution_candidate(source_path, kind, candidates) {
+        Ok(RankedResolution::Missing) | Err(_) => LinkResolution::Missing,
+        Ok(RankedResolution::Resolved { path, .. }) => LinkResolution::Resolved(path),
+        Ok(RankedResolution::Ambiguous { paths }) => LinkResolution::Ambiguous(paths),
     }
 }
 
@@ -120,15 +161,18 @@ impl Collection {
 
         for file_data in all_files {
             let path = file_data.path.clone();
+            if crate::api::CollectionPath::new(&path).is_err() {
+                continue;
+            }
             index.known_paths.insert(path.clone());
 
             if let Some(basename) = std::path::Path::new(&path)
                 .file_stem()
                 .and_then(|s| s.to_str())
             {
-                insert_unique_resolution_key(
-                    &mut index.basename_lower_to_path,
-                    basename.to_ascii_lowercase(),
+                insert_resolution_key(
+                    &mut index.basename_lower_to_paths,
+                    basename.to_lowercase(),
                     &path,
                 );
             }
@@ -138,19 +182,11 @@ impl Collection {
                 .get(&self.settings.id_field)
                 .and_then(|v| v.as_str())
             {
-                insert_unique_resolution_key(
-                    &mut index.id_lower_to_path,
-                    id.to_ascii_lowercase(),
-                    &path,
-                );
+                insert_resolution_key(&mut index.id_lower_to_paths, id.to_lowercase(), &path);
             }
 
             if let Some(title) = file_data.frontmatter.get("title").and_then(|v| v.as_str()) {
-                insert_unique_resolution_key(
-                    &mut index.title_lower_to_path,
-                    title.to_ascii_lowercase(),
-                    &path,
-                );
+                insert_resolution_key(&mut index.title_lower_to_paths, title.to_lowercase(), &path);
             }
         }
 
@@ -211,6 +247,14 @@ impl Collection {
             .parent()
             .and_then(|p| p.to_str())
             .unwrap_or("");
+        let resolves_from_source =
+            !target.starts_with('/') && (is_relative || format == "markdown" || format == "path");
+        if resolves_from_source && relative_path_crosses_root(&target, source_dir) {
+            return serde_json::json!({
+                "error": {"code": "path_traversal", "message": "Link escapes collection root"},
+                "issues": [{"code": "path_traversal", "field": field_name, "severity": "error"}]
+            });
+        }
 
         // Determine field type constraints
         let target_types = self.get_field_target_types(source_path, field_name);
@@ -232,8 +276,11 @@ impl Collection {
                 Some(target.clone())
             }
         } else {
-            // Simple name - try id_field, then filename
-            self.resolve_simple_name(&target, source_dir, &target_types)
+            // Simple name - try id_field, then deterministically ranked filename.
+            match self.resolve_simple_name(&target, source_path, &target_types) {
+                LinkResolution::Resolved(path) => Some(path),
+                LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
+            }
         }
         .map(|path| normalize_collection_path(&path));
 
@@ -293,7 +340,7 @@ impl Collection {
             match seg {
                 "." => {}
                 ".." => {
-                    segments.pop();
+                    segments.pop()?;
                 }
                 s if !s.is_empty() => {
                     segments.push(s);
@@ -308,10 +355,11 @@ impl Collection {
     pub(crate) fn resolve_simple_name(
         &self,
         name: &str,
-        _source_dir: &str,
+        source_path: &str,
         target_types: &[String],
-    ) -> Option<String> {
+    ) -> LinkResolution {
         let files = self.scan_collection_files();
+        let name_lower = name.to_lowercase();
         let id_field_name = if self.settings.id_field.is_empty() {
             "id"
         } else {
@@ -339,7 +387,7 @@ impl Collection {
             let fm = if let Some(ref yaml_fm) = doc.frontmatter {
                 crate::frontmatter::parser::yaml_to_json(yaml_fm)
             } else {
-                continue;
+                serde_json::Value::Object(serde_json::Map::new())
             };
 
             // Check target type constraint
@@ -356,7 +404,7 @@ impl Collection {
 
             // Check id_field match
             if let Some(id_val) = fm.get(id_field_name).and_then(|v| v.as_str()) {
-                if id_val.eq_ignore_ascii_case(name) {
+                if id_val.to_lowercase() == name_lower {
                     id_matches.push(rel_path.clone());
                 }
             }
@@ -366,44 +414,42 @@ impl Collection {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
-            if basename.eq_ignore_ascii_case(name) {
+            if basename.to_lowercase() == name_lower {
                 filename_matches.push(rel_path.clone());
             }
             if fm
                 .get("title")
                 .and_then(|value| value.as_str())
-                .is_some_and(|title| title.eq_ignore_ascii_case(name))
+                .is_some_and(|title| title.to_lowercase() == name_lower)
             {
                 title_matches.push(rel_path.clone());
             }
         }
 
-        // Match the hosted resolution priorities exactly: configured ID,
-        // basename, then title. Multiple matches at the first populated priority are
-        // ambiguous and must never be collapsed by directory or lexical order.
-        let candidates = if !id_matches.is_empty() {
-            id_matches
+        // Match the hosted priorities exactly. Duplicate configured IDs remain
+        // ambiguous; duplicate basenames use the specification's deterministic
+        // same-directory, shortest-path, then lexical ranking. Title is retained
+        // only as a final compatibility lookup and remains fail-closed.
+        if !id_matches.is_empty() {
+            select_local_resolution(source_path, RecordResolutionKeyKind::Id, id_matches)
         } else if !filename_matches.is_empty() {
-            filename_matches
+            select_local_resolution(
+                source_path,
+                RecordResolutionKeyKind::Basename,
+                filename_matches,
+            )
         } else {
-            title_matches
-        };
-
-        (candidates.len() == 1).then(|| candidates[0].clone())
+            select_local_resolution(source_path, RecordResolutionKeyKind::Title, title_matches)
+        }
     }
 
-    /// Get the target type constraints for a field.
-    pub(crate) fn get_field_target_types(
+    pub(crate) fn get_field_target_types_from_frontmatter(
         &self,
         source_path: &str,
         field_name: &str,
+        frontmatter: &serde_json::Value,
     ) -> Vec<String> {
-        // Read source file to get its type, then look up the field definition
-        let read_result = self.read(&serde_json::json!({"path": source_path}));
-        let Some(fm) = read_result.get("frontmatter") else {
-            return Vec::new();
-        };
-        let file_types = self.determine_types_for_path(fm, Some(source_path));
+        let file_types = self.determine_types_for_path(frontmatter, Some(source_path));
         for type_name in &file_types {
             if let Some(type_def) = self.types.get(&type_name.to_lowercase()) {
                 if let Some(field_def) = type_def.fields.get(field_name) {
@@ -414,11 +460,42 @@ impl Collection {
         Vec::new()
     }
 
+    /// Get the target type constraints for a field.
+    pub(crate) fn get_field_target_types(
+        &self,
+        source_path: &str,
+        field_name: &str,
+    ) -> Vec<String> {
+        let read_result = self.read(&serde_json::json!({"path": source_path}));
+        let Some(frontmatter) = read_result.get("frontmatter") else {
+            return Vec::new();
+        };
+        self.get_field_target_types_from_frontmatter(source_path, field_name, frontmatter)
+    }
+
+    fn eligible_resolution_paths(&self, paths: &[String], target_types: &[String]) -> Vec<String> {
+        if target_types.is_empty() {
+            return paths.to_vec();
+        }
+        paths
+            .iter()
+            .filter(|path| {
+                self.get_file_types(path).iter().any(|actual| {
+                    target_types
+                        .iter()
+                        .any(|expected| actual.eq_ignore_ascii_case(expected))
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Resolve a link target string to a file path.
     pub(crate) fn resolve_link_target(
         &self,
         target: &str,
         source_path: &str,
+        target_types: &[String],
         resolution_index: &LinkResolutionIndex,
     ) -> Option<String> {
         // Strip wikilink syntax
@@ -452,7 +529,7 @@ impl Collection {
             for c in joined.components() {
                 match c {
                     std::path::Component::ParentDir => {
-                        components.pop();
+                        components.pop()?;
                     }
                     std::path::Component::CurDir => {}
                     _ => {
@@ -466,30 +543,68 @@ impl Collection {
             target.to_string()
         };
 
-        // Exact path match
-        if resolution_index.known_paths.contains(&resolved_target) {
-            return Some(resolved_target.clone());
+        // Simple-name lookup follows the same priority and ranking as hosted
+        // resolution. A populated ambiguous ID class never falls through.
+        let simple_name = !resolved_target.contains('/')
+            && std::path::Path::new(&resolved_target).extension().is_none();
+        if simple_name {
+            let target_lower = resolved_target.to_lowercase();
+            if let Some(paths) = resolution_index.id_lower_to_paths.get(&target_lower) {
+                let eligible = self.eligible_resolution_paths(paths, target_types);
+                if !eligible.is_empty() {
+                    return match select_local_resolution(
+                        source_path,
+                        RecordResolutionKeyKind::Id,
+                        eligible,
+                    ) {
+                        LinkResolution::Resolved(path) => Some(path),
+                        LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
+                    };
+                }
+            }
+            if let Some(paths) = resolution_index.basename_lower_to_paths.get(&target_lower) {
+                let eligible = self.eligible_resolution_paths(paths, target_types);
+                if !eligible.is_empty() {
+                    return match select_local_resolution(
+                        source_path,
+                        RecordResolutionKeyKind::Basename,
+                        eligible,
+                    ) {
+                        LinkResolution::Resolved(path) => Some(path),
+                        LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
+                    };
+                }
+            }
+            if let Some(paths) = resolution_index.title_lower_to_paths.get(&target_lower) {
+                let eligible = self.eligible_resolution_paths(paths, target_types);
+                if !eligible.is_empty() {
+                    return match select_local_resolution(
+                        source_path,
+                        RecordResolutionKeyKind::Title,
+                        eligible,
+                    ) {
+                        LinkResolution::Resolved(path) => Some(path),
+                        LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
+                    };
+                }
+            }
+            return None;
         }
 
-        // With .md extension
+        // Explicit path targets retain exact path and extension behavior.
+        if resolution_index.known_paths.contains(&resolved_target) {
+            return self
+                .eligible_resolution_paths(std::slice::from_ref(&resolved_target), target_types)
+                .into_iter()
+                .next();
+        }
         if !resolved_target.ends_with(".md") && !resolved_target.ends_with(".mdx") {
             let with_md = format!("{}.md", resolved_target);
             if resolution_index.known_paths.contains(&with_md) {
-                return Some(with_md);
-            }
-        }
-
-        // Simple-name lookup follows the same priority as hosted resolution.
-        if !resolved_target.contains('/') {
-            let target_lower = resolved_target.to_ascii_lowercase();
-            if let Some(path) = resolution_index.id_lower_to_path.get(&target_lower) {
-                return path.clone();
-            }
-            if let Some(path) = resolution_index.basename_lower_to_path.get(&target_lower) {
-                return path.clone();
-            }
-            if let Some(path) = resolution_index.title_lower_to_path.get(&target_lower) {
-                return path.clone();
+                return self
+                    .eligible_resolution_paths(std::slice::from_ref(&with_md), target_types)
+                    .into_iter()
+                    .next();
             }
         }
 
@@ -740,24 +855,49 @@ impl Collection {
 
         // Resolve link target
         if field_def.validate_exists == Some(true) {
-            let matches = self.resolve_link_matches(&normalized, target);
+            let expected = allowed_target_types(field_def);
+            let matches = self.resolve_link_matches(&normalized, target, path, &expected);
 
             if matches.is_empty() {
-                issues.push(Issue {
-                    code: "link_not_found".to_string(),
-                    message: format!(
-                        "Link target '{}' not found for field '{}'",
-                        target, field_name
-                    ),
-                    path: Some(path.to_string()),
-                    field: Some(field_name.to_string()),
-                    severity: Severity::Error,
-                    expected: None,
-                    actual: None,
-                    type_name: Some(type_name.to_string()),
-                    line: None,
-                    column: None,
-                });
+                let unfiltered = if expected.is_empty() {
+                    Vec::new()
+                } else {
+                    self.resolve_link_matches(&normalized, target, path, &[])
+                };
+                if unfiltered.len() == 1 {
+                    let target_types = self.get_file_types(&unfiltered[0]);
+                    issues.push(Issue {
+                        code: "link_wrong_type".to_string(),
+                        message: format!(
+                            "Link target '{}' is type {:?}, expected one of {:?}",
+                            target, target_types, expected
+                        ),
+                        path: Some(path.to_string()),
+                        field: Some(field_name.to_string()),
+                        severity: Severity::Error,
+                        expected: None,
+                        actual: None,
+                        type_name: Some(type_name.to_string()),
+                        line: None,
+                        column: None,
+                    });
+                } else {
+                    issues.push(Issue {
+                        code: "link_not_found".to_string(),
+                        message: format!(
+                            "Link target '{}' not found for field '{}'",
+                            target, field_name
+                        ),
+                        path: Some(path.to_string()),
+                        field: Some(field_name.to_string()),
+                        severity: Severity::Error,
+                        expected: None,
+                        actual: None,
+                        type_name: Some(type_name.to_string()),
+                        line: None,
+                        column: None,
+                    });
+                }
             } else if matches.len() > 1 {
                 issues.push(Issue {
                     code: "ambiguous_link".to_string(),
@@ -803,7 +943,8 @@ impl Collection {
             }
         } else if !allowed_target_types(field_def).is_empty() {
             // Even without validate_exists, check target type if we can resolve
-            let matches = self.resolve_link_matches(&normalized, target);
+            let expected = allowed_target_types(field_def);
+            let matches = self.resolve_link_matches(&normalized, target, path, &expected);
             if matches.len() == 1 {
                 let matched_path = &matches[0];
                 let target_types = self.get_file_types(matched_path);
@@ -852,58 +993,52 @@ impl Collection {
     }
 
     /// Resolve a link target to matching file paths.
-    pub(crate) fn resolve_link_matches(&self, normalized: &str, original: &str) -> Vec<String> {
-        let files = self.scan_collection_files();
-        let mut matches = Vec::new();
-
-        for file_path in &files {
-            let rel_path = match file_path.strip_prefix(&self.root) {
-                Ok(p) => p.to_string_lossy().to_string().replace('\\', "/"),
-                Err(_) => continue,
+    pub(crate) fn resolve_link_matches(
+        &self,
+        normalized: &str,
+        original: &str,
+        source_path: &str,
+        target_types: &[String],
+    ) -> Vec<String> {
+        let simple_name =
+            !original.contains('/') && std::path::Path::new(original).extension().is_none();
+        if simple_name {
+            return match self.resolve_simple_name(original, source_path, target_types) {
+                LinkResolution::Missing => Vec::new(),
+                LinkResolution::Resolved(path) => vec![path],
+                LinkResolution::Ambiguous(paths) => paths,
             };
-
-            // Check exact path match (with .md extension)
-            let normalized_with_ext =
-                if !normalized.ends_with(".md") && !normalized.ends_with(".mdx") {
-                    format!("{}.md", normalized)
-                } else {
-                    normalized.to_string()
-                };
-            if rel_path == normalized_with_ext || rel_path == normalized {
-                matches.push(rel_path);
-                continue;
-            }
-
-            // Check file stem match (for simple name links)
-            let stem = std::path::Path::new(&rel_path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-
-            if stem.to_lowercase() == original.to_lowercase() {
-                matches.push(rel_path);
-                continue;
-            }
-
-            // Also check against the id_field
-            if !original.contains('/') && !original.contains('.') {
-                // For simple names, also check id field
-                if let Ok(content) = std::fs::read_to_string(file_path) {
-                    let doc = parse_document(&content);
-                    if let Some(serde_yaml::Value::Mapping(m)) = &doc.frontmatter {
-                        let json = yaml_mapping_to_json(m);
-                        if let Some(id_val) =
-                            json.get(&self.settings.id_field).and_then(|v| v.as_str())
-                        {
-                            if id_val == original && !matches.contains(&rel_path) {
-                                matches.push(rel_path);
-                            }
-                        }
-                    }
-                }
-            }
         }
 
+        let files = self.scan_collection_files();
+        let mut matches = Vec::new();
+        let normalized_with_ext = if !normalized.ends_with(".md") && !normalized.ends_with(".mdx") {
+            format!("{}.md", normalized)
+        } else {
+            normalized.to_string()
+        };
+        for file_path in &files {
+            let rel_path = match file_path.strip_prefix(&self.root) {
+                Ok(path) => path.to_string_lossy().to_string().replace('\\', "/"),
+                Err(_) => continue,
+            };
+            if rel_path != normalized_with_ext && rel_path != normalized {
+                continue;
+            }
+            if !target_types.is_empty() {
+                let actual = self.get_file_types(&rel_path);
+                if !actual.iter().any(|actual| {
+                    target_types
+                        .iter()
+                        .any(|expected| actual.eq_ignore_ascii_case(expected))
+                }) {
+                    continue;
+                }
+            }
+            matches.push(rel_path);
+        }
+        matches.sort();
+        matches.dedup();
         matches
     }
 

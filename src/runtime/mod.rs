@@ -87,6 +87,9 @@ pub use projection::{
     SEMANTIC_PROJECTION_SCHEMA_VERSION,
 };
 pub use provider::{CollectionProvider, FilesystemProvider};
+pub(crate) use record_resolution::{
+    select_resolution_candidate, RankedResolution, RankedResolutionCandidate,
+};
 pub use record_resolution::{
     OccurrenceResolutionLookup, RecordResolutionPlan, ResolutionCandidate, ResolutionLookupKey,
     ResolvedRecordStructure, ResolvedStructuralOccurrence, MAX_RESOLUTION_CANDIDATES,

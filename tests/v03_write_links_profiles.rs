@@ -28,6 +28,7 @@ schema:
       status: { type: string }
       priority: { type: integer }
       related: { type: string }
+      assignee: { type: string }
 collection:
   read_defaults:
     status: open
@@ -35,6 +36,9 @@ collection:
   links:
     related:
       target_type: [project, person]
+      validate_exists: true
+    assignee:
+      target_type: person
       validate_exists: true
 ---
 "#,
@@ -234,6 +238,59 @@ fn non_partial_batch_commits_one_staged_multi_file_plan() {
             .count(),
         0
     );
+}
+
+#[test]
+fn untrusted_backlink_inputs_with_unsafe_paths_fail_closed() {
+    let (_root, collection) = collection();
+    let backlinks = collection.build_backlinks_index(&[
+        mdbase::expressions::evaluator::ResolvedFileData {
+            path: "../escape/source.md".to_string(),
+            frontmatter: json!({}),
+            body: "[[alice]]".to_string(),
+        },
+        mdbase::expressions::evaluator::ResolvedFileData {
+            path: "../escape/alice.md".to_string(),
+            frontmatter: json!({"type": "person"}),
+            body: String::new(),
+        },
+    ]);
+    assert!(backlinks.is_empty());
+}
+
+#[test]
+fn target_scoped_links_drive_backlinks_to_the_same_winner() {
+    let (root, collection) = collection();
+    write_record(
+        &root,
+        "tasks/id.md",
+        "---\ntype: task\nid: alice\ntitle: Wrong type\nstatus: open\n---\n",
+    );
+    write_record(
+        &root,
+        "tasks/source.md",
+        "---\ntype: task\ntitle: Source\nstatus: open\nassignee: '[[alice]]'\n---\n",
+    );
+
+    let all_files = collection.build_all_files_data();
+    let backlinks = collection.build_backlinks_index(&all_files);
+    assert_eq!(
+        backlinks.get("people/alice.md"),
+        Some(&vec!["tasks/source.md".to_string()])
+    );
+    assert!(!backlinks.contains_key("tasks/id.md"));
+
+    assert_eq!(collection.cache_rebuild()["success"], true);
+    let cached = collection
+        .v03_operations()
+        .unwrap()
+        .query(&json!({"where": "file.backlinks.length > 0"}));
+    assert!(cached.valid, "{cached:#?}");
+    assert_eq!(
+        cached.result["results"][0]["file"]["path"],
+        "people/alice.md"
+    );
+    assert_eq!(cached.result["meta"]["total_count"], 1);
 }
 
 #[test]

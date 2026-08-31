@@ -77,13 +77,27 @@ impl Collection {
         for file_data in all_files {
             perf.files_processed += 1;
             let source_path = &file_data.path;
-            let mut targets: Vec<String> = Vec::new();
+            if crate::api::CollectionPath::new(source_path).is_err() {
+                continue;
+            }
+            let mut targets: Vec<(String, Vec<String>)> = Vec::new();
 
             // Extract links from frontmatter values
             let frontmatter_start = Instant::now();
             if let serde_json::Value::Object(ref map) = file_data.frontmatter {
-                for (_key, val) in map {
-                    extract_links_from_fm_value(val, &mut targets);
+                for (key, val) in map {
+                    let mut field_targets = Vec::new();
+                    extract_links_from_fm_value(val, &mut field_targets);
+                    let target_types = self.get_field_target_types_from_frontmatter(
+                        source_path,
+                        key,
+                        &file_data.frontmatter,
+                    );
+                    targets.extend(
+                        field_targets
+                            .into_iter()
+                            .map(|target| (target, target_types.clone())),
+                    );
                 }
             }
             perf.frontmatter_extract_ms += elapsed_ms(frontmatter_start);
@@ -91,23 +105,24 @@ impl Collection {
             // Extract links from body
             let body_links_start = Instant::now();
             let body_links = extract_links_from_body(&file_data.body);
-            targets.extend(body_links);
+            targets.extend(body_links.into_iter().map(|target| (target, Vec::new())));
             perf.body_links_extract_ms += elapsed_ms(body_links_start);
 
             // Extract embeds from body
             let body_embeds_start = Instant::now();
             let body_embeds = extract_embeds_from_body(&file_data.body);
-            targets.extend(body_embeds);
+            targets.extend(body_embeds.into_iter().map(|target| (target, Vec::new())));
             perf.body_embeds_extract_ms += elapsed_ms(body_embeds_start);
 
             // Resolve each target and add to backlinks index
             let mut seen_targets: Vec<String> = Vec::new();
             perf.targets_scanned += targets.len();
             let resolve_start = Instant::now();
-            for target in &targets {
+            for (target, target_types) in &targets {
                 // Resolve the target to a file path
                 perf.resolve_calls += 1;
-                let resolved = self.resolve_link_target(target, source_path, &resolution_index);
+                let resolved =
+                    self.resolve_link_target(target, source_path, target_types, &resolution_index);
                 if let Some(resolved_path) = resolved {
                     if !seen_targets.contains(&resolved_path) {
                         seen_targets.push(resolved_path.clone());

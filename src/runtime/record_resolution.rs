@@ -4,9 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::api::CollectionPath;
+
 use super::{
     record_structure::digest_structure, CatalogError, CompiledCatalog, RecordResolutionKeyKind,
-    RecordStructure, StructuralOccurrence, StructuralResolution,
+    RecordStructure, StructuralLinkKind, StructuralOccurrence, StructuralResolution,
 };
 
 pub const MAX_STRUCTURAL_OCCURRENCES: usize = 4_096;
@@ -41,6 +43,96 @@ pub struct ResolutionCandidate {
     pub lookup: ResolutionLookupKey,
     pub record_id: String,
     pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RankedResolutionCandidate {
+    pub record_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RankedResolution {
+    Missing,
+    Resolved { record_id: String, path: String },
+    Ambiguous { paths: Vec<String> },
+}
+
+pub(crate) fn select_resolution_candidate(
+    source_path: &str,
+    kind: RecordResolutionKeyKind,
+    candidates: impl IntoIterator<Item = RankedResolutionCandidate>,
+) -> Result<RankedResolution, CatalogError> {
+    let source = CollectionPath::new(source_path).map_err(|_| invalid_candidate_error())?;
+    let source_directory = source
+        .as_str()
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent);
+    let mut by_path = BTreeMap::<String, String>::new();
+    for candidate in candidates {
+        if candidate.record_id.is_empty() {
+            return Err(invalid_candidate_error());
+        }
+        let path = CollectionPath::new(&candidate.path).map_err(|_| invalid_candidate_error())?;
+        match by_path.entry(path.to_string()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(candidate.record_id);
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if entry.get() != &candidate.record_id =>
+            {
+                return Err(invalid_candidate_error());
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    let mut candidates = by_path
+        .into_iter()
+        .map(|(path, record_id)| RankedResolutionCandidate { record_id, path })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(RankedResolution::Missing);
+    }
+
+    if kind == RecordResolutionKeyKind::Basename {
+        candidates.sort_by(|left, right| {
+            let left_directory = left.path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            let right_directory = right.path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            let left_rank = (
+                left_directory != source_directory,
+                left.path.split('/').count(),
+                left.path.as_str(),
+                left.record_id.as_str(),
+            );
+            let right_rank = (
+                right_directory != source_directory,
+                right.path.split('/').count(),
+                right.path.as_str(),
+                right.record_id.as_str(),
+            );
+            left_rank.cmp(&right_rank)
+        });
+        let winner = candidates.remove(0);
+        return Ok(RankedResolution::Resolved {
+            record_id: winner.record_id,
+            path: winner.path,
+        });
+    }
+
+    if candidates.len() == 1 {
+        let winner = candidates.remove(0);
+        Ok(RankedResolution::Resolved {
+            record_id: winner.record_id,
+            path: winner.path,
+        })
+    } else {
+        Ok(RankedResolution::Ambiguous {
+            paths: candidates
+                .into_iter()
+                .map(|candidate| candidate.path)
+                .collect(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +200,8 @@ impl CompiledCatalog {
             };
             lookups.push(OccurrenceResolutionLookup {
                 occurrence_ordinal: occurrence.ordinal,
-                alternatives: self.resolution_lookup_alternatives(target),
+                alternatives: self
+                    .resolution_lookup_alternatives_for_occurrence(occurrence, target),
             });
         }
         let lookup_count = lookups
@@ -124,6 +217,42 @@ impl CompiledCatalog {
             structural_digest: structure.structural_digest.clone(),
             lookups,
         })
+    }
+
+    fn resolution_lookup_alternatives_for_occurrence(
+        &self,
+        occurrence: &StructuralOccurrence,
+        target: &str,
+    ) -> Vec<ResolutionLookupKey> {
+        let simple_wikilink = matches!(
+            occurrence.kind,
+            StructuralLinkKind::Wikilink | StructuralLinkKind::WikilinkEmbed
+        ) && !occurrence.relative
+            && !occurrence.raw_target.contains('/')
+            && std::path::Path::new(&occurrence.raw_target)
+                .extension()
+                .is_none();
+        if simple_wikilink {
+            let simple = target.to_lowercase();
+            return vec![
+                ResolutionLookupKey {
+                    priority: 0,
+                    kind: RecordResolutionKeyKind::Id,
+                    value: simple.clone(),
+                },
+                ResolutionLookupKey {
+                    priority: 1,
+                    kind: RecordResolutionKeyKind::Basename,
+                    value: simple.clone(),
+                },
+                ResolutionLookupKey {
+                    priority: 2,
+                    kind: RecordResolutionKeyKind::Title,
+                    value: simple,
+                },
+            ];
+        }
+        self.resolution_lookup_alternatives(target)
     }
 
     pub(crate) fn resolution_lookup_alternatives(&self, target: &str) -> Vec<ResolutionLookupKey> {
@@ -142,7 +271,7 @@ impl CompiledCatalog {
             }
         }
         if !target.contains('/') {
-            let simple = target.to_ascii_lowercase();
+            let simple = target.to_lowercase();
             alternatives.extend([
                 ResolutionLookupKey {
                     priority: 2,
@@ -186,6 +315,18 @@ impl CompiledCatalog {
         if candidates.len() > MAX_RESOLUTION_CANDIDATES {
             return Err(resolution_budget_error("resolution candidate"));
         }
+        let mut planned_occurrences = BTreeSet::new();
+        if plan
+            .lookups
+            .iter()
+            .any(|lookup| !planned_occurrences.insert(lookup.occurrence_ordinal))
+        {
+            return Err(CatalogError {
+                code: "invalid_resolution_plan".to_string(),
+                message: "The relationship-resolution plan repeats an occurrence ordinal."
+                    .to_string(),
+            });
+        }
 
         let planned = plan
             .lookups
@@ -223,27 +364,55 @@ impl CompiledCatalog {
             .cloned()
             .map(|occurrence| {
                 if occurrence.resolution != StructuralResolution::Unresolved {
-                    return ResolvedStructuralOccurrence {
+                    return Ok(ResolvedStructuralOccurrence {
                         resolution: occurrence.resolution,
                         occurrence,
                         target_record_id: None,
                         target_path: None,
                         ambiguous_paths: Vec::new(),
-                    };
+                    });
                 }
-                let matches = grouped
+                let selected = grouped
                     .get(&occurrence.ordinal)
-                    .and_then(|priorities| priorities.first_key_value().map(|(_, value)| value));
-                match matches {
-                    None => ResolvedStructuralOccurrence {
+                    .and_then(|priorities| priorities.first_key_value())
+                    .map(|(priority, matches)| {
+                        let kind = plan
+                            .lookups
+                            .iter()
+                            .find(|lookup| lookup.occurrence_ordinal == occurrence.ordinal)
+                            .and_then(|lookup| {
+                                lookup
+                                    .alternatives
+                                    .iter()
+                                    .find(|alternative| alternative.priority == *priority)
+                            })
+                            .map(|alternative| alternative.kind)
+                            .ok_or_else(|| CatalogError {
+                                code: "invalid_resolution_plan".to_string(),
+                                message: "The relationship-resolution plan does not define the returned priority."
+                                    .to_string(),
+                            })?;
+                        select_resolution_candidate(
+                            &structure.path,
+                            kind,
+                            matches
+                                .iter()
+                                .map(|(record_id, path)| RankedResolutionCandidate {
+                                    record_id: record_id.clone(),
+                                    path: path.clone(),
+                                }),
+                        )
+                    })
+                    .transpose()?;
+                Ok(match selected.unwrap_or(RankedResolution::Missing) {
+                    RankedResolution::Missing => ResolvedStructuralOccurrence {
                         occurrence,
                         resolution: StructuralResolution::Missing,
                         target_record_id: None,
                         target_path: None,
                         ambiguous_paths: Vec::new(),
                     },
-                    Some(matches) if matches.len() == 1 => {
-                        let (record_id, path) = matches.first().expect("one match").clone();
+                    RankedResolution::Resolved { record_id, path } => {
                         ResolvedStructuralOccurrence {
                             occurrence,
                             resolution: StructuralResolution::Resolved,
@@ -252,16 +421,16 @@ impl CompiledCatalog {
                             ambiguous_paths: Vec::new(),
                         }
                     }
-                    Some(matches) => ResolvedStructuralOccurrence {
+                    RankedResolution::Ambiguous { paths } => ResolvedStructuralOccurrence {
                         occurrence,
                         resolution: StructuralResolution::Ambiguous,
                         target_record_id: None,
                         target_path: None,
-                        ambiguous_paths: matches.iter().map(|(_, path)| path.clone()).collect(),
+                        ambiguous_paths: paths,
                     },
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, CatalogError>>()?;
 
         Ok(ResolvedRecordStructure {
             schema_version: structure.schema_version.clone(),
@@ -272,6 +441,13 @@ impl CompiledCatalog {
             body_links: structure.body_links.clone(),
             body_embeds: structure.body_embeds.clone(),
         })
+    }
+}
+
+fn invalid_candidate_error() -> CatalogError {
+    CatalogError {
+        code: "invalid_resolution_candidate".to_string(),
+        message: "The authority returned an invalid relationship candidate.".to_string(),
     }
 }
 
@@ -327,15 +503,15 @@ mod tests {
     }
 
     #[test]
-    fn exact_path_wins_over_lower_priority_identity_match() {
+    fn configured_id_wins_over_filename_match() {
         let catalog = catalog();
         let structure = structure("[[target]]");
         let plan = catalog.plan_record_resolution(&structure).unwrap();
         let lookup = &plan.lookups[0];
-        let markdown_path = lookup
+        let id = lookup
             .alternatives
             .iter()
-            .position(|item| item.priority == 1 && item.value == "target.md")
+            .position(|item| item.kind == RecordResolutionKeyKind::Id)
             .unwrap();
         let basename = lookup
             .alternatives
@@ -347,14 +523,14 @@ mod tests {
                 &structure,
                 &plan,
                 &[
-                    candidate(lookup, markdown_path, "exact", "target.md"),
-                    candidate(lookup, basename, "basename", "elsewhere/target.md"),
+                    candidate(lookup, basename, "basename", "notes/target.md"),
+                    candidate(lookup, id, "configured-id", "elsewhere/by-id.md"),
                 ],
             )
             .unwrap();
         assert_eq!(
             resolved.occurrences[0].target_record_id.as_deref(),
-            Some("exact")
+            Some("configured-id")
         );
         assert_eq!(
             resolved.occurrences[0].resolution,
@@ -373,18 +549,23 @@ mod tests {
     }
 
     #[test]
-    fn same_priority_multiple_records_are_ambiguous() {
+    fn duplicate_configured_ids_are_ambiguous() {
         let catalog = catalog();
         let structure = structure("[[target]]");
         let plan = catalog.plan_record_resolution(&structure).unwrap();
         let lookup = &plan.lookups[0];
+        let id = lookup
+            .alternatives
+            .iter()
+            .position(|item| item.kind == RecordResolutionKeyKind::Id)
+            .unwrap();
         let resolved = catalog
             .resolve_record_structure(
                 &structure,
                 &plan,
                 &[
-                    candidate(lookup, 2, "a", "a/target.md"),
-                    candidate(lookup, 2, "b", "b/target.md"),
+                    candidate(lookup, id, "a", "a/target.md"),
+                    candidate(lookup, id, "b", "b/target.md"),
                 ],
             )
             .unwrap();
@@ -395,6 +576,53 @@ mod tests {
         assert_eq!(
             resolved.occurrences[0].ambiguous_paths,
             ["a/target.md", "b/target.md"]
+        );
+    }
+
+    #[test]
+    fn duplicate_basenames_use_same_directory_shortest_then_lexical_ranking() {
+        let catalog = catalog();
+        let structure = structure("[[target]]");
+        let plan = catalog.plan_record_resolution(&structure).unwrap();
+        let lookup = &plan.lookups[0];
+        let basename = lookup
+            .alternatives
+            .iter()
+            .position(|item| item.kind == RecordResolutionKeyKind::Basename)
+            .unwrap();
+
+        let resolve = |paths: &[(&str, &str)]| {
+            let candidates = paths
+                .iter()
+                .map(|(record_id, path)| candidate(lookup, basename, record_id, path))
+                .collect::<Vec<_>>();
+            catalog
+                .resolve_record_structure(&structure, &plan, &candidates)
+                .unwrap()
+                .occurrences[0]
+                .target_path
+                .clone()
+                .unwrap()
+        };
+
+        assert_eq!(
+            resolve(&[
+                ("deep", "deep/nested/target.md"),
+                ("same", "notes/target.md")
+            ]),
+            "notes/target.md"
+        );
+        assert_eq!(
+            resolve(&[("deep", "deep/nested/target.md"), ("short", "a/target.md")]),
+            "a/target.md"
+        );
+        assert_eq!(
+            resolve(&[("beta", "beta/target.md"), ("alpha", "alpha/target.md")]),
+            "alpha/target.md"
+        );
+        assert_eq!(
+            resolve(&[("alpha", "alpha/target.md"), ("beta", "beta/target.md")]),
+            "alpha/target.md"
         );
     }
 
@@ -418,6 +646,19 @@ mod tests {
             .occurrences
             .iter()
             .any(|item| item.resolution == StructuralResolution::Malformed));
+    }
+
+    #[test]
+    fn duplicate_occurrence_lookups_in_a_plan_fail_closed() {
+        let catalog = catalog();
+        let structure = structure("[[target]]");
+        let mut plan = catalog.plan_record_resolution(&structure).unwrap();
+        plan.lookups.push(plan.lookups[0].clone());
+
+        let error = catalog
+            .resolve_record_structure(&structure, &plan, &[])
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_resolution_plan");
     }
 
     #[test]
@@ -451,6 +692,6 @@ mod tests {
         let plan = catalog.plan_record_resolution(&structure).unwrap();
         let value = serde_json::to_value(&plan).unwrap();
         assert_eq!(value["source_path"], json!("notes/source.md"));
-        assert_eq!(plan.lookups[0].alternatives.len(), 6);
+        assert_eq!(plan.lookups[0].alternatives.len(), 3);
     }
 }
