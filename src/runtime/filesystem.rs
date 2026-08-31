@@ -20,7 +20,8 @@ use super::{
     RuntimeChangeEventPage, RuntimeObserver,
 };
 use crate::transactions::{
-    self, RuntimeCommitAttempt, RuntimePrepareOutcome, RuntimeResolution, TransactionError,
+    self, RuntimeCommitAttempt, RuntimePrepareOutcome, RuntimeResolution, RuntimeSettlement,
+    TransactionError,
 };
 use crate::v03::OperationResult;
 use crate::watch::{CollectionWatcher, WatchEvent};
@@ -57,6 +58,22 @@ struct RuntimeOrder {
 struct SettlementCoordinator {
     active: Mutex<Option<CommitId>>,
     changed: Condvar,
+}
+
+struct SettlementCompletion {
+    coordinator: Arc<SettlementCoordinator>,
+    commit_id: CommitId,
+}
+
+impl Drop for SettlementCompletion {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.coordinator.active.lock() {
+            if active.as_ref() == Some(&self.commit_id) {
+                *active = None;
+            }
+            self.coordinator.changed.notify_all();
+        }
+    }
 }
 
 impl FilesystemRuntime {
@@ -396,9 +413,9 @@ impl FilesystemRuntime {
                 code: "commit_cancelled_before_start",
                 message: "prepared mutation was durably cancelled before commit".to_string(),
             }),
-            RuntimeCommitAttempt::SettlementRequired(commit_id)
-            | RuntimeCommitAttempt::SettlementPending(commit_id) => {
-                self.start_settlement(commit_id, context)
+            RuntimeCommitAttempt::SettlementRequired(settlement)
+            | RuntimeCommitAttempt::SettlementPending(settlement) => {
+                self.start_settlement(settlement, context)
             }
             RuntimeCommitAttempt::NeedsManualRecovery(commit_id) => {
                 Ok(CommitAttempt::NeedsManualRecovery { commit_id })
@@ -910,9 +927,10 @@ impl FilesystemRuntime {
 
     fn start_settlement(
         &self,
-        commit_id: CommitId,
+        settlement_owner: RuntimeSettlement,
         context: &OperationContext,
     ) -> Result<CommitAttempt, ProviderError> {
+        let commit_id = settlement_owner.commit_id().clone();
         {
             // Committing is already durable. Internal settlement ownership can
             // no longer be cancelled by the application deadline.
@@ -928,38 +946,36 @@ impl FilesystemRuntime {
         let order = self.order.clone();
         let settlement = self.settlement.clone();
         let worker_id = commit_id.clone();
+        let owner_slot = Arc::new(Mutex::new(Some(settlement_owner)));
+        let worker_owner_slot = owner_slot.clone();
+        let worker_provider = provider.clone();
+        let worker_watcher = watcher.clone();
+        let worker_pending_watch = pending_watch.clone();
+        let worker_order = order.clone();
+        let worker_settlement = settlement.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let spawned = std::thread::Builder::new()
             .name("mdbase-settlement".to_string())
             .spawn(move || {
-                let settlement_context = OperationContext::legacy();
-                let result =
-                    provider.with_collection_boundary_context(&settlement_context, |collection| {
-                        let resolution =
-                            transactions::settle_runtime_commit(collection, &worker_id)
-                                .map_err(transaction_error)?;
-                        finish_resolution_inside(
-                            collection,
-                            provider.as_ref(),
-                            watcher.as_ref(),
-                            pending_watch.as_ref(),
-                            order.as_ref(),
-                            &resolution,
-                        )
-                    });
-                if let Ok(mut active) = settlement.active.lock() {
-                    if active.as_ref() == Some(&worker_id) {
-                        *active = None;
-                    }
-                    settlement.changed.notify_all();
-                }
+                let mut owner = worker_owner_slot
+                    .lock()
+                    .expect("settlement owner slot must not be poisoned")
+                    .take()
+                    .expect("settlement owner must be moved exactly once");
+                let _completion = SettlementCompletion {
+                    coordinator: worker_settlement,
+                    commit_id: worker_id,
+                };
+                let result = finish_owned_settlement(
+                    &worker_provider,
+                    &worker_watcher,
+                    &worker_pending_watch,
+                    &worker_order,
+                    &mut owner,
+                );
                 let _ = sender.send(result);
             });
         if let Err(error) = spawned {
-            if let Ok(mut active) = self.settlement.active.lock() {
-                *active = None;
-                self.settlement.changed.notify_all();
-            }
             self.provider.report_error(
                 "commit",
                 "settlement_spawn",
@@ -968,7 +984,25 @@ impl FilesystemRuntime {
                     message: error.to_string(),
                 },
             );
-            return Ok(CommitAttempt::SettlementPending { commit_id });
+            let mut owner = owner_slot
+                .lock()
+                .map_err(|_| ProviderError::LockPoisoned)?
+                .take()
+                .ok_or_else(|| ProviderError::Transaction {
+                    code: "settlement_owner_missing",
+                    message: "failed settlement worker consumed its ownership token".to_string(),
+                })?;
+            let _completion = SettlementCompletion {
+                coordinator: settlement,
+                commit_id: commit_id.clone(),
+            };
+            return finish_owned_settlement(
+                &provider,
+                &watcher,
+                &pending_watch,
+                &order,
+                &mut owner,
+            );
         }
 
         loop {
@@ -1041,6 +1075,27 @@ impl FilesystemRuntime {
             }
         }
     }
+}
+
+fn finish_owned_settlement(
+    provider: &Arc<FilesystemProvider>,
+    watcher: &Arc<Mutex<CollectionWatcher>>,
+    pending_watch: &Arc<Mutex<VecDeque<WatchEvent>>>,
+    order: &Arc<Mutex<RuntimeOrder>>,
+    owner: &mut RuntimeSettlement,
+) -> Result<CommitAttempt, ProviderError> {
+    provider.with_collection_boundary_context(&OperationContext::legacy(), |collection| {
+        let resolution =
+            transactions::settle_runtime_commit(collection, owner).map_err(transaction_error)?;
+        finish_resolution_inside(
+            collection,
+            provider.as_ref(),
+            watcher.as_ref(),
+            pending_watch.as_ref(),
+            order.as_ref(),
+            &resolution,
+        )
+    })
 }
 
 fn finish_resolution_inside(

@@ -1567,6 +1567,71 @@ fn provider_serializes_conditional_writers() {
 }
 
 #[test]
+fn runtime_rejects_a_conditional_plan_when_authority_changes_after_shadow_capture() {
+    let directory = collection();
+    fs::write(
+        directory.path().join("task.md"),
+        "---\ntitle: Original\n---\n",
+    )
+    .unwrap();
+    let runtime =
+        Arc::new(FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap());
+    let read = runtime
+        .read(
+            &OperationRequest::new(OperationKind::Read, json!({"path": "task.md"})),
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    let revision = read.result.result["revision"].as_str().unwrap().to_string();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    crate::v03::batch::set_sparse_preparation_pause(
+        directory.path(),
+        entered.clone(),
+        release.clone(),
+    );
+
+    let stale_runtime = {
+        let runtime = runtime.clone();
+        let revision = revision.clone();
+        thread::spawn(move || {
+            runtime
+                .execute(&OperationRequest::new(
+                    OperationKind::Update,
+                    json!({
+                        "path": "task.md",
+                        "patch": {"title": "Runtime"},
+                        "if_revision": revision,
+                    }),
+                ))
+                .unwrap()
+        })
+    };
+    entered.wait();
+
+    let direct = FilesystemProvider::open(directory.path())
+        .unwrap()
+        .execute(&OperationRequest::new(
+            OperationKind::Update,
+            json!({
+                "path": "task.md",
+                "patch": {"title": "Direct"},
+                "if_revision": revision,
+            }),
+        ))
+        .unwrap();
+    assert!(direct.valid, "{direct:?}");
+    release.wait();
+
+    let stale = stale_runtime.join().unwrap();
+    assert!(!stale.valid, "a stale shadow plan committed: {stale:?}");
+    assert_eq!(stale.diagnostics[0].code, "concurrent_modification");
+    assert!(fs::read_to_string(directory.path().join("task.md"))
+        .unwrap()
+        .contains("title: Direct"));
+}
+
+#[test]
 fn provider_allows_read_only_compound_operations_to_overlap() {
     let directory = collection();
     let provider = Arc::new(FilesystemProvider::open(directory.path()).unwrap());
