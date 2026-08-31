@@ -29,12 +29,145 @@ pub(crate) use runtime::{set_runtime_crash_point, set_runtime_settlement_delay};
 
 pub(crate) type FileBaseline = BTreeMap<String, Vec<u8>>;
 
+#[cfg(test)]
+type PostCommitReplacements = BTreeMap<(PathBuf, String), Option<Vec<u8>>>;
+
+#[cfg(test)]
+fn post_commit_replacements() -> &'static std::sync::Mutex<PostCommitReplacements> {
+    static REPLACEMENTS: std::sync::OnceLock<std::sync::Mutex<PostCommitReplacements>> =
+        std::sync::OnceLock::new();
+    REPLACEMENTS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn deferred_cleanup_roots() -> &'static std::sync::Mutex<BTreeSet<PathBuf>> {
+    static ROOTS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    ROOTS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn inject_cleanup_deferred(root: &Path) {
+    deferred_cleanup_roots()
+        .lock()
+        .expect("deferred cleanup lock")
+        .insert(root.to_path_buf());
+}
+
+#[cfg(test)]
+pub(crate) fn inject_post_commit_replacement(root: &Path, path: &str, bytes: Option<Vec<u8>>) {
+    post_commit_replacements()
+        .lock()
+        .expect("post-commit replacement lock")
+        .insert((root.to_path_buf(), path.to_string()), bytes);
+}
+
+#[cfg(test)]
+pub(super) fn apply_post_commit_hook(collection: &Collection) -> Result<(), TransactionError> {
+    let mut all = post_commit_replacements()
+        .lock()
+        .expect("post-commit replacement lock");
+    let keys = all
+        .keys()
+        .filter(|(root, _)| root == &collection.root)
+        .cloned()
+        .collect::<Vec<_>>();
+    let replacements = keys
+        .into_iter()
+        .filter_map(|key| all.remove(&key).map(|value| (key.1, value)))
+        .collect::<Vec<_>>();
+    drop(all);
+    for (path, replacement) in replacements {
+        let target = CollectionPath::new(&path)?.under(&collection.root);
+        match replacement {
+            Some(bytes) => fs::write(target, bytes).expect("injected post-commit replacement"),
+            None => fs::remove_file(target).expect("injected post-commit removal"),
+        }
+    }
+    Ok(())
+}
+
 const TRANSACTIONS_DIR: &str = ".mdbase/transactions";
 const JOURNAL_FILE: &str = "journal.json";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedFileFacts {
+    pub size: u64,
+    pub mtime: Option<String>,
+}
+
+impl CommittedFileFacts {
+    pub(crate) fn attach_record_file(&self, file: &mut crate::api::RecordFile) {
+        file.size = self.size;
+        file.mtime = self.mtime.clone().unwrap_or_default();
+    }
+}
+
+pub(crate) fn attach_committed_file_facts(
+    result: &mut serde_json::Value,
+    facts: &BTreeMap<String, CommittedFileFacts>,
+) {
+    if let Some(operations) = result
+        .get_mut("operations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for operation in operations {
+            if let Some(item_result) = operation.get_mut("result") {
+                attach_committed_file_facts(item_result, facts);
+            }
+        }
+        return;
+    }
+    let Some(path) = result.get("path").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let Some(facts) = facts.get(path) else {
+        return;
+    };
+    let Some(file) = result
+        .get_mut("file")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    file.insert("size".to_string(), serde_json::Value::from(facts.size));
+    file.insert(
+        "mtime".to_string(),
+        serde_json::Value::String(facts.mtime.clone().unwrap_or_default()),
+    );
+}
+
+fn capture_committed_file_facts(
+    collection: &Collection,
+    entries: &[JournalEntry],
+) -> Result<BTreeMap<String, CommittedFileFacts>, TransactionError> {
+    let mut facts = BTreeMap::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.after_revision.is_some())
+    {
+        let path = CollectionPath::new(&entry.path)?.under(&collection.root);
+        let file = File::open(&path).map_err(|source| io_error(path.clone(), source))?;
+        let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+        let mtime = metadata.modified().ok().map(|time| {
+            let value: chrono::DateTime<chrono::Utc> = time.into();
+            value.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        });
+        facts.insert(
+            entry.path.clone(),
+            CommittedFileFacts {
+                size: metadata.len(),
+                mtime,
+            },
+        );
+    }
+    Ok(facts)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitOutcome {
     pub cleanup_deferred: bool,
+    pub file_facts: BTreeMap<String, CommittedFileFacts>,
 }
 
 #[derive(Debug, Error)]
@@ -217,6 +350,7 @@ fn commit_shadow_controlled(
         cleanup_transaction(&directory);
         return Ok(CommitOutcome {
             cleanup_deferred: false,
+            file_facts: BTreeMap::new(),
         });
     }
 
@@ -240,6 +374,7 @@ fn commit_shadow_controlled(
     journal.phase = Phase::Committing;
     persist_journal(&directory, &journal)?;
 
+    let mut file_facts = BTreeMap::new();
     for index in 0..journal.entries.len() {
         apply_entry(
             collection,
@@ -247,6 +382,23 @@ fn commit_shadow_controlled(
             &journal.entries[index],
             journal.scope,
         )?;
+        if journal.entries[index].after_revision.is_some() {
+            let entry = &journal.entries[index];
+            let path = CollectionPath::new(&entry.path)?.under(&collection.root);
+            let file = File::open(&path).map_err(|source| io_error(path.clone(), source))?;
+            let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+            let mtime = metadata.modified().ok().map(|time| {
+                let value: chrono::DateTime<chrono::Utc> = time.into();
+                value.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            });
+            file_facts.insert(
+                entry.path.clone(),
+                CommittedFileFacts {
+                    size: metadata.len(),
+                    mtime,
+                },
+            );
+        }
         journal.applied = index + 1;
         persist_journal(&directory, &journal)?;
         #[cfg(test)]
@@ -257,11 +409,23 @@ fn commit_shadow_controlled(
 
     journal.phase = Phase::Committed;
     persist_journal(&directory, &journal)?;
-    let cleanup_deferred = fs::remove_dir_all(&directory).is_err();
+    #[cfg(test)]
+    apply_post_commit_hook(collection)?;
+    #[cfg(test)]
+    let injected_cleanup_deferred = deferred_cleanup_roots()
+        .lock()
+        .expect("deferred cleanup lock")
+        .remove(&collection.root);
+    #[cfg(not(test))]
+    let injected_cleanup_deferred = false;
+    let cleanup_deferred = injected_cleanup_deferred || fs::remove_dir_all(&directory).is_err();
     if !cleanup_deferred {
         let _ = sync_dir(&collection.root.join(TRANSACTIONS_DIR));
     }
-    Ok(CommitOutcome { cleanup_deferred })
+    Ok(CommitOutcome {
+        cleanup_deferred,
+        file_facts,
+    })
 }
 
 /// Recover every durable transaction before a collection becomes available.

@@ -1,7 +1,7 @@
 use super::*;
 use crate::v03::OperationResult;
 use crate::Collection;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
@@ -474,6 +474,321 @@ fn provider_snapshot_matches_the_portable_sdk_digest_fixture() {
 }
 
 #[test]
+fn runtime_public_batch_rejects_partial_before_item_decode_or_shadow() {
+    let directory = collection();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    let before = runtime.current_generation().unwrap();
+    crate::mutation::reset_mutation_path_probes();
+    let request = OperationRequest::new(
+        OperationKind::Batch,
+        json!({
+            "allow_partial": true,
+            "operations": [
+                {"kind": "create", "input": {"path": "must-not-stage.md"}},
+                {"input": "malformed and must not decode"}
+            ]
+        }),
+    );
+    let outcome = runtime
+        .prepare(
+            &request,
+            &HostClaimId::generate(),
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    let PreparationOutcome::NoMutation(outcome) = outcome else {
+        panic!("partial runtime batch must be rejected without preparation")
+    };
+    assert!(!outcome.result.valid);
+    assert_eq!(outcome.result.diagnostics[0].code, "invalid_request");
+    assert_eq!(runtime.current_generation().unwrap(), before);
+    assert!(!directory.path().join("must-not-stage.md").exists());
+    assert_eq!(
+        crate::mutation::mutation_path_probes(),
+        crate::mutation::MutationPathProbes::default()
+    );
+}
+
+#[test]
+fn runtime_atomic_batch_commits_multiple_renames_reference_updates_and_replays_claim() {
+    let directory = collection();
+    fs::write(directory.path().join("old-one.md"), "one\n").unwrap();
+    fs::write(directory.path().join("old-two.md"), "two\n").unwrap();
+    fs::write(
+        directory.path().join("refs.md"),
+        "See [[old-one]] and [[old-two]].\n",
+    )
+    .unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    let claim = HostClaimId::generate();
+    let request = OperationRequest::new(
+        OperationKind::Batch,
+        json!({
+            "operations": [
+                {"kind": "rename", "input": {
+                    "from": "old-one.md", "to": "new-one.md", "update_refs": true,
+                    "include_document": true
+                }},
+                {"kind": "rename", "input": {
+                    "from": "old-two.md", "to": "new-two.md", "update_refs": true,
+                    "include_document": true
+                }}
+            ]
+        }),
+    );
+    crate::mutation::reset_mutation_path_probes();
+    let prepared = match runtime
+        .prepare(&request, &claim, &OperationContext::legacy())
+        .unwrap()
+    {
+        PreparationOutcome::Prepared(prepared) => prepared,
+        other => panic!("expected atomic batch preparation: {other:?}"),
+    };
+    assert_eq!(crate::mutation::mutation_path_probes().full_shadows, 1);
+    assert!(!directory.path().join("new-one.md").exists());
+    crate::transactions::inject_post_commit_replacement(
+        directory.path(),
+        "new-one.md",
+        Some(b"external replacement".to_vec()),
+    );
+    let committed = match runtime
+        .commit(&prepared, &OperationContext::legacy())
+        .unwrap()
+    {
+        CommitAttempt::Committed(outcome) => outcome,
+        other => panic!("expected committed batch: {other:?}"),
+    };
+    assert!(committed.result.valid, "{:?}", committed.result.diagnostics);
+    assert_eq!(committed.result.result["succeeded"], 2);
+    for item in committed.result.result["operations"].as_array().unwrap() {
+        assert!(item["result"]["file"]["size"].as_u64().unwrap() > 0);
+        assert!(!item["result"]["file"]["mtime"].as_str().unwrap().is_empty());
+    }
+    assert_eq!(
+        committed.result.result["operations"][0]["result"]["document"],
+        "one\n"
+    );
+    assert_eq!(
+        committed.result.result["operations"][0]["result"]["file"]["size"],
+        4
+    );
+    assert_eq!(
+        fs::read(directory.path().join("new-one.md")).unwrap(),
+        b"external replacement"
+    );
+    let ChangeSet::Exact(changes) = &committed.changes else {
+        panic!("batch must publish exact changes")
+    };
+    let page = changes
+        .page(
+            None,
+            std::num::NonZeroUsize::new(10).unwrap(),
+            std::num::NonZeroUsize::new(10).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        page.items
+            .iter()
+            .filter(|change| matches!(
+                change,
+                CanonicalChange::Record(RecordChange {
+                    kind: RecordChangeKind::Renamed,
+                    ..
+                })
+            ))
+            .count(),
+        2
+    );
+    assert!(page.items.iter().any(|change| matches!(
+        change,
+        CanonicalChange::Record(RecordChange {
+            kind: RecordChangeKind::Updated,
+            path,
+            ..
+        }) if path.as_str() == "refs.md"
+    )));
+    assert!(fs::read_to_string(directory.path().join("refs.md"))
+        .unwrap()
+        .contains("[[new-one]]"));
+    assert!(matches!(
+        runtime
+            .resolve_claim(&claim, &OperationContext::legacy())
+            .unwrap(),
+        Some((commit_id, DurableCommitState::Committed { .. })) if commit_id == *prepared.commit_id()
+    ));
+    drop(runtime);
+    let reopened = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    assert!(matches!(
+        reopened
+            .resolve_claim(&claim, &OperationContext::legacy())
+            .unwrap(),
+        Some((commit_id, DurableCommitState::Committed { .. })) if commit_id == *prepared.commit_id()
+    ));
+}
+
+#[test]
+fn runtime_atomic_batch_cancel_cas_claim_and_prepared_reopen_are_durable() {
+    let directory = collection();
+    fs::write(directory.path().join("cas.md"), "---\ntitle: Before\n---\n").unwrap();
+
+    let cancelled_claim = HostClaimId::generate();
+    let cancelled_request = OperationRequest::new(
+        OperationKind::Batch,
+        json!({"operations": [
+            {"kind": "create", "input": {"path": "cancel-one.md"}},
+            {"kind": "create", "input": {"path": "cancel-two.md"}}
+        ]}),
+    );
+    let cancelled_commit = {
+        let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+        match runtime
+            .prepare(
+                &cancelled_request,
+                &cancelled_claim,
+                &OperationContext::legacy(),
+            )
+            .unwrap()
+        {
+            PreparationOutcome::Prepared(prepared) => prepared.commit_id().clone(),
+            other => panic!("expected prepared batch: {other:?}"),
+        }
+    };
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    let attached = runtime
+        .attach_prepared(&cancelled_claim, &OperationContext::legacy())
+        .unwrap()
+        .expect("prepared batch claim must survive reopen");
+    assert_eq!(attached.commit_id(), &cancelled_commit);
+    assert_eq!(
+        runtime
+            .cancel(&attached, &OperationContext::legacy())
+            .unwrap(),
+        CancelOutcome::CancelledBeforeCommit
+    );
+    assert!(!directory.path().join("cancel-one.md").exists());
+    assert!(!directory.path().join("cancel-two.md").exists());
+    assert!(matches!(
+        runtime
+            .resolve_claim(&cancelled_claim, &OperationContext::legacy())
+            .unwrap(),
+        Some((commit_id, DurableCommitState::CancelledBeforeCommit))
+            if commit_id == cancelled_commit
+    ));
+
+    let conflict_claim = HostClaimId::generate();
+    let conflict_request = OperationRequest::new(
+        OperationKind::Batch,
+        json!({"operations": [
+            {"kind": "update", "input": {
+                "path": "cas.md", "fields": {"title": "Planned"}
+            }},
+            {"kind": "create", "input": {"path": "cas-sibling.md"}}
+        ]}),
+    );
+    let conflict = match runtime
+        .prepare(
+            &conflict_request,
+            &conflict_claim,
+            &OperationContext::legacy(),
+        )
+        .unwrap()
+    {
+        PreparationOutcome::Prepared(prepared) => prepared,
+        other => panic!("expected prepared CAS batch: {other:?}"),
+    };
+    assert!(matches!(
+        runtime.prepare(
+            &OperationRequest::new(
+                OperationKind::Batch,
+                json!({"operations": [
+                    {"kind": "create", "input": {"path": "claim-mismatch.md"}}
+                ]}),
+            ),
+            &conflict_claim,
+            &OperationContext::legacy(),
+        ),
+        Err(ProviderError::ClaimMismatch)
+    ));
+    fs::write(
+        directory.path().join("cas.md"),
+        "---\ntitle: External\n---\n",
+    )
+    .unwrap();
+    let rejection = match runtime
+        .commit(&conflict, &OperationContext::legacy())
+        .unwrap()
+    {
+        CommitAttempt::RejectedBeforeCommit { rejection } => rejection,
+        other => panic!("expected atomic CAS rejection: {other:?}"),
+    };
+    assert_eq!(
+        rejection.result.diagnostics[0].code,
+        "concurrent_modification"
+    );
+    assert!(!directory.path().join("cas-sibling.md").exists());
+    assert!(fs::read_to_string(directory.path().join("cas.md"))
+        .unwrap()
+        .contains("External"));
+    drop(runtime);
+    let reopened = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    assert!(matches!(
+        reopened
+            .resolve_claim(&conflict_claim, &OperationContext::legacy())
+            .unwrap(),
+        Some((commit_id, DurableCommitState::RejectedBeforeCommit { .. }))
+            if commit_id == *conflict.commit_id()
+    ));
+}
+
+#[test]
+fn runtime_atomic_batch_recovers_every_durable_settlement_crash_boundary() {
+    for point in 1..=4 {
+        let directory = collection();
+        let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+        let claim = HostClaimId::generate();
+        let request = OperationRequest::new(
+            OperationKind::Batch,
+            json!({"operations": [
+                {"kind": "create", "input": {
+                    "path": format!("crash-{point}-one.md"), "body": "one"
+                }},
+                {"kind": "create", "input": {
+                    "path": format!("crash-{point}-two.md"), "body": "two"
+                }}
+            ]}),
+        );
+        let prepared = match runtime
+            .prepare(&request, &claim, &OperationContext::legacy())
+            .unwrap()
+        {
+            PreparationOutcome::Prepared(prepared) => prepared,
+            other => panic!("expected prepared batch at crash point {point}: {other:?}"),
+        };
+        crate::transactions::set_runtime_crash_point(prepared.commit_id(), point);
+        assert!(runtime
+            .commit(&prepared, &OperationContext::legacy())
+            .is_err());
+        drop(runtime);
+
+        let reopened = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+        assert!(matches!(
+            reopened
+                .resolve_claim(&claim, &OperationContext::legacy())
+                .unwrap(),
+            Some((commit_id, DurableCommitState::Committed { .. }))
+                if commit_id == *prepared.commit_id()
+        ));
+        for suffix in ["one", "two"] {
+            assert_eq!(
+                fs::read_to_string(directory.path().join(format!("crash-{point}-{suffix}.md")),)
+                    .unwrap(),
+                suffix
+            );
+        }
+    }
+}
+
+#[test]
 fn runtime_prepare_is_durable_but_does_not_change_canonical_files() {
     let directory = collection();
     let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
@@ -524,6 +839,568 @@ fn runtime_prepare_is_durable_but_does_not_change_canonical_files() {
         matches!(outcome.changes, ChangeSet::Exact(ref batch) if batch.descriptor().count == 1)
     );
     assert!(directory.path().join("prepared.md").exists());
+}
+
+#[test]
+fn runtime_create_update_replay_committed_facts_after_reopen_and_postcommit_path_changes() {
+    let directory = collection();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    crate::mutation::reset_mutation_path_probes();
+    let claim = HostClaimId::generate();
+    let create = OperationRequest::new(
+        OperationKind::Create,
+        json!({"path": "runtime-facts.md", "body": "planned", "include_document": true}),
+    );
+    let prepared = match runtime
+        .prepare(&create, &claim, &OperationContext::legacy())
+        .unwrap()
+    {
+        PreparationOutcome::Prepared(prepared) => prepared,
+        other => panic!("expected create preparation: {other:?}"),
+    };
+    assert_eq!(
+        crate::mutation::mutation_path_probes(),
+        crate::mutation::MutationPathProbes {
+            wire_request_decodes: 1,
+            runtime_request_decodes: 1,
+            sparse_shadows: 1,
+            ..Default::default()
+        }
+    );
+    crate::transactions::inject_post_commit_replacement(
+        directory.path(),
+        "runtime-facts.md",
+        Some(b"external replacement".to_vec()),
+    );
+    let created = match runtime
+        .commit(&prepared, &OperationContext::legacy())
+        .unwrap()
+    {
+        CommitAttempt::Committed(outcome) => outcome,
+        other => panic!("expected committed create: {other:?}"),
+    };
+    assert_eq!(created.result.result["document"], "planned");
+    assert_eq!(
+        created.result.result["revision"],
+        crate::v03::revision(b"planned")
+    );
+    assert_eq!(created.result.result["file"]["size"], 7);
+    assert_ne!(created.result.result["file"]["mtime"], "");
+    assert_eq!(
+        fs::read(directory.path().join("runtime-facts.md")).unwrap(),
+        b"external replacement"
+    );
+    let create_commit_id = prepared.commit_id().clone();
+    drop(runtime);
+    let reopened = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    assert_eq!(
+        reopened
+            .resolve_commit(&create_commit_id, &OperationContext::legacy())
+            .unwrap(),
+        Some(DurableCommitState::Committed {
+            outcome: created.clone()
+        })
+    );
+    assert_eq!(
+        reopened
+            .resolve_claim(&claim, &OperationContext::legacy())
+            .unwrap(),
+        Some((
+            create_commit_id,
+            DurableCommitState::Committed { outcome: created }
+        ))
+    );
+    drop(reopened);
+
+    let directory = collection();
+    fs::write(directory.path().join("runtime-facts.md"), "before").unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    crate::mutation::reset_mutation_path_probes();
+    let claim = HostClaimId::generate();
+    let update = OperationRequest::new(
+        OperationKind::Update,
+        json!({"path": "runtime-facts.md", "document": "after"}),
+    );
+    let prepared = match runtime
+        .prepare(&update, &claim, &OperationContext::legacy())
+        .unwrap()
+    {
+        PreparationOutcome::Prepared(prepared) => prepared,
+        other => panic!("expected update preparation: {other:?}"),
+    };
+    assert_eq!(
+        crate::mutation::mutation_path_probes(),
+        crate::mutation::MutationPathProbes {
+            wire_request_decodes: 1,
+            runtime_request_decodes: 1,
+            sparse_shadows: 1,
+            ..Default::default()
+        }
+    );
+    crate::transactions::inject_post_commit_replacement(directory.path(), "runtime-facts.md", None);
+    let updated = match runtime
+        .commit(&prepared, &OperationContext::legacy())
+        .unwrap()
+    {
+        CommitAttempt::Committed(outcome) => outcome,
+        other => panic!("expected committed update: {other:?}"),
+    };
+    assert_eq!(updated.result.result["document"], "after");
+    assert_eq!(
+        updated.result.result["revision"],
+        crate::v03::revision(b"after")
+    );
+    assert_eq!(updated.result.result["file"]["size"], 5);
+    assert_ne!(updated.result.result["file"]["mtime"], "");
+    assert!(!directory.path().join("runtime-facts.md").exists());
+    let update_commit_id = prepared.commit_id().clone();
+    drop(runtime);
+    let reopened = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    assert_eq!(
+        reopened
+            .resolve_commit(&update_commit_id, &OperationContext::legacy())
+            .unwrap(),
+        Some(DurableCommitState::Committed {
+            outcome: updated.clone()
+        })
+    );
+    assert_eq!(
+        reopened
+            .resolve_claim(&claim, &OperationContext::legacy())
+            .unwrap(),
+        Some((
+            update_commit_id,
+            DurableCommitState::Committed { outcome: updated }
+        ))
+    );
+}
+
+#[test]
+fn runtime_rename_replays_planned_facts_and_exact_changes_after_reopen() {
+    let directory = collection();
+    let source = b"---\nid: stable\n---\nSee [[source]].\n";
+    let reference = b"See [[source]].\n";
+    fs::write(directory.path().join("source.md"), source).unwrap();
+    fs::write(directory.path().join("reference.md"), reference).unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    crate::mutation::reset_mutation_path_probes();
+    let claim = HostClaimId::generate();
+    let request = OperationRequest::new(
+        OperationKind::Rename,
+        json!({
+            "from": "source.md",
+            "to": "renamed.md",
+            "update_refs": true,
+            "include_document": true
+        }),
+    );
+    let prepared = match runtime
+        .prepare(&request, &claim, &OperationContext::legacy())
+        .unwrap()
+    {
+        PreparationOutcome::Prepared(prepared) => prepared,
+        other => panic!("expected rename preparation: {other:?}"),
+    };
+    assert_eq!(
+        crate::mutation::mutation_path_probes(),
+        crate::mutation::MutationPathProbes {
+            wire_request_decodes: 1,
+            runtime_request_decodes: 1,
+            full_shadows: 1,
+            ..Default::default()
+        }
+    );
+    crate::transactions::inject_post_commit_replacement(
+        directory.path(),
+        "renamed.md",
+        Some(b"external replacement".to_vec()),
+    );
+    let renamed = match runtime
+        .commit(&prepared, &OperationContext::legacy())
+        .unwrap()
+    {
+        CommitAttempt::Committed(outcome) => outcome,
+        other => panic!("expected committed rename: {other:?}"),
+    };
+    assert_eq!(renamed.result.result["from"], "source.md");
+    assert_eq!(renamed.result.result["to"], "renamed.md");
+    let planned_document = renamed.result.result["document"].as_str().unwrap();
+    assert_eq!(
+        renamed.result.result["file"]["size"],
+        planned_document.len()
+    );
+    assert_eq!(
+        renamed.result.result["revision"],
+        crate::v03::revision(planned_document.as_bytes())
+    );
+    assert_ne!(renamed.result.result["file"]["mtime"], "");
+    assert!(planned_document.contains("[[renamed]]"));
+    let ChangeSet::Exact(changes) = &renamed.changes else {
+        panic!("runtime rename must retain exact changes")
+    };
+    assert_eq!(changes.items().len(), 2);
+    let records = changes
+        .items()
+        .iter()
+        .map(|change| match change {
+            CanonicalChange::Record(record) => record,
+            _ => panic!("rename effects must be record changes"),
+        })
+        .collect::<Vec<_>>();
+    let primary = records
+        .iter()
+        .find(|record| record.kind == RecordChangeKind::Renamed)
+        .unwrap();
+    assert_eq!(primary.from.as_ref().unwrap().as_str(), "source.md");
+    let reference_change = records
+        .iter()
+        .find(|record| record.kind == RecordChangeKind::Updated)
+        .unwrap();
+    assert_eq!(reference_change.path.as_str(), "reference.md");
+    assert_eq!(
+        fs::read(directory.path().join("renamed.md")).unwrap(),
+        b"external replacement"
+    );
+    let commit_id = prepared.commit_id().clone();
+    drop(runtime);
+    let reopened = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    assert_eq!(
+        reopened
+            .resolve_commit(&commit_id, &OperationContext::legacy())
+            .unwrap(),
+        Some(DurableCommitState::Committed {
+            outcome: renamed.clone()
+        })
+    );
+    assert_eq!(
+        reopened
+            .resolve_claim(&claim, &OperationContext::legacy())
+            .unwrap(),
+        Some((
+            commit_id,
+            DurableCommitState::Committed { outcome: renamed }
+        ))
+    );
+}
+
+#[test]
+fn runtime_delete_uses_sparse_stage_and_replays_planned_result_after_reopen() {
+    let directory = collection();
+    fs::create_dir(directory.path().join("_types")).unwrap();
+    fs::write(
+        directory.path().join("_types/runtime-delete.md"),
+        "---\nkind: mdbase.type\nname: runtime-delete\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n",
+    )
+    .unwrap();
+    let before = b"---\ntype: runtime-delete\n---\nbefore";
+    fs::write(directory.path().join("runtime-delete.md"), before).unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    crate::mutation::reset_mutation_path_probes();
+    let claim = HostClaimId::generate();
+    let request = OperationRequest::new(
+        OperationKind::Delete,
+        json!({"path": "runtime-delete.md", "check_backlinks": true}),
+    );
+    let prepared = match runtime
+        .prepare(&request, &claim, &OperationContext::legacy())
+        .unwrap()
+    {
+        PreparationOutcome::Prepared(prepared) => prepared,
+        other => panic!("expected delete preparation: {other:?}"),
+    };
+    assert_eq!(
+        crate::mutation::mutation_path_probes(),
+        crate::mutation::MutationPathProbes {
+            wire_request_decodes: 1,
+            runtime_request_decodes: 1,
+            sparse_shadows: 1,
+            ..Default::default()
+        }
+    );
+    crate::transactions::inject_post_commit_replacement(
+        directory.path(),
+        "runtime-delete.md",
+        Some(b"external replacement".to_vec()),
+    );
+    let deleted = match runtime
+        .commit(&prepared, &OperationContext::legacy())
+        .unwrap()
+    {
+        CommitAttempt::Committed(outcome) => outcome,
+        other => panic!("expected committed delete: {other:?}"),
+    };
+    assert_eq!(deleted.result.result["path"], "runtime-delete.md");
+    assert_eq!(deleted.result.result["deleted"], true);
+    let ChangeSet::Exact(changes) = &deleted.changes else {
+        panic!("runtime delete must retain one exact change")
+    };
+    let [CanonicalChange::Record(change)] = changes.items() else {
+        panic!("runtime delete must retain one record change")
+    };
+    assert_eq!(change.kind, RecordChangeKind::Deleted);
+    assert_eq!(
+        change.before_revision.as_ref().unwrap().as_str(),
+        crate::v03::revision(before)
+    );
+    assert_eq!(
+        change.before_types.iter().collect::<Vec<_>>(),
+        ["runtime-delete"]
+    );
+    assert!(change.after_revision.is_none());
+    assert_eq!(change.after_types.iter().count(), 0);
+    assert_eq!(
+        fs::read(directory.path().join("runtime-delete.md")).unwrap(),
+        b"external replacement"
+    );
+    let commit_id = prepared.commit_id().clone();
+    drop(runtime);
+    let reopened = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    assert_eq!(
+        reopened
+            .resolve_commit(&commit_id, &OperationContext::legacy())
+            .unwrap(),
+        Some(DurableCommitState::Committed {
+            outcome: deleted.clone()
+        })
+    );
+    assert_eq!(
+        reopened
+            .resolve_claim(&claim, &OperationContext::legacy())
+            .unwrap(),
+        Some((
+            commit_id,
+            DurableCommitState::Committed { outcome: deleted }
+        ))
+    );
+}
+
+#[test]
+fn runtime_delete_dry_run_missing_and_stale_are_generation_neutral() {
+    let directory = collection();
+    let bytes = b"before";
+    fs::write(directory.path().join("target.md"), bytes).unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    let generation = runtime.current_generation().unwrap();
+
+    for (input, valid, code) in [
+        (json!({"path": "target.md", "dry_run": true}), true, None),
+        (json!({"path": "missing.md"}), false, Some("file_not_found")),
+        (
+            json!({"path": "target.md", "if_revision": "sha256:stale"}),
+            false,
+            Some("concurrent_modification"),
+        ),
+    ] {
+        crate::mutation::reset_mutation_path_probes();
+        let outcome = runtime
+            .prepare(
+                &OperationRequest::new(OperationKind::Delete, input),
+                &HostClaimId::generate(),
+                &OperationContext::legacy(),
+            )
+            .unwrap();
+        let PreparationOutcome::NoMutation(outcome) = outcome else {
+            panic!("dry-run and rejected deletes must not stage a transaction")
+        };
+        assert_eq!(outcome.result.valid, valid);
+        if let Some(code) = code {
+            assert_eq!(outcome.result.diagnostics[0].code, code);
+        } else {
+            assert_eq!(outcome.result.result["would_delete"], true);
+        }
+        assert_eq!(outcome.generation, generation);
+        assert!(matches!(outcome.changes, ChangeSet::None));
+        assert_eq!(
+            crate::mutation::mutation_path_probes(),
+            crate::mutation::MutationPathProbes {
+                wire_request_decodes: 1,
+                runtime_request_decodes: 1,
+                sparse_shadows: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(fs::read(directory.path().join("target.md")).unwrap(), bytes);
+        assert_eq!(runtime.current_generation().unwrap(), generation);
+    }
+}
+
+#[test]
+fn runtime_sparse_mutations_reject_invalid_revisions_with_direct_wire_parity() {
+    let directory = collection();
+    let before = b"before";
+    fs::write(directory.path().join("target.md"), before).unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    let generation = runtime.current_generation().unwrap();
+    let direct_collection = Collection::open(directory.path()).unwrap();
+    let direct = crate::v03::Operations::new(&direct_collection).unwrap();
+    let invalid_revisions = [
+        Value::Null,
+        json!(7),
+        json!({}),
+        json!([]),
+        json!(""),
+        json!(true),
+    ];
+
+    for (operation, kind) in [
+        ("create", OperationKind::Create),
+        ("update", OperationKind::Update),
+        ("delete", OperationKind::Delete),
+    ] {
+        for revision in &invalid_revisions {
+            let path = if operation == "create" {
+                "created.md"
+            } else {
+                "target.md"
+            };
+            let mut input = json!({"path": path, "if_revision": revision});
+            if operation == "update" {
+                input["patch"] = json!({"changed": true});
+            }
+            let direct_result = match operation {
+                "create" => direct.create(&input),
+                "update" => direct.update(&input),
+                "delete" => direct.delete(&input),
+                _ => unreachable!(),
+            };
+            assert!(!direct_result.valid);
+            assert_eq!(direct_result.diagnostics[0].code, "invalid_request");
+
+            let prepared = runtime
+                .prepare(
+                    &OperationRequest::new(kind, input),
+                    &HostClaimId::generate(),
+                    &OperationContext::legacy(),
+                )
+                .unwrap();
+            let PreparationOutcome::NoMutation(outcome) = prepared else {
+                panic!("invalid revision must not prepare {operation}")
+            };
+            assert!(!outcome.result.valid);
+            assert_eq!(outcome.result.result, direct_result.result);
+            assert_eq!(outcome.result.diagnostics, direct_result.diagnostics);
+            assert_eq!(outcome.generation, generation);
+            assert!(matches!(outcome.changes, ChangeSet::None));
+            assert_eq!(
+                fs::read(directory.path().join("target.md")).unwrap(),
+                before
+            );
+            assert!(!directory.path().join("created.md").exists());
+            assert_eq!(runtime.current_generation().unwrap(), generation);
+        }
+    }
+}
+
+#[test]
+fn runtime_delete_invalid_record_matrix_retains_exact_revision_and_path_types() {
+    for (name, bytes) in [
+        ("malformed.md", b"---\ntitle: [bad\n---\nBody\n".as_slice()),
+        ("nonmapping.md", b"---\n- item\n---\nBody\n".as_slice()),
+        ("binary.md", b"bad\xffutf8".as_slice()),
+    ] {
+        let directory = collection();
+        fs::create_dir(directory.path().join("_types")).unwrap();
+        fs::write(
+            directory.path().join("_types/path-record.md"),
+            format!(
+                "---\nkind: mdbase.type\nname: path-record\nmatch:\n  path_glob: '{name}'\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n"
+            ),
+        )
+        .unwrap();
+        fs::write(directory.path().join(name), bytes).unwrap();
+        let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+        let prepared = match runtime
+            .prepare(
+                &OperationRequest::new(OperationKind::Delete, json!({"path": name})),
+                &HostClaimId::generate(),
+                &OperationContext::legacy(),
+            )
+            .unwrap()
+        {
+            PreparationOutcome::Prepared(prepared) => prepared,
+            other => panic!("invalid record delete must prepare: {other:?}"),
+        };
+        let committed = match runtime
+            .commit(&prepared, &OperationContext::legacy())
+            .unwrap()
+        {
+            CommitAttempt::Committed(outcome) => outcome,
+            other => panic!("invalid record delete must commit: {other:?}"),
+        };
+        let ChangeSet::Exact(changes) = committed.changes else {
+            panic!("invalid record delete must be exact")
+        };
+        let [CanonicalChange::Record(change)] = changes.items() else {
+            panic!("invalid record delete must contain one record change")
+        };
+        assert_eq!(change.kind, RecordChangeKind::Deleted);
+        assert_eq!(
+            change.before_revision.as_ref().unwrap().as_str(),
+            crate::v03::revision(bytes)
+        );
+        assert_eq!(
+            change.before_types.iter().collect::<Vec<_>>(),
+            ["path-record"]
+        );
+        assert!(!directory.path().join(name).exists());
+    }
+}
+
+#[test]
+fn runtime_delete_backlinks_survive_planning_but_commit_conflicts_reject() {
+    let directory = collection();
+    fs::write(directory.path().join("target.md"), "before").unwrap();
+    fs::write(directory.path().join("ref.md"), "See [[target]].\n").unwrap();
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    let generation = runtime.current_generation().unwrap();
+    let preview = runtime
+        .prepare(
+            &OperationRequest::new(
+                OperationKind::Delete,
+                json!({"path": "target.md", "check_backlinks": true, "dry_run": true}),
+            ),
+            &HostClaimId::generate(),
+            &OperationContext::legacy(),
+        )
+        .unwrap();
+    let PreparationOutcome::NoMutation(preview) = preview else {
+        panic!("delete preview must not stage")
+    };
+    assert_eq!(
+        preview.result.result["broken_links"],
+        json!([{"path": "ref.md"}])
+    );
+
+    let prepared = match runtime
+        .prepare(
+            &OperationRequest::new(
+                OperationKind::Delete,
+                json!({"path": "target.md", "check_backlinks": true}),
+            ),
+            &HostClaimId::generate(),
+            &OperationContext::legacy(),
+        )
+        .unwrap()
+    {
+        PreparationOutcome::Prepared(prepared) => prepared,
+        other => panic!("delete must prepare before the conflict: {other:?}"),
+    };
+    fs::write(directory.path().join("target.md"), "external conflict").unwrap();
+    let rejection = runtime
+        .commit(&prepared, &OperationContext::legacy())
+        .unwrap();
+    let CommitAttempt::RejectedBeforeCommit { rejection } = rejection else {
+        panic!("commit-time replacement must reject")
+    };
+    assert_eq!(
+        rejection.result.diagnostics[0].code,
+        "concurrent_modification"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("target.md")).unwrap(),
+        "external conflict"
+    );
+    assert_eq!(runtime.current_generation().unwrap(), generation);
 }
 
 #[test]

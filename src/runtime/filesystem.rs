@@ -297,6 +297,11 @@ impl FilesystemRuntime {
         self.provider
             .with_collection_boundary_context(context, |collection| {
                 super::feed::ensure_capacity(collection)?;
+                if request.operation == super::OperationKind::Batch {
+                    return super::batch::prepare(
+                        self, collection, request, claim, &digest, context,
+                    );
+                }
                 let preparation = crate::v03::batch::prepare_single_runtime(
                     collection,
                     request.operation.as_str(),

@@ -28,6 +28,7 @@ pub mod generated;
 pub mod init;
 pub mod links;
 pub mod matching;
+pub(crate) mod mutation;
 pub mod operations;
 pub mod query;
 pub(crate) mod record_load;

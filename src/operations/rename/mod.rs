@@ -1,4 +1,4 @@
-//! Rename with reference updates (§12.5).
+//! Rename planning and publication (§12.5).
 
 mod body;
 mod frontmatter;
@@ -10,11 +10,15 @@ mod publication;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use planner::ReferenceRewritePlan;
+
 use crate::api::operations::RenameInput;
+use crate::api::{RenameRequest, Revision};
 use crate::errors::*;
+use crate::mutation::{PlannedRecord, PlannedRename, PreparationOptions, PreparedRename};
 use crate::operations::{
-    atomic_rename_noclobber, atomic_write_in_prepared_parent, ensure_no_symlink_components,
-    ensure_regular_record_file, ensure_revision, mutation_record_path,
+    atomic_rename_noclobber, atomic_write_in_prepared_parent,
+    ensure_no_symlink_components_diagnostic, ensure_regular_record_file_diagnostic,
     prepare_record_parent_no_follow,
 };
 use crate::Collection;
@@ -23,248 +27,332 @@ use crate::Collection;
 use hooks::apply_injected_root_replacement;
 
 impl Collection {
-    /// Rename a file (§12.5).
+    /// Legacy JSON rename edge. Canonical callers use the typed mutation service.
     pub fn rename(&self, input: &serde_json::Value) -> serde_json::Value {
+        #[cfg(test)]
+        crate::mutation::probe_legacy_parse();
         let input = match RenameInput::parse(input) {
             Ok(parsed) => parsed,
-            Err(err) => return err,
-        };
-        let RenameInput {
-            from,
-            to,
-            update_refs,
-            dry_run,
-            last_known_mtime,
-            if_revision,
-            mut simulate_before_ref_update,
-            last_known_ref_mtimes,
-        } = input;
-        let from = match mutation_record_path(self, &from) {
-            Ok(path) => path.to_string(),
             Err(error) => return error,
         };
-        let to_collection_path = match mutation_record_path(self, &to) {
+        let from = match crate::operations::mutation_record_path(self, &input.from) {
             Ok(path) => path,
             Err(error) => return error,
         };
-        let to = to_collection_path.to_string();
-        if let Err(error) = ensure_no_symlink_components(&self.root, &from, self.spec_profile) {
-            return error;
-        }
-        if let Err(error) = ensure_no_symlink_components(&self.root, &to, self.spec_profile) {
-            return error;
-        }
-        for simulated in &mut simulate_before_ref_update {
-            simulated.path = match mutation_record_path(self, &simulated.path) {
-                Ok(path) => path.to_string(),
-                Err(error) => return error,
-            };
-            if let Err(error) =
-                ensure_no_symlink_components(&self.root, &simulated.path, self.spec_profile)
-            {
-                return error;
-            }
-        }
-
-        let _write_lock = if dry_run {
-            None
-        } else {
-            match crate::transactions::WriteLock::acquire(self) {
-                Ok(write_lock) => Some(write_lock),
-                Err(error) => return op_error(error.code(), &error.to_string()),
-            }
+        let to = match crate::operations::mutation_record_path(self, &input.to) {
+            Ok(path) => path,
+            Err(error) => return error,
         };
-
-        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
-        };
-
-        let from_path = self.root.join(&from);
-        let to_path = self.root.join(&to);
-        if let Err(error) = ensure_regular_record_file(&from_path, &from) {
-            return error;
-        }
-        let Some(source_entry) = snapshot.entry(&from) else {
-            return op_error(FILE_NOT_FOUND, &format!("Source not found: {from}"));
-        };
-        if to_path.exists() {
-            return op_error(PATH_CONFLICT, &format!("Target already exists: {to}"));
-        }
-        if if_revision
+        let if_revision = match input
+            .if_revision
             .as_deref()
-            .is_some_and(|expected| expected != source_entry.facts().revision)
+            .map(Revision::parse)
+            .transpose()
         {
-            return op_error(
-                CONCURRENT_MODIFICATION,
-                &format!("File '{from}' no longer matches the requested revision"),
-            );
-        }
-        if let Some(known_ms) = last_known_mtime {
-            let captured_ms = source_entry.facts().mtime_ns.max(0) as u64 / 1_000_000;
-            if captured_ms != known_ms {
-                return op_error(
+            Ok(value) => value,
+            Err(_) => {
+                return crate::errors::op_error(
                     CONCURRENT_MODIFICATION,
-                    &format!("File '{from}' was modified externally"),
-                );
-            }
-        }
-
-        let source_id = source_entry
-            .raw_frontmatter()
-            .and_then(serde_json::Value::as_object)
-            .and_then(|frontmatter| frontmatter.get(&self.settings.id_field))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let update_refs = update_refs.unwrap_or(self.settings.rename_update_refs);
-        let mut warnings = Vec::new();
-        let mut ref_update_failures = Vec::new();
-        let plans = if update_refs {
-            self.plan_reference_rewrites(
-                &snapshot,
-                &from,
-                &to,
-                &source_id,
-                &mut warnings,
-                &mut ref_update_failures,
-            )
-        } else {
-            Vec::new()
-        };
-        #[cfg(test)]
-        apply_injected_root_replacement(&self.root);
-
-        if dry_run {
-            let references_affected = plans
-                .iter()
-                .flat_map(|plan| plan.updates.iter().cloned())
-                .collect::<Vec<_>>();
-            let mut result = serde_json::json!({
-                "from": from,
-                "to": to,
-                "dry_run": true,
-                "would_rename": true,
-            });
-            if !references_affected.is_empty() {
-                result["references_affected"] = serde_json::Value::Array(references_affected);
-            }
-            if !warnings.is_empty() {
-                result["warnings"] = serde_json::Value::Array(warnings);
-            }
-            if !ref_update_failures.is_empty() {
-                result["error"] = serde_json::json!({
-                    "code": RENAME_REF_UPDATE_FAILED,
-                    "message": "Some reference updates could not be prepared",
-                });
-                result["partial_updates"] = serde_json::json!({"failed": ref_update_failures});
-            }
-            return result;
-        }
-
-        if !self.rename_root_path_is_current() {
-            return op_error(
-                CONCURRENT_MODIFICATION,
-                "Collection root was replaced during rename",
-            );
-        }
-        if let Err(error) = prepare_record_parent_no_follow(self, &to_collection_path) {
-            return op_error(
-                "io_error",
-                &format!("Failed to prepare target folder safely: {error}"),
-            );
-        }
-        if let Err(error) = ensure_revision(&from_path, &from, if_revision.as_deref()) {
-            return error;
-        }
-        let current_source = match crate::record_load::load_record_no_follow(self, &from) {
-            Ok(Some(current)) => current,
-            Ok(None) | Err(_) => {
-                return op_error(
-                    CONCURRENT_MODIFICATION,
-                    &format!("File '{from}' was modified externally"),
+                    &format!("File '{}' was modified externally", input.from),
                 )
             }
         };
-        if current_source.facts().revision != source_entry.facts().revision {
-            return op_error(
-                CONCURRENT_MODIFICATION,
-                &format!("File '{from}' was modified externally"),
-            );
-        }
-        if let Err(error) = ensure_no_symlink_components(&self.root, &from, self.spec_profile) {
-            return error;
-        }
-        // The publication primitive below is ambient for cross-platform
-        // no-clobber semantics, so fence the public root again immediately
-        // before it is invoked.
-        if !self.rename_root_path_is_current() {
-            return op_error(
-                CONCURRENT_MODIFICATION,
-                "Collection root was replaced during rename",
-            );
-        }
-        if let Err(e) = atomic_rename_noclobber(&from_path, &to_path) {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                return op_error(PATH_CONFLICT, &format!("Target already exists: {to}"));
+        let simulations = input
+            .simulate_before_ref_update
+            .into_iter()
+            .map(|simulation| {
+                crate::operations::mutation_record_path(self, &simulation.path)
+                    .map(|path| (path, simulation.content))
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let simulations = match simulations {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        for (path, _) in &simulations {
+            if let Err(error) = crate::operations::ensure_no_symlink_components(
+                &self.root,
+                path.as_str(),
+                self.spec_profile,
+            ) {
+                return error;
             }
-            let error_str = e.to_string();
-            if error_str.contains("NUL") || error_str.contains("null") {
-                return op_error(INVALID_PATH, &format!("Invalid path: {e}"));
-            }
-            return op_error("io_error", &format!("Failed to rename: {e}"));
         }
+        let request = RenameRequest {
+            from,
+            to,
+            update_refs: input
+                .update_refs
+                .unwrap_or(self.settings.rename_update_refs),
+            if_revision,
+            include_document: false,
+        };
+        let _write_lock = if input.dry_run {
+            None
+        } else {
+            match crate::transactions::WriteLock::acquire(self) {
+                Ok(lock) => Some(lock),
+                Err(error) => return crate::errors::op_error(error.code(), &error.to_string()),
+            }
+        };
+        let prepared = match crate::mutation::prepare_rename(
+            self,
+            request,
+            PreparationOptions {
+                create_document: None,
+                dry_run: input.dry_run,
+            },
+            input.last_known_mtime,
+            input.last_known_ref_mtimes,
+            simulations,
+        ) {
+            Ok(prepared) => prepared,
+            Err(diagnostics) => return mutation_failure_json(diagnostics),
+        };
+        match self.rename_planned(prepared) {
+            Ok(planned) => planned_legacy_result(&planned),
+            Err(failure) => mutation_failure_json(failure.diagnostics),
+        }
+    }
 
-        if update_refs {
-            for sim in &simulate_before_ref_update {
-                let full = self.root.join(&sim.path);
-                let prepared = crate::api::CollectionPath::new(&sim.path)
-                    .ok()
-                    .filter(|path| {
-                        self.rename_root_path_is_current()
-                            && prepare_record_parent_no_follow(self, path).is_ok()
-                    })
-                    .is_some_and(|_| self.rename_root_path_is_current());
-                if !prepared {
-                    continue;
-                }
-                let _ = atomic_write_in_prepared_parent(&full, sim.content.as_bytes());
-                if let Ok(meta) = std::fs::metadata(&full) {
-                    if let Ok(cur) = meta.modified() {
-                        let times = std::fs::FileTimes::new()
-                            .set_modified(cur + std::time::Duration::from_secs(1));
-                        if let Ok(file) = std::fs::File::options().write(true).open(&full) {
-                            let _ = file.set_times(times);
-                        }
+    pub(crate) fn rename_planned(
+        &self,
+        prepared: PreparedRename,
+    ) -> Result<PlannedRename, crate::mutation::MutationFailure> {
+        let PreparedRename {
+            request,
+            dry_run,
+            source_revision,
+            source_types,
+            source_id,
+            source_frontmatter,
+            source_effective_frontmatter,
+            source_body,
+            source_bytes,
+            reference_plans,
+            warnings,
+            mut reference_failures,
+            legacy_ref_mtimes,
+            legacy_simulations,
+        } = prepared;
+        let from = request.from.to_string();
+        let to = request.to.to_string();
+        let planned_reference_writes = reference_plans.clone();
+        let references_affected = reference_plans
+            .iter()
+            .flat_map(|plan| plan.updates.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut destination_bytes = reference_plans
+            .iter()
+            .find(|plan| plan.execution_path == to)
+            .map(|plan| plan.output.as_bytes().to_vec())
+            .unwrap_or_else(|| source_bytes.clone());
+
+        if !dry_run {
+            #[cfg(test)]
+            apply_injected_root_replacement(&self.root);
+            ensure_no_symlink_components_diagnostic(&self.root, &from, self.spec_profile)
+                .map_err(crate::mutation::MutationFailure::diagnostic)?;
+            ensure_no_symlink_components_diagnostic(&self.root, &to, self.spec_profile)
+                .map_err(crate::mutation::MutationFailure::diagnostic)?;
+            ensure_regular_record_file_diagnostic(&request.from.under(&self.root), &from)
+                .map_err(crate::mutation::MutationFailure::diagnostic)?;
+            if !self.rename_root_path_is_current() {
+                return Err(crate::mutation::MutationFailure::operation(
+                    CONCURRENT_MODIFICATION,
+                    "Collection root was replaced during rename",
+                ));
+            }
+            prepare_record_parent_no_follow(self, &request.to).map_err(|error| {
+                crate::mutation::MutationFailure::operation(
+                    "io_error",
+                    format!("Failed to prepare target folder safely: {error}"),
+                )
+            })?;
+            let current = crate::record_load::load_record_no_follow(self, &from)
+                .ok()
+                .flatten()
+                .ok_or_else(|| {
+                    crate::mutation::MutationFailure::operation(
+                        CONCURRENT_MODIFICATION,
+                        format!("File '{from}' was modified externally"),
+                    )
+                })?;
+            if current.facts().revision != source_revision
+                || request
+                    .if_revision
+                    .as_ref()
+                    .is_some_and(|expected| expected.as_str() != current.facts().revision)
+            {
+                return Err(crate::mutation::MutationFailure::operation(
+                    CONCURRENT_MODIFICATION,
+                    format!("File '{from}' was modified externally"),
+                ));
+            }
+            if !self.rename_root_path_is_current() {
+                return Err(crate::mutation::MutationFailure::operation(
+                    CONCURRENT_MODIFICATION,
+                    "Collection root was replaced during rename",
+                ));
+            }
+            atomic_rename_noclobber(
+                &request.from.under(&self.root),
+                &request.to.under(&self.root),
+            )
+            .map_err(|error| {
+                crate::mutation::MutationFailure::operation(
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        PATH_CONFLICT
+                    } else {
+                        "io_error"
+                    },
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        format!("Target already exists: {to}")
+                    } else {
+                        format!("Failed to rename: {error}")
+                    },
+                )
+            })?;
+
+            if request.update_refs {
+                for (path, content) in legacy_simulations {
+                    if prepare_record_parent_no_follow(self, &path).is_ok() {
+                        let _ = atomic_write_in_prepared_parent(
+                            &path.under(&self.root),
+                            content.as_bytes(),
+                        );
                     }
                 }
             }
-        }
-
-        let mut references_updated = Vec::new();
-        if update_refs {
-            self.execute_reference_rewrites(
-                plans,
-                &last_known_ref_mtimes,
-                &mut references_updated,
-                &mut ref_update_failures,
-            );
-        }
-
-        let mut result = serde_json::json!({"from": from, "to": to});
-        if !references_updated.is_empty() {
-            result["references_updated"] = serde_json::Value::Array(references_updated);
-        }
-        if !warnings.is_empty() {
-            result["warnings"] = serde_json::Value::Array(warnings);
-        }
-        if !ref_update_failures.is_empty() {
-            result["error"] = serde_json::json!({
-                "code": RENAME_REF_UPDATE_FAILED,
-                "message": "Some reference updates failed",
+            let planned_destination = destination_bytes.clone();
+            let mut references_updated = Vec::new();
+            if request.update_refs {
+                self.execute_reference_rewrites(
+                    reference_plans,
+                    &legacy_ref_mtimes,
+                    &mut references_updated,
+                    &mut reference_failures,
+                );
+            }
+            if reference_failures
+                .iter()
+                .any(|failure| failure.get("path").and_then(serde_json::Value::as_str) == Some(&to))
+            {
+                destination_bytes = source_bytes;
+            } else {
+                destination_bytes = planned_destination;
+            }
+            let destination_body = planned_body(&destination_bytes, &source_body);
+            return Ok(PlannedRename {
+                from: request.from,
+                to: request.to.clone(),
+                source_revision: source_revision.clone(),
+                source_types: source_types.clone(),
+                source_id,
+                destination: PlannedRecord {
+                    path: request.to,
+                    types: source_types,
+                    frontmatter: source_frontmatter,
+                    effective_frontmatter: source_effective_frontmatter,
+                    body: destination_body,
+                    bytes: destination_bytes,
+                    diagnostics: Vec::new(),
+                    before_revision: Some(source_revision),
+                    include_document: request.include_document,
+                },
+                reference_plans: planned_reference_writes,
+                references_affected,
+                references_updated,
+                warnings,
+                reference_failures,
+                dry_run: false,
             });
-            result["partial_updates"] = serde_json::json!({"failed": ref_update_failures});
         }
-        result
+
+        let destination_body = planned_body(&destination_bytes, &source_body);
+        Ok(PlannedRename {
+            from: request.from,
+            to: request.to.clone(),
+            source_revision: source_revision.clone(),
+            source_types: source_types.clone(),
+            source_id,
+            destination: PlannedRecord {
+                path: request.to,
+                types: source_types,
+                frontmatter: source_frontmatter,
+                effective_frontmatter: source_effective_frontmatter,
+                body: destination_body,
+                bytes: destination_bytes,
+                diagnostics: Vec::new(),
+                before_revision: Some(source_revision),
+                include_document: request.include_document,
+            },
+            reference_plans: planned_reference_writes,
+            references_affected,
+            references_updated: Vec::new(),
+            warnings,
+            reference_failures,
+            dry_run: true,
+        })
+    }
+}
+
+fn planned_body(bytes: &[u8], fallback: &str) -> String {
+    std::str::from_utf8(bytes)
+        .ok()
+        .map(crate::frontmatter::parser::parse_document_for_rewrite)
+        .map(|(document, _)| document.body)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn planned_legacy_result(planned: &PlannedRename) -> serde_json::Value {
+    let mut result = if planned.dry_run {
+        serde_json::json!({
+            "from": planned.from,
+            "to": planned.to,
+            "dry_run": true,
+            "would_rename": true,
+        })
+    } else {
+        serde_json::json!({"from": planned.from, "to": planned.to})
+    };
+    let references = if planned.dry_run {
+        &planned.references_affected
+    } else {
+        &planned.references_updated
+    };
+    if !references.is_empty() {
+        result[if planned.dry_run {
+            "references_affected"
+        } else {
+            "references_updated"
+        }] = serde_json::Value::Array(references.clone());
+    }
+    if !planned.warnings.is_empty() {
+        result["warnings"] = serde_json::Value::Array(planned.warnings.clone());
+    }
+    if !planned.reference_failures.is_empty() {
+        result["error"] = serde_json::json!({
+            "code": RENAME_REF_UPDATE_FAILED,
+            "message": if planned.dry_run {
+                "Some reference updates could not be prepared"
+            } else {
+                "Some reference updates failed"
+            },
+        });
+        result["partial_updates"] = serde_json::json!({"failed": planned.reference_failures});
+    }
+    result
+}
+
+fn mutation_failure_json(diagnostics: Vec<crate::diagnostic::Diagnostic>) -> serde_json::Value {
+    if diagnostics.len() == 1 {
+        serde_json::json!({"error": diagnostics.into_iter().next().unwrap()})
+    } else {
+        serde_json::json!({"error": {
+            "code": VALIDATION_FAILED,
+            "message": "Validation failed",
+            "issues": diagnostics,
+        }})
     }
 }

@@ -5,7 +5,7 @@ use super::hooks::{apply_injected_reference_removal, take_injected_reference_ope
 use super::planner::ReferenceRewritePlan;
 
 impl Collection {
-    pub(super) fn execute_reference_rewrites(
+    pub(crate) fn execute_reference_rewrites(
         &self,
         plans: Vec<ReferenceRewritePlan>,
         mtime_overrides: &std::collections::HashMap<String, u64>,
@@ -94,7 +94,7 @@ impl Collection {
         }
     }
 
-    pub(super) fn rename_root_path_is_current(&self) -> bool {
+    pub(crate) fn rename_root_path_is_current(&self) -> bool {
         let held = self
             .root_capability()
             .and_then(|directory| same_file::Handle::from_file(directory.into_std_file()));

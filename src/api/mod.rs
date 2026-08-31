@@ -9,9 +9,11 @@ mod typed;
 pub use collection_path::{CollectionPath, CollectionPathError};
 pub use query::{FrontmatterMode, QueryDirection, QueryOrder, QueryRequest, QueryResult};
 pub use typed::{
-    BatchItemResult, BatchOperation, BatchRequest, BatchResult, CreateRequest,
-    DeletePreflightResult, DeleteRequest, DeleteResult, Diagnostic, DiagnosticCode, MdbaseError,
-    MdbaseResult, OperationOutcome, ReadRequest, RecordDocument, RecordFile, RenamePreflightResult,
-    RenameRequest, RenameResult, Revision, Severity, TypedCollection, UpdateRequest,
-    V02MigrationChange, V02MigrationRequest, V02MigrationResult,
+    BatchDeletePreflightResult, BatchItemResult, BatchOperation, BatchOperationResult,
+    BatchRenamePartialUpdates, BatchRenamePreflightResult, BatchRenameResult, BatchRequest,
+    BatchResult, CreateRequest, DeletePreflightResult, DeleteRequest, DeleteResult, Diagnostic,
+    DiagnosticCode, EmptyBatchOperationResult, MdbaseError, MdbaseResult, OperationOutcome,
+    ReadRequest, RecordDocument, RecordFile, RenamePreflightResult, RenameRequest, RenameResult,
+    Revision, Severity, TypedCollection, UpdateRequest, V02MigrationChange, V02MigrationRequest,
+    V02MigrationResult,
 };
