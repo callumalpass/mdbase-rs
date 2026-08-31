@@ -249,13 +249,19 @@ fn concurrent_renames_never_replace_the_winner() {
         );
     }
 
+    // Collection acquisition is not part of this no-clobber race. Open each
+    // authority first so the barrier synchronizes only the rename operations
+    // rather than platform-specific cache initialization.
+    let collections = (0..WRITERS)
+        .map(|_| open_collection(root))
+        .collect::<Vec<_>>();
     let barrier = Arc::new(Barrier::new(WRITERS));
-    let handles = (0..WRITERS)
-        .map(|index| {
-            let root = root.to_path_buf();
+    let handles = collections
+        .into_iter()
+        .enumerate()
+        .map(|(index, collection)| {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
-                let collection = open_collection(&root);
                 barrier.wait();
                 (
                     index,
