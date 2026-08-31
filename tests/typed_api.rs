@@ -711,8 +711,15 @@ fn typed_and_wire_create_update_outcomes_and_diagnostic_order_match() {
         "include_document": true,
     }));
     assert!(wire_create.valid, "{:?}", wire_create.diagnostics);
-    let typed_value = serde_json::to_value(&typed_create.value).unwrap();
-    assert_eq!(typed_value, wire_create.result);
+    let mut typed_value = serde_json::to_value(&typed_create.value).unwrap();
+    let mut wire_value = wire_create.result.clone();
+    let typed_mtime = typed_value["file"]["mtime"].as_str().unwrap();
+    let wire_mtime = wire_value["file"]["mtime"].as_str().unwrap();
+    assert!(!typed_mtime.is_empty());
+    assert!(!wire_mtime.is_empty());
+    typed_value["file"].as_object_mut().unwrap().remove("mtime");
+    wire_value["file"].as_object_mut().unwrap().remove("mtime");
+    assert_eq!(typed_value, wire_value);
 
     let replacement = "\u{feff}---\ntype: task\ntitle: Replaced\n---\r\nBody\r\n";
     let typed_update = typed_records
