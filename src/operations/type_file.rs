@@ -57,15 +57,19 @@ impl Collection {
             .held_root()
             .atomic_create(Path::new(&path), document.as_bytes())
         {
-            return failed(if error.kind() == std::io::ErrorKind::AlreadyExists {
-                Diagnostic::error(
-                    "path_conflict",
-                    format!("A type definition already exists at '{path}'."),
-                    Some(path.clone()),
-                )
-            } else {
-                io_diagnostic(&path, error)
-            });
+            return failed(
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    || self.held_root().exists_file(Path::new(&path))
+                {
+                    Diagnostic::error(
+                        "path_conflict",
+                        format!("A type definition already exists at '{path}'."),
+                        Some(path.clone()),
+                    )
+                } else {
+                    io_diagnostic(&path, error)
+                },
+            );
         }
         match self.reopen_held(true) {
             Ok(reloaded) => reloaded.type_file_result(&path),
