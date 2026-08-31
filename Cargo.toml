@@ -24,6 +24,7 @@ include = [
 [workspace]
 members = [
     ".",
+    "crates/mdbase-architecture-check",
     "crates/mdbase-command",
     "crates/mdbase-runtime",
     "crates/mdbase-testbed-adapter",
