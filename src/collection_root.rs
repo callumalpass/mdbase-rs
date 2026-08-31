@@ -78,7 +78,27 @@ impl CollectionRoot {
                         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                         Err(error) => return Err(error),
                     }
-                    dir = dir.open_dir_nofollow(part)?;
+                    let mut opened = None;
+                    for attempt in 0..=20 {
+                        match dir.open_dir_nofollow(part) {
+                            Ok(next) => {
+                                opened = Some(next);
+                                break;
+                            }
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::NotFound && attempt < 20 =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    dir = opened.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "created directory did not become visible",
+                        )
+                    })?;
                 }
                 Err(error) => return Err(error),
             }
