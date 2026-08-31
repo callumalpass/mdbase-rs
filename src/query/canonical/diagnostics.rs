@@ -1,8 +1,9 @@
 use serde_json::{json, Value};
 
-use crate::v03::{cel, Diagnostic, OperationResult};
+use crate::cel;
+use crate::diagnostic::Diagnostic;
 
-pub(super) fn invalid_schema(mut diagnostic: Diagnostic) -> Diagnostic {
+pub(crate) fn invalid_schema(mut diagnostic: Diagnostic) -> Diagnostic {
     let original_code = diagnostic.code;
     diagnostic.code = "invalid_query".to_string();
     diagnostic.path = None;
@@ -48,13 +49,5 @@ pub(crate) fn invalid_record(path: &str, reason: &str) -> Diagnostic {
         type_name: None,
         schema_location: None,
         details: Some(json!({"reason": reason})),
-    }
-}
-
-pub(super) fn failed(diagnostics: Vec<Diagnostic>) -> OperationResult {
-    OperationResult {
-        valid: false,
-        result: json!({}),
-        diagnostics,
     }
 }

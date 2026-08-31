@@ -1,4 +1,5 @@
 use clap::{Args as ClapArgs, ValueEnum};
+use mdbase::api::ReadRequest;
 use mdbase::frontmatter::parser::json_to_yaml_mapping;
 use mdbase::frontmatter::serializer::serialize_document;
 use mdbase::runtime::{FilesystemRuntime, OperationKind, OperationRequest};
@@ -80,7 +81,6 @@ pub struct Args {
     /// Workload to run; queries is the fastest feedback loop
     #[arg(long, value_enum, default_value_t = Scenario::Queries)]
     scenario: Scenario,
-
     /// Number of task files in the synthetic fixture
     #[arg(long, default_value_t = 5000)]
     files: usize,
@@ -137,7 +137,7 @@ pub struct Args {
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
-    /// Optional fixture root path; defaults to `/tmp/mdbase-profile-<timestamp>-<pid>`.
+    /// Fixture root; defaults to `/tmp/mdbase-profile-<timestamp>-<pid>`.
     #[arg(long)]
     fixture_root: Option<PathBuf>,
 
@@ -264,8 +264,7 @@ impl Drop for FixtureCleanup {
 
 /// Run the deterministic engine profile selected by the unified CLI.
 ///
-/// When `collection_root` is present, records are never modified and only the
-/// metadata-page and editor query workloads run.
+/// With `collection_root`, only read-only metadata-page/editor workloads run.
 pub fn run(args: Args, collection_root: Option<&Path>, output_json: bool) -> Result<(), String> {
     validate_args(&args, collection_root.is_some())?;
     if let Some(root) = collection_root {
@@ -876,31 +875,26 @@ fn summarize_query_phases(profiles: &[QueryPerformance]) -> BTreeMap<String, Pha
 
 fn summarize_query_counters(profiles: &[QueryPerformance]) -> BTreeMap<String, f64> {
     let count = profiles.len().max(1) as f64;
+    let mean = |field: fn(&QueryPerformance) -> usize| {
+        profiles
+            .iter()
+            .map(|profile| field(profile) as f64)
+            .sum::<f64>()
+            / count
+    };
     [
+        ("records_loaded", mean(|value| value.records_loaded)),
         (
-            "records_loaded",
-            profiles
-                .iter()
-                .map(|profile| profile.records_loaded as f64)
-                .sum::<f64>()
-                / count,
+            "record_source_loads",
+            mean(|value| value.record_source_loads),
         ),
         (
-            "candidates",
-            profiles
-                .iter()
-                .map(|profile| profile.candidates as f64)
-                .sum::<f64>()
-                / count,
+            "context_record_loads",
+            mean(|value| value.context_record_loads),
         ),
-        (
-            "results",
-            profiles
-                .iter()
-                .map(|profile| profile.results as f64)
-                .sum::<f64>()
-                / count,
-        ),
+        ("total_source_loads", mean(|value| value.total_source_loads)),
+        ("candidates", mean(|value| value.candidates)),
+        ("results", mean(|value| value.results)),
         (
             "link_graph_built",
             profiles
@@ -940,6 +934,9 @@ fn merge_query_performance(target: &mut QueryPerformance, value: QueryPerformanc
     target.groups_us += value.groups_us;
     target.serialize_us += value.serialize_us;
     target.records_loaded += value.records_loaded;
+    target.record_source_loads += value.record_source_loads;
+    target.context_record_loads += value.context_record_loads;
+    target.total_source_loads += value.total_source_loads;
     target.candidates += value.candidates;
     target.results += value.results;
     target.cache_used |= value.cache_used;
@@ -1025,10 +1022,13 @@ fn profile_read(
         .map(|_| rng.gen_range(0..task_paths.len()))
         .collect();
 
+    let typed = collection.typed().map_err(|error| error.to_string())?;
     run_timed("read", iterations, |i| {
-        let path = &task_paths[picks[i]];
-        let result = collection.read(&json!({ "path": path }));
-        ensure_success(&result)
+        let request = ReadRequest::new(&task_paths[picks[i]]).map_err(|error| error.to_string())?;
+        typed
+            .read(request)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     })
 }
 

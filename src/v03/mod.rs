@@ -4,29 +4,29 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use jsonschema::error::{ValidationError, ValidationErrorKind};
 use jsonschema::{Draft, JSONSchema};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_to_json};
 use crate::{Collection, SpecProfile};
+use schema_diagnostics::validation_diagnostic;
 
 pub(crate) mod batch;
-pub(crate) mod cel;
 mod collection_setup;
 mod lifecycle;
 mod operations;
 pub(crate) mod query;
+mod schema_diagnostics;
 mod type_pack;
 pub(crate) mod write_membership;
 
-pub use cel::{
+pub use crate::cel::{
     evaluate_runtime_expression, evaluate_runtime_template, validate_runtime_expression,
     WorkflowCelError,
 };
+pub use crate::diagnostic::Diagnostic;
 pub use collection_setup::{
     CollectionSetup, CollectionSetupApplyOptions, CollectionSetupAssessment,
     CollectionSetupProvisions, CollectionSetupReceipt, CollectionSetupRequirements,
@@ -70,42 +70,6 @@ const TYPE_FILE_SCHEMA: &str = include_str!("../../schemas/v0.3/type-file.schema
 const TYPE_PACK_SCHEMA: &str = include_str!("../../schemas/v0.3/type-pack.schema.json");
 const TYPE_PACK_LOCK_SCHEMA: &str = include_str!("../../schemas/v0.3/type-pack-lock.schema.json");
 const VIEW_SCHEMA: &str = include_str!("../../schemas/v0.3/view.schema.json");
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Diagnostic {
-    pub severity: String,
-    pub code: String,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub field: Option<String>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub type_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema_location: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<Value>,
-}
-
-impl Diagnostic {
-    pub fn error(
-        code: impl Into<String>,
-        message: impl Into<String>,
-        path: Option<String>,
-    ) -> Self {
-        Self {
-            severity: "error".to_string(),
-            code: code.into(),
-            message: message.into(),
-            path,
-            field: None,
-            type_name: None,
-            schema_location: None,
-            details: None,
-        }
-    }
-}
 
 pub(super) fn collection_validation_errors(collection: &Collection) -> Vec<Diagnostic> {
     let validation = collection.validate_op(&serde_json::json!({}));
@@ -758,75 +722,6 @@ fn validate_value(
             .collect(),
     };
     diagnostics
-}
-
-fn validation_diagnostic(
-    error: ValidationError<'_>,
-    path: &str,
-    schema_id: &str,
-    type_name: Option<&str>,
-) -> Diagnostic {
-    let field = diagnostic_field(&error);
-    Diagnostic {
-        severity: "error".to_string(),
-        code: diagnostic_code(&error.kind).to_string(),
-        message: error.to_string(),
-        path: Some(path.to_string()),
-        field,
-        type_name: type_name.map(str::to_string),
-        schema_location: Some(format!("{schema_id}#{}", error.schema_path)),
-        details: Some(serde_json::json!({
-            "instance_path": error.instance_path.to_string(),
-            "schema_path": error.schema_path.to_string(),
-        })),
-    }
-}
-
-fn diagnostic_code(kind: &ValidationErrorKind) -> &'static str {
-    match kind {
-        ValidationErrorKind::Required { .. } => "schema_required",
-        ValidationErrorKind::AdditionalProperties { .. } => "schema_additional_properties",
-        ValidationErrorKind::UnevaluatedProperties { .. } => "schema_unevaluated_properties",
-        ValidationErrorKind::Type { .. } => "schema_type",
-        ValidationErrorKind::Constant { .. } => "schema_const",
-        ValidationErrorKind::Enum { .. } => "schema_enum",
-        ValidationErrorKind::Pattern { .. } => "schema_pattern",
-        ValidationErrorKind::MinLength { .. } => "schema_min_length",
-        ValidationErrorKind::MaxLength { .. } => "schema_max_length",
-        ValidationErrorKind::Minimum { .. } => "schema_minimum",
-        ValidationErrorKind::Maximum { .. } => "schema_maximum",
-        ValidationErrorKind::MultipleOf { .. } => "schema_multiple_of",
-        ValidationErrorKind::ExclusiveMinimum { .. } => "schema_exclusive_minimum",
-        ValidationErrorKind::ExclusiveMaximum { .. } => "schema_exclusive_maximum",
-        ValidationErrorKind::MinItems { .. } => "schema_min_items",
-        ValidationErrorKind::MaxItems { .. } => "schema_max_items",
-        ValidationErrorKind::UniqueItems => "schema_unique_items",
-        ValidationErrorKind::OneOfMultipleValid | ValidationErrorKind::OneOfNotValid => {
-            "schema_one_of"
-        }
-        ValidationErrorKind::AnyOf => "schema_any_of",
-        ValidationErrorKind::Not { .. } => "schema_not",
-        ValidationErrorKind::Format { .. } => "format_invalid",
-        _ => "schema_invalid",
-    }
-}
-
-fn diagnostic_field(error: &ValidationError<'_>) -> Option<String> {
-    match &error.kind {
-        ValidationErrorKind::Required { property } => property.as_str().map(str::to_string),
-        ValidationErrorKind::AdditionalProperties { unexpected }
-        | ValidationErrorKind::UnevaluatedProperties { unexpected } => unexpected.first().cloned(),
-        _ => error
-            .instance_path
-            .to_string()
-            .rsplit('/')
-            .find(|segment| !segment.is_empty())
-            .map(decode_pointer_segment),
-    }
-}
-
-fn decode_pointer_segment(segment: &str) -> String {
-    segment.replace("~1", "/").replace("~0", "~")
 }
 
 fn compile_schema(schema: &Value) -> Result<JSONSchema, String> {

@@ -1,8 +1,4 @@
-//! Repeatable, non-gating Phase 0 observations for the coordinated runtime task.
-//!
-//! This binary intentionally reports measurements rather than enforcing latency or
-//! memory budgets. It uses the public collection/provider/watcher APIs so the
-//! observations remain useful when the runtime contract changes.
+//! Repeatable, non-gating measurements through public collection/provider/watcher APIs.
 
 use chrono::Utc;
 use mdbase::runtime::{CollectionProvider, FilesystemProvider, OperationKind, OperationRequest};
@@ -489,8 +485,11 @@ fn profile_read(
     let mut rng = StdRng::seed_from_u64(seed);
     timed("read", iterations, |_| {
         let path = &task_paths[rng.gen_range(0..task_paths.len())];
-        let result = collection.read(&json!({"path": path}));
-        ensure_json_success(&result)
+        collection
+            .typed()
+            .and_then(|typed| typed.read(mdbase::api::ReadRequest::new(path)?))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     })
 }
 

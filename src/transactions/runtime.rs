@@ -13,8 +13,7 @@ use crate::runtime::{
     CanonicalChange, ChangeBatch, ChangeBatchDescriptor, ChangeEventId, ChangeWatermark,
     CollectionGeneration, CommitId, HostClaimId, OperationContext,
 };
-use crate::v03::{Diagnostic, OperationResult};
-use crate::Collection;
+use crate::{diagnostic::Diagnostic, v03::OperationResult, Collection};
 
 const RUNTIME_JOURNAL_VERSION: u32 = 2;
 const MAX_ACTIVE_RUNTIME_TRANSACTIONS: usize = 128;

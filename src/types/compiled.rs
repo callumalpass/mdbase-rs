@@ -102,7 +102,7 @@ fn compile_type(type_def: &TypeDef) -> Result<CompiledTypePlan, CompileTypeError
         .as_ref()
         .and_then(|rules| rules.match_expr.as_deref())
     {
-        let expression = crate::v03::cel::compile(source).map_err(|error| {
+        let expression = crate::cel::compile(source).map_err(|error| {
             CompileTypeError::invalid(
                 type_def,
                 format!("Match expression is invalid: {}", error.message),
@@ -128,7 +128,7 @@ fn compile_type(type_def: &TypeDef) -> Result<CompiledTypePlan, CompileTypeError
                 let Some(source) = action.get("if").and_then(serde_json::Value::as_str) else {
                     continue;
                 };
-                let expression = crate::v03::cel::compile(source).map_err(|error| {
+                let expression = crate::cel::compile(source).map_err(|error| {
                     CompileTypeError::invalid(
                         type_def,
                         format!(

@@ -9,9 +9,10 @@ use super::diagnostics;
 use super::model::{Candidate, Query};
 use super::preflight::{self, CompiledSelection};
 use super::result::{build_groups, compare_values, serialize_candidate, sort_candidates};
+use crate::cel;
+use crate::diagnostic::Diagnostic;
 use crate::expressions::evaluator::resolve_execution_timezone;
 use crate::query::cache_source::{InvalidRecordStub, LocalRecord};
-use crate::v03::{cel, validate_query, Diagnostic, OperationResult};
 use crate::{Collection, OperationCancellation, OperationCancelled};
 
 /// Payload-free phase timings and counters for one canonical v0.3 query.
@@ -36,6 +37,12 @@ pub struct QueryPerformance {
     pub groups_us: u64,
     pub serialize_us: u64,
     pub records_loaded: usize,
+    /// Bulk snapshot/cache sources opened for candidate records.
+    pub record_source_loads: usize,
+    /// Point reads performed to hydrate `context.this`.
+    pub context_record_loads: usize,
+    /// All record sources opened (`record_source_loads + context_record_loads`).
+    pub total_source_loads: usize,
     pub candidates: usize,
     pub results: usize,
     pub cache_used: bool,
@@ -43,42 +50,107 @@ pub struct QueryPerformance {
     pub link_graph_built: bool,
 }
 
-pub(crate) fn execute(collection: &Collection, input: &Value) -> OperationResult {
-    execute_profiled(collection, input).0
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct QueryPathProbes {
+    pub wire_schema_validations: usize,
+    pub wire_query_decodes: usize,
+    pub typed_request_json_encodes: usize,
+    pub operation_result_decodes: usize,
+    pub core_executions: usize,
+    /// Bulk snapshot/cache sources opened for candidate records.
+    pub record_source_loads: usize,
+    /// Point reads performed to hydrate `context.this`.
+    pub context_record_loads: usize,
+    /// All record sources opened (`record_source_loads + context_record_loads`).
+    pub total_source_loads: usize,
 }
 
-pub(crate) fn execute_profiled(
-    collection: &Collection,
-    input: &Value,
-) -> (OperationResult, QueryPerformance) {
-    execute_profiled_cancellable(collection, input, &OperationCancellation::new(), false)
-        .expect("a fresh cancellation token cannot be cancelled")
+#[cfg(test)]
+thread_local! {
+    static QUERY_PATH_PROBES: std::cell::Cell<QueryPathProbes> =
+        const { std::cell::Cell::new(QueryPathProbes {
+            wire_schema_validations: 0,
+            wire_query_decodes: 0,
+            typed_request_json_encodes: 0,
+            operation_result_decodes: 0,
+            core_executions: 0,
+            record_source_loads: 0,
+            context_record_loads: 0,
+            total_source_loads: 0,
+        }) };
 }
 
-pub(crate) fn execute_cancellable(
-    collection: &Collection,
-    input: &Value,
-    cancellation: &OperationCancellation,
-) -> Result<OperationResult, OperationCancelled> {
-    execute_profiled_cancellable(collection, input, cancellation, false).map(|(result, _)| result)
+#[cfg(test)]
+fn bump_probe(update: impl FnOnce(&mut QueryPathProbes)) {
+    QUERY_PATH_PROBES.with(|probes| {
+        let mut value = probes.get();
+        update(&mut value);
+        probes.set(value);
+    });
 }
 
-pub(crate) fn execute_runtime_cancellable(
-    collection: &Collection,
-    input: &Value,
-    cancellation: &OperationCancellation,
-) -> Result<OperationResult, OperationCancelled> {
-    execute_profiled_cancellable(collection, input, cancellation, true).map(|(result, _)| result)
+#[cfg(test)]
+pub(crate) fn reset_query_path_probes() {
+    QUERY_PATH_PROBES.with(|probes| probes.set(QueryPathProbes::default()));
 }
 
-fn execute_profiled_cancellable(
+#[cfg(test)]
+pub(crate) fn query_path_probes() -> QueryPathProbes {
+    QUERY_PATH_PROBES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn record_typed_request_json_encode() {
+    bump_probe(|probes| probes.typed_request_json_encodes += 1);
+}
+
+#[cfg(test)]
+pub(crate) fn record_wire_schema_validation() {
+    bump_probe(|probes| probes.wire_schema_validations += 1);
+}
+
+#[cfg(test)]
+pub(crate) fn record_wire_query_decode() {
+    bump_probe(|probes| probes.wire_query_decodes += 1);
+}
+
+/// Dynamic rows and metadata produced by the already-parsed query core.
+pub(crate) struct QueryExecution {
+    pub records: Vec<Value>,
+    pub total_count: usize,
+    pub has_more: bool,
+    pub meta: Value,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+pub(crate) type QueryEvaluation = Result<QueryExecution, Vec<Diagnostic>>;
+
+pub(crate) fn execute_typed(collection: &Collection, query: Query) -> QueryEvaluation {
+    execute_model_profiled_cancellable(
+        collection,
+        query,
+        &OperationCancellation::new(),
+        false,
+        Instant::now(),
+        0,
+    )
+    .expect("a fresh cancellation token cannot be cancelled")
+    .0
+}
+
+pub(crate) fn execute_model_profiled_cancellable(
     collection: &Collection,
-    input: &Value,
+    query: Query,
     cancellation: &OperationCancellation,
     runtime_cache: bool,
-) -> Result<(OperationResult, QueryPerformance), OperationCancelled> {
-    let total_started = Instant::now();
-    let mut performance = QueryPerformance::default();
+    total_started: Instant,
+    schema_us: u64,
+) -> Result<(QueryEvaluation, QueryPerformance), OperationCancelled> {
+    let mut performance = QueryPerformance {
+        schema_us,
+        ..QueryPerformance::default()
+    };
     macro_rules! finish {
         ($result:expr) => {{
             performance.total_us = micros(total_started.elapsed());
@@ -87,32 +159,12 @@ fn execute_profiled_cancellable(
     }
 
     cancellation.check()?;
-
+    #[cfg(test)]
+    bump_probe(|probes| probes.core_executions += 1);
     let phase = Instant::now();
-    let schema_diagnostics = validate_query(input)
-        .into_iter()
-        .map(diagnostics::invalid_schema)
-        .collect::<Vec<_>>();
-    performance.schema_us = micros(phase.elapsed());
-    cancellation.check()?;
-    if !schema_diagnostics.is_empty() {
-        finish!(diagnostics::failed(schema_diagnostics));
-    }
-
-    let phase = Instant::now();
-    let query = match serde_json::from_value::<Query>(input.clone()) {
-        Ok(query) => query,
-        Err(error) => {
-            finish!(diagnostics::failed(vec![Diagnostic::error(
-                "invalid_query",
-                format!("Query could not be decoded: {error}"),
-                None,
-            )]));
-        }
-    };
     let compiled = match preflight::compile(query) {
         Ok(compiled) => compiled,
-        Err(diagnostics) => finish!(diagnostics::failed(diagnostics)),
+        Err(diagnostics) => finish!(Err(diagnostics)),
     };
     performance.preflight_us = micros(phase.elapsed());
     cancellation.check()?;
@@ -124,7 +176,7 @@ fn execute_profiled_cancellable(
     ) {
         Ok(timezone) => timezone,
         Err(message) => {
-            finish!(diagnostics::failed(vec![Diagnostic::error(
+            finish!(Err(vec![Diagnostic::error(
                 "invalid_timezone",
                 message,
                 None,
@@ -134,7 +186,7 @@ fn execute_profiled_cancellable(
     let clock = match cel::operation_clock(timezone) {
         Ok(clock) => clock,
         Err(error) => {
-            finish!(diagnostics::failed(vec![Diagnostic::error(
+            finish!(Err(vec![Diagnostic::error(
                 error.code,
                 error.message,
                 None,
@@ -216,6 +268,13 @@ fn execute_profiled_cancellable(
             .type_plans
             .values()
             .any(|plan| !plan.computed.is_empty());
+    performance.record_source_loads = 1;
+    performance.total_source_loads = 1;
+    #[cfg(test)]
+    bump_probe(|probes| {
+        probes.record_source_loads += 1;
+        probes.total_source_loads += 1;
+    });
     let loaded = if runtime_cache {
         collection.load_runtime_query_data_profiled_cancellable(
             true,
@@ -241,7 +300,7 @@ fn execute_profiled_cancellable(
                     .to_string_lossy()
                     .replace('\\', "/")
             });
-            finish!(diagnostics::failed(vec![Diagnostic::error(
+            finish!(Err(vec![Diagnostic::error(
                 "collection_snapshot_failed",
                 error.to_string(),
                 path,
@@ -336,7 +395,7 @@ fn execute_profiled_cancellable(
         .collect::<Vec<_>>();
     let type_definitions = Arc::new(collection.types.clone());
     let phase = Instant::now();
-    let context = match load_context(
+    let (context, context_record_loads) = match load_context(
         collection,
         &compiled.query,
         all_files.clone(),
@@ -344,9 +403,18 @@ fn execute_profiled_cancellable(
         type_definitions.clone(),
     ) {
         Ok(context) => context,
-        Err(diagnostic) => finish!(diagnostics::failed(vec![*diagnostic])),
+        Err(diagnostic) => finish!(Err(vec![*diagnostic])),
     };
     performance.context_us = micros(phase.elapsed());
+    performance.context_record_loads = context_record_loads;
+    performance.total_source_loads = performance
+        .record_source_loads
+        .saturating_add(context_record_loads);
+    #[cfg(test)]
+    bump_probe(|probes| {
+        probes.context_record_loads += context_record_loads;
+        probes.total_source_loads += context_record_loads;
+    });
     cancellation.check()?;
 
     let phase = Instant::now();
@@ -528,17 +596,13 @@ fn execute_profiled_cancellable(
     if let Some(groups) = groups {
         meta["groups"] = Value::Array(groups);
     }
-    let serialized_diagnostics =
-        serde_json::to_value(&query_diagnostics).unwrap_or_else(|_| json!([]));
-    let result = OperationResult {
-        valid: true,
-        result: json!({
-            "results": results,
-            "meta": meta,
-            "diagnostics": serialized_diagnostics,
-        }),
+    let result = Ok(QueryExecution {
+        records: results,
+        total_count,
+        has_more,
+        meta,
         diagnostics: query_diagnostics,
-    };
+    });
     performance.total_us = micros(total_started.elapsed());
     Ok((result, performance))
 }
@@ -557,6 +621,10 @@ fn apply_load_performance(
     performance.all_files_us = millis_to_micros(load.build_all_files_ms);
     performance.link_graph_us = millis_to_micros(load.build_backlinks_ms);
     performance.records_loaded = load.file_records;
+    performance.record_source_loads = 1;
+    performance.total_source_loads = performance
+        .record_source_loads
+        .saturating_add(performance.context_record_loads);
     performance.cache_used = load.cache_used;
     performance.cache_fallback = load.cache_fallback;
     performance.link_graph_built = load.built_link_graph;
@@ -569,7 +637,7 @@ fn build_metadata_page_result(
     total_count: usize,
     has_more: bool,
     performance: &mut QueryPerformance,
-) -> OperationResult {
+) -> QueryEvaluation {
     let phase = Instant::now();
     let mut query_diagnostics = Vec::new();
     let results = records
@@ -616,21 +684,17 @@ fn build_metadata_page_result(
         .collect::<Vec<_>>();
     performance.evaluate_us = micros(phase.elapsed());
     performance.results = results.len();
-    let serialized_diagnostics =
-        serde_json::to_value(&query_diagnostics).unwrap_or_else(|_| json!([]));
     let meta = json!({
         "total_count": total_count,
         "has_more": has_more,
     });
-    OperationResult {
-        valid: true,
-        result: json!({
-            "results": results,
-            "meta": meta,
-            "diagnostics": serialized_diagnostics,
-        }),
+    Ok(QueryExecution {
+        records: results,
+        total_count,
+        has_more,
+        meta,
         diagnostics: query_diagnostics,
-    }
+    })
 }
 
 fn millis_to_micros(milliseconds: f64) -> u64 {
@@ -690,5 +754,113 @@ fn record_metadata_value(record: &LocalRecord, field: &str) -> Value {
         .as_ref()
         .map_or(Value::Null, |value| Value::String(value.clone())),
         _ => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use crate::api::{CollectionPath, QueryRequest};
+    use crate::Collection;
+
+    use super::{query_path_probes, reset_query_path_probes};
+
+    #[test]
+    fn typed_query_skips_wire_and_envelope_paths_and_loads_once() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  timezone: UTC\n  validation: warn\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("one.md"), "---\ntitle: One\n---\nBody\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        let request = QueryRequest {
+            context: Some(CollectionPath::new("one.md").unwrap()),
+            ..QueryRequest::builder().where_expression("true")
+        };
+
+        let invalid = QueryRequest {
+            timezone: Some(String::new()),
+            ..QueryRequest::default()
+        };
+        reset_query_path_probes();
+        assert!(collection.typed().unwrap().query(invalid).is_err());
+        assert_eq!(query_path_probes(), super::QueryPathProbes::default());
+
+        reset_query_path_probes();
+        let typed = collection.typed().unwrap().query(request.clone()).unwrap();
+        assert_eq!(typed.value.total_count, 1);
+        assert_eq!(
+            query_path_probes(),
+            super::QueryPathProbes {
+                core_executions: 1,
+                record_source_loads: 1,
+                context_record_loads: 1,
+                total_source_loads: 2,
+                ..super::QueryPathProbes::default()
+            }
+        );
+
+        reset_query_path_probes();
+        let wire = crate::v03::query::execute(&collection, &request.to_wire());
+        assert!(wire.valid, "{wire:#?}");
+        assert_eq!(
+            query_path_probes(),
+            super::QueryPathProbes {
+                wire_schema_validations: 1,
+                wire_query_decodes: 1,
+                typed_request_json_encodes: 1,
+                core_executions: 1,
+                record_source_loads: 1,
+                context_record_loads: 1,
+                total_source_loads: 2,
+                ..super::QueryPathProbes::default()
+            }
+        );
+
+        let missing = QueryRequest {
+            context: Some(CollectionPath::new("missing.md").unwrap()),
+            ..QueryRequest::builder().where_expression("true")
+        };
+        reset_query_path_probes();
+        assert!(collection.typed().unwrap().query(missing.clone()).is_err());
+        assert_eq!(
+            query_path_probes(),
+            super::QueryPathProbes {
+                core_executions: 1,
+                record_source_loads: 1,
+                total_source_loads: 1,
+                ..super::QueryPathProbes::default()
+            }
+        );
+
+        reset_query_path_probes();
+        let (wire, performance) =
+            crate::v03::query::execute_profiled(&collection, &missing.to_wire());
+        assert!(!wire.valid, "{wire:#?}");
+        assert_eq!(performance.context_record_loads, 0);
+        assert_eq!(performance.total_source_loads, 1);
+        assert_eq!(
+            query_path_probes(),
+            super::QueryPathProbes {
+                wire_schema_validations: 1,
+                wire_query_decodes: 1,
+                typed_request_json_encodes: 1,
+                core_executions: 1,
+                record_source_loads: 1,
+                total_source_loads: 1,
+                ..super::QueryPathProbes::default()
+            }
+        );
+
+        let (invalid_path, performance) = crate::v03::query::execute_profiled(
+            &collection,
+            &serde_json::json!({"context": {"this": {"path": "../outside.md"}}}),
+        );
+        assert!(!invalid_path.valid, "{invalid_path:#?}");
+        assert_eq!(performance.context_record_loads, 0);
+        assert_eq!(performance.total_source_loads, 1);
     }
 }

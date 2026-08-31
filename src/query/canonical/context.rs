@@ -4,13 +4,14 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use super::model::Query;
+use crate::cel;
+use crate::diagnostic::Diagnostic;
 use crate::expressions::evaluator::{
     extract_embeds_from_body, extract_links_from_body, extract_tags_from_body, EvalContext,
     NoteNamespaceSource, ResolvedFileData,
 };
 use crate::query::cache_source::FileRecord;
 use crate::types::schema::TypeDef;
-use crate::v03::{cel, Diagnostic};
 use crate::Collection;
 
 pub(super) type LinkGraph = Option<Arc<HashMap<String, Vec<String>>>>;
@@ -21,35 +22,35 @@ pub(super) fn load_context(
     all_files: Option<Arc<Vec<ResolvedFileData>>>,
     backlinks: LinkGraph,
     type_definitions: Arc<HashMap<String, TypeDef>>,
-) -> Result<Option<Box<EvalContext>>, Box<Diagnostic>> {
+) -> Result<(Option<Box<EvalContext>>, usize), Box<Diagnostic>> {
     let Some(context) = &query.context else {
-        return Ok(None);
+        return Ok((None, 0));
     };
     let path = &context.this.path;
-    let read = collection.read(&json!({"path": path}));
-    if read.get("error").is_some() {
-        return Err(Box::new(Diagnostic::error(
+    let request = crate::api::ReadRequest::new(path).map_err(|_| {
+        Box::new(Diagnostic::error(
             "context_not_found",
             format!("Query context record '{path}' was not found."),
             Some(path.clone()),
-        )));
-    }
-    let effective = read
-        .get("effective_frontmatter")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let persisted = read
-        .get("frontmatter")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let types = read
-        .get("types")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(String::from)
-        .collect::<Vec<_>>();
+        ))
+    })?;
+    let read = crate::operations::read::evaluate_typed_read(
+        collection,
+        &request,
+        crate::operations::read::TypedReadSource::Filesystem,
+    )
+    .into_outcome()
+    .map_err(|_| {
+        Box::new(Diagnostic::error(
+            "context_not_found",
+            format!("Query context record '{path}' was not found."),
+            Some(path.clone()),
+        ))
+    })?
+    .value;
+    let effective = read.effective_frontmatter.clone();
+    let persisted = read.frontmatter.clone();
+    let types = read.types.clone();
     let mut bindings = cel::enrich_record_bindings(
         &effective,
         &persisted,
@@ -61,26 +62,26 @@ pub(super) fn load_context(
             Value::Array(types.iter().cloned().map(Value::String).collect()),
         );
     }
-    Ok(Some(Box::new(EvalContext {
-        frontmatter: bindings,
-        raw_frontmatter: Some(persisted),
-        file_path: Some(path.clone()),
-        body: read.get("body").and_then(Value::as_str).map(String::from),
-        file_size: read.pointer("/file/size").and_then(Value::as_u64),
-        file_mtime: read
-            .pointer("/file/mtime")
-            .and_then(Value::as_str)
-            .map(String::from),
-        file_ctime: None,
-        this_context: None,
-        all_files,
-        traversal_depth: std::cell::Cell::new(0),
-        backlinks_index: backlinks,
-        type_names: Some(types),
-        types: Some(type_definitions),
-        note_namespace_source: NoteNamespaceSource::Effective,
-        string_concat: false,
-    })))
+    Ok((
+        Some(Box::new(EvalContext {
+            frontmatter: bindings,
+            raw_frontmatter: Some(persisted),
+            file_path: Some(path.clone()),
+            body: Some(read.body),
+            file_size: Some(read.file.size),
+            file_mtime: Some(read.file.mtime),
+            file_ctime: None,
+            this_context: None,
+            all_files,
+            traversal_depth: std::cell::Cell::new(0),
+            backlinks_index: backlinks,
+            type_names: Some(types),
+            types: Some(type_definitions),
+            note_namespace_source: NoteNamespaceSource::Effective,
+            string_concat: false,
+        })),
+        1,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1,4 +1,4 @@
-//! Portable v0.3 expression host bindings built on the shared evaluator.
+//! Version-neutral portable expression host bindings built on the shared evaluator.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -6,12 +6,13 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
-use super::{Diagnostic, OperationResult};
+use crate::diagnostic::Diagnostic;
 use crate::expressions::ast::Expr;
 use crate::expressions::evaluator::{
     evaluate_with_limits, EvalContext, EvaluationClock, NoteNamespaceSource,
 };
 use crate::expressions::parser::Parser;
+use crate::v03::OperationResult;
 use crate::Collection;
 
 pub(crate) const MAX_SOURCE_BYTES: usize = 64 * 1024;
@@ -149,48 +150,43 @@ pub(crate) fn evaluate_record(collection: &Collection, input: &Value) -> Operati
             Some(path.to_string()),
         );
     };
-    let read = collection.read(&json!({"path": path}));
-    if let Some(error) = read.get("error") {
-        return failed(
-            error
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("operation_failed"),
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Record could not be read."),
-            Some(path.to_string()),
-        );
-    }
+    let request = match crate::api::ReadRequest::new(path) {
+        Ok(request) => request,
+        Err(error) => return failed("invalid_path", error.to_string(), Some(path.to_string())),
+    };
+    let read = match crate::operations::read::evaluate_typed_read(
+        collection,
+        &request,
+        crate::operations::read::TypedReadSource::Filesystem,
+    )
+    .into_outcome()
+    {
+        Ok(outcome) => outcome.value,
+        Err(error) => {
+            let diagnostic = error.diagnostics().first();
+            return failed(
+                diagnostic
+                    .map(|diagnostic| diagnostic.code.as_str())
+                    .unwrap_or("operation_failed"),
+                diagnostic
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .unwrap_or("Record could not be read."),
+                Some(path.to_string()),
+            );
+        }
+    };
 
-    let effective = read
-        .get("effective_frontmatter")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let raw = read
-        .get("frontmatter")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let type_names = read
-        .get("types")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(String::from)
-        .collect::<Vec<_>>();
+    let effective = read.effective_frontmatter.clone();
+    let raw = read.frontmatter.clone();
+    let type_names = read.types;
     let known_fields = known_fields(collection, &type_names);
     let mut context = EvalContext::empty();
     context.frontmatter = enrich_record_bindings(&effective, &raw, known_fields.iter());
     context.raw_frontmatter = Some(raw);
     context.file_path = Some(path.to_string());
-    context.body = read.get("body").and_then(Value::as_str).map(String::from);
-    context.file_size = read.pointer("/file/size").and_then(Value::as_u64);
-    context.file_mtime = read
-        .pointer("/file/mtime")
-        .and_then(Value::as_str)
-        .map(String::from);
+    context.body = Some(read.body);
+    context.file_size = Some(read.file.size);
+    context.file_mtime = Some(read.file.mtime);
     context.type_names = Some(type_names);
     context.types = Some(Arc::new(collection.types.clone()));
     context.note_namespace_source = NoteNamespaceSource::Effective;

@@ -183,17 +183,10 @@ fn read_effective_frontmatter(
     rel_path: &str,
     collection: &crate::Collection,
 ) -> Option<(Value, Vec<String>)> {
-    let result = collection.read(&json!({"path": rel_path}));
-    let frontmatter = result.get("effective_frontmatter").cloned()?;
-    let types: Vec<String> = result
-        .get("types")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let request = crate::api::ReadRequest::new(rel_path).ok()?;
+    let result = collection.typed().ok()?.read(request).ok()?.value;
+    let frontmatter = result.effective_frontmatter;
+    let types = result.types;
 
     // Remove computed fields from frontmatter
     let mut fm = frontmatter;

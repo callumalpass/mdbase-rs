@@ -7,12 +7,13 @@ use serde_json::{json, Value};
 
 use super::execute::is_configured_obsidian_source;
 use super::model::ObsidianBaseDocument;
+use crate::diagnostic::Diagnostic;
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to_json};
 use crate::operations::{
     atomic_create, atomic_write, ensure_no_symlink_components, ensure_revision,
     ensure_safe_relative_path, sync_directory,
 };
-use crate::v03::{self, Diagnostic, OperationResult};
+use crate::v03::{self, OperationResult};
 use crate::Collection;
 
 type DiagnosticResult<T> = Result<T, Box<Diagnostic>>;

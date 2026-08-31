@@ -7,8 +7,9 @@ use std::path::Path;
 use serde_json::{json, Value};
 use tempfile::NamedTempFile;
 
+use crate::diagnostic::Diagnostic;
 use crate::operations::{ensure_no_symlink_components, ensure_revision, ensure_safe_relative_path};
-use crate::v03::{self, Diagnostic, OperationResult};
+use crate::v03::{self, OperationResult};
 use crate::Collection;
 
 impl Collection {
