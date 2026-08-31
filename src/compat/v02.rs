@@ -48,10 +48,10 @@ pub(crate) fn query(
         .unwrap_or(false);
     Ok(OperationOutcome {
         value: QueryResult {
-            records,
+            records: records.into_iter().map(Into::into).collect(),
             total_count,
             has_more,
-            meta,
+            meta: crate::api::QueryMetadata::new(meta),
         },
         diagnostics,
     })

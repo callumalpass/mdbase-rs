@@ -85,7 +85,7 @@ impl PlannedRename {
             document,
             from: self.from.clone(),
             to: self.to.clone(),
-            references_updated: self.references_updated.clone(),
+            references_updated: crate::api::reference_evidence(self.references_updated.clone()),
         }
     }
 
@@ -94,8 +94,8 @@ impl PlannedRename {
             from: self.from.clone(),
             to: self.to.clone(),
             would_rename: true,
-            references_affected: self.references_affected.clone(),
-            warnings: self.warnings.clone(),
+            references_affected: crate::api::reference_evidence(self.references_affected.clone()),
+            warnings: self.warnings.clone().into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -117,7 +117,7 @@ impl PlannedDelete {
         crate::api::DeleteResult {
             path: self.path.clone(),
             deleted: self.deleted,
-            broken_links: self.broken_links.clone(),
+            broken_links: crate::api::reference_evidence(self.broken_links.clone()),
         }
     }
 
@@ -125,7 +125,7 @@ impl PlannedDelete {
         crate::api::DeletePreflightResult {
             path: self.path.clone(),
             would_delete: true,
-            broken_links: self.broken_links.clone(),
+            broken_links: crate::api::reference_evidence(self.broken_links.clone()),
         }
     }
 }

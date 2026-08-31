@@ -55,12 +55,21 @@ pub struct CatalogError {
     pub message: String,
 }
 
+fn catalog_provider_error(error: super::ProviderError) -> CatalogError {
+    CatalogError {
+        code: error.code().to_string(),
+        message: error.to_string(),
+    }
+}
+
 /// Immutable, provider-neutral compiled resource catalog.
 ///
 /// It contains no records, filesystem authority, credentials, or durable host
 /// identity. Evicting it changes performance only.
 pub struct CompiledCatalog {
     resource_revision: String,
+    pub(super) configuration_document: String,
+    pub(super) type_resources: Vec<ResolvedTypeResource>,
     pub(super) collection: Collection,
     pub(super) contracts: Vec<crate::data_contracts::ResolvedRecordContract>,
 }
@@ -91,6 +100,7 @@ impl CompiledCatalog {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<Map<_, _>>();
 
+        let type_resources = input.types.clone();
         let mut type_files = Vec::with_capacity(input.types.len());
         for resource in input.types {
             let definition = resource
@@ -172,6 +182,8 @@ impl CompiledCatalog {
             })?;
         Ok(Self {
             resource_revision: input.resource_revision,
+            configuration_document: input.configuration_document,
+            type_resources,
             contracts,
             collection: Collection {
                 root: PathBuf::new(),
@@ -200,8 +212,16 @@ impl CompiledCatalog {
         })
     }
 
-    pub fn read_record(&self, input: &Value, record: &CanonicalRecordInput) -> OperationResult {
-        self.collection
+    /// Evaluate one provider-supplied exact record and return the canonical
+    /// typed read outcome. The provider remains authoritative for selecting
+    /// the exact record and for every persistence decision.
+    pub fn read_record_typed(
+        &self,
+        input: &Value,
+        record: &CanonicalRecordInput,
+    ) -> Result<super::CanonicalOperationOutcome, CatalogError> {
+        let result = self
+            .collection
             .v03_operations()
             .expect("compiled catalogs always use the canonical profile")
             .read_record(
@@ -212,14 +232,38 @@ impl CompiledCatalog {
                     size: record.file_size,
                     mtime: record.file_mtime.clone(),
                 },
-            )
+            );
+        super::CanonicalOperationOutcome::hosted_wire_edge(super::OperationKind::Read, result)
+            .map_err(catalog_provider_error)
     }
 
-    pub fn read_record_not_found(&self, input: &Value) -> OperationResult {
-        self.collection
+    /// Compatibility projection for current Connect callers.
+    #[deprecated(note = "use read_record_typed")]
+    pub fn read_record(&self, input: &Value, record: &CanonicalRecordInput) -> OperationResult {
+        self.read_record_typed(input, record)
+            .expect("the typed read adapter accepts every canonical wire outcome")
+            .to_v03()
+    }
+
+    pub fn read_record_not_found_typed(
+        &self,
+        input: &Value,
+    ) -> Result<super::CanonicalOperationOutcome, CatalogError> {
+        let result = self
+            .collection
             .v03_operations()
             .expect("compiled catalogs always use the canonical profile")
-            .read_record_not_found(input)
+            .read_record_not_found(input);
+        super::CanonicalOperationOutcome::hosted_wire_edge(super::OperationKind::Read, result)
+            .map_err(catalog_provider_error)
+    }
+
+    /// Compatibility projection for current Connect callers.
+    #[deprecated(note = "use read_record_not_found_typed")]
+    pub fn read_record_not_found(&self, input: &Value) -> OperationResult {
+        self.read_record_not_found_typed(input)
+            .expect("the typed missing-read adapter accepts every canonical wire outcome")
+            .to_v03()
     }
 
     /// Parse and classify one exact Markdown document for a provider-owned
@@ -419,6 +463,7 @@ fn catalog_error_from_diagnostic(diagnostic: &Diagnostic) -> CatalogError {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use serde_json::json;

@@ -149,11 +149,11 @@ impl CompiledCatalog {
     /// Execute canonical validation against a bounded caller-supplied exact
     /// neighborhood. The host supplies uniqueness and link-resolution
     /// candidates selected from a consistent projection snapshot.
-    pub fn execute_hosted_validation(
+    pub fn execute_hosted_validation_typed(
         &self,
         plan: &HostedValidationPlan,
         records: &[CanonicalRecordInput],
-    ) -> Result<OperationResult, CatalogError> {
+    ) -> Result<super::CanonicalOperationOutcome, CatalogError> {
         if plan.catalog_revision != self.resource_revision() {
             return Err(validation_error(
                 "hosted_validation_catalog_mismatch",
@@ -224,10 +224,26 @@ impl CompiledCatalog {
             root_capability: Collection::capability_for_root(directory.path())
                 .map_err(validation_stage_error)?,
         };
-        Ok(collection
+        let result = collection
             .v03_operations()
             .expect("compiled catalogs always use the canonical profile")
-            .validate(&plan.input))
+            .validate(&plan.input);
+        super::CanonicalOperationOutcome::hosted_wire_edge(super::OperationKind::Validate, result)
+            .map_err(|error| validation_error(error.code(), error.to_string()))
+    }
+
+    /// Compatibility projection for current Connect callers. Validation's
+    /// value remains explicitly wire-only because no typed validation model
+    /// exists; diagnostics and envelope state are typed.
+    #[deprecated(note = "use execute_hosted_validation_typed")]
+    pub fn execute_hosted_validation(
+        &self,
+        plan: &HostedValidationPlan,
+        records: &[CanonicalRecordInput],
+    ) -> Result<OperationResult, CatalogError> {
+        Ok(self
+            .execute_hosted_validation_typed(plan, records)?
+            .to_v03())
     }
 }
 
@@ -259,6 +275,7 @@ fn validation_stage_error(error: std::io::Error) -> CatalogError {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use serde_json::json;
 

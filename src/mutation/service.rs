@@ -790,37 +790,22 @@ mod tests {
             assert!(!source.contains(&removed_hydrator), "{}", path.display());
         }
         let batch = std::fs::read_to_string(repository.join("src/v03/batch.rs")).unwrap();
-        let runtime_rename_adapter = batch
-            .split("pub(crate) fn prepare_single_runtime")
+        let runtime_rename_core = batch
+            .split("fn prepare_runtime_rename_typed")
             .nth(1)
             .unwrap()
             .split("fn execute_non_record_runtime_operation")
             .next()
             .unwrap();
-        assert_eq!(
-            runtime_rename_adapter
-                .matches("mutation_adapter::prepare_runtime_rename(")
-                .count(),
-            1
-        );
-        assert!(!runtime_rename_adapter.contains(&["v03", "operations"].join("_")));
-        assert!(!runtime_rename_adapter.contains("execute_mutation_direct"));
-        let rename_adapter =
-            std::fs::read_to_string(repository.join("src/v03/mutation_adapter.rs")).unwrap();
-        let runtime_rename_core = rename_adapter
-            .split("pub(super) fn prepare_runtime_rename")
-            .nth(1)
-            .unwrap()
-            .split("pub(super) fn planned_rename_result")
-            .next()
-            .unwrap();
         assert_eq!(runtime_rename_core.matches("decode_rename(").count(), 1);
         assert_eq!(runtime_rename_core.matches("plan_rename(").count(), 1);
+        assert!(!runtime_rename_core.contains("OperationResult"));
+        assert!(!runtime_rename_core.contains("recover_v03"));
         let runtime_delete_adapter = batch
-            .split("fn prepare_sparse_runtime")
+            .split("fn prepare_sparse_typed")
             .nth(1)
             .unwrap()
-            .split("if matches!(operation, \"create\" | \"update\")")
+            .split("fn typed_projection_error")
             .next()
             .unwrap();
         assert_eq!(runtime_delete_adapter.matches("plan_delete(").count(), 1);

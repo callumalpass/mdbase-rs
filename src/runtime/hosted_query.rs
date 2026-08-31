@@ -80,6 +80,54 @@ pub struct HostedResidualEvaluation {
     pub aggregate_values: Vec<Value>,
 }
 
+/// One canonical projection with the provider-visible row name kept separate
+/// from its dynamic projected value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostedNamedProjectedValue {
+    pub name: String,
+    pub value: crate::api::ProjectedValue,
+}
+
+/// Typed provider-owned continuation state. mdbase binds semantic ordering to
+/// the plan; the provider owns storage, expiry, encryption, and single-use
+/// cursor enforcement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostedQueryCursorState {
+    pub plan_digest: String,
+    pub snapshot_revision: String,
+    #[serde(default)]
+    pub order_values: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_id: Option<String>,
+    pub emitted_rows: u64,
+}
+
+/// Provider-supplied, already canonically evaluated page material.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostedQueryPageInput {
+    pub records: Vec<HostedNamedProjectedValue>,
+    /// Exact total, or `None` when exact counting was explicitly deferred.
+    pub total_count: Option<usize>,
+    pub has_more: bool,
+    pub meta: crate::api::QueryMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<HostedQueryCursorState>,
+    #[serde(default)]
+    pub diagnostics: Vec<crate::api::Diagnostic>,
+}
+
+/// Closed typed page assembled after mdbase residual evaluation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostedQueryPage {
+    pub operation: super::CanonicalOperationOutcome,
+    pub records: Vec<HostedNamedProjectedValue>,
+    pub meta: crate::api::QueryMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<HostedQueryCursorState>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum CandidatePredicate {
@@ -647,6 +695,78 @@ impl CompiledCatalog {
         Ok(plan)
     }
 
+    /// Assemble a typed hosted query page after the provider has applied the
+    /// closed candidate plan and mdbase has evaluated every retained residual.
+    /// This function does not read storage, allocate cursor authority, or
+    /// persist continuation state.
+    pub fn finalize_hosted_query_page_typed(
+        &self,
+        plan: &HostedQueryPlan,
+        input: HostedQueryPageInput,
+    ) -> Result<HostedQueryPage, CatalogError> {
+        let HostedQueryPageInput {
+            records,
+            total_count,
+            has_more,
+            meta,
+            cursor,
+            diagnostics,
+        } = input;
+        if plan.version != HOSTED_QUERY_PLAN_VERSION
+            || plan.catalog_revision != self.resource_revision()
+            || plan.integrity_digest()? != plan.plan_digest
+            || cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.plan_digest != plan.plan_digest)
+        {
+            return Err(query_error(
+                "hosted_query_plan_mismatch",
+                "Hosted query page or cursor is not bound to the current semantic plan.",
+            ));
+        }
+        if records.len() as u64 > plan.page_size
+            || records.len() as u64 > plan.budgets.max_page_size
+        {
+            return Err(query_error(
+                "hosted_result_budget_exceeded",
+                "Hosted query page exceeds its compiled result budget.",
+            ));
+        }
+        let values = records.iter().map(|record| record.value.clone()).collect();
+        let operation = super::CanonicalOperationOutcome {
+            valid: !diagnostics
+                .iter()
+                .any(|item| item.severity == crate::api::Severity::Error),
+            value: super::CanonicalOperationValue::Query(Some(super::CanonicalQueryValue {
+                records: values,
+                total_count,
+                has_more,
+                meta: meta.clone(),
+                embedded_diagnostics: diagnostics.clone(),
+            })),
+            diagnostics,
+        };
+        Ok(HostedQueryPage {
+            operation,
+            records,
+            meta,
+            cursor,
+        })
+    }
+
+    /// Compatibility projection for a typed hosted query page.
+    #[deprecated(note = "use finalize_hosted_query_page_typed")]
+    pub fn finalize_hosted_query_page(
+        &self,
+        plan: &HostedQueryPlan,
+        input: HostedQueryPageInput,
+    ) -> Result<crate::v03::OperationResult, CatalogError> {
+        Ok(self
+            .finalize_hosted_query_page_typed(plan, input)?
+            .operation
+            .to_v03())
+    }
+
     /// Canonically evaluate one retained exact record against a compiled plan.
     ///
     /// This is the point-residual seam used after provider candidate selection.
@@ -928,8 +1048,8 @@ impl CompiledCatalog {
     ) -> Result<Box<crate::expressions::evaluator::EvalContext>, CatalogError> {
         use crate::expressions::evaluator::{EvalContext, NoteNamespaceSource};
 
-        let read = self.read_record(&serde_json::json!({"path": record.path}), record);
-        if !read.valid {
+        let read = self.read_record_typed(&serde_json::json!({"path": record.path}), record)?;
+        let Some(document) = read.record().cloned().filter(|_| read.valid) else {
             return Err(query_error(
                 "context_invalid",
                 format!(
@@ -937,26 +1057,10 @@ impl CompiledCatalog {
                     record.path
                 ),
             ));
-        }
-        let effective = read
-            .result
-            .get("effective_frontmatter")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        let persisted = read
-            .result
-            .get("frontmatter")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        let types = read
-            .result
-            .get("types")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(String::from)
-            .collect::<Vec<_>>();
+        };
+        let effective = document.effective_frontmatter;
+        let persisted = document.frontmatter;
+        let types = document.types;
         let mut bindings = cel::enrich_record_bindings(
             &effective,
             &persisted,
@@ -972,11 +1076,7 @@ impl CompiledCatalog {
             frontmatter: bindings,
             raw_frontmatter: Some(persisted),
             file_path: Some(record.path.clone()),
-            body: read
-                .result
-                .get("body")
-                .and_then(Value::as_str)
-                .map(String::from),
+            body: Some(document.body),
             file_size: Some(if record.file_size == 0 {
                 record.document.len() as u64
             } else {

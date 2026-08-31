@@ -124,34 +124,25 @@ impl CompiledCatalog {
         record: &CanonicalRecordInput,
     ) -> Result<BenchmarkProjection, CatalogError> {
         let classified = self.classify_record(record)?;
-        let read = self.read_record(&serde_json::json!({"path": record.path}), record);
-        let (effective_frontmatter, mut diagnostics) = if read.valid {
-            (
-                read.result
-                    .get("effective_frontmatter")
-                    .and_then(Value::as_object)
-                    .cloned()
-                    .unwrap_or_default(),
-                read.diagnostics
-                    .iter()
-                    .map(|diagnostic| BenchmarkDiagnostic {
-                        code: diagnostic.code.clone(),
-                        severity: diagnostic.severity.clone(),
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        } else {
-            (
-                Map::new(),
-                read.diagnostics
-                    .iter()
-                    .map(|diagnostic| BenchmarkDiagnostic {
-                        code: diagnostic.code.clone(),
-                        severity: diagnostic.severity.clone(),
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        };
+        let read = self.read_record_typed(&serde_json::json!({"path": record.path}), record)?;
+        let effective_frontmatter = read
+            .record()
+            .and_then(|record| record.effective_frontmatter.as_object())
+            .cloned()
+            .unwrap_or_else(Map::new);
+        let mut diagnostics = read
+            .diagnostics
+            .iter()
+            .map(|diagnostic| BenchmarkDiagnostic {
+                code: diagnostic.code.to_string(),
+                severity: match diagnostic.severity {
+                    crate::api::Severity::Error => "error",
+                    crate::api::Severity::Warning => "warning",
+                    crate::api::Severity::Info => "info",
+                }
+                .to_string(),
+            })
+            .collect::<Vec<_>>();
         if classified.frontmatter_error.is_some()
             && !diagnostics
                 .iter()

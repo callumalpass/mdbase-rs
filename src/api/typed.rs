@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-use super::{CollectionPath, CollectionPathError, QueryRequest, QueryResult};
+use super::{
+    CollectionPath, CollectionPathError, ProjectedValue, QueryMetadata, QueryRequest, QueryResult,
+    ReferenceEvidence,
+};
 use crate::diagnostic::Diagnostic as CanonicalDiagnostic;
 use crate::{Collection, SpecProfile};
 
@@ -656,7 +659,7 @@ pub struct DeleteResult {
     pub deleted: bool,
     /// Inbound references that would become broken.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub broken_links: Vec<Value>,
+    pub broken_links: Vec<ReferenceEvidence>,
 }
 
 /// Non-mutating preview of a delete request.
@@ -668,7 +671,7 @@ pub struct DeletePreflightResult {
     pub would_delete: bool,
     /// Inbound references that would become broken.
     #[serde(default)]
-    pub broken_links: Vec<Value>,
+    pub broken_links: Vec<ReferenceEvidence>,
 }
 
 /// Result of a rename request.
@@ -683,7 +686,7 @@ pub struct RenameResult {
     pub to: CollectionPath,
     /// References rewritten as part of the rename.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub references_updated: Vec<Value>,
+    pub references_updated: Vec<ReferenceEvidence>,
 }
 
 /// Non-mutating preview of a rename request.
@@ -697,10 +700,10 @@ pub struct RenamePreflightResult {
     pub would_rename: bool,
     /// References that would be rewritten.
     #[serde(default)]
-    pub references_affected: Vec<Value>,
+    pub references_affected: Vec<ReferenceEvidence>,
     /// Preflight warnings.
     #[serde(default)]
-    pub warnings: Vec<Value>,
+    pub warnings: Vec<ProjectedValue>,
 }
 
 /// Exact non-mutating delete result within a batch.
@@ -716,14 +719,14 @@ pub struct BatchDeletePreflightResult {
     pub would_delete: bool,
     /// Inbound references that would become broken.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub broken_links: Vec<Value>,
+    pub broken_links: Vec<ReferenceEvidence>,
 }
 
 /// Failed reference rewrites retained by a batch rename result.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BatchRenamePartialUpdates {
     /// Reference writes which could not be applied to the working set.
-    pub failed: Vec<Value>,
+    pub failed: Vec<ReferenceEvidence>,
 }
 
 /// Exact rename result within a batch, including partial reference failures.
@@ -750,7 +753,7 @@ pub struct BatchRenamePreflightResult {
     pub would_rename: bool,
     /// References that would be rewritten.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub references_affected: Vec<Value>,
+    pub references_affected: Vec<ReferenceEvidence>,
     /// Failed reference rewrites, when planning found partial failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_updates: Option<BatchRenamePartialUpdates>,
@@ -910,10 +913,53 @@ impl<'a> TypedCollection<'a> {
         match crate::query::canonical::execute_typed(self.collection, query) {
             Ok(execution) => Ok(OperationOutcome {
                 value: QueryResult {
-                    records: execution.records,
+                    records: execution.records.into_iter().map(Into::into).collect(),
                     total_count: execution.total_count,
                     has_more: execution.has_more,
-                    meta: execution.meta,
+                    meta: QueryMetadata::new(execution.meta),
+                },
+                diagnostics: execution
+                    .diagnostics
+                    .into_iter()
+                    .map(Diagnostic::from)
+                    .collect(),
+            }),
+            Err(diagnostics) => Err(MdbaseError::Operation {
+                diagnostics: diagnostics.into_iter().map(Diagnostic::from).collect(),
+            }),
+        }
+    }
+
+    pub(crate) fn query_runtime(
+        &self,
+        request: QueryRequest,
+    ) -> MdbaseResult<OperationOutcome<QueryResult>> {
+        let schema_diagnostics = crate::query::canonical::model::validate_typed(&request);
+        if !schema_diagnostics.is_empty() {
+            return Err(MdbaseError::Operation {
+                diagnostics: schema_diagnostics
+                    .into_iter()
+                    .map(Diagnostic::from)
+                    .collect(),
+            });
+        }
+        let query = crate::query::canonical::model::Query::from_typed(&request);
+        let (evaluation, _) = crate::query::canonical::execute_model_profiled_cancellable(
+            self.collection,
+            query,
+            &crate::OperationCancellation::new(),
+            true,
+            std::time::Instant::now(),
+            0,
+        )
+        .expect("a fresh cancellation token cannot be cancelled");
+        match evaluation {
+            Ok(execution) => Ok(OperationOutcome {
+                value: QueryResult {
+                    records: execution.records.into_iter().map(Into::into).collect(),
+                    total_count: execution.total_count,
+                    has_more: execution.has_more,
+                    meta: QueryMetadata::new(execution.meta),
                 },
                 diagnostics: execution
                     .diagnostics

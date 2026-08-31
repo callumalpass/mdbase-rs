@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use super::CollectionPath;
+use super::{CollectionPath, ProjectedValue, QueryMetadata};
 
 /// Sort direction for query ordering and grouping.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -80,6 +80,28 @@ pub struct QueryRequest {
 }
 
 impl QueryRequest {
+    pub(crate) fn decode_wire(mut value: Value) -> Result<Self, serde_json::Error> {
+        if let Some(object) = value.as_object_mut() {
+            if let Some(path) = object
+                .get("context")
+                .and_then(|value| value.get("this"))
+                .and_then(|value| value.get("path"))
+                .cloned()
+            {
+                object.insert("context".to_string(), path);
+            }
+            if let Some(projections) = object.get_mut("projections").and_then(Value::as_object_mut)
+            {
+                for projection in projections.values_mut() {
+                    if let Some(expression) = projection.get("expr").cloned() {
+                        *projection = expression;
+                    }
+                }
+            }
+        }
+        serde_json::from_value(value)
+    }
+
     /// Start a query with canonical defaults.
     pub fn builder() -> Self {
         Self::default()
@@ -208,7 +230,7 @@ fn insert_order(target: &mut Map<String, Value>, name: &str, order: &[QueryOrder
 pub struct QueryResult {
     /// Returned records.
     #[serde(rename = "results")]
-    pub records: Vec<Value>,
+    pub records: Vec<ProjectedValue>,
     /// Total matching records before pagination.
     #[serde(skip_serializing)]
     pub total_count: usize,
@@ -216,5 +238,5 @@ pub struct QueryResult {
     #[serde(skip_serializing)]
     pub has_more: bool,
     /// Canonical query metadata.
-    pub meta: Value,
+    pub meta: QueryMetadata,
 }

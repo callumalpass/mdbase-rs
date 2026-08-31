@@ -9,7 +9,11 @@ use serde_json::Value;
 use crate::v03::OperationResult;
 use crate::{Collection, SpecProfile};
 
-use super::{CatalogError, CompiledCatalog, ResolvedTypeResource};
+use super::{
+    CanonicalChange, CanonicalOperationOutcome, CatalogError, ChangeBatch, ChangeSet,
+    CompiledCatalog, OperationKind, ResolvedTypeResource, ResourceChange, ResourceChangeKind,
+};
+use crate::api::{CollectionPath, Revision};
 
 const MAX_HOSTED_RESOURCE_DOCUMENTS: usize = 2_000;
 const MAX_HOSTED_RESOURCE_BYTES: usize = 32 * 1024 * 1024;
@@ -39,6 +43,17 @@ pub struct HostedResourceMutationPlan {
     pub documents: Vec<HostedResourceDocument>,
     pub types: Vec<ResolvedTypeResource>,
     pub contracts: Vec<crate::data_contracts::ResolvedRecordContract>,
+}
+
+/// Typed hosted resource mutation plan with exact canonical evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedHostedResourceMutationPlan {
+    pub operation: CanonicalOperationOutcome,
+    pub documents: Vec<HostedResourceDocument>,
+    pub types: Vec<ResolvedTypeResource>,
+    pub contracts: Vec<crate::data_contracts::ResolvedRecordContract>,
+    pub changes: Vec<ResourceChange>,
+    pub change_set: ChangeSet,
 }
 
 /// Closed provider-neutral definition operation executed over bounded exact
@@ -71,14 +86,26 @@ pub struct HostedDefinitionPlan {
     pub contracts: Vec<crate::data_contracts::ResolvedRecordContract>,
 }
 
+/// Typed hosted definition plan with exact canonical resource evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedHostedDefinitionPlan {
+    pub operation: CanonicalOperationOutcome,
+    pub documents: Vec<(String, String)>,
+    pub types: Vec<ResolvedTypeResource>,
+    pub contracts: Vec<crate::data_contracts::ResolvedRecordContract>,
+    /// Closed exact resource evidence; assessments always return an empty set.
+    pub changes: Vec<ResourceChange>,
+    pub change_set: ChangeSet,
+}
+
 impl CompiledCatalog {
     /// Execute a closed resource-only operation without staging any records.
-    pub fn execute_hosted_resource_read(
+    pub fn execute_hosted_resource_read_typed(
         &self,
         operation: &str,
         input: &Value,
         resources: &[(String, String)],
-    ) -> Result<OperationResult, CatalogError> {
+    ) -> Result<CanonicalOperationOutcome, CatalogError> {
         if !matches!(operation, "read_type" | "list_views" | "read_view_source") {
             return Err(resource_error(
                 "unsupported_hosted_resource_read",
@@ -142,22 +169,36 @@ impl CompiledCatalog {
         let operations = collection
             .v03_operations()
             .expect("compiled catalogs always use the canonical profile");
-        Ok(match operation {
+        let result = match operation {
             "read_type" => operations.read_type(input),
             "list_views" => operations.list_views(input),
             "read_view_source" => operations.read_view_source(input),
             _ => unreachable!(),
-        })
+        };
+        hosted_resource_outcome(operation_kind(operation)?, result)
+    }
+
+    /// Compatibility projection for current Connect callers.
+    #[deprecated(note = "use execute_hosted_resource_read_typed")]
+    pub fn execute_hosted_resource_read(
+        &self,
+        operation: &str,
+        input: &Value,
+        resources: &[(String, String)],
+    ) -> Result<OperationResult, CatalogError> {
+        Ok(self
+            .execute_hosted_resource_read_typed(operation, input, resources)?
+            .to_v03())
     }
 
     /// Execute one resource mutation in a disposable resource-only stage and
     /// return the complete bounded resource/catalog write set.
-    pub fn plan_hosted_resource_mutation(
+    pub fn plan_hosted_resource_mutation_typed(
         &self,
         operation: &str,
         input: &Value,
         resources: &[HostedResourceDocument],
-    ) -> Result<HostedResourceMutationPlan, CatalogError> {
+    ) -> Result<TypedHostedResourceMutationPlan, CatalogError> {
         if !matches!(
             operation,
             "create_type"
@@ -188,11 +229,14 @@ impl CompiledCatalog {
             _ => unreachable!(),
         };
         if !result.valid {
-            return Ok(HostedResourceMutationPlan {
-                result,
+            let operation = hosted_resource_outcome(operation_kind(operation)?, result.clone())?;
+            return Ok(TypedHostedResourceMutationPlan {
+                operation,
                 documents: Vec::new(),
                 types: Vec::new(),
                 contracts: Vec::new(),
+                changes: Vec::new(),
+                change_set: ChangeSet::None,
             });
         }
         let reloaded = Collection::open(directory.path()).map_err(|error| {
@@ -201,45 +245,27 @@ impl CompiledCatalog {
                 format!("Mutated hosted resources could not be reopened: {error}"),
             )
         })?;
-        let changed_path = result
-            .result
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                resource_error(
-                    "hosted_resource_plan_incomplete",
-                    "The canonical resource mutation omitted its changed path.",
-                )
-            })?;
-        let mut expected = resources
+        let existing_kinds = resources
             .iter()
-            .map(|resource| (resource.path.clone(), resource.kind))
+            .map(|resource| (resource.path.as_str(), resource.kind))
             .collect::<std::collections::BTreeMap<_, _>>();
-        if operation == "delete_view_source" {
-            expected.remove(changed_path);
+        let created_kind = if operation.ends_with("type") {
+            HostedResourceKind::Type
         } else {
-            expected.insert(
-                changed_path.to_string(),
-                if operation.ends_with("type") {
-                    HostedResourceKind::Type
-                } else {
-                    HostedResourceKind::View
-                },
-            );
-        }
-        let mut documents = expected
+            HostedResourceKind::View
+        };
+        let mut documents = load_definition_stage(directory.path())?
             .into_iter()
-            .map(|(path, kind)| {
-                let document = fs::read_to_string(directory.path().join(&path))
-                    .map_err(resource_stage_error)?;
-                Ok(HostedResourceDocument {
-                    revision: crate::v03::revision(document.as_bytes()),
-                    path,
-                    kind,
-                    document,
-                })
+            .map(|(path, document)| HostedResourceDocument {
+                revision: crate::v03::revision(document.as_bytes()),
+                kind: existing_kinds
+                    .get(path.as_str())
+                    .copied()
+                    .unwrap_or(created_kind),
+                path,
+                document,
             })
-            .collect::<Result<Vec<_>, CatalogError>>()?;
+            .collect::<Vec<_>>();
         documents.sort_by(|left, right| left.path.cmp(&right.path));
         let report = crate::v03::inspect_collection(directory.path());
         if !report.valid {
@@ -315,11 +341,32 @@ impl CompiledCatalog {
             .collect::<Vec<_>>();
         contracts
             .sort_by(|left, right| (&left.id, &left.version).cmp(&(&right.id, &right.version)));
-        Ok(HostedResourceMutationPlan {
-            result,
+        let changes = resource_document_changes(resources, &documents)?;
+        let change_set = resource_change_set(&changes)?;
+        let operation = hosted_resource_outcome(operation_kind(operation)?, result.clone())?;
+        Ok(TypedHostedResourceMutationPlan {
+            operation,
             documents,
             types,
             contracts,
+            changes,
+            change_set,
+        })
+    }
+
+    /// Legacy compatibility entry point.
+    pub fn plan_hosted_resource_mutation(
+        &self,
+        operation: &str,
+        input: &Value,
+        resources: &[HostedResourceDocument],
+    ) -> Result<HostedResourceMutationPlan, CatalogError> {
+        let plan = self.plan_hosted_resource_mutation_typed(operation, input, resources)?;
+        Ok(HostedResourceMutationPlan {
+            result: plan.operation.to_v03(),
+            documents: plan.documents,
+            types: plan.types,
+            contracts: plan.contracts,
         })
     }
 
@@ -327,41 +374,72 @@ impl CompiledCatalog {
     /// record document. Apply operations return the complete bounded resource
     /// stage and the resulting canonical type/contract catalog for atomic host
     /// persistence.
+    pub fn plan_hosted_definition_operation_typed(
+        &self,
+        operation: HostedDefinitionOperation<'_>,
+        resources: &[(String, String)],
+    ) -> Result<TypedHostedDefinitionPlan, CatalogError> {
+        let (directory, collection) = self.stage_resources(resources)?;
+        let (result, applied, kind) = match operation {
+            HostedDefinitionOperation::AssessTypePack { provision, options } => (
+                collection.assess_type_pack(provision, options),
+                false,
+                OperationKind::AssessTypePack,
+            ),
+            HostedDefinitionOperation::ApplyTypePack { provision, options } => (
+                collection.apply_type_pack(provision, options),
+                true,
+                OperationKind::ApplyTypePack,
+            ),
+            HostedDefinitionOperation::AssessCollectionSetup { setup } => (
+                collection.assess_collection_setup(setup),
+                false,
+                OperationKind::AssessCollectionSetup,
+            ),
+            HostedDefinitionOperation::ApplyCollectionSetup { setup, options } => (
+                collection.apply_collection_setup(setup, options),
+                true,
+                OperationKind::ApplyCollectionSetup,
+            ),
+        };
+        if !applied || !result.valid {
+            let operation = hosted_resource_outcome(kind, result.clone())?;
+            return Ok(TypedHostedDefinitionPlan {
+                operation,
+                documents: Vec::new(),
+                types: Vec::new(),
+                contracts: Vec::new(),
+                changes: Vec::new(),
+                change_set: ChangeSet::None,
+            });
+        }
+        let documents = load_definition_stage(directory.path())?;
+        let (types, contracts) = resolve_definition_catalog(directory.path(), &documents)?;
+        let changes = definition_document_changes(resources, &documents)?;
+        let change_set = resource_change_set(&changes)?;
+        let operation = hosted_resource_outcome(kind, result.clone())?;
+        Ok(TypedHostedDefinitionPlan {
+            operation,
+            documents,
+            types,
+            contracts,
+            changes,
+            change_set,
+        })
+    }
+
+    /// Legacy compatibility entry point.
     pub fn plan_hosted_definition_operation(
         &self,
         operation: HostedDefinitionOperation<'_>,
         resources: &[(String, String)],
     ) -> Result<HostedDefinitionPlan, CatalogError> {
-        let (directory, collection) = self.stage_resources(resources)?;
-        let (result, applied) = match operation {
-            HostedDefinitionOperation::AssessTypePack { provision, options } => {
-                (collection.assess_type_pack(provision, options), false)
-            }
-            HostedDefinitionOperation::ApplyTypePack { provision, options } => {
-                (collection.apply_type_pack(provision, options), true)
-            }
-            HostedDefinitionOperation::AssessCollectionSetup { setup } => {
-                (collection.assess_collection_setup(setup), false)
-            }
-            HostedDefinitionOperation::ApplyCollectionSetup { setup, options } => {
-                (collection.apply_collection_setup(setup, options), true)
-            }
-        };
-        if !applied || !result.valid {
-            return Ok(HostedDefinitionPlan {
-                result,
-                documents: Vec::new(),
-                types: Vec::new(),
-                contracts: Vec::new(),
-            });
-        }
-        let documents = load_definition_stage(directory.path())?;
-        let (types, contracts) = resolve_definition_catalog(directory.path(), &documents)?;
+        let plan = self.plan_hosted_definition_operation_typed(operation, resources)?;
         Ok(HostedDefinitionPlan {
-            result,
-            documents,
-            types,
-            contracts,
+            result: plan.operation.to_v03(),
+            documents: plan.documents,
+            types: plan.types,
+            contracts: plan.contracts,
         })
     }
 
@@ -390,6 +468,163 @@ impl CompiledCatalog {
                 .map_err(resource_stage_error)?,
         };
         Ok((directory, collection))
+    }
+}
+
+fn hosted_resource_outcome(
+    kind: OperationKind,
+    result: OperationResult,
+) -> Result<CanonicalOperationOutcome, CatalogError> {
+    CanonicalOperationOutcome::hosted_wire_edge(kind, result)
+        .map_err(|error| resource_error(error.code(), error.to_string()))
+}
+
+fn operation_kind(operation: &str) -> Result<OperationKind, CatalogError> {
+    operation.parse().map_err(|_| {
+        resource_error(
+            "unsupported_hosted_resource_operation",
+            format!("Unsupported hosted resource operation '{operation}'."),
+        )
+    })
+}
+
+fn resource_document_changes(
+    before: &[HostedResourceDocument],
+    after: &[HostedResourceDocument],
+) -> Result<Vec<ResourceChange>, CatalogError> {
+    let before = before
+        .iter()
+        .map(|document| {
+            (
+                document.path.as_str(),
+                (document.kind, document.revision.as_str()),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let after = after
+        .iter()
+        .map(|document| {
+            (
+                document.path.as_str(),
+                (document.kind, document.revision.as_str()),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    normalized_resource_changes(before, after)
+}
+
+fn definition_document_changes(
+    before: &[(String, String)],
+    after: &[(String, String)],
+) -> Result<Vec<ResourceChange>, CatalogError> {
+    let before = before
+        .iter()
+        .map(|(path, document)| {
+            (
+                path.as_str(),
+                (
+                    resource_kind_from_path(path),
+                    crate::v03::revision(document.as_bytes()),
+                ),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let after = after
+        .iter()
+        .map(|(path, document)| {
+            (
+                path.as_str(),
+                (
+                    resource_kind_from_path(path),
+                    crate::v03::revision(document.as_bytes()),
+                ),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    normalized_resource_changes(
+        before
+            .iter()
+            .map(|(path, (kind, revision))| (*path, (*kind, revision.as_str())))
+            .collect(),
+        after
+            .iter()
+            .map(|(path, (kind, revision))| (*path, (*kind, revision.as_str())))
+            .collect(),
+    )
+}
+
+fn normalized_resource_changes<'a>(
+    before: std::collections::BTreeMap<&'a str, (HostedResourceKind, &'a str)>,
+    after: std::collections::BTreeMap<&'a str, (HostedResourceKind, &'a str)>,
+) -> Result<Vec<ResourceChange>, CatalogError> {
+    let paths = before
+        .keys()
+        .chain(after.keys())
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut changes = Vec::new();
+    for path in paths {
+        let old = before.get(path);
+        let new = after.get(path);
+        if old.map(|value| value.1) == new.map(|value| value.1) {
+            continue;
+        }
+        let kind = new.or(old).expect("resource exists on one side").0;
+        changes.push(ResourceChange {
+            kind: canonical_resource_kind(kind),
+            path: CollectionPath::new(path)
+                .map_err(|error| resource_error("invalid_resource_path", error.to_string()))?,
+            before_revision: old
+                .map(|value| Revision::parse(value.1.to_string()))
+                .transpose()
+                .map_err(|error| resource_error("invalid_revision", error.to_string()))?,
+            after_revision: new
+                .map(|value| Revision::parse(value.1.to_string()))
+                .transpose()
+                .map_err(|error| resource_error("invalid_revision", error.to_string()))?,
+        });
+    }
+    Ok(changes)
+}
+
+fn resource_change_set(changes: &[ResourceChange]) -> Result<ChangeSet, CatalogError> {
+    if changes.is_empty() {
+        return Ok(ChangeSet::None);
+    }
+    ChangeBatch::new(
+        changes
+            .iter()
+            .cloned()
+            .map(CanonicalChange::Resource)
+            .collect(),
+    )
+    .map(ChangeSet::Exact)
+    .map_err(|error| resource_error(error.code(), error.to_string()))
+}
+
+fn canonical_resource_kind(kind: HostedResourceKind) -> ResourceChangeKind {
+    match kind {
+        HostedResourceKind::Configuration => ResourceChangeKind::Configuration,
+        HostedResourceKind::Contract => ResourceChangeKind::Contract,
+        HostedResourceKind::Type => ResourceChangeKind::TypeDefinition,
+        HostedResourceKind::View => ResourceChangeKind::ViewSource,
+        HostedResourceKind::Lock | HostedResourceKind::Schema => ResourceChangeKind::File,
+    }
+}
+
+fn resource_kind_from_path(path: &str) -> HostedResourceKind {
+    if path == "mdbase.yaml" {
+        HostedResourceKind::Configuration
+    } else if path.contains("contract") {
+        HostedResourceKind::Contract
+    } else if path.ends_with(".base") || path.contains("view") {
+        HostedResourceKind::View
+    } else if path.contains("type") {
+        HostedResourceKind::Type
+    } else if path.contains("lock") || path.contains("provision") {
+        HostedResourceKind::Lock
+    } else {
+        HostedResourceKind::Schema
     }
 }
 
@@ -584,6 +819,7 @@ fn resource_stage_error(error: std::io::Error) -> CatalogError {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -754,9 +990,10 @@ mod tests {
             assessment.result.diagnostics
         );
         assert!(assessment.documents.is_empty());
+        let assessment_wire = assessment.result.clone();
         let apply_options = crate::v03::TypePackApplyOptions {
             installed_by: assessment_options.installed_by.clone(),
-            expected_assessment_digest: assessment.result.result["assessment_digest"]
+            expected_assessment_digest: assessment_wire.result["assessment_digest"]
                 .as_str()
                 .unwrap()
                 .to_string(),

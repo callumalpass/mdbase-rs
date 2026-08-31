@@ -11,13 +11,13 @@ use sha2::{Digest, Sha256};
 use super::diff::canonical_changes;
 use super::observer::NoopObserver;
 use super::{
-    CancelOutcome, ChangeBatch, ChangeEventIdentity, ChangeFeed, ChangeFeedBaseline,
-    ChangeFeedOwnerId, ChangeFeedTransfer, ChangeFeedTransferId, ChangeFeedTransferIntent,
-    ChangePage, ChangePageCursor, ChangeSet, ChangeWatermark, CollectionGeneration, CommitAttempt,
-    CommitId, CommitRejection, DurableCommitState, ExecutionOutcome, FilesystemProvider,
-    HostClaimId, ObserverOptions, OperationContext, OperationRequest, PreparationOutcome,
-    PreparedMutation, ProviderError, ReadCursor, ReadPage, RuntimeChangeEvent,
-    RuntimeChangeEventPage, RuntimeObserver,
+    CancelOutcome, CanonicalOperationOutcome, ChangeBatch, ChangeEventIdentity, ChangeFeed,
+    ChangeFeedBaseline, ChangeFeedOwnerId, ChangeFeedTransfer, ChangeFeedTransferId,
+    ChangeFeedTransferIntent, ChangePage, ChangePageCursor, ChangeSet, ChangeWatermark,
+    CollectionGeneration, CommitAttempt, CommitId, CommitRejection, DurableCommitState,
+    ExecutionOutcome, FilesystemProvider, HostClaimId, ObserverOptions, OperationContext,
+    OperationRequest, PreparationOutcome, PreparedMutation, ProviderError, ReadCursor, ReadPage,
+    RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeObserver,
 };
 use crate::transactions::{
     self, RuntimeCommitAttempt, RuntimePrepareOutcome, RuntimeResolution, RuntimeSettlement,
@@ -165,24 +165,46 @@ impl FilesystemRuntime {
         self.execute_with_context(request, &OperationContext::legacy())
     }
 
-    /// Execute while honoring the caller's cancellation and deadline before
-    /// the mutation commit boundary.
+    /// Compatibility wrapper which serializes the typed runtime result exactly
+    /// once at the v0.3 wire edge.
     pub fn execute_with_context(
         &self,
         request: &OperationRequest,
         context: &OperationContext,
     ) -> Result<OperationResult, ProviderError> {
+        self.execute_typed_with_context(request, context)
+            .map(|outcome| outcome.operation.to_v03())
+    }
+
+    pub fn execute_typed(
+        &self,
+        request: &OperationRequest,
+    ) -> Result<ExecutionOutcome, ProviderError> {
+        self.execute_typed_with_context(request, &OperationContext::legacy())
+    }
+
+    /// Execute the compatibility-decoded request and return the closed typed
+    /// runtime outcome.
+    pub fn execute_typed_with_context(
+        &self,
+        request: &OperationRequest,
+        context: &OperationContext,
+    ) -> Result<ExecutionOutcome, ProviderError> {
         if !request.operation.is_mutation() {
-            return self
-                .provider
-                .execute_with_post_context(request, context, |_| Ok(()));
+            return self.read(request, context);
         }
         let claim = HostClaimId::generate();
-        match self.prepare(request, &claim, context)? {
-            PreparationOutcome::NoMutation(outcome) => Ok(outcome.result),
+        match self.prepare_typed(request, &claim, context)? {
+            PreparationOutcome::NoMutation(outcome) => Ok(outcome),
             PreparationOutcome::Prepared(prepared) => match self.commit(&prepared, context)? {
-                CommitAttempt::Committed(outcome) => Ok(outcome.result),
-                CommitAttempt::RejectedBeforeCommit { rejection } => Ok(rejection.result),
+                CommitAttempt::Committed(outcome) => Ok(outcome),
+                CommitAttempt::RejectedBeforeCommit { rejection } => Ok(ExecutionOutcome::new(
+                    rejection.operation,
+                    self.current_generation()?,
+                    ChangeSet::None,
+                    None,
+                    None,
+                )),
                 CommitAttempt::SettlementPending { commit_id } => Err(ProviderError::Transaction {
                     code: "outcome_unknown",
                     message: format!(
@@ -217,21 +239,27 @@ impl FilesystemRuntime {
         self.wait_for_settlement(context)?;
         let expected = self.current_generation()?;
         self.provider.ensure_runtime_cache(&expected, context)?;
-        let mut generation = None;
-        let result = self
-            .provider
-            .execute_with_post_context(request, context, |_| {
-                generation = Some(self.current_generation()?);
-                Ok(())
-            })?;
-        let generation = generation.ok_or(ProviderError::LockPoisoned)?;
-        Ok(ExecutionOutcome {
-            result,
+        let operation = match request.operation {
+            super::OperationKind::Read | super::OperationKind::Query => self
+                .provider
+                .with_collection_read_context(context, |collection| {
+                    Ok::<_, ProviderError>(execute_typed_read_operation(collection, request))
+                })?,
+            _ => {
+                let result = self
+                    .provider
+                    .execute_with_post_context(request, context, |_| Ok(()))?;
+                CanonicalOperationOutcome::wire_only(request.operation, result)
+            }
+        };
+        let generation = self.current_generation()?;
+        Ok(ExecutionOutcome::new(
+            operation,
             generation,
-            changes: ChangeSet::None,
-            commit_id: None,
-            change_event: None,
-        })
+            ChangeSet::None,
+            None,
+            None,
+        ))
     }
 
     /// Open a bounded generation-pinned read page.
@@ -286,6 +314,15 @@ impl FilesystemRuntime {
         claim: &HostClaimId,
         context: &OperationContext,
     ) -> Result<PreparationOutcome, ProviderError> {
+        self.prepare_typed(request, claim, context)
+    }
+
+    pub fn prepare_typed(
+        &self,
+        request: &OperationRequest,
+        claim: &HostClaimId,
+        context: &OperationContext,
+    ) -> Result<PreparationOutcome, ProviderError> {
         if !request.operation.is_mutation() {
             return Err(ProviderError::UnsupportedOperation(
                 "prepare requires a mutation operation".to_string(),
@@ -309,14 +346,14 @@ impl FilesystemRuntime {
                     context,
                 )?;
                 match preparation {
-                    crate::v03::batch::RuntimeSinglePreparation::NoMutation(result) => {
-                        Ok(PreparationOutcome::NoMutation(ExecutionOutcome {
-                            result,
-                            generation: self.current_generation()?,
-                            changes: ChangeSet::None,
-                            commit_id: None,
-                            change_event: None,
-                        }))
+                    crate::v03::batch::RuntimeSinglePreparation::NoMutation(operation) => {
+                        Ok(PreparationOutcome::NoMutation(ExecutionOutcome::new(
+                            operation,
+                            self.current_generation()?,
+                            ChangeSet::None,
+                            None,
+                            None,
+                        )))
                     }
                     crate::v03::batch::RuntimeSinglePreparation::Prepared(plan) => {
                         let changes = canonical_changes(&plan.before, &plan.after, Some(request))?;
@@ -328,7 +365,7 @@ impl FilesystemRuntime {
                                 desired: &plan.desired,
                                 claim,
                                 mutation_digest: &digest,
-                                result: &plan.result,
+                                operation: &plan.operation,
                                 changes: &changes,
                                 event_id: &event_id,
                             },
@@ -336,14 +373,14 @@ impl FilesystemRuntime {
                         )
                         .map_err(transaction_error)?
                         {
-                            RuntimePrepareOutcome::NoMutation(result) => {
-                                Ok(PreparationOutcome::NoMutation(ExecutionOutcome {
-                                    result,
-                                    generation: self.current_generation()?,
-                                    changes: ChangeSet::None,
-                                    commit_id: None,
-                                    change_event: None,
-                                }))
+                            RuntimePrepareOutcome::NoMutation(operation) => {
+                                Ok(PreparationOutcome::NoMutation(ExecutionOutcome::new(
+                                    operation,
+                                    self.current_generation()?,
+                                    ChangeSet::None,
+                                    None,
+                                    None,
+                                )))
                             }
                             RuntimePrepareOutcome::Prepared(commit_id) => {
                                 Ok(PreparationOutcome::Prepared(PreparedMutation {
@@ -1206,6 +1243,51 @@ fn synchronize_known_shared(
     Ok(())
 }
 
+fn execute_typed_read_operation(
+    collection: &crate::Collection,
+    request: &OperationRequest,
+) -> CanonicalOperationOutcome {
+    let typed = match collection.typed() {
+        Ok(typed) => typed,
+        Err(error) => return CanonicalOperationOutcome::failure(request.operation, error),
+    };
+    match request.operation {
+        super::OperationKind::Read => {
+            match serde_json::from_value::<crate::api::ReadRequest>(request.input.clone()) {
+                Ok(request) => typed
+                    .read(request)
+                    .map(CanonicalOperationOutcome::read)
+                    .unwrap_or_else(|error| {
+                        CanonicalOperationOutcome::failure(super::OperationKind::Read, error)
+                    }),
+                Err(error) => CanonicalOperationOutcome::failure(
+                    super::OperationKind::Read,
+                    crate::api::MdbaseError::InvalidRequest {
+                        message: error.to_string(),
+                    },
+                ),
+            }
+        }
+        super::OperationKind::Query => {
+            match crate::api::QueryRequest::decode_wire(request.input.clone()) {
+                Ok(request) => typed
+                    .query_runtime(request)
+                    .map(CanonicalOperationOutcome::query)
+                    .unwrap_or_else(|error| {
+                        CanonicalOperationOutcome::failure(super::OperationKind::Query, error)
+                    }),
+                Err(error) => CanonicalOperationOutcome::failure(
+                    super::OperationKind::Query,
+                    crate::api::MdbaseError::InvalidRequest {
+                        message: error.to_string(),
+                    },
+                ),
+            }
+        }
+        _ => unreachable!("only migrated read operations use the typed read executor"),
+    }
+}
+
 fn mutation_digest(request: &OperationRequest) -> Result<String, ProviderError> {
     let bytes = serde_jcs::to_vec(request)
         .map_err(|error| ProviderError::InvalidChangeSet(error.to_string()))?;
@@ -1244,16 +1326,16 @@ fn committed_outcome(resolution: &RuntimeResolution) -> Result<ExecutionOutcome,
             message: "expected a committed runtime transaction".to_string(),
         });
     };
-    Ok(ExecutionOutcome {
-        result: result.clone(),
-        generation: generation.clone(),
-        changes: ChangeSet::Exact(changes.clone()),
-        commit_id: Some(commit_id.clone()),
-        change_event: Some(ChangeEventIdentity {
+    Ok(ExecutionOutcome::new(
+        result.clone(),
+        generation.clone(),
+        ChangeSet::Exact(changes.clone()),
+        Some(commit_id.clone()),
+        Some(ChangeEventIdentity {
             id: event_id.clone(),
             watermark: *watermark,
         }),
-    })
+    ))
 }
 
 fn rejected(resolution: &RuntimeResolution) -> Result<CommitRejection, ProviderError> {
@@ -1263,9 +1345,7 @@ fn rejected(resolution: &RuntimeResolution) -> Result<CommitRejection, ProviderE
             message: "expected a rejected runtime transaction".to_string(),
         });
     };
-    Ok(CommitRejection {
-        result: rejection.clone(),
-    })
+    Ok(CommitRejection::new(rejection.clone()))
 }
 
 fn durable_state(resolution: &RuntimeResolution) -> Result<DurableCommitState, ProviderError> {

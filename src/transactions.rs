@@ -473,7 +473,7 @@ fn recover_one(collection: &Collection, directory: &Path) -> Result<bool, Transa
     let version = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64));
-    if version == Some(2) {
+    if matches!(version, Some(2 | 3)) {
         return runtime::recover_runtime_one(collection, directory, &bytes);
     }
     let mut journal: Journal = serde_json::from_slice(&bytes)

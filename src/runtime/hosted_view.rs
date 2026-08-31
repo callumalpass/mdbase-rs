@@ -28,17 +28,28 @@ pub enum HostedCanonicalViewPlanning {
     Invalid { result: OperationResult },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum HostedCanonicalViewPlanningTyped {
+    Planned {
+        plan: Box<HostedCanonicalViewPlan>,
+    },
+    Invalid {
+        operation: Box<super::CanonicalOperationOutcome>,
+    },
+}
+
 impl CompiledCatalog {
     /// Compile one exact canonical saved-view record into the same closed query
     /// plan used by direct hosted queries. The view and optional `this` record
     /// are point inputs; no collection enumeration occurs in this seam.
-    pub fn plan_hosted_canonical_view(
+    pub fn plan_hosted_canonical_view_typed(
         &self,
         input: &Value,
         view_record: &CanonicalRecordInput,
         context_record: Option<&CanonicalRecordInput>,
         allowed_types: &[String],
-    ) -> Result<HostedCanonicalViewPlanning, CatalogError> {
+    ) -> Result<HostedCanonicalViewPlanningTyped, CatalogError> {
         let requested_path = input
             .get("path")
             .and_then(Value::as_str)
@@ -61,7 +72,7 @@ impl CompiledCatalog {
         let document = Value::Object(classified_view.frontmatter.clone());
         let mut prepared = match crate::views::prepare_hosted_canonical_view(&document, input) {
             Ok(prepared) => prepared,
-            Err(result) => return Ok(HostedCanonicalViewPlanning::Invalid { result }),
+            Err(result) => return typed_invalid_result(result),
         };
         let context = match prepared.context_path.as_deref() {
             None => None,
@@ -81,7 +92,7 @@ impl CompiledCatalog {
             &prepared,
             context.as_ref().map(|context| context.types.as_slice()),
         ) {
-            return Ok(HostedCanonicalViewPlanning::Invalid { result });
+            return typed_invalid_result(result);
         }
         if !allowed_types.is_empty() {
             if prepared.context_path.as_deref() != Some(view_record.path.as_str())
@@ -138,9 +149,37 @@ impl CompiledCatalog {
             context_revision,
             invocation_digest: format!("sha256:{:x}", Sha256::digest(canonical)),
         };
-        Ok(HostedCanonicalViewPlanning::Planned {
+        Ok(HostedCanonicalViewPlanningTyped::Planned {
             plan: Box::new(plan),
         })
+    }
+
+    /// Compatibility projection for current Connect callers.
+    #[deprecated(note = "use plan_hosted_canonical_view_typed")]
+    pub fn plan_hosted_canonical_view(
+        &self,
+        input: &Value,
+        view_record: &CanonicalRecordInput,
+        context_record: Option<&CanonicalRecordInput>,
+        allowed_types: &[String],
+    ) -> Result<HostedCanonicalViewPlanning, CatalogError> {
+        Ok(
+            match self.plan_hosted_canonical_view_typed(
+                input,
+                view_record,
+                context_record,
+                allowed_types,
+            )? {
+                HostedCanonicalViewPlanningTyped::Planned { plan } => {
+                    HostedCanonicalViewPlanning::Planned { plan }
+                }
+                HostedCanonicalViewPlanningTyped::Invalid { operation } => {
+                    HostedCanonicalViewPlanning::Invalid {
+                        result: operation.to_v03(),
+                    }
+                }
+            },
+        )
     }
 }
 
@@ -178,17 +217,33 @@ fn invalid(
     code: impl Into<String>,
     message: impl Into<String>,
     field: impl Into<String>,
-) -> HostedCanonicalViewPlanning {
-    HostedCanonicalViewPlanning::Invalid {
-        result: OperationResult {
-            valid: false,
-            result: json!({}),
-            diagnostics: vec![Diagnostic::error(code, message, Some(field.into()))],
-        },
-    }
+) -> HostedCanonicalViewPlanningTyped {
+    let result = OperationResult {
+        valid: false,
+        result: json!({}),
+        diagnostics: vec![Diagnostic::error(code, message, Some(field.into()))],
+    };
+    typed_invalid_result(result).expect("view wire outcomes have a closed discriminator")
+}
+
+fn typed_invalid_result(
+    result: OperationResult,
+) -> Result<HostedCanonicalViewPlanningTyped, CatalogError> {
+    let operation = super::CanonicalOperationOutcome::hosted_wire_edge(
+        super::OperationKind::ExecuteView,
+        result,
+    )
+    .map_err(|error| CatalogError {
+        code: error.code().to_string(),
+        message: error.to_string(),
+    })?;
+    Ok(HostedCanonicalViewPlanningTyped::Invalid {
+        operation: Box::new(operation),
+    })
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use serde_json::json;
 

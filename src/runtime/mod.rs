@@ -9,6 +9,7 @@ mod api;
 mod batch;
 #[cfg(feature = "hosted-storage-benchmark")]
 mod benchmark;
+mod canonical_operation;
 mod catalog;
 mod context;
 mod cursor;
@@ -39,6 +40,13 @@ pub use benchmark::{
     BenchmarkDiagnostic, BenchmarkFileFacts, BenchmarkProjection, CandidateExpression,
     CandidateTruth, CompiledCandidate, ProjectionRelationship, QueryRequirements,
 };
+pub use canonical_operation::{
+    CanonicalCollectionSetupAppliedValue, CanonicalCollectionSetupConflictValue,
+    CanonicalCollectionSetupValue, CanonicalDeleteValue, CanonicalOperationOutcome,
+    CanonicalOperationValue, CanonicalQueryValue, CanonicalRenamePreflightValue,
+    CanonicalRenameValue, CanonicalTypePackValue, DefinitionResultExtensions,
+    WireOnlyOperationValue,
+};
 pub use catalog::{
     CanonicalRecordInput, CatalogError, CatalogInput, CompiledCatalog, ResolvedTypeResource,
 };
@@ -49,23 +57,29 @@ pub use hosted_base::{
     HostedBaseRecordContext, HostedBaseRequirements, HostedBaseRow, HOSTED_BASE_PLAN_VERSION,
     MAX_HOSTED_BASE_RELATED_RECORDS,
 };
-pub use hosted_mutation::{HostedMutationChange, HostedMutationPlan, HostedMutationRequest};
+pub use hosted_mutation::{
+    HostedMutationChange, HostedMutationPlan, HostedMutationRequest, HostedRecordChange,
+    TypedHostedMutationPlan,
+};
 pub use hosted_query::{
     CandidateComparison, CandidateComparisonOperator, CandidateComparisonPruning, CandidateField,
     CandidatePredicate, CandidateVerdict, CanonicalResidual, HostedAggregate, HostedGroup,
-    HostedOrder, HostedOrderDirection, HostedQueryBudgets, HostedQueryPlan,
+    HostedNamedProjectedValue, HostedOrder, HostedOrderDirection, HostedQueryBudgets,
+    HostedQueryCursorState, HostedQueryPage, HostedQueryPageInput, HostedQueryPlan,
     HostedQueryRequirements, HostedReduction, HostedReductionAccumulator, HostedReductionInput,
     HostedResidualEvaluation, HostedScalarKind, HostedSortSemantics, ProjectionAvailability,
     HOSTED_QUERY_PLAN_VERSION,
 };
 pub use hosted_resource::{
     HostedDefinitionOperation, HostedDefinitionPlan, HostedResourceDocument, HostedResourceKind,
-    HostedResourceMutationPlan,
+    HostedResourceMutationPlan, TypedHostedDefinitionPlan, TypedHostedResourceMutationPlan,
 };
 pub use hosted_validation::{
     HostedValidationPlan, HostedValidationRequirement, HostedValidationRequirementKind,
 };
-pub use hosted_view::{HostedCanonicalViewPlan, HostedCanonicalViewPlanning};
+pub use hosted_view::{
+    HostedCanonicalViewPlan, HostedCanonicalViewPlanning, HostedCanonicalViewPlanningTyped,
+};
 #[cfg(feature = "tracing")]
 pub use observer::TracingObserver;
 pub use observer::{

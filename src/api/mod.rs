@@ -2,11 +2,14 @@
 #![warn(missing_docs)]
 
 mod collection_path;
+mod dynamic;
 pub(crate) mod operations;
 mod query;
-mod typed;
+pub(crate) mod typed;
 
 pub use collection_path::{CollectionPath, CollectionPathError};
+pub(crate) use dynamic::reference_evidence;
+pub use dynamic::{ProjectedValue, QueryMetadata, ReferenceEvidence};
 pub use query::{FrontmatterMode, QueryDirection, QueryOrder, QueryRequest, QueryResult};
 pub use typed::{
     BatchDeletePreflightResult, BatchItemResult, BatchOperation, BatchOperationResult,

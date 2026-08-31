@@ -6,10 +6,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::{CanonicalOperationOutcome, ProviderError};
 use crate::api::{CollectionPath, Revision};
-use crate::v03::OperationResult;
-
-use super::ProviderError;
 
 /// Privacy-safe accounting for rebuildable state retained by one runtime.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -453,9 +451,10 @@ pub enum RebuildReason {
 }
 
 /// Exact or explicitly broad canonical effects of one observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum ChangeSet {
     /// No canonical resource changed.
+    #[default]
     None,
     /// Exact immutable canonical changes.
     Exact(ChangeBatch),
@@ -466,8 +465,14 @@ pub enum ChangeSet {
 /// Provider result plus local generation, transaction, and change metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionOutcome {
-    /// Normative portable v0.3 operation envelope.
-    pub result: OperationResult,
+    /// Closed typed semantic operation outcome.
+    pub operation: CanonicalOperationOutcome,
+    /// Ephemeral v0.3 compatibility projection for coordinated host migration.
+    ///
+    /// This field is never journaled and will be removed after Connect consumes
+    /// `operation` exclusively.
+    #[deprecated(note = "use operation; removal tracked after the Connect Phase 4 migration")]
+    pub result: crate::v03::OperationResult,
     /// Runtime generation observed or produced.
     pub generation: CollectionGeneration,
     /// Canonical effects produced by the operation.
@@ -476,6 +481,27 @@ pub struct ExecutionOutcome {
     pub commit_id: Option<CommitId>,
     /// Durable normalized event identity for a canonical change.
     pub change_event: Option<ChangeEventIdentity>,
+}
+
+impl ExecutionOutcome {
+    pub(crate) fn new(
+        operation: CanonicalOperationOutcome,
+        generation: CollectionGeneration,
+        changes: ChangeSet,
+        commit_id: Option<CommitId>,
+        change_event: Option<ChangeEventIdentity>,
+    ) -> Self {
+        let result = operation.to_v03();
+        #[allow(deprecated)]
+        Self {
+            operation,
+            result,
+            generation,
+            changes,
+            commit_id,
+            change_event,
+        }
+    }
 }
 
 /// Source of one durable runtime change event.
@@ -613,6 +639,7 @@ impl PreparedMutation {
 }
 
 /// Result of mutation preparation before the durable commit boundary.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum PreparationOutcome {
     /// Validation failure, dry-run, or semantic no-op; no transaction exists.
@@ -624,8 +651,19 @@ pub enum PreparationOutcome {
 /// Durable semantic rejection produced by the commit-time CAS recheck.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CommitRejection {
-    /// Canonical portable operation failure.
-    pub result: OperationResult,
+    /// Typed canonical operation failure.
+    pub operation: CanonicalOperationOutcome,
+    /// Ephemeral v0.3 compatibility projection; never persisted.
+    #[deprecated(note = "use operation; removal tracked after the Connect Phase 4 migration")]
+    pub result: crate::v03::OperationResult,
+}
+
+impl CommitRejection {
+    pub(crate) fn new(operation: CanonicalOperationOutcome) -> Self {
+        let result = operation.to_v03();
+        #[allow(deprecated)]
+        Self { operation, result }
+    }
 }
 
 /// Recoverable state of one claimed mutation.
