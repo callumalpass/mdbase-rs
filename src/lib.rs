@@ -40,6 +40,13 @@ pub mod views;
 pub mod watch;
 
 pub use cancellation::{OperationCancellation, OperationCancelled, OperationStopReason};
+pub use snapshot::{CollectionDiscoveryCause, CollectionSnapshotError};
+
+#[cfg(test)]
+pub(crate) use snapshot::{
+    cancel_scan_after_entries_for_test, replace_descendant_on_scan_for_test,
+    reset_snapshot_scan_calls_for_test, snapshot_scan_calls_for_test,
+};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -149,6 +156,7 @@ impl CollectionResources {
 /// A loaded mdbase collection.
 pub struct Collection {
     pub(crate) root: PathBuf,
+    root_capability: cap_std::fs::Dir,
     pub(crate) spec_profile: SpecProfile,
     pub(crate) settings: Settings,
     /// Namespaced collection configuration retained for optional adapters.
@@ -163,6 +171,14 @@ impl Collection {
     /// Authorized collection root.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn root_capability(&self) -> std::io::Result<cap_std::fs::Dir> {
+        self.root_capability.try_clone()
+    }
+
+    pub(crate) fn capability_for_root(root: &Path) -> std::io::Result<cap_std::fs::Dir> {
+        cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
     }
 
     /// Immutable runtime settings loaded with this collection.
@@ -217,6 +233,15 @@ impl Collection {
         root: &Path,
         recover_pending_transactions: bool,
     ) -> Result<Self, serde_json::Value> {
+        let root_capability =
+            cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority()).map_err(
+                |error| {
+                    crate::errors::op_error(
+                        crate::errors::INVALID_CONFIG,
+                        &format!("collection root could not be opened: {error}"),
+                    )
+                },
+            )?;
         let config_result = config::load_config_for_open(root);
         if config_result.get("valid") != Some(&serde_json::Value::Bool(true)) {
             return Err(config_result);
@@ -351,6 +376,12 @@ impl Collection {
         let recovered = if recover_pending_transactions {
             let recovery_collection = Collection {
                 root: root.to_path_buf(),
+                root_capability: root_capability.try_clone().map_err(|error| {
+                    crate::errors::op_error(
+                        crate::errors::INVALID_CONFIG,
+                        &format!("collection root capability could not be cloned: {error}"),
+                    )
+                })?,
                 spec_profile,
                 settings: settings.clone(),
                 config_extensions: config_extensions.clone(),
@@ -430,6 +461,7 @@ impl Collection {
 
         let collection = Collection {
             root: root.to_path_buf(),
+            root_capability,
             spec_profile,
             settings,
             config_extensions,
@@ -448,83 +480,6 @@ impl Collection {
             serde_json::Value::String(s) if s == "warn" => StrictMode::Warn,
             _ => StrictMode::Off,
         }
-    }
-
-    /// Scan all Markdown files in the collection.
-    ///
-    /// Discovery failures are explicit so callers cannot confuse an
-    /// incomplete collection with an empty or smaller one.
-    pub(crate) fn scan_collection_files_checked(
-        &self,
-    ) -> Result<Vec<PathBuf>, crate::snapshot::CollectionScanError> {
-        let mut files = Vec::new();
-        self.scan_dir_recursive_checked(&self.root, &mut files)?;
-        files.sort();
-        Ok(files)
-    }
-
-    /// Transitional wrapper for legacy operations that have not yet adopted
-    /// the typed snapshot boundary.
-    pub(crate) fn scan_collection_files(&self) -> Vec<PathBuf> {
-        self.scan_collection_files_checked().unwrap_or_default()
-    }
-
-    fn scan_dir_recursive_checked(
-        &self,
-        dir: &Path,
-        files: &mut Vec<PathBuf>,
-    ) -> Result<(), crate::snapshot::CollectionScanError> {
-        use crate::snapshot::CollectionScanError;
-
-        let entries =
-            std::fs::read_dir(dir).map_err(|source| CollectionScanError::ReadDirectory {
-                path: dir.to_path_buf(),
-                source,
-            })?;
-        for entry in entries {
-            let entry = entry.map_err(|source| CollectionScanError::ReadEntry {
-                directory: dir.to_path_buf(),
-                source,
-            })?;
-            let path = entry.path();
-            let file_type =
-                entry
-                    .file_type()
-                    .map_err(|source| CollectionScanError::InspectEntry {
-                        path: path.clone(),
-                        source,
-                    })?;
-
-            // Never follow links while discovering collection resources. A
-            // symlink below the authorized root can otherwise expose an
-            // unrelated directory to query, cache, links, runtime loading, or
-            // watch even when direct CRUD paths are contained.
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                if self.settings.include_subfolders {
-                    let rel = path
-                        .strip_prefix(&self.root)
-                        .map_err(|_| CollectionScanError::OutsideRoot { path: path.clone() })?
-                        .to_string_lossy()
-                        .to_string();
-                    if !crate::record_path::has_hidden_component(&rel) && !self.is_excluded(&rel) {
-                        self.scan_dir_recursive_checked(&path, files)?;
-                    }
-                }
-            } else if file_type.is_file() {
-                let rel = path
-                    .strip_prefix(&self.root)
-                    .map_err(|_| CollectionScanError::OutsideRoot { path: path.clone() })?
-                    .to_string_lossy()
-                    .to_string();
-                if self.validate_record_path(&rel).is_ok() {
-                    files.push(path);
-                }
-            }
-        }
-        Ok(())
     }
 }
 

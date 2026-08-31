@@ -74,6 +74,22 @@ Failures return `MdbaseError`. For `Operation` and `LossyMigration`, inspect
 location, and optional details. Match diagnostic codes for program behavior;
 messages are for humans.
 
+Filesystem-backed traversal helpers such as `Collection::build_all_files_data`
+return the non-exhaustive `CollectionSnapshotError`. Match its typed
+`Discovery`, `RecordUnavailable`, `RecordRead`, `CacheUnavailable`, and
+`Cancelled` variants rather than parsing display text. Discovery exposes a
+non-exhaustive `CollectionDiscoveryCause`; I/O variants retain their
+`std::io::Error` source. `path()` returns only an unambiguous platform
+filesystem path, while record variants expose a separately named canonical
+`collection_path`. Use `is_cancelled()` for cancellation handling.
+
+A successful capture does not imply that every authored record parsed. For
+`build_all_files_data`, valid-UTF-8 records with malformed or non-mapping
+frontmatter still participate with empty frontmatter, path-derived types, and
+their authored body. Invalid-UTF-8 records stay represented as invalid entries
+in the authoritative snapshot so validation and repair can find them, but they
+are omitted from this text-only traversal projection.
+
 ## Dry runs
 
 Set `dry_run = true` on create, update, delete, or rename requests to execute

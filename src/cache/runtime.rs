@@ -49,7 +49,7 @@ pub(crate) fn rebuild(
             .map_err(|_| CacheError::OutsideRoot(absolute.display().to_string()))?
             .to_string_lossy()
             .replace('\\', "/");
-        indexer::reindex_file(&transaction, collection, &absolute, &relative)?;
+        indexer::reindex_file(&transaction, collection, &relative)?;
     }
     indexer::resolve_all_links(&transaction, collection)?;
     let _ = advance_generation(&transaction, generation)?;
@@ -111,12 +111,7 @@ pub(crate) fn apply_changes(
         indexer::remove_file(&transaction, path)?;
     }
     for path in reindex {
-        indexer::reindex_file(
-            &transaction,
-            collection,
-            &collection.root.join(&path),
-            &path,
-        )?;
+        indexer::reindex_file(&transaction, collection, &path)?;
     }
     if resolution_unstable {
         indexer::resolve_all_links(&transaction, collection)?;

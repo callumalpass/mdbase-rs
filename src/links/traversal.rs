@@ -1,7 +1,6 @@
 //! asFile() traversal (§8.7).
 
-use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json};
-use crate::Collection;
+use crate::{Collection, CollectionSnapshotError, OperationCancellation};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -22,33 +21,20 @@ fn elapsed_ms(start: Instant) -> f64 {
 }
 
 impl Collection {
-    /// Build all files data for asFile() traversal in expressions.
-    pub fn build_all_files_data(&self) -> Vec<crate::expressions::evaluator::ResolvedFileData> {
-        let files = self.scan_collection_files();
-        files
-            .iter()
-            .filter_map(|fp| {
-                let rp = fp
-                    .strip_prefix(&self.root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default()
-                    .replace('\\', "/");
-                let content = std::fs::read_to_string(fp).ok()?;
-                let doc = parse_document(&content);
-                let fm = match &doc.frontmatter {
-                    Some(serde_yaml::Value::Mapping(m)) => yaml_mapping_to_json(m),
-                    _ => serde_json::json!({}),
-                };
-                let type_names = self.determine_types_for_path(&fm, Some(&rp));
-                let effective = self.apply_defaults(&fm, &type_names);
-                let effective = self.coerce_types(&effective, &type_names);
-                Some(crate::expressions::evaluator::ResolvedFileData {
-                    path: rp,
-                    frontmatter: effective,
-                    body: doc.body,
-                })
-            })
-            .collect()
+    /// Build expression traversal data from one authoritative collection capture.
+    ///
+    /// This is a deliberate pre-release API break: discovery, cancellation, and
+    /// record-read failures are explicit rather than being projected to an empty
+    /// collection. Valid-UTF-8 authored records with malformed or non-mapping
+    /// frontmatter participate with empty frontmatter, path-derived types, and
+    /// their authored body. Invalid-UTF-8 records remain snapshot-invalid and
+    /// repairable but are omitted from this text traversal projection.
+    pub fn build_all_files_data(
+        &self,
+    ) -> Result<Vec<crate::expressions::evaluator::ResolvedFileData>, CollectionSnapshotError> {
+        self.capture_collection_snapshot(&OperationCancellation::new())
+            .map(|snapshot| snapshot.resolved_files_data())
+            .map_err(CollectionSnapshotError::from)
     }
 
     /// Build backlinks index from all files data.
@@ -65,6 +51,43 @@ impl Collection {
         all_files: &[crate::expressions::evaluator::ResolvedFileData],
         profile: bool,
     ) -> (HashMap<String, Vec<String>>, Option<BacklinksPerf>) {
+        let resolution_index = self.build_link_resolution_index(all_files);
+        self.build_backlinks_index_with_resolution(all_files, profile, &resolution_index)
+    }
+
+    pub(crate) fn build_authoritative_backlinks_index(
+        &self,
+    ) -> Result<HashMap<String, Vec<String>>, CollectionSnapshotError> {
+        let snapshot = self
+            .capture_collection_snapshot(&OperationCancellation::new())
+            .map_err(CollectionSnapshotError::from)?;
+        Ok(self.build_backlinks_index_for_snapshot(&snapshot))
+    }
+
+    pub(crate) fn build_backlinks_index_for_snapshot(
+        &self,
+        snapshot: &crate::snapshot::AuthoritativeCollectionSnapshot,
+    ) -> HashMap<String, Vec<String>> {
+        let resolved_files = snapshot.resolved_files_data();
+        self.build_backlinks_index_for_snapshot_files(snapshot, &resolved_files)
+    }
+
+    pub(crate) fn build_backlinks_index_for_snapshot_files(
+        &self,
+        snapshot: &crate::snapshot::AuthoritativeCollectionSnapshot,
+        resolved_files: &[crate::expressions::evaluator::ResolvedFileData],
+    ) -> HashMap<String, Vec<String>> {
+        let resolution_index = snapshot.link_resolution_index_from_resolved(self, resolved_files);
+        self.build_backlinks_index_with_resolution(resolved_files, false, &resolution_index)
+            .0
+    }
+
+    fn build_backlinks_index_with_resolution(
+        &self,
+        all_files: &[crate::expressions::evaluator::ResolvedFileData],
+        profile: bool,
+        resolution_index: &crate::links::resolver::LinkResolutionIndex,
+    ) -> (HashMap<String, Vec<String>>, Option<BacklinksPerf>) {
         use crate::expressions::evaluator::{
             extract_embeds_from_body, extract_links_from_body, extract_links_from_fm_value,
         };
@@ -72,7 +95,6 @@ impl Collection {
         let total_start = Instant::now();
         let mut perf = BacklinksPerf::default();
         let mut index: HashMap<String, Vec<String>> = HashMap::new();
-        let resolution_index = self.build_link_resolution_index(all_files);
 
         for file_data in all_files {
             perf.files_processed += 1;
@@ -122,7 +144,7 @@ impl Collection {
                 // Resolve the target to a file path
                 perf.resolve_calls += 1;
                 let resolved =
-                    self.resolve_link_target(target, source_path, target_types, &resolution_index);
+                    self.resolve_link_target(target, source_path, target_types, resolution_index);
                 if let Some(resolved_path) = resolved {
                     if !seen_targets.contains(&resolved_path) {
                         seen_targets.push(resolved_path.clone());
@@ -148,5 +170,34 @@ impl Collection {
         } else {
             (index, None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collection() -> (tempfile::TempDir, Collection) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
+        let collection = Collection::open(root.path()).unwrap();
+        (root, collection)
+    }
+
+    #[test]
+    fn fallible_public_build_retains_utf8_malformed_records_without_hiding_capture_failure() {
+        let (root, collection) = collection();
+        std::fs::write(root.path().join("valid.md"), "body\n").unwrap();
+        std::fs::write(root.path().join("malformed.md"), "---\na: [broken\n---\n").unwrap();
+        let files = collection.build_all_files_data().unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|file| file.path == "valid.md"));
+        assert!(files.iter().any(|file| file.path == "malformed.md"));
+
+        crate::cancel_scan_after_entries_for_test(Some(1));
+        assert!(matches!(
+            collection.build_all_files_data(),
+            Err(CollectionSnapshotError::Cancelled)
+        ));
     }
 }

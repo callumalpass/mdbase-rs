@@ -4,6 +4,60 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Breaking
+
+- `Collection::build_all_files_data` now returns
+  `Result<Vec<ResolvedFileData>, CollectionSnapshotError>` instead of silently
+  treating discovery/read failures as an empty collection. This is a deliberate
+  pre-release Rust API break. The external Tasknotes TUI is a known direct
+  consumer and must migrate its view-query and project-link callers before the
+  next release. `CollectionSnapshotError` is now a non-exhaustive typed error:
+  discovery causes and record-read failures retain `std::io::Error` sources,
+  and filesystem paths are distinct from canonical collection-relative paths.
+  `CollectionDiscoveryCause` is publicly re-exported for exhaustive cause
+  inspection within a wildcard match. Traversal projections include
+  valid-UTF-8 authored records whose frontmatter is malformed or non-mapping:
+  they contribute empty frontmatter, path-derived types, and their authored
+  body. Invalid-UTF-8 records remain snapshot-invalid and repairable, but are
+  omitted from text traversal projections.
+- `frontmatter::serializer::serialize_document` and
+  `serialize_document_with_bom` now return
+  `Result<String, FrontmatterSerializationError>`. Callers must handle YAML
+  emitter failures; serialization no longer panics or substitutes empty YAML.
+
+### Fixed
+
+- Generated values now evaluate against effective defaults and dependencies,
+  sequence starts are floors, and sequence exhaustion returns the typed
+  `generated_sequence_overflow` error without wrapping or consuming a
+  reservation.
+- Explicit v0.3 batches reject adjacent and non-adjacent duplicate mutation
+  paths with stable `duplicate_batch_path` diagnostics before shadow creation,
+  generated-value reservation, dry-run, or real mutation in either partial
+  mode.
+- Authoritative snapshots retain sorted entries with a single canonical path
+  owner and a one-time path-to-index map. Invalid record loads now use closed
+  owned states: authored UTF-8 failures always retain their exact document and
+  layout with a restricted frontmatter reason, while invalid UTF-8 has no text
+  state and an intrinsic reason. Batch type-only selection constructs no
+  resolved-file, computed-field, or backlinks projection; expression selection
+  reuses one resolved-file projection and omits the link graph when the existing
+  expression analyzer proves it unnecessary.
+- The internal record loader now accepts only a capability-bound collection and
+  collection-relative path; the obsolete ignored absolute-path argument was
+  removed without a compatibility wrapper.
+- Batch and backfill validate final effective proposed corpora, and backfill
+  byte-revision fences every real write against edits made after planning.
+- Rename and reference rewriting now plan from one authoritative snapshot;
+  source and reference publication boundaries reject stale byte revisions,
+  unavailable records, replaced collection roots, and no-follow destination
+  parent races without adopting new data or creating directories outside the
+  held root capability. Body and frontmatter rewrites share canonical
+  source-relative link selection, preserve case-insensitive configured-ID links
+  in every rewrite context, and
+  dry-run includes projected self-reference updates exactly as execution plans
+  them.
+
 ## 0.4.0-rc.4 - 2026-08-10
 
 ### Fixed

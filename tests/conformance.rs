@@ -1301,7 +1301,9 @@ fn execute_operation(
                     .and_then(|v| v.as_str())
                     .map(String::from);
                 // Build all_files for asFile() traversal
-                let all_files = collection.build_all_files_data();
+                let all_files = collection
+                    .build_all_files_data()
+                    .expect("collection snapshot");
                 let backlinks_index = collection.build_backlinks_index(&all_files);
                 let all_files_arc = std::sync::Arc::new(all_files);
                 let backlinks_arc = std::sync::Arc::new(backlinks_index);

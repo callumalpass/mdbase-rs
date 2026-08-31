@@ -3,6 +3,54 @@ use crate::links::resolver::compute_relative_path;
 use crate::Collection;
 
 impl Collection {
+    pub(crate) fn simple_wikilink_resolution(
+        &self,
+        link_val: &str,
+        source_path: &str,
+        target_types: &[String],
+        resolution_index: &crate::links::resolver::LinkResolutionIndex,
+    ) -> Option<crate::links::resolver::LinkResolution> {
+        if !link_val.starts_with("[[") || !link_val.ends_with("]]") {
+            return None;
+        }
+        let inner = &link_val[2..link_val.len() - 2];
+        let target = inner
+            .split('|')
+            .next()
+            .unwrap_or(inner)
+            .split('#')
+            .next()
+            .unwrap_or(inner)
+            .trim();
+        if target.is_empty() || target.contains('/') || target.contains('.') {
+            return None;
+        }
+        Some(self.resolve_simple_name(resolution_index, target, source_path, target_types))
+    }
+
+    pub(crate) fn is_stable_configured_id_wikilink(
+        &self,
+        link_val: &str,
+        source_id: Option<&str>,
+    ) -> bool {
+        if !link_val.starts_with("[[") || !link_val.ends_with("]]") {
+            return false;
+        }
+        let inner = &link_val[2..link_val.len() - 2];
+        let target = inner
+            .split('|')
+            .next()
+            .unwrap_or(inner)
+            .split('#')
+            .next()
+            .unwrap_or(inner)
+            .trim();
+        !target.is_empty()
+            && !target.contains('/')
+            && !target.contains('.')
+            && source_id.is_some_and(|id| target.to_lowercase() == id.to_lowercase())
+    }
+
     /// Check if a link value resolves to the renamed file.
     pub(crate) fn link_resolves_to(
         &self,
@@ -11,7 +59,6 @@ impl Collection {
         from_stem: &str,
         from_no_ext: &str,
         source_dir: &str,
-        source_id: Option<&str>,
     ) -> bool {
         let is_wikilink = link_val.starts_with("[[") && link_val.ends_with("]]");
         let is_md_link = link_val.contains("](");
@@ -53,18 +100,6 @@ impl Collection {
         };
 
         if target.is_empty() {
-            return false;
-        }
-
-        // A simple wikilink matching the configured record ID continues to
-        // resolve after a path-only rename.  Treat it as stable even when its
-        // spelling differs only by case from the former filename stem.
-        if is_wikilink
-            && !target.contains('/')
-            && !target.contains('.')
-            && target != from_stem
-            && source_id.is_some_and(|id| target.eq_ignore_ascii_case(id))
-        {
             return false;
         }
 

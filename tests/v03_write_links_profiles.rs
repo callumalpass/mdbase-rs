@@ -272,7 +272,7 @@ fn target_scoped_links_drive_backlinks_to_the_same_winner() {
         "---\ntype: task\ntitle: Source\nstatus: open\nassignee: '[[alice]]'\n---\n",
     );
 
-    let all_files = collection.build_all_files_data();
+    let all_files = collection.build_all_files_data().unwrap();
     let backlinks = collection.build_backlinks_index(&all_files);
     assert_eq!(
         backlinks.get("people/alice.md"),
@@ -291,6 +291,57 @@ fn target_scoped_links_drive_backlinks_to_the_same_winner() {
         "people/alice.md"
     );
     assert_eq!(cached.result["meta"]["total_count"], 1);
+}
+
+#[test]
+fn malformed_frontmatter_record_remains_a_resolution_and_backlink_candidate() {
+    let (root, collection) = collection();
+    write_record(
+        &root,
+        "tasks/source.md",
+        "---\ntype: task\ntitle: '[[broken]]'\nstatus: open\n---\n",
+    );
+    write_record(
+        &root,
+        "broken.md",
+        "---\na: [broken\n---\nBody still links to [[alice]].\n",
+    );
+
+    assert_eq!(
+        collection.resolve_link(&json!({"path": "tasks/source.md", "field": "title"})),
+        json!({"resolved_path": "broken.md"})
+    );
+    let all_files = collection.build_all_files_data().unwrap();
+    assert!(all_files.iter().any(|file| {
+        file.path == "broken.md"
+            && file
+                .frontmatter
+                .as_object()
+                .is_some_and(|map| map.is_empty())
+            && file.body.contains("[[alice]]")
+    }));
+    let backlinks = collection.build_backlinks_index(&all_files);
+    assert_eq!(
+        backlinks.get("people/alice.md"),
+        Some(&vec!["broken.md".to_string()])
+    );
+
+    fs::write(root.path().join("binary.md"), b"bad\xffutf8").unwrap();
+    write_record(
+        &root,
+        "tasks/binary-source.md",
+        "---\ntype: task\ntitle: '[[binary]]'\nstatus: open\n---\n",
+    );
+    assert!(
+        collection.resolve_link(&json!({"path": "tasks/binary-source.md", "field": "title"}))
+            ["resolved_path"]
+            .is_null()
+    );
+    assert!(!collection
+        .build_all_files_data()
+        .unwrap()
+        .iter()
+        .any(|file| file.path == "binary.md"));
 }
 
 #[test]

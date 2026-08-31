@@ -160,11 +160,21 @@ impl CompiledCatalog {
                 message: error.message,
             })?;
 
+        let empty_root = tempfile::tempdir().map_err(|error| CatalogError {
+            code: "catalog_root_unavailable".to_string(),
+            message: error.to_string(),
+        })?;
+        let root_capability =
+            Collection::capability_for_root(empty_root.path()).map_err(|error| CatalogError {
+                code: "catalog_root_unavailable".to_string(),
+                message: error.to_string(),
+            })?;
         Ok(Self {
             resource_revision: input.resource_revision,
             contracts,
             collection: Collection {
                 root: PathBuf::new(),
+                root_capability,
                 spec_profile: SpecProfile::V03,
                 settings,
                 config_extensions,

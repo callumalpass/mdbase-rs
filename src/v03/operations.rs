@@ -699,14 +699,13 @@ impl<'a> Operations<'a> {
         if let Err(error) = crate::operations::ensure_regular_record_file(&full_path, &path) {
             return Err(collect_diagnostics(&error, Some(&path), "error"));
         }
-        let loaded =
-            crate::record_load::load_record(self.collection, &full_path, &path).map_err(|_| {
-                vec![Diagnostic::error(
-                    "file_read_failed",
-                    "Record could not be read.",
-                    Some(path.clone()),
-                )]
-            })?;
+        let loaded = crate::record_load::load_record(self.collection, &path).map_err(|_| {
+            vec![Diagnostic::error(
+                "file_read_failed",
+                "Record could not be read.",
+                Some(path.clone()),
+            )]
+        })?;
         let (old, prepared_revision) = match loaded {
             crate::record_load::RecordLoadOutcome::Parsed {
                 raw_frontmatter,
@@ -716,9 +715,12 @@ impl<'a> Operations<'a> {
                 raw_frontmatter.as_object().cloned().unwrap_or_default(),
                 Some(Value::String(facts.revision)),
             ),
-            crate::record_load::RecordLoadOutcome::Invalid { facts, reason, .. } => {
+            crate::record_load::RecordLoadOutcome::Invalid { facts, state, .. } => {
                 if candidate.is_none() {
-                    return Err(vec![invalid_record_diagnostic(&path, reason.as_str())]);
+                    return Err(vec![invalid_record_diagnostic(
+                        &path,
+                        state.reason().as_str(),
+                    )]);
                 }
                 (Map::new(), Some(Value::String(facts.revision)))
             }
@@ -761,15 +763,28 @@ impl<'a> Operations<'a> {
         }
         if let Some(candidate) = candidate {
             if lifecycle_draft != draft {
-                let frontmatter = json_to_yaml_mapping(&Value::Object(lifecycle_draft));
-                normalized.insert(
-                    "document".to_string(),
-                    Value::String(serializer::serialize_document_with_bom(
-                        candidate.had_bom,
-                        &frontmatter,
-                        &candidate.document.body,
-                    )),
-                );
+                let canonical = json_to_yaml_mapping(&Value::Object(lifecycle_draft.clone()));
+                let frontmatter = candidate
+                    .document
+                    .frontmatter
+                    .as_ref()
+                    .and_then(serde_yaml::Value::as_mapping)
+                    .map_or(canonical, |authored| {
+                        serializer::reconcile_json_object(authored, &lifecycle_draft)
+                    });
+                let document = serializer::serialize_document_with_bom(
+                    candidate.had_bom,
+                    &frontmatter,
+                    &candidate.document.body,
+                )
+                .map_err(|error| {
+                    vec![Diagnostic::error(
+                        crate::errors::FRONTMATTER_SERIALIZATION_FAILED,
+                        error.to_string(),
+                        Some(path.clone()),
+                    )]
+                })?;
+                normalized.insert("document".to_string(), Value::String(document));
             }
             normalized.insert("include_document".to_string(), Value::Bool(true));
         } else {

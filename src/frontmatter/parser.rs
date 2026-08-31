@@ -1,5 +1,7 @@
 //! YAML frontmatter parsing (§3).
 
+use std::ops::Range;
+
 use serde_yaml::Value as YamlValue;
 
 /// Parsed frontmatter result.
@@ -13,170 +15,154 @@ pub struct ParsedDocument {
     pub has_frontmatter: bool,
 }
 
+/// Internal parse result that borrows body text by byte range instead of owning it.
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedDocumentLayout {
+    frontmatter: Option<YamlValue>,
+    body_range: Range<usize>,
+    has_frontmatter: bool,
+    had_bom: bool,
+}
+
 /// Structural frontmatter state shared by collection consumers.
-///
-/// Parsing is deliberately separate from policy: queries may omit opaque
-/// records, validation may diagnose them, and snapshots may preserve them.
-/// Consumers should match this enum instead of interpreting the YAML error
-/// sentinel themselves.
 #[derive(Debug, Clone, Copy)]
 pub enum FrontmatterState<'a> {
-    /// The document has no complete leading frontmatter block.
     Absent,
-    /// The document has canonical object frontmatter.
     Mapping(&'a serde_yaml::Mapping),
-    /// The frontmatter block is not valid YAML.
     InvalidYaml,
-    /// The frontmatter block explicitly contains YAML null.
     Null,
-    /// The frontmatter block is valid YAML but is not an object.
     NonMapping(&'a YamlValue),
 }
 
+fn frontmatter_state(frontmatter: Option<&YamlValue>) -> FrontmatterState<'_> {
+    match frontmatter {
+        None => FrontmatterState::Absent,
+        Some(value) if is_parse_error(value) => FrontmatterState::InvalidYaml,
+        Some(YamlValue::Mapping(mapping)) => FrontmatterState::Mapping(mapping),
+        Some(YamlValue::Null) => FrontmatterState::Null,
+        Some(value) => FrontmatterState::NonMapping(value),
+    }
+}
+
 impl ParsedDocument {
-    /// Classify frontmatter once so callers only choose policy.
     pub fn frontmatter_state(&self) -> FrontmatterState<'_> {
-        match self.frontmatter.as_ref() {
-            None => FrontmatterState::Absent,
-            Some(value) if is_parse_error(value) => FrontmatterState::InvalidYaml,
-            Some(YamlValue::Mapping(mapping)) => FrontmatterState::Mapping(mapping),
-            Some(YamlValue::Null) => FrontmatterState::Null,
-            Some(value) => FrontmatterState::NonMapping(value),
+        frontmatter_state(self.frontmatter.as_ref())
+    }
+}
+
+impl ParsedDocumentLayout {
+    pub(crate) fn frontmatter_state(&self) -> FrontmatterState<'_> {
+        frontmatter_state(self.frontmatter.as_ref())
+    }
+
+    pub(crate) fn body<'a>(&self, document: &'a str) -> &'a str {
+        &document[self.body_range.clone()]
+    }
+
+    pub(crate) fn had_bom(&self) -> bool {
+        self.had_bom
+    }
+
+    pub(crate) fn into_parsed_document(self, document: &str) -> ParsedDocument {
+        let body = self.body(document).to_string();
+        ParsedDocument {
+            frontmatter: self.frontmatter,
+            body,
+            has_frontmatter: self.has_frontmatter,
         }
     }
 }
 
 /// Parse a markdown document into frontmatter and body.
-///
-/// Returns the raw YAML value for frontmatter (which may be a mapping, list, scalar, or null)
-/// and the body string. Callers must check that frontmatter is a mapping.
 pub fn parse_document(content: &str) -> ParsedDocument {
-    parse_document_for_rewrite(content).0
+    parse_document_layout(content).into_parsed_document(content)
 }
 
 /// Parse while retaining encoding information needed by internal rewrite paths.
-/// This keeps BOM bookkeeping out of the public `ParsedDocument` layout.
 pub(crate) fn parse_document_for_rewrite(content: &str) -> (ParsedDocument, bool) {
-    // Strip exactly one marker. A second marker is document content.
-    let had_bom = content.starts_with('\u{FEFF}');
-    let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
-    (parse_document_without_bom(content), had_bom)
+    let layout = parse_document_layout(content);
+    let had_bom = layout.had_bom();
+    (layout.into_parsed_document(content), had_bom)
 }
 
-fn parse_document_without_bom(content: &str) -> ParsedDocument {
-    // §3.1: Opening --- must be the very first line
-    if !content.starts_with("---") {
-        return ParsedDocument {
-            frontmatter: None,
-            body: content.to_string(),
-            has_frontmatter: false,
-        };
+/// Parse YAML/frontmatter once while retaining body identity as a byte range.
+pub(crate) fn parse_document_layout(content: &str) -> ParsedDocumentLayout {
+    let had_bom = content.starts_with('\u{FEFF}');
+    let bom_len = if had_bom { '\u{FEFF}'.len_utf8() } else { 0 };
+    let without_bom = &content[bom_len..];
+
+    let absent = || ParsedDocumentLayout {
+        frontmatter: None,
+        body_range: bom_len..content.len(),
+        has_frontmatter: false,
+        had_bom,
+    };
+    if !without_bom.starts_with("---") {
+        return absent();
     }
 
-    // Check that the first line is exactly "---" (possibly with trailing whitespace/newline)
-    let first_line_end = content.find('\n').unwrap_or(content.len());
-    let first_line = content[..first_line_end].trim_end();
-    if first_line != "---" {
-        return ParsedDocument {
-            frontmatter: None,
-            body: content.to_string(),
-            has_frontmatter: false,
-        };
+    let first_line_end = without_bom.find('\n').unwrap_or(without_bom.len());
+    if without_bom[..first_line_end].trim_end() != "---" {
+        return absent();
     }
-
-    // Find the closing ---
     let after_open = first_line_end + 1;
-    if after_open >= content.len() {
-        // File is just "---\n" with nothing after
-        return ParsedDocument {
-            frontmatter: None,
-            body: content.to_string(),
-            has_frontmatter: false,
-        };
+    if after_open >= without_bom.len() {
+        return absent();
     }
 
-    let rest = &content[after_open..];
-    // Search for a line that is exactly "---"
-    let mut pos = 0;
-    let mut found_close = None;
+    let rest = &without_bom[after_open..];
+    let mut position = 0;
+    let mut close_position = None;
     for line_with_ending in rest.split_inclusive('\n') {
         let line = line_with_ending
             .strip_suffix('\n')
             .unwrap_or(line_with_ending);
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.trim_end() == "---" {
-            found_close = Some(pos);
+            close_position = Some(position);
             break;
         }
-        pos += line_with_ending.len();
+        position += line_with_ending.len();
     }
-
-    let close_pos = match found_close {
-        Some(p) => p,
-        None => {
-            // No closing delimiter found - treat entire content as body (no frontmatter)
-            return ParsedDocument {
-                frontmatter: None,
-                body: content.to_string(),
-                has_frontmatter: false,
-            };
-        }
+    let Some(close_position) = close_position else {
+        return absent();
     };
 
-    let yaml_str = &rest[..close_pos];
-    let body_start = after_open + close_pos + 3; // skip "---"
-                                                 // Skip the newline after closing ---
-    let body = if body_start < content.len() {
-        let b = &content[body_start..];
-        if let Some(stripped) = b.strip_prefix('\n') {
-            stripped.to_string()
-        } else if let Some(stripped) = b.strip_prefix("\r\n") {
-            stripped.to_string()
-        } else {
-            b.to_string()
-        }
+    let yaml_source = &rest[..close_position];
+    let after_close = after_open + close_position + 3;
+    let suffix = &without_bom[after_close..];
+    let newline_len = if suffix.starts_with("\r\n") {
+        2
+    } else if suffix.starts_with('\n') {
+        1
     } else {
-        String::new()
+        0
     };
-
-    // Parse the YAML content
-    let yaml_value: YamlValue = match serde_yaml::from_str(yaml_str) {
-        Ok(v) => v,
-        Err(_) => {
-            // Return the raw yaml string as an error indicator - caller handles this
-            return ParsedDocument {
-                frontmatter: Some(YamlValue::Tagged(Box::new(
-                    serde_yaml::value::TaggedValue {
-                        tag: serde_yaml::value::Tag::new("!parse_error"),
-                        value: YamlValue::String(yaml_str.to_string()),
-                    },
-                ))),
-                body,
-                has_frontmatter: true,
-            };
-        }
-    };
-    // Obsidian permits an explicit but empty frontmatter block. It has the
-    // same persisted fields as a body-only record, not scalar frontmatter.
-    let yaml_value = if yaml_str.trim().is_empty() {
-        YamlValue::Mapping(serde_yaml::Mapping::new())
+    let body_start = bom_len + after_close + newline_len;
+    let parsed_yaml = if yaml_source.trim().is_empty() {
+        Ok(YamlValue::Mapping(serde_yaml::Mapping::new()))
     } else {
-        yaml_value
+        serde_yaml::from_str(yaml_source)
     };
+    let frontmatter = Some(parsed_yaml.unwrap_or_else(|_| {
+        YamlValue::Tagged(Box::new(serde_yaml::value::TaggedValue {
+            tag: serde_yaml::value::Tag::new("!parse_error"),
+            value: YamlValue::String(yaml_source.to_string()),
+        }))
+    }));
 
-    ParsedDocument {
-        frontmatter: Some(yaml_value),
-        body,
+    ParsedDocumentLayout {
+        frontmatter,
+        body_range: body_start..content.len(),
         has_frontmatter: true,
+        had_bom,
     }
 }
 
-/// Check if a parsed YAML value represents a parse error (our sentinel).
 pub fn is_parse_error(value: &YamlValue) -> bool {
     matches!(value, YamlValue::Tagged(t) if t.tag == serde_yaml::value::Tag::new("!parse_error"))
 }
 
-/// Convert a YAML mapping to a JSON object.
 pub fn yaml_mapping_to_json(mapping: &serde_yaml::Mapping) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     for (k, v) in mapping {
@@ -187,7 +173,6 @@ pub fn yaml_mapping_to_json(mapping: &serde_yaml::Mapping) -> serde_json::Value 
     serde_json::Value::Object(obj)
 }
 
-/// Convert a serde_yaml::Value to serde_json::Value.
 pub fn yaml_to_json(yaml: &YamlValue) -> serde_json::Value {
     match yaml {
         YamlValue::Null => serde_json::Value::Null,
@@ -199,12 +184,14 @@ pub fn yaml_to_json(yaml: &YamlValue) -> serde_json::Value {
                 serde_json::Value::Number(u.into())
             } else if let Some(f) = n.as_f64() {
                 if f.is_infinite() {
-                    // Preserve infinity as string for validation
-                    if f.is_sign_positive() {
-                        serde_json::Value::String(".inf".to_string())
-                    } else {
-                        serde_json::Value::String("-.inf".to_string())
-                    }
+                    serde_json::Value::String(
+                        if f.is_sign_positive() {
+                            ".inf"
+                        } else {
+                            "-.inf"
+                        }
+                        .to_string(),
+                    )
                 } else if f.is_nan() {
                     serde_json::Value::String(".nan".to_string())
                 } else {
@@ -225,16 +212,10 @@ pub fn yaml_to_json(yaml: &YamlValue) -> serde_json::Value {
     }
 }
 
-/// Normalize YAML datetime strings to ISO 8601 format.
-/// YAML timestamps like "2024-03-15 10:30:00" should become "2024-03-15T10:30:00".
 fn normalize_yaml_datetime(s: &str) -> String {
-    // Match pattern: YYYY-MM-DD HH:MM:SS (with optional timezone)
-    // The space between date and time should be replaced with 'T'
     if s.len() >= 19 {
         let bytes = s.as_bytes();
-        // Check for YYYY-MM-DD HH:MM:SS pattern
-        if bytes.len() >= 19
-            && bytes[4] == b'-'
+        if bytes[4] == b'-'
             && bytes[7] == b'-'
             && bytes[10] == b' '
             && bytes[13] == b':'
@@ -256,7 +237,6 @@ fn normalize_yaml_datetime(s: &str) -> String {
     s.to_string()
 }
 
-/// Convert a JSON value to a YAML mapping for writing.
 pub fn json_to_yaml_mapping(json: &serde_json::Value) -> serde_yaml::Mapping {
     let mut mapping = serde_yaml::Mapping::new();
     if let serde_json::Value::Object(obj) = json {
@@ -267,20 +247,15 @@ pub fn json_to_yaml_mapping(json: &serde_json::Value) -> serde_yaml::Mapping {
     mapping
 }
 
-/// Convert a serde_json::Value to serde_yaml::Value.
 pub fn json_to_yaml(json: &serde_json::Value) -> YamlValue {
     match json {
         serde_json::Value::Null => YamlValue::Null,
         serde_json::Value::Bool(b) => YamlValue::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                YamlValue::Number(serde_yaml::Number::from(i))
-            } else if let Some(f) = n.as_f64() {
-                YamlValue::Number(serde_yaml::Number::from(f))
-            } else {
-                YamlValue::Null
-            }
-        }
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(YamlValue::from)
+            .or_else(|| n.as_f64().map(YamlValue::from))
+            .unwrap_or(YamlValue::Null),
         serde_json::Value::String(s) => YamlValue::String(s.clone()),
         serde_json::Value::Array(arr) => {
             YamlValue::Sequence(arr.iter().map(json_to_yaml).collect())
@@ -297,7 +272,24 @@ pub fn json_to_yaml(json: &serde_json::Value) -> YamlValue {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_document;
+    use super::{parse_document, parse_document_layout, FrontmatterState};
+
+    #[test]
+    fn layout_borrows_body_and_public_parse_stays_owned() {
+        let source = "\u{feff}---\ntitle: Original\n---\nBody\n";
+        let layout = parse_document_layout(source);
+        assert!(layout.had_bom());
+        assert!(layout.has_frontmatter);
+        assert!(matches!(
+            layout.frontmatter_state(),
+            FrontmatterState::Mapping(_)
+        ));
+        assert_eq!(layout.body(source), "Body\n");
+        let body = layout.body(source);
+        let body_start = source.find("Body").unwrap();
+        assert!(std::ptr::eq(body.as_ptr(), source[body_start..].as_ptr()));
+        assert_eq!(parse_document(source).body, "Body\n");
+    }
 
     #[test]
     fn empty_explicit_frontmatter_is_an_empty_mapping() {
@@ -321,43 +313,32 @@ mod tests {
     #[test]
     fn parses_crlf_frontmatter_without_shifting_the_closing_delimiter() {
         let parsed = parse_document("---\r\ntitle: Windows\r\ncount: 2\r\n---\r\nBody\r\n");
-        let frontmatter = parsed
-            .frontmatter
-            .expect("CRLF frontmatter should parse")
-            .as_mapping()
-            .expect("frontmatter should be a mapping")
-            .clone();
-
         assert_eq!(
-            frontmatter
-                .get(serde_yaml::Value::String("title".to_string()))
-                .and_then(serde_yaml::Value::as_str),
+            parsed.frontmatter.as_ref().and_then(YamlValueExt::title),
             Some("Windows")
         );
         assert_eq!(parsed.body, "Body\r\n");
     }
 
+    trait YamlValueExt {
+        fn title(&self) -> Option<&str>;
+    }
+    impl YamlValueExt for serde_yaml::Value {
+        fn title(&self) -> Option<&str> {
+            self.as_mapping()?
+                .get(serde_yaml::Value::String("title".to_string()))?
+                .as_str()
+        }
+    }
+
     #[test]
-    fn leading_bom_is_stripped_and_recorded_not_treated_as_content() {
-        // BOM write policy: strip exactly one leading U+FEFF at parse time and
-        // record it so serialization can restore the byte prefix.
+    fn leading_bom_is_stripped_from_body() {
         for source in [
             "\u{feff}---\ntitle: Original\n---\nBody\n",
             "\u{feff}Body only, no frontmatter.\n",
         ] {
-            let parsed = parse_document(source);
-            assert!(
-                !parsed.body.starts_with('\u{feff}'),
-                "BOM must not leak into body"
-            );
+            assert!(!parse_document(source).body.starts_with('\u{feff}'));
         }
-
-        let parsed = parse_document("\u{feff}---\ntitle: Original\n---\nBody\n");
-        assert!(parsed.has_frontmatter);
-        assert_eq!(parsed.body, "Body\n");
-
-        let parsed = parse_document("---\ntitle: Original\n---\nBody\n");
-        assert!(parsed.has_frontmatter);
     }
 
     #[test]

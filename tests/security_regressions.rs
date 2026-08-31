@@ -309,7 +309,7 @@ fn rename_reports_ref_update_io_failures() {
         &root.join("mdbase.yaml"),
         "spec_version: 0.2.0\nsettings:\n  rename_update_refs: true\n",
     );
-    write_file(&root.join("target.md"), "---\nid: target\n---\n");
+    write_file(&root.join("target.md"), "---\nid: stable-target-id\n---\n");
     write_file(&root.join("ref.md"), "---\nref: \"[[target]]\"\n---\n");
 
     let ref_path = root.join("ref.md");

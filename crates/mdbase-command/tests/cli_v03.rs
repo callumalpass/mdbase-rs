@@ -264,7 +264,7 @@ fn update_refs_flag_overrides_the_collection_default() {
         "spec_version: 0.3.0\nsettings:\n  rename_update_refs: false\n",
     )
     .unwrap();
-    fs::write(root.path().join("a.md"), "---\nid: a\n---\n").unwrap();
+    fs::write(root.path().join("a.md"), "filename-resolved target\n").unwrap();
     fs::write(root.path().join("r.md"), "---\nref: \"[[a]]\"\n---\n").unwrap();
 
     let (status, result) = run(&root, &["rename", "a.md", "b.md", "--update-refs"]);

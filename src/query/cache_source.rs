@@ -172,7 +172,7 @@ impl Collection {
                 .map_err(|_| CacheError::OutsideRoot(abs_path.display().to_string()))?
                 .to_string_lossy()
                 .replace('\\', "/");
-            indexer::reindex_file(&transaction, self, abs_path, &rel_path)?;
+            indexer::reindex_file(&transaction, self, &rel_path)?;
         }
 
         if !changes.stale.is_empty() || !changes.deleted.is_empty() {
@@ -501,13 +501,13 @@ impl Collection {
                 .to_string_lossy()
                 .replace('\\', "/");
 
-            let outcome =
-                crate::record_load::load_record(self, file_path, &rel_path).map_err(|source| {
-                    SnapshotError::ReadFile {
-                        path: file_path.clone(),
-                        source,
-                    }
-                })?;
+            let outcome = crate::record_load::load_record(self, &rel_path).map_err(|source| {
+                SnapshotError::ReadFile {
+                    collection_path: rel_path.clone(),
+                    filesystem_path: file_path.clone(),
+                    source,
+                }
+            })?;
             let facts = outcome.facts();
             let file_mtime_iso = (facts.mtime_ns != 0).then(|| ns_to_iso(facts.mtime_ns));
             let file_ctime_iso = facts.ctime_ns.map(ns_to_iso);
@@ -517,21 +517,26 @@ impl Collection {
                 RecordLoadOutcome::Parsed {
                     raw_frontmatter,
                     effective_frontmatter,
-                    body,
+                    document,
+                    layout,
                     type_names,
                     ..
                 } => LocalRecord::Parsed(FileRecord {
                     rel_path,
                     raw_frontmatter,
                     effective_frontmatter,
-                    body: if include_bodies { body } else { String::new() },
+                    body: if include_bodies {
+                        layout.body(&document).to_string()
+                    } else {
+                        String::new()
+                    },
                     type_names,
                     file_size,
                     file_mtime_iso,
                     file_ctime_iso,
                 }),
                 RecordLoadOutcome::Invalid {
-                    type_names, reason, ..
+                    type_names, state, ..
                 } => LocalRecord::Invalid(InvalidRecordStub {
                     rel_path,
                     type_names,
@@ -539,7 +544,7 @@ impl Collection {
                     file_mtime_iso,
                     file_ctime_iso,
                     source_revision,
-                    reason: reason.as_str().to_string(),
+                    reason: state.reason().as_str().to_string(),
                 }),
             };
             records.push(record);

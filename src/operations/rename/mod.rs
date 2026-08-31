@@ -2,19 +2,25 @@
 
 mod body;
 mod frontmatter;
+#[cfg(test)]
+pub(super) mod hooks;
 mod link_rewrite;
+mod planner;
+mod publication;
+#[cfg(test)]
+mod tests;
 
 use crate::api::operations::RenameInput;
 use crate::errors::*;
-use crate::frontmatter::parser::{
-    parse_document, parse_document_for_rewrite, yaml_mapping_to_json,
-};
-use crate::frontmatter::serializer;
 use crate::operations::{
-    atomic_rename_noclobber, ensure_no_symlink_components, ensure_regular_record_file,
-    ensure_revision, mutation_record_path,
+    atomic_rename_noclobber, atomic_write_in_prepared_parent, ensure_no_symlink_components,
+    ensure_regular_record_file, ensure_revision, mutation_record_path,
+    prepare_record_parent_no_follow,
 };
 use crate::Collection;
+
+#[cfg(test)]
+use hooks::apply_injected_root_replacement;
 
 impl Collection {
     /// Rename a file (§12.5).
@@ -37,10 +43,11 @@ impl Collection {
             Ok(path) => path.to_string(),
             Err(error) => return error,
         };
-        let to = match mutation_record_path(self, &to) {
-            Ok(path) => path.to_string(),
+        let to_collection_path = match mutation_record_path(self, &to) {
+            Ok(path) => path,
             Err(error) => return error,
         };
+        let to = to_collection_path.to_string();
         if let Err(error) = ensure_no_symlink_components(&self.root, &from, self.spec_profile) {
             return error;
         }
@@ -58,6 +65,7 @@ impl Collection {
                 return error;
             }
         }
+
         let _write_lock = if dry_run {
             None
         } else {
@@ -67,90 +75,71 @@ impl Collection {
             }
         };
 
+        let snapshot = match self.capture_collection_snapshot(&crate::OperationCancellation::new())
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return op_error("collection_snapshot_failed", &error.to_string()),
+        };
+
         let from_path = self.root.join(&from);
         let to_path = self.root.join(&to);
-
         if let Err(error) = ensure_regular_record_file(&from_path, &from) {
             return error;
         }
-        if !from_path.exists() {
-            return op_error(FILE_NOT_FOUND, &format!("Source not found: {}", from));
-        }
-
+        let Some(source_entry) = snapshot.entry(&from) else {
+            return op_error(FILE_NOT_FOUND, &format!("Source not found: {from}"));
+        };
         if to_path.exists() {
-            return op_error(PATH_CONFLICT, &format!("Target already exists: {}", to));
+            return op_error(PATH_CONFLICT, &format!("Target already exists: {to}"));
         }
-
-        if let Err(error) = ensure_revision(&from_path, &from, if_revision.as_deref()) {
-            return error;
+        if if_revision
+            .as_deref()
+            .is_some_and(|expected| expected != source_entry.facts().revision)
+        {
+            return op_error(
+                CONCURRENT_MODIFICATION,
+                &format!("File '{from}' no longer matches the requested revision"),
+            );
         }
-
-        // A dry run must not create the destination folder.
-        if !dry_run {
-            if let Some(parent) = to_path.parent() {
-                if let Err(error) = std::fs::create_dir_all(parent) {
-                    return op_error(
-                        "io_error",
-                        &format!("Failed to create target folder: {error}"),
-                    );
-                }
-            }
-        }
-        if let Err(error) = ensure_no_symlink_components(&self.root, &to, self.spec_profile) {
-            return error;
-        }
-
-        // Concurrent modification detection for source file
         if let Some(known_ms) = last_known_mtime {
-            if let Ok(meta) = std::fs::metadata(&from_path) {
-                if let Ok(mtime) = meta.modified() {
-                    let current_ms = mtime
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    if current_ms != known_ms {
-                        return op_error(
-                            CONCURRENT_MODIFICATION,
-                            &format!("File '{}' was modified externally", from),
-                        );
-                    }
-                }
-            }
-        }
-
-        // Read the source file's id before rename (for id-stability check)
-        let source_id = std::fs::read_to_string(&from_path)
-            .ok()
-            .and_then(|content| {
-                let doc = parse_document(&content);
-                if let Some(serde_yaml::Value::Mapping(m)) = &doc.frontmatter {
-                    let json = yaml_mapping_to_json(m);
-                    json.get(&self.settings.id_field)
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                }
-            });
-
-        let update_refs = update_refs.unwrap_or(self.settings.rename_update_refs);
-        if dry_run {
-            let mut references_affected: Vec<serde_json::Value> = Vec::new();
-            let mut warnings: Vec<serde_json::Value> = Vec::new();
-            let mut ignored_failures: Vec<serde_json::Value> = Vec::new();
-            if update_refs {
-                self.update_references_after_rename_with_mtime(
-                    &from,
-                    &to,
-                    &source_id,
-                    &mut references_affected,
-                    &mut warnings,
-                    &mut ignored_failures,
-                    &std::collections::HashMap::new(),
-                    &std::collections::HashMap::new(),
-                    true,
+            let captured_ms = source_entry.facts().mtime_ns.max(0) as u64 / 1_000_000;
+            if captured_ms != known_ms {
+                return op_error(
+                    CONCURRENT_MODIFICATION,
+                    &format!("File '{from}' was modified externally"),
                 );
             }
+        }
+
+        let source_id = source_entry
+            .raw_frontmatter()
+            .and_then(serde_json::Value::as_object)
+            .and_then(|frontmatter| frontmatter.get(&self.settings.id_field))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let update_refs = update_refs.unwrap_or(self.settings.rename_update_refs);
+        let mut warnings = Vec::new();
+        let mut ref_update_failures = Vec::new();
+        let plans = if update_refs {
+            self.plan_reference_rewrites(
+                &snapshot,
+                &from,
+                &to,
+                &source_id,
+                &mut warnings,
+                &mut ref_update_failures,
+            )
+        } else {
+            Vec::new()
+        };
+        #[cfg(test)]
+        apply_injected_root_replacement(&self.root);
+
+        if dry_run {
+            let references_affected = plans
+                .iter()
+                .flat_map(|plan| plan.updates.iter().cloned())
+                .collect::<Vec<_>>();
             let mut result = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -163,14 +152,57 @@ impl Collection {
             if !warnings.is_empty() {
                 result["warnings"] = serde_json::Value::Array(warnings);
             }
+            if !ref_update_failures.is_empty() {
+                result["error"] = serde_json::json!({
+                    "code": RENAME_REF_UPDATE_FAILED,
+                    "message": "Some reference updates could not be prepared",
+                });
+                result["partial_updates"] = serde_json::json!({"failed": ref_update_failures});
+            }
             return result;
         }
 
+        if !self.rename_root_path_is_current() {
+            return op_error(
+                CONCURRENT_MODIFICATION,
+                "Collection root was replaced during rename",
+            );
+        }
+        if let Err(error) = prepare_record_parent_no_follow(self, &to_collection_path) {
+            return op_error(
+                "io_error",
+                &format!("Failed to prepare target folder safely: {error}"),
+            );
+        }
         if let Err(error) = ensure_revision(&from_path, &from, if_revision.as_deref()) {
             return error;
         }
+        let current_source = match crate::record_load::load_record_no_follow(self, &from) {
+            Ok(Some(current)) => current,
+            Ok(None) | Err(_) => {
+                return op_error(
+                    CONCURRENT_MODIFICATION,
+                    &format!("File '{from}' was modified externally"),
+                )
+            }
+        };
+        if current_source.facts().revision != source_entry.facts().revision {
+            return op_error(
+                CONCURRENT_MODIFICATION,
+                &format!("File '{from}' was modified externally"),
+            );
+        }
         if let Err(error) = ensure_no_symlink_components(&self.root, &from, self.spec_profile) {
             return error;
+        }
+        // The publication primitive below is ambient for cross-platform
+        // no-clobber semantics, so fence the public root again immediately
+        // before it is invoked.
+        if !self.rename_root_path_is_current() {
+            return op_error(
+                CONCURRENT_MODIFICATION,
+                "Collection root was replaced during rename",
+            );
         }
         if let Err(e) = atomic_rename_noclobber(&from_path, &to_path) {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -178,75 +210,48 @@ impl Collection {
             }
             let error_str = e.to_string();
             if error_str.contains("NUL") || error_str.contains("null") {
-                return op_error(INVALID_PATH, &format!("Invalid path: {}", e));
+                return op_error(INVALID_PATH, &format!("Invalid path: {e}"));
             }
-            return op_error("io_error", &format!("Failed to rename: {}", e));
+            return op_error("io_error", &format!("Failed to rename: {e}"));
         }
 
-        // Determine if we should update references
-        let mut references_updated: Vec<serde_json::Value> = Vec::new();
-        let mut warnings: Vec<serde_json::Value> = Vec::new();
-        let mut ref_update_failures: Vec<serde_json::Value> = Vec::new();
-
         if update_refs {
-            // Apply simulate.external_modify with timing: before_ref_update
-            // This is passed as "simulate_before_ref_update" in the input
             for sim in &simulate_before_ref_update {
                 let full = self.root.join(&sim.path);
-                if let Some(parent) = full.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                let prepared = crate::api::CollectionPath::new(&sim.path)
+                    .ok()
+                    .filter(|path| {
+                        self.rename_root_path_is_current()
+                            && prepare_record_parent_no_follow(self, path).is_ok()
+                    })
+                    .is_some_and(|_| self.rename_root_path_is_current());
+                if !prepared {
+                    continue;
                 }
-                let _ = crate::operations::atomic_write(&full, sim.content.as_bytes());
-                // Always bump mtime forward by 1 second to guarantee it
-                // differs from the pre-simulate value recorded by the
-                // test runner, regardless of filesystem granularity.
+                let _ = atomic_write_in_prepared_parent(&full, sim.content.as_bytes());
                 if let Ok(meta) = std::fs::metadata(&full) {
                     if let Ok(cur) = meta.modified() {
-                        let bumped = cur + std::time::Duration::from_secs(1);
-                        let times = std::fs::FileTimes::new().set_modified(bumped);
-                        if let Ok(f) = std::fs::File::options().write(true).open(&full) {
-                            let _ = f.set_times(times);
+                        let times = std::fs::FileTimes::new()
+                            .set_modified(cur + std::time::Duration::from_secs(1));
+                        if let Ok(file) = std::fs::File::options().write(true).open(&full) {
+                            let _ = file.set_times(times);
                         }
                     }
                 }
             }
+        }
 
-            // Record mtimes of all collection files before updating refs
-            let files = self.scan_collection_files();
-            let mut file_mtimes: std::collections::HashMap<String, std::time::SystemTime> =
-                std::collections::HashMap::new();
-            for file_path in &files {
-                if let Ok(meta) = std::fs::metadata(file_path) {
-                    if let Ok(mtime) = meta.modified() {
-                        let rel = file_path
-                            .strip_prefix(&self.root)
-                            .map(|p| p.to_string_lossy().to_string().replace('\\', "/"))
-                            .unwrap_or_default();
-                        file_mtimes.insert(rel, mtime);
-                    }
-                }
-            }
-
-            // Also check for last_known_ref_mtimes provided by the test runner
-            let ref_mtime_overrides = last_known_ref_mtimes.clone();
-
-            self.update_references_after_rename_with_mtime(
-                &from,
-                &to,
-                &source_id,
+        let mut references_updated = Vec::new();
+        if update_refs {
+            self.execute_reference_rewrites(
+                plans,
+                &last_known_ref_mtimes,
                 &mut references_updated,
-                &mut warnings,
                 &mut ref_update_failures,
-                &file_mtimes,
-                &ref_mtime_overrides,
-                false,
             );
         }
 
-        let mut result = serde_json::json!({
-            "from": from,
-            "to": to,
-        });
+        let mut result = serde_json::json!({"from": from, "to": to});
         if !references_updated.is_empty() {
             result["references_updated"] = serde_json::Value::Array(references_updated);
         }
@@ -256,205 +261,10 @@ impl Collection {
         if !ref_update_failures.is_empty() {
             result["error"] = serde_json::json!({
                 "code": RENAME_REF_UPDATE_FAILED,
-                "message": "Some reference updates failed due to concurrent modification",
+                "message": "Some reference updates failed",
             });
-            result["partial_updates"] = serde_json::json!({
-                "failed": ref_update_failures,
-            });
+            result["partial_updates"] = serde_json::json!({"failed": ref_update_failures});
         }
         result
-    }
-
-    /// Update references in all collection files after a rename (with mtime checking).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn update_references_after_rename_with_mtime(
-        &self,
-        from: &str,
-        to: &str,
-        source_id: &Option<String>,
-        references_updated: &mut Vec<serde_json::Value>,
-        warnings: &mut Vec<serde_json::Value>,
-        ref_update_failures: &mut Vec<serde_json::Value>,
-        recorded_mtimes: &std::collections::HashMap<String, std::time::SystemTime>,
-        mtime_overrides: &std::collections::HashMap<String, u64>,
-        dry_run: bool,
-    ) {
-        let from_stem = std::path::Path::new(from)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        let to_stem = std::path::Path::new(to)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        let from_no_ext = from
-            .strip_suffix(".md")
-            .or_else(|| from.strip_suffix(".mdx"))
-            .unwrap_or(from);
-        let to_no_ext = to
-            .strip_suffix(".md")
-            .or_else(|| to.strip_suffix(".mdx"))
-            .unwrap_or(to);
-        let ambiguous_stem_counts = self.collect_wikilink_stem_counts(from, !dry_run);
-
-        let files = self.scan_collection_files();
-
-        for file_path in &files {
-            let rel_path = match file_path.strip_prefix(&self.root) {
-                Ok(p) => p.to_string_lossy().to_string().replace('\\', "/"),
-                Err(_) => continue,
-            };
-
-            // Skip the old path (doesn't exist anymore)
-            if rel_path == from {
-                continue;
-            }
-
-            let content = match std::fs::read_to_string(file_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            // Rewrite parsing strips exactly one encoding marker and returns
-            // its state separately, so every write path can restore it.
-            let (doc, had_bom) = parse_document_for_rewrite(&content);
-            let source_dir = std::path::Path::new(&rel_path)
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let mut fm_changed = false;
-            let mut body_changed = false;
-            let mut pending_updates: Vec<serde_json::Value> = Vec::new();
-            let mut fm_yaml = match &doc.frontmatter {
-                Some(v @ serde_yaml::Value::Mapping(_)) => Some(v.clone()),
-                _ => None,
-            };
-
-            // Update frontmatter link fields (if mapping frontmatter exists).
-            if let Some(fm) = fm_yaml.as_mut() {
-                self.update_fm_links(
-                    fm,
-                    from,
-                    to,
-                    &from_stem,
-                    &to_stem,
-                    from_no_ext,
-                    to_no_ext,
-                    &source_dir,
-                    &rel_path,
-                    source_id,
-                    &ambiguous_stem_counts,
-                    &mut fm_changed,
-                    &mut pending_updates,
-                    warnings,
-                );
-            }
-
-            // Update body links
-            let mut new_body = doc.body.clone();
-            if self.update_body_links(
-                &mut new_body,
-                from,
-                to,
-                &from_stem,
-                &to_stem,
-                from_no_ext,
-                to_no_ext,
-                &source_dir,
-                source_id.as_deref(),
-            ) {
-                body_changed = true;
-                pending_updates.push(serde_json::json!({
-                    "path": rel_path,
-                    "location": "body",
-                }));
-            }
-
-            // Write back if changed
-            if fm_changed || body_changed {
-                if dry_run {
-                    references_updated.extend(pending_updates);
-                    continue;
-                }
-                // Check for concurrent modification before writing
-                let mtime_conflict = if let Some(&override_ms) = mtime_overrides.get(&rel_path) {
-                    // Use test-provided override mtime
-                    if let Ok(meta) = std::fs::metadata(file_path) {
-                        if let Ok(current) = meta.modified() {
-                            let current_ms = current
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as u64)
-                                .unwrap_or(0);
-                            current_ms != override_ms
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else if let Some(recorded) = recorded_mtimes.get(&rel_path) {
-                    // Use recorded mtime from before ref updates
-                    if let Ok(meta) = std::fs::metadata(file_path) {
-                        if let Ok(current) = meta.modified() {
-                            current != *recorded
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                if mtime_conflict {
-                    ref_update_failures.push(serde_json::json!({
-                        "path": rel_path,
-                        "reason": "concurrent_modification",
-                    }));
-                    continue;
-                }
-
-                let output = if fm_changed {
-                    let new_fm = fm_yaml
-                        .as_ref()
-                        .and_then(serde_yaml::Value::as_mapping)
-                        .expect("changed frontmatter is a mapping");
-                    serializer::serialize_document_with_bom(had_bom, new_fm, &new_body)
-                } else if doc.has_frontmatter {
-                    // A body-only edit must preserve valid or malformed
-                    // frontmatter bytes exactly, including delimiter style.
-                    let body_offset = content
-                        .len()
-                        .checked_sub(doc.body.len())
-                        .expect("parsed body is an exact document suffix");
-                    let mut output = String::with_capacity(body_offset + new_body.len());
-                    output.push_str(&content[..body_offset]);
-                    output.push_str(&new_body);
-                    output
-                } else {
-                    // Includes ordinary body-only files and the two-BOM case:
-                    // the first marker is restored while the second remains
-                    // part of `new_body` according to parser policy.
-                    serializer::serialize_document_with_bom(
-                        had_bom,
-                        &serde_yaml::Mapping::new(),
-                        &new_body,
-                    )
-                };
-                if let Err(e) = crate::operations::atomic_write(file_path, output.as_bytes()) {
-                    ref_update_failures.push(serde_json::json!({
-                        "path": rel_path,
-                        "reason": "io_error",
-                        "message": e.to_string(),
-                    }));
-                    continue;
-                }
-                references_updated.extend(pending_updates);
-            }
-        }
     }
 }

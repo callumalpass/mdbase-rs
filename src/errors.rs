@@ -59,6 +59,7 @@ pub const VALIDATION_FAILED: &str = "validation_failed";
 pub const PERMISSION_DENIED: &str = "permission_denied";
 pub const CONCURRENT_MODIFICATION: &str = "concurrent_modification";
 pub const PATH_TRAVERSAL: &str = "path_traversal";
+pub const FRONTMATTER_SERIALIZATION_FAILED: &str = "frontmatter_serialization_failed";
 
 // Rename Operations
 pub const RENAME_REF_UPDATE_FAILED: &str = "rename_ref_update_failed";
