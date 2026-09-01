@@ -342,15 +342,34 @@ impl CollectionRoot {
 
     pub(crate) fn open_lock_file(&self, relative: &Path) -> std::io::Result<std::fs::File> {
         let (parent, leaf) = split_parent(relative)?;
-        let dir = self.create_dir_all(parent)?;
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .follow(FollowSymlinks::No);
-        let file = dir.open_with(leaf, &options)?.into_std();
+        let file = (0..=20)
+            .find_map(|attempt| {
+                let opened = self.create_dir_all(parent).and_then(|dir| {
+                    let mut options = OpenOptions::new();
+                    options
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .follow(FollowSymlinks::No);
+                    dir.open_with(leaf, &options).map(|file| file.into_std())
+                });
+                match opened {
+                    Ok(file) => Some(Ok(file)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && attempt < 20 => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        None
+                    }
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "lock directory did not remain visible",
+                )
+            })?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || has_multiple_hard_links(&metadata) {
             return Err(std::io::Error::new(
@@ -538,6 +557,12 @@ fn collect_files(dir: &Dir, prefix: &Path, result: &mut Vec<PathBuf>) -> std::io
     for entry in dir.entries()? {
         let entry = entry?;
         let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with(".mdbase-publish-"))
+        {
+            continue;
+        }
         let kind = entry.file_type()?;
         let path = prefix.join(&name);
         if kind.is_symlink() {

@@ -4,7 +4,7 @@ use crate::runtime::{CollectionSnapshotResourceKind, OperationContext, ProviderE
 use crate::Collection;
 use notify::{
     event::{CreateKind, MetadataKind, ModifyKind, RemoveKind},
-    Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    Event, EventKind, RecursiveMode, Watcher,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -722,9 +722,9 @@ fn watch_loop(
     // `RecommendedWatcher` and test control both invoke this exact shared
     // callable instance. Tests never reconstruct the callback pipeline.
     let installed_callback = filesystem_callback.clone();
-    let mut watcher: RecommendedWatcher =
+    let mut watcher =
         match notify::recommended_watcher(move |event: Result<Event, notify::Error>| {
-            installed_callback(event);
+            installed_callback(event)
         }) {
             Ok(watcher) => watcher,
             Err(error) => {
@@ -799,6 +799,8 @@ fn watch_loop(
         match inputs.recv_timeout(wait) {
             Ok(WorkerInput::Command(Command::Stop)) => {
                 let _ = watcher.unwatch(&root);
+                #[cfg(windows)]
+                thread::sleep(Duration::from_millis(100));
                 return;
             }
             Ok(WorkerInput::Command(Command::Rescan(pending))) => {
