@@ -4,8 +4,10 @@ use crate::runtime::{CollectionSnapshotResourceKind, OperationContext, ProviderE
 use crate::Collection;
 use notify::{
     event::{CreateKind, MetadataKind, ModifyKind, RemoveKind},
-    Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    Event, EventKind, RecursiveMode, Watcher,
 };
+#[cfg(windows)]
+use notify::{Config as WatcherConfig, PollWatcher};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -722,16 +724,25 @@ fn watch_loop(
     // `RecommendedWatcher` and test control both invoke this exact shared
     // callable instance. Tests never reconstruct the callback pipeline.
     let installed_callback = filesystem_callback.clone();
-    let mut watcher: RecommendedWatcher =
-        match notify::recommended_watcher(move |event: Result<Event, notify::Error>| {
-            installed_callback(event);
-        }) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                let _ = ready.send(Err(error));
-                return;
-            }
-        };
+    let event_handler = move |event: Result<Event, notify::Error>| {
+        installed_callback(event);
+    };
+    #[cfg(not(windows))]
+    let watcher = notify::recommended_watcher(event_handler);
+    #[cfg(windows)]
+    let watcher = PollWatcher::new(
+        event_handler,
+        WatcherConfig::default()
+            .with_poll_interval(debounce.max(Duration::from_millis(20)))
+            .with_follow_symlinks(false),
+    );
+    let mut watcher = match watcher {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
     if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
         let _ = ready.send(Err(error));
         return;
