@@ -1,6 +1,6 @@
 {
   "rustSourceFileCountMax": 173,
-  "rustSourceLineCountMax": 100297,
+  "rustSourceLineCountMax": 100300,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-architecture-check/src/main.rs": 1188,
@@ -29,7 +29,7 @@
     "src/v03/type_pack.rs": 2135,
     "src/views/execute.rs": 1376,
     "src/views/expression.rs": 2965,
-    "src/watch/real.rs": 3220
+    "src/watch/real.rs": 3223
   },
   "deadCodeAllowancesByFile": {
     "crates/mdbase-command/src/lib.rs": 1,

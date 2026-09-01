@@ -797,7 +797,10 @@ fn watch_loop(
             .map(|deadline| deadline.saturating_duration_since(current_time).min(tick))
             .unwrap_or(tick);
         match inputs.recv_timeout(wait) {
-            Ok(WorkerInput::Command(Command::Stop)) => return,
+            Ok(WorkerInput::Command(Command::Stop)) => {
+                let _ = watcher.unwatch(&root);
+                return;
+            }
             Ok(WorkerInput::Command(Command::Rescan(pending))) => {
                 if pending.ticket.cancelled.load(Ordering::Acquire) {
                     pending.ticket.release();
