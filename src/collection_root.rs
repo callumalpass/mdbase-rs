@@ -538,6 +538,12 @@ fn collect_files(dir: &Dir, prefix: &Path, result: &mut Vec<PathBuf>) -> std::io
     for entry in dir.entries()? {
         let entry = entry?;
         let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with(".mdbase-publish-"))
+        {
+            continue;
+        }
         let kind = entry.file_type()?;
         let path = prefix.join(&name);
         if kind.is_symlink() {
