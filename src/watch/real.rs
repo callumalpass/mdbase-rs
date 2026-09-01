@@ -799,6 +799,8 @@ fn watch_loop(
         match inputs.recv_timeout(wait) {
             Ok(WorkerInput::Command(Command::Stop)) => {
                 let _ = watcher.unwatch(&root);
+                #[cfg(windows)]
+                thread::sleep(Duration::from_millis(100));
                 return;
             }
             Ok(WorkerInput::Command(Command::Rescan(pending))) => {
