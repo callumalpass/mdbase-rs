@@ -411,6 +411,21 @@ impl CanonicalOperationOutcome {
         }
     }
 
+    /// Mutably access the primary record produced by a completed record
+    /// mutation. Hosted providers use this narrow typed seam to replace staged
+    /// filesystem metadata with the authoritative commit metadata before
+    /// durable receipt publication.
+    pub fn record_mutation_value_mut(&mut self) -> Option<&mut RecordDocument> {
+        match &mut self.value {
+            CanonicalOperationValue::Create(Some(record))
+            | CanonicalOperationValue::Update(Some(record)) => Some(record),
+            CanonicalOperationValue::Rename(Some(CanonicalRenameValue::Renamed(result))) => {
+                Some(&mut result.result.document)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn read(outcome: crate::api::OperationOutcome<RecordDocument>) -> Self {
         Self {
             valid: true,
@@ -1071,6 +1086,34 @@ mod tests {
         let typed = CanonicalOperationOutcome::recover_v03(kind, wire.clone()).unwrap();
         assert_eq!(typed.to_v03(), wire);
         typed
+    }
+
+    #[test]
+    fn hosted_commit_metadata_replaces_only_completed_record_mutations() {
+        let mut renamed = record("after.md");
+        let renamed = renamed.as_object_mut().unwrap();
+        renamed.insert("from".to_string(), json!("before.md"));
+        renamed.insert("to".to_string(), json!("after.md"));
+
+        for (kind, result) in [
+            (OperationKind::Create, record("created.md")),
+            (OperationKind::Update, record("updated.md")),
+            (OperationKind::Rename, Value::Object(renamed.clone())),
+        ] {
+            let mut outcome = roundtrip(kind, result);
+            outcome
+                .record_mutation_value_mut()
+                .expect("completed record mutation")
+                .file
+                .mtime = "2026-02-02T00:00:00.123456Z".to_string();
+            assert_eq!(
+                outcome.to_v03().result["file"]["mtime"],
+                "2026-02-02T00:00:00.123456Z"
+            );
+        }
+
+        let mut read = roundtrip(OperationKind::Read, record("read.md"));
+        assert!(read.record_mutation_value_mut().is_none());
     }
 
     #[test]
