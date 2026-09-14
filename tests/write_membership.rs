@@ -448,9 +448,9 @@ fn inferred_selection_validates_auxiliary_types_and_propagates_match_errors() {
             ),
         );
         if throwing {
-            add_throwing_type(root.path(), "aux");
+            add_throwing_type(root.path(), "secondary");
         } else {
-            write(root.path(), "_types/aux.md", "---\nkind: mdbase.type\nname: aux\nmatch:\n  where: {kind: note}\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object, required: [extra]}\n---\n");
+            write(root.path(), "_types/secondary.md", "---\nkind: mdbase.type\nname: secondary\nmatch:\n  where: {kind: note}\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object, required: [extra]}\n---\n");
         }
         let collection = Collection::open(root.path()).unwrap();
         let result = collection.v03_operations().unwrap().create(
