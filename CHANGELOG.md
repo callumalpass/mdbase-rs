@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- Permit selected-type and contract-selected creates in collections with empty
+  explicit membership keys when final persisted data matches the selection.
+  Retain auxiliary-type validation, matching errors, lifecycle membership checks,
+  and explicit-declaration preservation when declaration keys are configured.
+- Apply empty-list write policy before final create membership validation.
+
 ### Breaking
 
 - Context-free JSON `Collection` create/update/delete/rename/backfill/batch

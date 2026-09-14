@@ -798,6 +798,11 @@ fn shared_v03_core_collection_fixture_passes() {
 }
 
 #[test]
+fn shared_v03_optional_membership_fixture_passes() {
+    run_suite("core/optional-membership.yaml", "core_collection", 9);
+}
+
+#[test]
 fn shared_v03_lifecycle_fixture_passes() {
     run_suite("lifecycle/lifecycle.yaml", "lifecycle", 7);
 }

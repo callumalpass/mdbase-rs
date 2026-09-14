@@ -45,43 +45,33 @@ impl ResolvedWriteMembership {
             path,
         )?;
         let selected = designated.as_ref().or(requested.as_ref());
-        let initially_explicit = declarations_present || selected.is_some();
+        let initially_explicit = declarations_present
+            || (selected.is_some() && !collection.settings.explicit_type_keys.is_empty());
 
         // Freeze one clock even for explicit authority. If a later stage erases the
         // declaration, the diagnostic classification must not observe a new time.
         let evaluation_clock = capture_clock(collection, path)?;
-        let mut types = if declarations_present || selected.is_some() {
+        let mut types = if initially_explicit {
             if let Some(name) = selected {
                 explicit.push(name.clone());
             }
             canonicalize(&mut explicit);
             explicit
         } else {
-            implicit_membership(collection, draft, path, &evaluation_clock)?
+            let mut inferred = implicit_membership(collection, draft, path, &evaluation_clock)?;
+            // A request selects the schema/lifecycle and derived-path owner, not
+            // a mandatory frontmatter representation. Final serialization must
+            // still classify as every frozen type, including this selection.
+            if let Some(name) = selected {
+                inferred.push(name.clone());
+                canonicalize(&mut inferred);
+            }
+            inferred
         };
 
-        if let Some(name) = selected {
-            if collection.settings.explicit_type_keys.is_empty() {
-                return Err(vec![persistence_failure(
-                    path,
-                    &types,
-                    &[],
-                    "No explicit type keys are configured.",
-                )]);
-            }
+        if let Some(name) = selected.filter(|_| initially_explicit) {
             persist_selected(collection, draft, name, path)?;
-            let reopened = match classify(collection, draft, path, Some(&evaluation_clock)) {
-                Ok(reopened) => reopened,
-                Err(_) if collection.settings.explicit_type_keys.is_empty() => {
-                    return Err(vec![persistence_failure(
-                        path,
-                        &types,
-                        &[],
-                        "No explicit type keys are configured and implicit reopen classification failed.",
-                    )]);
-                }
-                Err(errors) => return Err(errors),
-            };
+            let reopened = classify(collection, draft, path, Some(&evaluation_clock))?;
             if reopened != types {
                 return Err(vec![changed(
                     "type_membership_persistence_failed",
@@ -582,24 +572,6 @@ fn authority_changed(path: &str, before: &[String], after: &[String]) -> Diagnos
     diagnostic
 }
 
-fn persistence_failure(
-    path: &str,
-    before: &[String],
-    after: &[String],
-    reason: &str,
-) -> Diagnostic {
-    let mut d = changed(
-        "type_membership_persistence_failed",
-        "Configured type membership cannot be persisted for this record.",
-        path,
-        before,
-        after,
-    );
-    if let Some(Value::Object(details)) = &mut d.details {
-        details.insert("reason".to_string(), Value::String(reason.to_string()));
-    }
-    d
-}
 fn changed(
     code: &str,
     message: &str,
