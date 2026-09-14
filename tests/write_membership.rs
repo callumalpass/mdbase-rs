@@ -377,7 +377,7 @@ fn unknown_explicit_membership_fails_without_writing() {
 }
 
 #[test]
-fn selected_membership_without_keys_never_reopens_implicitly() {
+fn selected_membership_without_keys_requires_a_matching_rule() {
     let root = fixture("kind");
     write(root.path(), "mdbase.yaml", "spec_version: \"0.3.0\"\nsettings:\n  contracts_folder: contracts\n  explicit_type_keys: []\n");
     let collection = Collection::open(root.path()).unwrap();
@@ -385,10 +385,7 @@ fn selected_membership_without_keys_never_reopens_implicitly() {
         "path":"no.md", "type":"note", "frontmatter":{"kind":"note","title":"matches"}
     }));
     assert!(!result.valid);
-    assert_eq!(
-        result.diagnostics[0].code,
-        "type_membership_persistence_failed"
-    );
+    assert_eq!(result.diagnostics[0].code, "type_membership_changed");
     assert!(!root.path().join("no.md").exists());
     drop(collection);
     let reopened = Collection::open(root.path()).unwrap();
@@ -399,6 +396,72 @@ fn selected_membership_without_keys_never_reopens_implicitly() {
             .read(&json!({"path":"no.md"}))
             .valid
     );
+}
+
+#[test]
+fn inferred_selection_reopens_without_writing_a_membership_key() {
+    for contract in [false, true] {
+        let root = fixture("");
+        let source = fs::read_to_string(root.path().join("_types/note.md")).unwrap();
+        write(
+            root.path(),
+            "_types/note.md",
+            &source.replace(
+                "version: 1\n",
+                "version: 1\nmatch:\n  where: {kind: note}\n",
+            ),
+        );
+        let collection = Collection::open(root.path()).unwrap();
+        let mut request = json!({"path":"yes.md", "type":"note", "frontmatter":{"kind":"note","title":"matches","type":"article-journal"}});
+        if contract {
+            request["contract"] = json!("example.note");
+            request["contract_version"] = json!("1.0.0");
+        }
+        let result = collection.v03_operations().unwrap().create(&request);
+        assert!(result.valid, "{result:?}");
+        drop(collection);
+        let reopened = Collection::open(root.path()).unwrap();
+        let read = reopened
+            .v03_operations()
+            .unwrap()
+            .read(&json!({"path":"yes.md"}));
+        assert!(read.valid, "{read:?}");
+        assert_eq!(read.result["types"], json!(["note"]));
+        assert_eq!(read.result["frontmatter"]["type"], "article-journal");
+        assert!(read.result["frontmatter"].get("types").is_none());
+        assert!(read.result["frontmatter"].get("mdbase_type").is_none());
+    }
+}
+
+#[test]
+fn inferred_selection_validates_auxiliary_types_and_propagates_match_errors() {
+    for throwing in [false, true] {
+        let root = fixture("");
+        write(root.path(), "mdbase.yaml", "spec_version: '0.3.0'\nsettings:\n  contracts_folder: contracts\n  explicit_type_keys: []\n  default_validation: error\n");
+        let source = fs::read_to_string(root.path().join("_types/note.md")).unwrap();
+        write(
+            root.path(),
+            "_types/note.md",
+            &source.replace(
+                "version: 1\n",
+                "version: 1\nmatch:\n  where: {kind: note}\n",
+            ),
+        );
+        if throwing {
+            add_throwing_type(root.path(), "aux");
+        } else {
+            write(root.path(), "_types/aux.md", "---\nkind: mdbase.type\nname: aux\nmatch:\n  where: {kind: note}\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object, required: [extra]}\n---\n");
+        }
+        let collection = Collection::open(root.path()).unwrap();
+        let result = collection.v03_operations().unwrap().create(
+            &json!({"path":"no.md","type":"note","frontmatter":{"kind":"note","title":"matches"}}),
+        );
+        assert!(!result.valid, "{result:?}");
+        assert!(!root.path().join("no.md").exists());
+        if throwing {
+            assert_eq!(result.diagnostics[0].code, "expression_evaluation_error");
+        }
+    }
 }
 
 #[test]

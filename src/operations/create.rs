@@ -413,6 +413,9 @@ impl Collection {
         if self.settings.write_nulls == "omit" {
             write_obj.retain(|_, v| !v.is_null());
         }
+        if !self.settings.write_empty_lists {
+            write_obj.retain(|_, v| !v.as_array().is_some_and(Vec::is_empty));
+        }
         if let Some(membership) = &membership {
             if let Err(diagnostics) = membership.revalidate(self, &write_obj, path.as_str()) {
                 return Err(crate::mutation::MutationFailure::diagnostics(diagnostics));
