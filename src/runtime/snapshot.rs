@@ -59,6 +59,34 @@ pub struct CollectionSnapshotRecord {
 }
 
 impl Collection {
+    /// Classify path-owned resources without reading record contents. Shared by
+    /// snapshot capture and the ordinary-file namespace boundary.
+    pub(crate) fn structural_resource_kind(
+        &self,
+        portable: &str,
+    ) -> Option<CollectionSnapshotResourceKind> {
+        let path = std::path::Path::new(portable);
+        let extension = path.extension().and_then(|value| value.to_str());
+        if matches!(portable, "mdbase.lock.yaml" | "mdbase.provisions.yaml") {
+            Some(CollectionSnapshotResourceKind::Lock)
+        } else if path.starts_with(&self.settings().types_folder)
+            && matches!(extension, Some("md" | "yaml" | "yml"))
+        {
+            Some(CollectionSnapshotResourceKind::Type)
+        } else if path.starts_with(&self.settings().contracts_folder) && extension == Some("md") {
+            Some(CollectionSnapshotResourceKind::Contract)
+        } else if extension == Some("json") && is_schema_resource_path(portable) {
+            Some(CollectionSnapshotResourceKind::Schema)
+        } else if extension == Some("base")
+            && !crate::record_path::has_hidden_component(portable)
+            && crate::views::is_configured_obsidian_source(self, portable)
+        {
+            Some(CollectionSnapshotResourceKind::View)
+        } else {
+            None
+        }
+    }
+
     /// Capture canonical resources and records from this loaded collection.
     ///
     /// Long-running hosts should normally call [`super::FilesystemProvider::snapshot`],
@@ -163,34 +191,7 @@ fn collection_snapshot(
     {
         context.check()?;
         let portable = path.to_string_lossy().replace('\\', "/");
-        let kind = if matches!(
-            portable.as_str(),
-            "mdbase.lock.yaml" | "mdbase.provisions.yaml"
-        ) {
-            Some(CollectionSnapshotResourceKind::Lock)
-        } else if path.starts_with(&collection.settings().types_folder)
-            && matches!(
-                path.extension().and_then(|value| value.to_str()),
-                Some("md" | "yaml" | "yml")
-            )
-        {
-            Some(CollectionSnapshotResourceKind::Type)
-        } else if path.starts_with(&collection.settings().contracts_folder)
-            && path.extension().and_then(|value| value.to_str()) == Some("md")
-        {
-            Some(CollectionSnapshotResourceKind::Contract)
-        } else if path.extension().and_then(|value| value.to_str()) == Some("json")
-            && is_schema_resource_path(&portable)
-        {
-            Some(CollectionSnapshotResourceKind::Schema)
-        } else if path.extension().and_then(|value| value.to_str()) == Some("base")
-            && !crate::record_path::has_hidden_component(&portable)
-            && crate::views::is_configured_obsidian_source(collection, &portable)
-        {
-            Some(CollectionSnapshotResourceKind::View)
-        } else {
-            None
-        };
+        let kind = collection.structural_resource_kind(&portable);
         if let Some(kind) = kind {
             resource_entries =
                 resource_entries
