@@ -239,23 +239,32 @@ mod tests {
                 fs::create_dir(root.path().join("detour")).unwrap();
                 fs::write(root.path().join("detour/unrelated.json"), "{}").unwrap();
             }
+            let reference = "../detour/../schema.json";
+            let source_resolves = crate::v03::resolve_schema_ref(
+                reference,
+                &root.path().join("_types/task.md"),
+                root.path(),
+            )
+            .is_ok();
             let authority = CollectionRoot::acquire(root.path()).unwrap();
             let staged = stage(&authority, Path::new("_types"), |_| true).unwrap();
-            assert_eq!(
-                staged
-                    .path()
-                    .join("_types/../detour/../schema.json")
-                    .canonicalize()
-                    .is_ok(),
-                exists
-            );
+            let staged_resolves = crate::v03::resolve_schema_ref(
+                reference,
+                &staged.path().join("_types/task.md"),
+                staged.path(),
+            )
+            .is_ok();
+            // Path canonicalization differs across platforms when the cancelled
+            // component is missing. Scoped staging must preserve the platform's
+            // source behavior rather than impose Unix semantics on Windows.
+            assert_eq!(staged_resolves, source_resolves);
             assert!(!staged.path().join("detour/unrelated.json").exists());
-            if exists {
+            if source_resolves {
                 let collection = crate::Collection::open(root.path()).unwrap();
                 assert!(collection.types.contains_key("task"));
                 let shadow = crate::mutation::shadow::shadow_collection(&collection).unwrap();
                 assert!(shadow.collection.types.contains_key("task"));
-                assert!(shadow.directory.path().join("detour").is_dir());
+                assert_eq!(shadow.directory.path().join("detour").is_dir(), exists);
                 assert!(!shadow
                     .directory
                     .path()
