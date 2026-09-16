@@ -106,31 +106,14 @@ pub(crate) fn load_types_with_warnings_held(
     types_folder: &str,
     migrations_folder: &str,
 ) -> Result<LoadTypesResult, String> {
-    let staging = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let types = Path::new(types_folder);
-    for relative in root
-        .files_recursive(Path::new(""))
-        .map_err(|error| error.to_string())?
-    {
-        // Schema references are permitted to target JSON resources elsewhere
-        // below the collection root. Snapshot those alongside type documents.
-        if !relative.starts_with(types)
-            && relative.extension().and_then(|value| value.to_str()) != Some("json")
-        {
-            continue;
-        }
-        let bytes = root.read(&relative).map_err(|error| {
-            format!(
-                "Failed to read type resource '{}': {error}",
-                relative.display()
+    let staging = crate::definition_stage::stage(root, Path::new(types_folder), |path| {
+        !path.starts_with(migrations_folder)
+            && matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("md" | "yaml" | "yml")
             )
-        })?;
-        let destination = staging.path().join(&relative);
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        std::fs::write(destination, bytes).map_err(|error| error.to_string())?;
-    }
+    })
+    .map_err(|error| error.to_string())?;
     load_types_with_warnings(staging.path(), types_folder, migrations_folder)
 }
 

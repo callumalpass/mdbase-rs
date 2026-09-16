@@ -19,6 +19,7 @@ mod collection_root;
 pub(crate) mod compat;
 pub mod config;
 pub mod data_contracts;
+mod definition_stage;
 pub(crate) mod diagnostic;
 pub mod expressions;
 pub mod field_reference;

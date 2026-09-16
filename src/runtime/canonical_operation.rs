@@ -676,6 +676,28 @@ impl CanonicalOperationOutcome {
             OperationKind::Delete => CanonicalOperationValue::Delete(None),
             OperationKind::Rename => CanonicalOperationValue::Rename(None),
             OperationKind::Batch => CanonicalOperationValue::Batch(None),
+            OperationKind::AssessTypePack => CanonicalOperationValue::AssessTypePack(None),
+            OperationKind::ApplyTypePack => CanonicalOperationValue::ApplyTypePack(None),
+            OperationKind::AssessCollectionSetup => {
+                CanonicalOperationValue::AssessCollectionSetup(None)
+            }
+            OperationKind::ApplyCollectionSetup => {
+                CanonicalOperationValue::ApplyCollectionSetup(None)
+            }
+            OperationKind::CreateViewSource
+            | OperationKind::UpdateViewSource
+            | OperationKind::DeleteViewSource => {
+                CanonicalOperationValue::ViewResourceMutation(CanonicalResourceOperationValue {
+                    operation,
+                    result: serde_json::json!({}),
+                })
+            }
+            OperationKind::CreateType | OperationKind::UpdateType => {
+                CanonicalOperationValue::TypeResourceMutation(CanonicalResourceOperationValue {
+                    operation,
+                    result: serde_json::json!({}),
+                })
+            }
             _ => unreachable!("typed invalid outcomes are migrated operations"),
         };
         Self {
@@ -1380,6 +1402,37 @@ mod tests {
                 serde_json::from_value(serde_json::to_value(&typed).unwrap()).unwrap();
             assert_eq!(replay, typed);
             assert_eq!(replay.to_v03(), typed.to_v03());
+        }
+    }
+
+    #[test]
+    fn resource_and_definition_commit_conflicts_remain_typed_rejections() {
+        for kind in [
+            OperationKind::AssessTypePack,
+            OperationKind::ApplyTypePack,
+            OperationKind::AssessCollectionSetup,
+            OperationKind::ApplyCollectionSetup,
+            OperationKind::CreateViewSource,
+            OperationKind::UpdateViewSource,
+            OperationKind::DeleteViewSource,
+            OperationKind::CreateType,
+            OperationKind::UpdateType,
+        ] {
+            let outcome = CanonicalOperationOutcome::invalid(
+                kind,
+                vec![WireDiagnostic::error(
+                    "concurrent_modification",
+                    "Changed after preparation",
+                    Some("mdbase.yaml".into()),
+                )
+                .into()],
+            );
+            assert_eq!(outcome.operation_kind(), Some(kind));
+            assert!(!outcome.to_v03().valid);
+            assert_eq!(outcome.to_v03().result, json!({}));
+            let replay: CanonicalOperationOutcome =
+                serde_json::from_value(serde_json::to_value(&outcome).unwrap()).unwrap();
+            assert_eq!(replay, outcome);
         }
     }
 

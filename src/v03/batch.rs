@@ -84,6 +84,9 @@ pub(crate) fn prepare_single_runtime(
     if matches!(operation, "create" | "update" | "delete") {
         return prepare_sparse_runtime(collection, operation, input, context);
     }
+    if operation == "apply_collection_setup" {
+        return super::collection_setup::prepare_runtime(collection, input, context);
+    }
 
     let before = collection.snapshot_with_context(context)?;
     context.check()?;
@@ -202,7 +205,6 @@ fn execute_non_record_runtime_operation(
         "create_type" => operations.create_type(input),
         "update_type" => operations.update_type(input),
         "apply_type_pack" => execute_type_pack(operations.collection(), input),
-        "apply_collection_setup" => execute_collection_setup(operations.collection(), input),
         _ => failed(vec![Diagnostic::error(
             "invalid_request",
             format!("Unsupported mutation operation '{operation}'."),
@@ -223,21 +225,6 @@ fn execute_type_pack(collection: &Collection, input: &Value) -> OperationResult 
     match (provision, options) {
         (Some(provision), Some(options)) => collection.apply_type_pack(&provision, &options),
         _ => invalid_request("Type-pack apply input requires valid provision and options."),
-    }
-}
-
-fn execute_collection_setup(collection: &Collection, input: &Value) -> OperationResult {
-    let setup = input
-        .get("setup")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<super::CollectionSetup>(value).ok());
-    let options = input
-        .get("options")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<super::CollectionSetupApplyOptions>(value).ok());
-    match (setup, options) {
-        (Some(setup), Some(options)) => collection.apply_collection_setup(&setup, &options),
-        _ => invalid_request("Collection setup apply input requires valid setup and options."),
     }
 }
 
@@ -1321,13 +1308,24 @@ mod tests {
         );
         write(
             &source.path().join("_types/note.md"),
-            "---\nkind: mdbase.type\nname: note\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n",
+            "---\nkind: mdbase.type\nname: note\nschema:\n  dialect: json-schema-2020-12\n  ref: ../schema.json\n---\n",
         );
         write(&source.path().join("visible.md"), "---\ntype: note\n---\n");
         write(
             &source.path().join("schema.json"),
             "{\"type\":\"object\"}\n",
         );
+        write(&source.path().join("_types/nested.md"),
+            "---\nkind: mdbase.type\nname: nested\nschema:\n  dialect: json-schema-2020-12\n  ref: ./nested.json\n---\n");
+        write(
+            &source.path().join("_types/nested.json"),
+            "{\"type\":\"object\"}",
+        );
+        write(
+            &source.path().join("_types/unrelated.json"),
+            "must not copy",
+        );
+        write(&source.path().join("unrelated.json"), "must not copy");
         write(&source.path().join(".git/large.md"), "must not copy");
         write(
             &source.path().join("nested/mdbase.yaml"),
@@ -1351,6 +1349,9 @@ mod tests {
         assert!(root.join("_types/note.md").is_file());
         assert!(root.join("visible.md").is_file());
         assert!(root.join("schema.json").is_file());
+        assert!(root.join("_types/nested.json").is_file());
+        assert!(!root.join("_types/unrelated.json").exists());
+        assert!(!root.join("unrelated.json").exists());
         assert!(root.join("views/configured.base").is_file());
         assert!(!root.join("unconfigured.base").exists());
         assert!(!root.join("private/excluded.base").exists());

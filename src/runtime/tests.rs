@@ -551,6 +551,10 @@ fn provider_snapshot_classifies_only_valid_canonical_markdown_views_as_resources
     )
     .unwrap();
     fs::write(
+        directory.path().join("views/lookalike.md"),
+        "---\ntype: [view]\nid: lookalike\nversion: 1\nname: Not a view resource\nviews:\n  - id: all\n    name: All\n---\n",
+    ).unwrap();
+    fs::write(
         directory.path().join("note.md"),
         "---\ntitle: Ordinary note\n---\nBody\n",
     )
@@ -579,7 +583,12 @@ fn provider_snapshot_classifies_only_valid_canonical_markdown_views_as_resources
             .iter()
             .map(|record| record.path.as_str())
             .collect::<Vec<_>>(),
-        ["broken.md", "note.md", "views/invalid.md"]
+        [
+            "broken.md",
+            "note.md",
+            "views/invalid.md",
+            "views/lookalike.md"
+        ]
     );
     assert_eq!(
         snapshot.records[0].frontmatter_error.as_deref(),

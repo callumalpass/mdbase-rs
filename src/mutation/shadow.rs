@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::diagnostic::Diagnostic;
 use crate::runtime::{OperationContext, ProviderError};
@@ -18,10 +18,12 @@ pub(crate) fn shadow_collection(
 ) -> Result<ShadowCollection, Box<Diagnostic>> {
     #[cfg(test)]
     crate::mutation::probe_full_shadow();
-    shadow_collection_inner(collection, None).map_err(|error| match error {
-        RuntimeBatchError::Diagnostic(diagnostic) => diagnostic,
-        RuntimeBatchError::Provider(error) => {
-            Box::new(Diagnostic::error(error.code(), error.to_string(), None))
+    shadow_collection_inner(collection, &OperationContext::current_or_legacy()).map_err(|error| {
+        match error {
+            RuntimeBatchError::Diagnostic(diagnostic) => diagnostic,
+            RuntimeBatchError::Provider(error) => {
+                Box::new(Diagnostic::error(error.code(), error.to_string(), None))
+            }
         }
     })
 }
@@ -32,7 +34,7 @@ pub(crate) fn shadow_collection_context(
 ) -> Result<ShadowCollection, ProviderError> {
     #[cfg(test)]
     crate::mutation::probe_full_shadow();
-    shadow_collection_inner(collection, Some(context)).map_err(|error| match error {
+    shadow_collection_inner(collection, context).map_err(|error| match error {
         RuntimeBatchError::Diagnostic(diagnostic) => {
             ProviderError::CollectionOpen(diagnostic.message.clone())
         }
@@ -47,11 +49,9 @@ enum RuntimeBatchError {
 
 fn shadow_collection_inner(
     collection: &Collection,
-    context: Option<&OperationContext>,
+    context: &OperationContext,
 ) -> Result<ShadowCollection, RuntimeBatchError> {
-    if let Some(context) = context {
-        context.check().map_err(RuntimeBatchError::Provider)?;
-    }
+    context.check().map_err(RuntimeBatchError::Provider)?;
     let directory = tempfile::tempdir().map_err(|error| {
         RuntimeBatchError::Diagnostic(Box::new(Diagnostic::error(
             "batch_preflight_failed",
@@ -77,7 +77,7 @@ fn shadow_collection_inner(
 fn copy_collection(
     collection: &Collection,
     destination: &Path,
-    context: Option<&OperationContext>,
+    context: &OperationContext,
 ) -> Result<crate::transactions::FileBaseline, RuntimeBatchError> {
     let mut baseline = BTreeMap::new();
     let mut captured_entries = 0_u64;
@@ -87,27 +87,29 @@ fn copy_collection(
         .map_err(|error| {
             RuntimeBatchError::Diagnostic(Box::new(copy_error(Path::new(""), error)))
         })?;
+    let schemas = referenced_schemas(collection, &files, context)?;
+    schemas
+        .stage_directories(collection.held_root(), destination)
+        .map_err(|error| {
+            RuntimeBatchError::Diagnostic(Box::new(copy_error(Path::new(""), error)))
+        })?;
     for relative in files {
-        if let Some(context) = context {
-            context.check().map_err(RuntimeBatchError::Provider)?;
-        }
-        if !should_copy_file(collection, &relative)
+        context.check().map_err(RuntimeBatchError::Provider)?;
+        if !should_copy_file(collection, &relative, &schemas.files)
             || below_nested_collection(collection, &relative)
         {
             continue;
         }
-        if let Some(context) = context {
-            captured_entries = captured_entries.checked_add(1).ok_or({
-                RuntimeBatchError::Provider(ProviderError::CaptureLimitExceeded(
-                    crate::runtime::CaptureLimitExceeded {
-                        kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
-                        limit: u64::MAX,
-                        attempted: u64::MAX,
-                    },
-                ))
-            })?;
-            charge_capture_path(context, &relative, captured_entries)?;
-        }
+        captured_entries = captured_entries.checked_add(1).ok_or({
+            RuntimeBatchError::Provider(ProviderError::CaptureLimitExceeded(
+                crate::runtime::CaptureLimitExceeded {
+                    kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                    limit: u64::MAX,
+                    attempted: u64::MAX,
+                },
+            ))
+        })?;
+        charge_capture_path(context, &relative, captured_entries)?;
         let target = destination.join(&relative);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|error| {
@@ -126,19 +128,21 @@ fn copy_collection(
 pub(crate) fn collect_collection_files(
     collection: &Collection,
 ) -> Result<crate::transactions::FileBaseline, Box<Diagnostic>> {
-    collect_collection_files_inner(collection, None).map_err(|error| match error {
-        RuntimeBatchError::Diagnostic(diagnostic) => diagnostic,
-        RuntimeBatchError::Provider(error) => {
-            Box::new(Diagnostic::error(error.code(), error.to_string(), None))
-        }
-    })
+    collect_collection_files_inner(collection, &OperationContext::current_or_legacy()).map_err(
+        |error| match error {
+            RuntimeBatchError::Diagnostic(diagnostic) => diagnostic,
+            RuntimeBatchError::Provider(error) => {
+                Box::new(Diagnostic::error(error.code(), error.to_string(), None))
+            }
+        },
+    )
 }
 
 pub(crate) fn collect_collection_files_context(
     collection: &Collection,
     context: &OperationContext,
 ) -> Result<crate::transactions::FileBaseline, ProviderError> {
-    collect_collection_files_inner(collection, Some(context)).map_err(|error| match error {
+    collect_collection_files_inner(collection, context).map_err(|error| match error {
         RuntimeBatchError::Diagnostic(diagnostic) => {
             ProviderError::CollectionOpen(diagnostic.message.clone())
         }
@@ -148,7 +152,7 @@ pub(crate) fn collect_collection_files_context(
 
 fn collect_collection_files_inner(
     collection: &Collection,
-    context: Option<&OperationContext>,
+    context: &OperationContext,
 ) -> Result<crate::transactions::FileBaseline, RuntimeBatchError> {
     let mut files = BTreeMap::new();
     let mut captured_entries = 0_u64;
@@ -158,25 +162,22 @@ fn collect_collection_files_inner(
         .map_err(|error| {
             RuntimeBatchError::Diagnostic(Box::new(copy_error(Path::new(""), error)))
         })?;
+    let schemas = referenced_schemas(collection, &paths, context)?;
     for relative in paths {
-        if let Some(context) = context {
-            context.check().map_err(RuntimeBatchError::Provider)?;
-        }
-        if should_copy_file(collection, &relative)
+        context.check().map_err(RuntimeBatchError::Provider)?;
+        if should_copy_file(collection, &relative, &schemas.files)
             && !below_nested_collection(collection, &relative)
         {
-            if let Some(context) = context {
-                captured_entries = captured_entries.checked_add(1).ok_or({
-                    RuntimeBatchError::Provider(ProviderError::CaptureLimitExceeded(
-                        crate::runtime::CaptureLimitExceeded {
-                            kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
-                            limit: u64::MAX,
-                            attempted: u64::MAX,
-                        },
-                    ))
-                })?;
-                charge_capture_path(context, &relative, captured_entries)?;
-            }
+            captured_entries = captured_entries.checked_add(1).ok_or({
+                RuntimeBatchError::Provider(ProviderError::CaptureLimitExceeded(
+                    crate::runtime::CaptureLimitExceeded {
+                        kind: crate::runtime::CaptureLimitKind::ArithmeticOverflow,
+                        limit: u64::MAX,
+                        attempted: u64::MAX,
+                    },
+                ))
+            })?;
+            charge_capture_path(context, &relative, captured_entries)?;
             let bytes = read_capture_file(collection, &relative, context)?;
             files.insert(portable_path(&relative), bytes);
         }
@@ -202,20 +203,12 @@ fn charge_capture_path(
 fn read_capture_file(
     collection: &Collection,
     relative: &Path,
-    context: Option<&OperationContext>,
+    context: &OperationContext,
 ) -> Result<Vec<u8>, RuntimeBatchError> {
     let mut file = collection
         .held_root()
         .open_file(relative)
         .map_err(|error| RuntimeBatchError::Diagnostic(Box::new(copy_error(relative, error))))?;
-    if context.is_none() {
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|error| {
-            RuntimeBatchError::Diagnostic(Box::new(copy_error(relative, error)))
-        })?;
-        return Ok(bytes);
-    }
-    let context = context.unwrap();
     let size = file
         .metadata()
         .map_err(|error| RuntimeBatchError::Diagnostic(Box::new(copy_error(relative, error))))?
@@ -292,7 +285,32 @@ fn below_nested_collection(collection: &Collection, path: &Path) -> bool {
     false
 }
 
-fn should_copy_file(collection: &Collection, relative: &Path) -> bool {
+fn referenced_schemas(
+    collection: &Collection,
+    paths: &[PathBuf],
+    context: &OperationContext,
+) -> Result<crate::definition_stage::SchemaDependencies, RuntimeBatchError> {
+    let mut schemas = crate::definition_stage::SchemaDependencies::default();
+    for path in paths {
+        if (path.starts_with(&collection.settings.types_folder)
+            || path.starts_with(&collection.settings.contracts_folder))
+            && !path.starts_with(&collection.settings.migrations_folder)
+            && matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("md" | "yaml" | "yml")
+            )
+            && !below_nested_collection(collection, path)
+        {
+            schemas.extend(crate::definition_stage::schema_dependencies(
+                path,
+                &read_capture_file(collection, path, context)?,
+            ));
+        }
+    }
+    Ok(schemas)
+}
+
+fn should_copy_file(collection: &Collection, relative: &Path, schemas: &BTreeSet<PathBuf>) -> bool {
     if relative == Path::new("mdbase.yaml") {
         return true;
     }
@@ -302,6 +320,9 @@ fn should_copy_file(collection: &Collection, relative: &Path) -> bool {
     if relative == Path::new("mdbase.provisions.yaml") {
         return true;
     }
+    if schemas.contains(relative) {
+        return true;
+    }
     let extension = relative.extension().and_then(|value| value.to_str());
     if relative.starts_with(Path::new(&collection.settings.migrations_folder)) {
         return matches!(extension, Some("md" | "json"));
@@ -309,7 +330,7 @@ fn should_copy_file(collection: &Collection, relative: &Path) -> bool {
     if relative.starts_with(Path::new(&collection.settings.types_folder))
         || relative.starts_with(Path::new(&collection.settings.contracts_folder))
     {
-        return extension == Some("md");
+        return matches!(extension, Some("md" | "yaml" | "yml"));
     }
     if extension == Some("base") {
         let relative = portable_path(relative);
@@ -319,10 +340,7 @@ fn should_copy_file(collection: &Collection, relative: &Path) -> bool {
     let relative = portable_path(relative);
     !collection.is_excluded(&relative)
         && (collection.is_valid_extension(&relative)
-            || Path::new(&relative)
-                .extension()
-                .and_then(|value| value.to_str())
-                == Some("json"))
+            || (extension == Some("json") && crate::runtime::is_schema_resource_path(&relative)))
 }
 
 fn portable_path(path: &Path) -> String {

@@ -288,6 +288,9 @@ fn collection_snapshot(
 
 fn is_canonical_view(record: &CollectionSnapshotRecord) -> bool {
     record.frontmatter_error.is_none()
+        // The view schema requires this exact discriminator. Ordinary notes
+        // must not compile and run the complete view validator on every scan.
+        && record.frontmatter.get("type").and_then(Value::as_str) == Some("view")
         && !crate::v03::validate_view(
             &Value::Object(record.frontmatter.clone()),
             record.path.as_str(),
