@@ -1,7 +1,7 @@
 //! Local-only synthetic TaskNotes setup/startup benchmark. See docs/large-collection-benchmark.md.
 use mdbase::runtime::{
-    ChangeFeedOwnerId, FilesystemRuntime, OperationContext, OperationDeadline, OperationKind,
-    OperationRequest,
+    ChangeFeedOwnerId, CommitAttempt, FilesystemRuntime, HostClaimId, OperationContext,
+    OperationDeadline, OperationKind, OperationRequest, PreparationOutcome,
 };
 use mdbase::v03::{CollectionSetup, CollectionSetupApplyOptions, OperationResult};
 use mdbase::{Collection, OperationCancellation};
@@ -214,13 +214,26 @@ fn apply(
         "expected_provision_digest": assessment["provision_digest"],
     }))?;
     timed(phase, || {
-        checked(runtime.execute_with_context(
-            &OperationRequest::new(
-                OperationKind::ApplyCollectionSetup,
-                json!({"setup": setup, "options": options}),
-            ),
-            &context(ms),
-        )?)?;
+        let context = context(ms);
+        let request = OperationRequest::new(
+            OperationKind::ApplyCollectionSetup,
+            json!({"setup": setup, "options": options}),
+        );
+        let prepared = timed(&format!("{phase}.prepare"), || {
+            Ok(runtime.prepare(&request, &HostClaimId::generate(), &context)?)
+        })?;
+        let outcome = match prepared {
+            PreparationOutcome::NoMutation(outcome) => outcome,
+            PreparationOutcome::Prepared(prepared) => {
+                timed(&format!("{phase}.commit_and_settle"), || {
+                    match runtime.commit(&prepared, &context)? {
+                        CommitAttempt::Committed(outcome) => Ok(outcome),
+                        other => Err(format!("setup did not settle: {other:?}").into()),
+                    }
+                })?
+            }
+        };
+        checked(outcome.operation.to_v03())?;
         Ok(())
     })
 }
@@ -250,7 +263,7 @@ fn query(
     let mut response_bytes = 0;
     let lease = page.next.clone();
     loop {
-        let result = checked(page.outcome.result)?;
+        let result = checked(page.outcome.operation.to_v03())?;
         response_bytes += serde_json::to_vec(&result)?.len();
         for row in result["results"]
             .as_array()
