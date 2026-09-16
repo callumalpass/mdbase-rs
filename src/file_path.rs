@@ -58,7 +58,7 @@ impl Collection {
         } else {
             self.is_excluded_without_nested_collection(path.as_str())
         };
-        if excluded {
+        if excluded || self.structural_resource_kind(path.as_str()).is_some() {
             return Err(FilePathError::Reserved);
         }
         if self.is_valid_extension(path.as_str()) {
@@ -79,7 +79,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::write(
             directory.path().join("mdbase.yaml"),
-            "spec_version: 0.3.0\nsettings:\n  record_extensions: [md, mdx]\n  exclude: [private/**]\n",
+            "spec_version: 0.3.0\nx-obsidian:\n  bases:\n    include: ['views/*.base']\nsettings:\n  record_extensions: [md, mdx]\n  exclude: [private/**]\n",
         )
         .unwrap();
         let collection = Collection::open(directory.path()).unwrap();
@@ -107,6 +107,11 @@ mod tests {
             "record.md",
             "draft.mdx",
             "mdbase.yaml",
+            "mdbase.lock.yaml",
+            "mdbase.provisions.yaml",
+            "schemas/custom.json",
+            "_schemas/custom.json",
+            "views/tasks.base",
             "_types/task.yaml",
             ".git/config",
             "notes/.private/photo.png",
@@ -118,6 +123,7 @@ mod tests {
                 "{path} must not be an ordinary collection file"
             );
         }
+        assert!(collection.validate_file_path("unconfigured.base").is_ok());
         assert_eq!(
             collection.validate_file_path("record.md").unwrap_err(),
             FilePathError::RecordPath
