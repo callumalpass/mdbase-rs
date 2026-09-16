@@ -33,7 +33,8 @@ static RUNTIME_SETTLEMENT_DELAYS: std::sync::Mutex<Vec<(String, u64)>> =
     std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-static RUNTIME_CRASH_POINT: std::sync::Mutex<Option<(String, u8)>> = std::sync::Mutex::new(None);
+static RUNTIME_CRASH_POINTS: std::sync::Mutex<std::collections::BTreeMap<String, u8>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(test)]
 pub(crate) fn set_runtime_settlement_delay(id: &CommitId, delay: std::time::Duration) {
@@ -49,7 +50,10 @@ pub(crate) fn set_runtime_settlement_delay(id: &CommitId, delay: std::time::Dura
 
 #[cfg(test)]
 pub(crate) fn set_runtime_crash_point(id: &CommitId, point: u8) {
-    *RUNTIME_CRASH_POINT.lock().unwrap() = Some((id.as_str().to_string(), point));
+    RUNTIME_CRASH_POINTS
+        .lock()
+        .unwrap()
+        .insert(id.as_str().to_string(), point);
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -696,12 +700,9 @@ fn settle(
 
 #[cfg(test)]
 fn simulate_runtime_crash(id: &str, point: u8) -> Result<(), TransactionError> {
-    let mut configured = RUNTIME_CRASH_POINT.lock().unwrap();
-    if configured
-        .as_ref()
-        .is_some_and(|candidate| candidate.0 == id && candidate.1 == point)
-    {
-        *configured = None;
+    let mut configured = RUNTIME_CRASH_POINTS.lock().unwrap();
+    if configured.get(id) == Some(&point) {
+        configured.remove(id);
         return Err(TransactionError::SimulatedCrash);
     }
     Ok(())
@@ -1951,6 +1952,25 @@ mod tests {
     use crate::OperationCancellation;
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    #[test]
+    fn runtime_crash_injection_is_isolated_by_commit() {
+        let first = CommitId::from_stored(ulid::Ulid::new().to_string());
+        let second = CommitId::from_stored(ulid::Ulid::new().to_string());
+        set_runtime_crash_point(&first, 1);
+        set_runtime_crash_point(&second, 2);
+        assert!(simulate_runtime_crash(first.as_str(), 2).is_ok());
+        assert!(matches!(
+            simulate_runtime_crash(first.as_str(), 1),
+            Err(TransactionError::SimulatedCrash)
+        ));
+        assert!(matches!(
+            simulate_runtime_crash(second.as_str(), 2),
+            Err(TransactionError::SimulatedCrash)
+        ));
+        assert!(simulate_runtime_crash(first.as_str(), 1).is_ok());
+        assert!(simulate_runtime_crash(second.as_str(), 2).is_ok());
+    }
 
     fn collection() -> (tempfile::TempDir, Collection) {
         let root = tempfile::tempdir().unwrap();
