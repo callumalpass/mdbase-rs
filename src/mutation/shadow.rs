@@ -88,9 +88,14 @@ fn copy_collection(
             RuntimeBatchError::Diagnostic(Box::new(copy_error(Path::new(""), error)))
         })?;
     let schemas = referenced_schemas(collection, &files, context)?;
+    schemas
+        .stage_directories(collection.held_root(), destination)
+        .map_err(|error| {
+            RuntimeBatchError::Diagnostic(Box::new(copy_error(Path::new(""), error)))
+        })?;
     for relative in files {
         context.check().map_err(RuntimeBatchError::Provider)?;
-        if !should_copy_file(collection, &relative, &schemas)
+        if !should_copy_file(collection, &relative, &schemas.files)
             || below_nested_collection(collection, &relative)
         {
             continue;
@@ -160,7 +165,7 @@ fn collect_collection_files_inner(
     let schemas = referenced_schemas(collection, &paths, context)?;
     for relative in paths {
         context.check().map_err(RuntimeBatchError::Provider)?;
-        if should_copy_file(collection, &relative, &schemas)
+        if should_copy_file(collection, &relative, &schemas.files)
             && !below_nested_collection(collection, &relative)
         {
             captured_entries = captured_entries.checked_add(1).ok_or({
@@ -284,8 +289,8 @@ fn referenced_schemas(
     collection: &Collection,
     paths: &[PathBuf],
     context: &OperationContext,
-) -> Result<BTreeSet<PathBuf>, RuntimeBatchError> {
-    let mut schemas = BTreeSet::new();
+) -> Result<crate::definition_stage::SchemaDependencies, RuntimeBatchError> {
+    let mut schemas = crate::definition_stage::SchemaDependencies::default();
     for path in paths {
         if (path.starts_with(&collection.settings.types_folder)
             || path.starts_with(&collection.settings.contracts_folder))
