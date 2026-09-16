@@ -1,8 +1,8 @@
 # Large collection setup/startup benchmark
 
-This is a local, synthetic **engine/runtime** benchmark for the TaskNotes large-collection investigation. It does not connect to a daemon, LAB, staging, production, or a user's collection. It complements `phase0-baseline` (general queries/mutations/concurrency) by exercising application contract setup and its nested runtime transaction path.
+This is a local, synthetic **engine/runtime** benchmark for the TaskNotes large-collection investigation. It does not connect to a daemon, LAB, staging, production, or a user's collection. It complements `phase0-baseline` (general queries/mutations/concurrency) by exercising application contract setup through the durable runtime transaction path.
 
-Initial measurements, including a settlement-pending failure under a 20-second runtime budget: [2026-09-16 baseline](../benchmarks/large-collection-startup-2026-09-16.md).
+Initial measurements, including a settlement-pending failure under a 20-second runtime budget: [2026-09-16 baseline](../benchmarks/large-collection-startup-2026-09-16.md). Current-main comparison and setup simplification: [2026-09-16 follow-up](../benchmarks/collection-setup-2026-09-16.md).
 
 ## Build and smoke test
 
@@ -53,7 +53,7 @@ This separates note count, matching task count, directory traversal, JSON stagin
 4. Fresh `FilesystemRuntime::open`, including watcher startup.
 5. Open/establish a change-feed baseline.
 6. Assess TaskNotes contract installation via the runtime provider's collection boundary.
-7. Apply installation through `FilesystemRuntime::execute_with_context`, **including** runtime prepare/staging/commit/reconciliation, not just the inner direct collection method.
+7. Apply installation through `FilesystemRuntime::prepare` and `commit`, **including** durable staging/commit/reconciliation, not just the direct collection method. Report `.prepare` and `.commit_and_settle` separately under the combined apply phase; both share **one** operation context/deadline.
 8. Drop/reopen the provisioned runtime; on-disk cache from setup remains.
 9. Query all `task` records with effective frontmatter and bodies, requesting 1,000 items; time first and each continuation page, total traversal, and serialized engine-result bytes. Verify exact count and no duplicates.
 10. Repeat without bodies as an explicitly **warm** comparison, not a controlled cold A/B trial.
