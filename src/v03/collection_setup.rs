@@ -317,7 +317,7 @@ pub(crate) fn prepare_runtime(
     use super::batch::{RuntimeMutationPlan, RuntimeSinglePreparation};
     use crate::runtime::{CanonicalOperationOutcome, OperationKind};
     let outcome =
-        |result| CanonicalOperationOutcome::wire_only(OperationKind::ApplyCollectionSetup, result);
+        |result| CanonicalOperationOutcome::definition(OperationKind::ApplyCollectionSetup, result);
     let decoded = input
         .get("setup")
         .cloned()
@@ -332,7 +332,7 @@ pub(crate) fn prepare_runtime(
         return Ok(RuntimeSinglePreparation::NoMutation(outcome(setup_error(
             "invalid_request",
             "Collection setup apply input requires valid setup and options.",
-        ))));
+        ))?));
     };
     let before = collection.snapshot_with_context(context)?;
     let planned = context.scope(|| reviewed_plan(collection, &setup, &options));
@@ -343,11 +343,11 @@ pub(crate) fn prepare_runtime(
         Ok(plan) => plan,
         Err(result) => {
             context.check()?;
-            return Ok(RuntimeSinglePreparation::NoMutation(outcome(result)));
+            return Ok(RuntimeSinglePreparation::NoMutation(outcome(result)?));
         }
     };
     context.check()?;
-    let result = outcome(applied_setup_result(&plan, false));
+    let result = outcome(applied_setup_result(&plan, false))?;
     if plan.assessment.status == "current" {
         return Ok(RuntimeSinglePreparation::NoMutation(result));
     }
