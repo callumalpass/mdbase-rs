@@ -73,6 +73,17 @@ const TYPE_PACK_SCHEMA: &str = include_str!("../../schemas/v0.3/type-pack.schema
 const TYPE_PACK_LOCK_SCHEMA: &str = include_str!("../../schemas/v0.3/type-pack-lock.schema.json");
 const VIEW_SCHEMA: &str = include_str!("../../schemas/v0.3/view.schema.json");
 
+pub(crate) const CONTRACT_SCHEMA_FIELDS: [&str; 8] = [
+    "record_schema",
+    "binding_schema",
+    "data_schema",
+    "source_schema",
+    "input_schema",
+    "output_schema",
+    "error_schema",
+    "provider_schema",
+];
+
 pub(super) fn collection_validation_errors(collection: &Collection) -> Vec<Diagnostic> {
     let validation = collection.validate_op(&serde_json::json!({}));
     let valid = validation.get("valid").and_then(Value::as_bool) == Some(true);
@@ -558,16 +569,7 @@ pub fn parse_data_contract_file(
         return Err(diagnostics);
     }
 
-    for field in [
-        "record_schema",
-        "binding_schema",
-        "data_schema",
-        "source_schema",
-        "input_schema",
-        "output_schema",
-        "error_schema",
-        "provider_schema",
-    ] {
+    for field in CONTRACT_SCHEMA_FIELDS {
         let Some(wrapper) = frontmatter.get(field) else {
             continue;
         };
@@ -854,7 +856,7 @@ pub(crate) fn unsupported_schema_reference(schema: &Value) -> Option<(&'static s
     }
 }
 
-fn is_forbidden_reference(reference: &str) -> bool {
+pub(crate) fn is_forbidden_reference(reference: &str) -> bool {
     let has_scheme = reference.split_once(':').is_some_and(|(scheme, _)| {
         !scheme.is_empty()
             && scheme.chars().enumerate().all(|(index, character)| {

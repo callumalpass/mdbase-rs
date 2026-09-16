@@ -205,21 +205,19 @@ impl OperationContext {
     }
 
     pub(crate) fn check_depth(&self, depth: u64) -> Result<(), ProviderError> {
-        if depth > self.limits.max_depth {
-            return Err(limit(CaptureLimitKind::Depth, self.limits.max_depth, depth));
-        }
-        Ok(())
+        self.record_limit(check_limit(
+            depth,
+            self.limits.max_depth,
+            CaptureLimitKind::Depth,
+        ))
     }
 
     pub(crate) fn check_file_bytes(&self, bytes: u64) -> Result<(), ProviderError> {
-        if bytes > self.limits.max_file_bytes {
-            return Err(limit(
-                CaptureLimitKind::FileBytes,
-                self.limits.max_file_bytes,
-                bytes,
-            ));
-        }
-        Ok(())
+        self.record_limit(check_limit(
+            bytes,
+            self.limits.max_file_bytes,
+            CaptureLimitKind::FileBytes,
+        ))
     }
 
     /// Check the number of entries retained by one capture. Entry and resource
