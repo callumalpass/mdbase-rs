@@ -99,7 +99,7 @@ pub use outcome::{
     CursorReleaseOutcome, DurableCommitState, ExecutionOutcome, HostClaimId,
     LegacyJournalInventory, PreparationOutcome, PreparedMutation, ReadCursor, ReadPage,
     RebuildReason, RecordChange, RecordChangeKind, ResourceChange, ResourceChangeKind,
-    RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeMeasurements,
+    RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeClaimInspection, RuntimeMeasurements,
 };
 pub use projection::{
     PreparedSemanticProjection, RecordResolutionKey, RecordResolutionKeyKind, SemanticFileFacts,

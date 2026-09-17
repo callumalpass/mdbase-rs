@@ -458,6 +458,81 @@ pub(crate) fn resolve_runtime_claim(
         .transpose()
 }
 
+/// Inspect under the writer lock so phase and revision evidence agree.
+pub(crate) fn inspect_runtime_claims(
+    collection: &Collection,
+    context: &OperationContext,
+) -> Result<Vec<crate::runtime::RuntimeClaimInspection>, TransactionError> {
+    context_check(context)?;
+    let _lock = WriteLock::acquire_context(collection, context)?;
+    let mut claims = Vec::new();
+    for directory in transaction_directories(collection)? {
+        context_check(context)?;
+        let journal = read_runtime_journal(collection, &directory)?;
+        let phase = match journal.phase {
+            RuntimePhase::Prepared => "prepared",
+            RuntimePhase::Committing => "committing",
+            RuntimePhase::Committed => "committed",
+            RuntimePhase::RejectedBeforeCommit => "rejected_before_commit",
+            RuntimePhase::CancelledBeforeCommit => "cancelled_before_commit",
+            RuntimePhase::NeedsManualRecovery => "needs_manual_recovery",
+        };
+        claims.push(crate::runtime::RuntimeClaimInspection {
+            commit_id: commit_id(&journal),
+            claim: serde_json::from_value(serde_json::Value::String(journal.host_claim.clone()))
+                .map_err(|error| TransactionError::InvalidJournal(error.to_string()))?,
+            phase: phase.to_string(),
+            resolution_acked: journal.resolution_acked,
+            event_acked: journal.event_acked,
+            current_revisions_match: committed_revisions_match(collection, &journal)?,
+            paths: journal
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect(),
+        });
+    }
+    Ok(claims)
+}
+
+fn committed_revisions_match(
+    collection: &Collection,
+    journal: &RuntimeJournal,
+) -> Result<bool, TransactionError> {
+    if journal.phase != RuntimePhase::Committed {
+        return Ok(false);
+    }
+    for entry in &journal.entries {
+        if current_revision(collection, Path::new(&entry.path))? != entry.after_revision {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Explicit host recovery: revalidate exact terminal evidence under the same
+/// lock as acknowledgement. The host must establish ownership separately.
+pub(crate) fn acknowledge_verified_runtime_claim(
+    collection: &Collection,
+    claim: &HostClaimId,
+    context: &OperationContext,
+) -> Result<bool, TransactionError> {
+    context_check(context)?;
+    let _lock = WriteLock::acquire_context(collection, context)?;
+    let Some(mut journal) = find_by_claim(collection, claim.as_str())? else {
+        return Ok(false);
+    };
+    if !journal.event_acked || !committed_revisions_match(collection, &journal)? {
+        return Ok(false);
+    }
+    journal.resolution_acked = true;
+    let directory = transaction_directory(collection, &commit_id(&journal));
+    // Persist first: even an interrupted cleanup records the acknowledged state.
+    persist_runtime_journal(collection, &directory, &journal)?;
+    cleanup_transaction(collection, &directory);
+    Ok(true)
+}
+
 pub(crate) fn ack_runtime_resolution(
     collection: &Collection,
     id: &CommitId,
@@ -1982,6 +2057,32 @@ mod tests {
         fs::write(root.path().join("a.md"), "old-a\n").unwrap();
         let collection = Collection::open(root.path()).unwrap();
         (root, collection)
+    }
+
+    #[test]
+    fn verified_ack_requires_terminal_event_and_exact_current_revisions() {
+        let (_root, collection) = collection();
+        let context = OperationContext::legacy();
+        let id = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
+        let claim = inspect_runtime_claims(&collection, &context)
+            .unwrap()
+            .remove(0)
+            .claim;
+        assert!(!acknowledge_verified_runtime_claim(&collection, &claim, &context).unwrap());
+        let mut settlement = match commit(&collection, &id) {
+            RuntimeCommitAttempt::SettlementRequired(settlement) => settlement,
+            other => panic!("expected settlement: {other:?}"),
+        };
+        settle_runtime_commit(&collection, &mut settlement).unwrap();
+        assert!(!acknowledge_verified_runtime_claim(&collection, &claim, &context).unwrap());
+        ack_runtime_change_event(&collection, &id, &context).unwrap();
+        fs::write(collection.root.join("a.md"), b"later edit\n").unwrap();
+        assert!(!acknowledge_verified_runtime_claim(&collection, &claim, &context).unwrap());
+        fs::write(collection.root.join("a.md"), b"new-a\n").unwrap();
+        assert!(acknowledge_verified_runtime_claim(&collection, &claim, &context).unwrap());
+        assert!(inspect_runtime_claims(&collection, &context)
+            .unwrap()
+            .is_empty());
     }
 
     fn change(path: &str, before: &[u8], after: &[u8]) -> ChangeBatch {

@@ -533,6 +533,33 @@ impl FilesystemRuntime {
             })
     }
 
+    /// Inspect retained claims without exposing record payloads. This is a local
+    /// administrative API, not an application operation.
+    pub fn inspect_runtime_claims(
+        &self,
+        context: &OperationContext,
+    ) -> Result<Vec<super::RuntimeClaimInspection>, ProviderError> {
+        self.provider
+            .with_collection_context(context, |collection| {
+                transactions::inspect_runtime_claims(collection, context).map_err(transaction_error)
+            })
+    }
+
+    /// Acknowledge a committed claim only if its event is acknowledged and every
+    /// current record revision still matches its durable after-image. The caller
+    /// must separately establish that no response-replay owner needs the claim.
+    pub fn acknowledge_verified_runtime_claim(
+        &self,
+        claim: &HostClaimId,
+        context: &OperationContext,
+    ) -> Result<bool, ProviderError> {
+        self.provider
+            .with_collection_boundary_context(context, |collection| {
+                transactions::acknowledge_verified_runtime_claim(collection, claim, context)
+                    .map_err(transaction_error)
+            })
+    }
+
     pub fn ack_commit_resolution(
         &self,
         commit_id: &CommitId,
