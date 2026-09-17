@@ -2062,7 +2062,7 @@ mod tests {
     #[test]
     fn verified_ack_requires_terminal_event_and_exact_current_revisions() {
         let (_root, collection) = collection();
-        let context = OperationContext::legacy();
+        let context = OperationContext::internal();
         let id = prepare(&collection, "a.md", b"old-a\n", b"new-a\n");
         let claim = inspect_runtime_claims(&collection, &context)
             .unwrap()
