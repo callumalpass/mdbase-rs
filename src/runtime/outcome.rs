@@ -696,6 +696,20 @@ impl CommitRejection {
     }
 }
 
+/// Inspection of retained transaction metadata. Record contents are never included.
+#[derive(Clone, Debug, Serialize)]
+pub struct RuntimeClaimInspection {
+    pub commit_id: CommitId,
+    /// Capability for the local host, deliberately excluded from serialized reports.
+    #[serde(skip)]
+    pub claim: HostClaimId,
+    pub phase: String,
+    pub resolution_acked: bool,
+    pub event_acked: bool,
+    pub current_revisions_match: bool,
+    pub paths: Vec<String>,
+}
+
 /// Recoverable state of one claimed mutation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DurableCommitState {
