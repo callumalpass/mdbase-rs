@@ -3,9 +3,41 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+use serde_json::{Map, Value};
+
 use super::expression::{
-    ensure_markdown_extension, normalize_path, strip_markdown_extension, strip_subpath, BasesFile,
+    ensure_markdown_extension, normalize_path, strip_markdown_extension, strip_subpath, wikilink,
+    BasesFile, BasesLink,
 };
+
+/// Links written as whole property values, in property and list order, as Obsidian lists them
+/// before a note's body links: wikilinks, and Markdown links such as `[Label](Note.md)`.
+pub(crate) fn frontmatter_links(properties: &Map<String, Value>) -> Vec<BasesLink> {
+    static MARKDOWN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^\[([^\]]*)\]\(([^)]+)\)$").expect("markdown link expression")
+    });
+    let link = |value: &Value| {
+        let text = value.as_str()?.trim();
+        wikilink(text).or_else(|| {
+            let captures = MARKDOWN.captures(text)?;
+            Some(BasesLink {
+                path: captures[2].to_string(),
+                display: Some(captures[1].to_string()),
+                ..Default::default()
+            })
+        })
+    };
+    properties
+        .values()
+        .flat_map(|value| match value {
+            Value::Array(items) => items.iter().filter_map(link).collect::<Vec<_>>(),
+            value => link(value).into_iter().collect(),
+        })
+        .collect()
+}
 
 /// Every file a view evaluation may open through `file()`, `asFile()` or `this`.
 ///

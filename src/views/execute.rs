@@ -1088,13 +1088,19 @@ fn record_file(record: &FileRecord) -> BasesFile {
             file.tags.push(tag);
         }
     }
-    file.links = extract_links_from_body(&record.body)
-        .into_iter()
-        .map(|path| BasesLink {
-            path,
-            ..Default::default()
-        })
-        .collect();
+    file.links = record
+        .effective_frontmatter
+        .as_object()
+        .map(super::files::frontmatter_links)
+        .unwrap_or_default();
+    file.links.extend(
+        extract_links_from_body(&record.body)
+            .into_iter()
+            .map(|path| BasesLink {
+                path,
+                ..Default::default()
+            }),
+    );
     file.embeds = extract_embeds_from_body(&record.body)
         .into_iter()
         .map(|path| BasesLink {
