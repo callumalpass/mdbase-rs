@@ -1,6 +1,6 @@
 {
-  "rustSourceFileCountMax": 177,
-  "rustSourceLineCountMax": 102098,
+  "rustSourceFileCountMax": 178,
+  "rustSourceLineCountMax": 102269,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-architecture-check/src/main.rs": 1188,
@@ -14,7 +14,7 @@
     "src/query/engine.rs": 1086,
     "src/runtime/filesystem.rs": 1462,
     "src/runtime/canonical_operation.rs": 1504,
-    "src/runtime/hosted_base.rs": 1968,
+    "src/runtime/hosted_base.rs": 1966,
     "src/runtime/hosted_mutation.rs": 1200,
     "src/runtime/hosted_query.rs": 3400,
     "src/runtime/hosted_resource.rs": 1040,
@@ -27,8 +27,8 @@
     "src/v03/batch.rs": 1520,
     "src/v03/collection_setup.rs": 1791,
     "src/v03/type_pack.rs": 2135,
-    "src/views/execute.rs": 1376,
-    "src/views/expression.rs": 2965,
+    "src/views/execute.rs": 1368,
+    "src/views/expression.rs": 2936,
     "src/watch/real.rs": 3225
   },
   "deadCodeAllowancesByFile": {

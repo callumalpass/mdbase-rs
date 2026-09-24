@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
 use chrono::{
     DateTime, Datelike, FixedOffset, Local, Months, NaiveDate, NaiveDateTime, TimeZone, Timelike,
@@ -406,7 +406,7 @@ pub(crate) struct BasesEvaluationContext {
     pub note: Map<String, Value>,
     pub file: BasesFile,
     pub this_file: Option<BasesFile>,
-    pub files: Arc<Vec<BasesFile>>,
+    pub files: Arc<super::files::BasesFiles>,
     pub formulas: Arc<BTreeMap<String, String>>,
     pub property_types: Arc<BTreeMap<String, String>>,
     pub link_resolutions: Arc<BTreeMap<String, Option<String>>>,
@@ -1760,56 +1760,7 @@ impl<'a> Evaluator<'a> {
     }
 
     fn find_file(&self, target: &str) -> Option<&BasesFile> {
-        let target = strip_subpath(target);
-        let markdown = ensure_markdown_extension(&target);
-        let lower_target = target.to_lowercase();
-        let lower_markdown = markdown.to_lowercase();
-        let lower_basename = strip_markdown_extension(&target).to_lowercase();
-        self.context
-            .files
-            .iter()
-            .find(|file| normalize_path(&file.path) == normalize_path(&target))
-            .or_else(|| {
-                self.context
-                    .files
-                    .iter()
-                    .find(|file| normalize_path(&file.path) == normalize_path(&markdown))
-            })
-            .or_else(|| {
-                self.context
-                    .files
-                    .iter()
-                    .find(|file| normalize_path(&file.path).ends_with(&format!("/{markdown}")))
-            })
-            .or_else(|| {
-                self.context.files.iter().find(|file| {
-                    file.basename == target || strip_markdown_extension(&file.name) == target
-                })
-            })
-            .or_else(|| {
-                self.context
-                    .files
-                    .iter()
-                    .find(|file| normalize_path(&file.path).to_lowercase() == lower_target)
-            })
-            .or_else(|| {
-                self.context
-                    .files
-                    .iter()
-                    .find(|file| normalize_path(&file.path).to_lowercase() == lower_markdown)
-            })
-            .or_else(|| {
-                self.context.files.iter().find(|file| {
-                    file.name.to_lowercase() == lower_target
-                        || file.name.to_lowercase() == lower_markdown
-                })
-            })
-            .or_else(|| {
-                self.context
-                    .files
-                    .iter()
-                    .find(|file| file.basename.to_lowercase() == lower_basename)
-            })
+        self.context.files.find(target)
     }
 
     fn file_from_target(&self, target: &str) -> RuntimeValue {
@@ -1819,8 +1770,7 @@ impl<'a> Evaluator<'a> {
             Some(path) => self
                 .context
                 .files
-                .iter()
-                .find(|file| file.path == path)
+                .by_path(&path)
                 .cloned()
                 .map(|file| RuntimeValue::File(Box::new(file)))
                 .unwrap_or_else(|| RuntimeValue::File(Box::new(file_defaults(&path)))),
@@ -1838,8 +1788,7 @@ impl<'a> Evaluator<'a> {
             Some(path) => self
                 .context
                 .files
-                .iter()
-                .find(|file| file.path == path)
+                .by_path(&path)
                 .cloned()
                 .map(|file| RuntimeValue::File(Box::new(file)))
                 .unwrap_or_else(|| RuntimeValue::File(Box::new(file_defaults(&path)))),
@@ -2173,7 +2122,9 @@ fn start_of_day(value: &DateValue) -> DateValue {
 fn format_date(value: &DateValue, pattern: &str) -> String {
     let date = value.timezone.local_datetime(value.millis);
     let mut format = pattern.to_string();
-    let literals = Regex::new(r"\[([^]]*)\]").expect("literal expression");
+    static LITERALS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\[([^]]*)\]").expect("literal expression"));
+    let literals = &*LITERALS;
     let mut stored = Vec::new();
     format = literals
         .replace_all(&format, |captures: &regex::Captures<'_>| {
@@ -2217,7 +2168,10 @@ fn date_property(value: &DateValue, property: &str) -> RuntimeValue {
 }
 
 fn parse_duration(value: &str) -> Option<DurationValue> {
-    let pattern = Regex::new(r"(?i)([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(years?|y|months?|M|weeks?|w|days?|d|hours?|h|minutes?|m|seconds?|s|milliseconds?|ms)\b").expect("duration expression");
+    static PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(years?|y|months?|M|weeks?|w|days?|d|hours?|h|minutes?|m|seconds?|s|milliseconds?|ms)\b").expect("duration expression")
+    });
+    let pattern = &*PATTERN;
     let mut duration = DurationValue::default();
     let mut matched = false;
     for captures in pattern.captures_iter(value.trim()) {
@@ -2461,18 +2415,19 @@ fn normalize_tag(value: &str) -> String {
     value.trim_start_matches('#').to_string()
 }
 fn is_external(value: &str) -> bool {
-    Regex::new(r"^[A-Za-z][A-Za-z0-9+.-]*:")
-        .expect("external link expression")
-        .is_match(value)
+    static EXTERNAL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^[A-Za-z][A-Za-z0-9+.-]*:").expect("external link expression")
+    });
+    EXTERNAL.is_match(value)
 }
-fn strip_subpath(value: &str) -> String {
+pub(super) fn strip_subpath(value: &str) -> String {
     value
         .split_once('#')
         .map(|(path, _)| path)
         .unwrap_or(value)
         .to_string()
 }
-fn ensure_markdown_extension(value: &str) -> String {
+pub(super) fn ensure_markdown_extension(value: &str) -> String {
     let (head, tail) = value
         .split_once('#')
         .map(|(head, tail)| (head, format!("#{tail}")))
@@ -2487,10 +2442,10 @@ fn ensure_markdown_extension(value: &str) -> String {
         format!("{head}.md{tail}")
     }
 }
-fn strip_markdown_extension(value: &str) -> String {
+pub(super) fn strip_markdown_extension(value: &str) -> String {
     value.strip_suffix(".md").unwrap_or(value).to_string()
 }
-fn normalize_path(value: &str) -> String {
+pub(super) fn normalize_path(value: &str) -> String {
     value.replace('\\', "/").trim_start_matches('/').to_string()
 }
 fn same_markdown_variant(left: &str, right: &str) -> bool {
@@ -2611,13 +2566,29 @@ fn unique_key(value: &RuntimeValue) -> String {
     }
 }
 
+/// Expressions run once per record, so each pattern is compiled once and reused.
 fn compile_regex(pattern: &str, flags: &str) -> Result<Regex, String> {
+    const MAX_ENTRIES: usize = 256;
+    type Compiled = Result<Regex, String>;
+    static CACHE: OnceLock<RwLock<HashMap<(String, String), Compiled>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    let key = (pattern.to_string(), flags.to_string());
+    if let Some(compiled) = cache.read().ok().and_then(|cache| cache.get(&key).cloned()) {
+        return compiled;
+    }
     let mut builder = RegexBuilder::new(pattern);
     builder
         .case_insensitive(flags.contains('i'))
         .multi_line(flags.contains('m'))
         .dot_matches_new_line(flags.contains('s'));
-    builder.build().map_err(|error| error.to_string())
+    let compiled = builder.build().map_err(|error| error.to_string());
+    if let Ok(mut cache) = cache.write() {
+        if cache.len() >= MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(key, compiled.clone());
+    }
+    compiled
 }
 fn regex_is_match(pattern: &str, flags: &str, value: &str) -> Result<bool, String> {
     match compile_regex(pattern, flags) {
@@ -2649,17 +2620,17 @@ fn regex_split(value: &str, pattern: &str, flags: &str) -> Result<Vec<String>, S
         .collect())
 }
 fn title_case(value: &str) -> String {
-    Regex::new(r"\p{L}+")
-        .expect("word expression")
-        .replace_all(value, |captures: &regex::Captures<'_>| {
-            let word = &captures[0];
-            let mut chars = word.chars();
-            chars
-                .next()
-                .map(|first| format!("{}{}", first.to_uppercase(), chars.as_str().to_lowercase()))
-                .unwrap_or_default()
-        })
-        .to_string()
+    static WORD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\p{L}+").expect("word expression"));
+    WORD.replace_all(value, |captures: &regex::Captures<'_>| {
+        let word = &captures[0];
+        let mut chars = word.chars();
+        chars
+            .next()
+            .map(|first| format!("{}{}", first.to_uppercase(), chars.as_str().to_lowercase()))
+            .unwrap_or_default()
+    })
+    .to_string()
 }
 fn escape_html(value: &str) -> String {
     value
