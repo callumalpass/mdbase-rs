@@ -6,6 +6,15 @@ use std::time::Instant;
 
 type BacklinksBuildResult =
     Result<(HashMap<String, Vec<String>>, Option<BacklinksPerf>), crate::runtime::CatalogError>;
+/// Backlinks, each stored link's resolved target, and optional profiling.
+type LinkGraphBuildResult = Result<
+    (
+        HashMap<String, Vec<String>>,
+        crate::links::linked_files::StoredLinkTargets,
+        Option<BacklinksPerf>,
+    ),
+    crate::runtime::CatalogError,
+>;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BacklinksPerf {
@@ -50,6 +59,32 @@ impl Collection {
             .map(|(index, _)| index)
     }
 
+    /// Link traversal data (for `asFile()`) and the backlinks index for a set of records, from
+    /// one resolution pass over their links.
+    pub fn build_link_graph(
+        &self,
+        all_files: Vec<crate::expressions::evaluator::ResolvedFileData>,
+    ) -> Result<
+        (
+            crate::links::linked_files::LinkedFiles,
+            HashMap<String, Vec<String>>,
+        ),
+        crate::runtime::CatalogError,
+    > {
+        let resolution_index = self.build_link_resolution_index(&all_files);
+        let (backlinks, stored, _) =
+            self.build_link_graph_with_resolution(&all_files, false, &resolution_index)?;
+        Ok((
+            crate::links::linked_files::LinkedFiles::new(
+                all_files,
+                stored,
+                &self.settings.id_field,
+                Some(resolution_index),
+            ),
+            backlinks,
+        ))
+    }
+
     pub(crate) fn build_backlinks_index_profiled(
         &self,
         all_files: &[crate::expressions::evaluator::ResolvedFileData],
@@ -83,6 +118,17 @@ impl Collection {
         profile: bool,
         resolution_index: &crate::links::resolver::LinkResolutionIndex,
     ) -> BacklinksBuildResult {
+        self.build_link_graph_with_resolution(all_files, profile, resolution_index)
+            .map(|(index, _, perf)| (index, perf))
+    }
+
+    /// Backlinks plus the target each stored link resolved to, from one resolution pass.
+    pub(crate) fn build_link_graph_with_resolution(
+        &self,
+        all_files: &[crate::expressions::evaluator::ResolvedFileData],
+        profile: bool,
+        resolution_index: &crate::links::resolver::LinkResolutionIndex,
+    ) -> LinkGraphBuildResult {
         use crate::expressions::evaluator::{
             extract_embeds_from_body, extract_links_from_body, extract_links_from_fm_value,
         };
@@ -90,6 +136,7 @@ impl Collection {
         let total_start = Instant::now();
         let mut perf = BacklinksPerf::default();
         let mut index: HashMap<String, Vec<String>> = HashMap::new();
+        let mut stored = crate::links::linked_files::StoredLinkTargets::new();
 
         for file_data in all_files {
             perf.files_processed += 1;
@@ -141,6 +188,12 @@ impl Collection {
                 let resolved =
                     self.resolve_link_target(target, source_path, target_types, resolution_index)?;
                 if let Some(resolved_path) = resolved {
+                    // A frontmatter link comes first and keeps its declared target types.
+                    stored
+                        .entry(source_path.clone())
+                        .or_default()
+                        .entry(target.clone())
+                        .or_insert_with(|| resolved_path.clone());
                     if !seen_targets.contains(&resolved_path) {
                         seen_targets.push(resolved_path.clone());
                         index
@@ -160,11 +213,7 @@ impl Collection {
         }
 
         perf.total_ms = elapsed_ms(total_start);
-        if profile {
-            Ok((index, Some(perf)))
-        } else {
-            Ok((index, None))
-        }
+        Ok((index, stored, profile.then_some(perf)))
     }
 }
 

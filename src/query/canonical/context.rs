@@ -8,7 +8,7 @@ use crate::cel;
 use crate::diagnostic::Diagnostic;
 use crate::expressions::evaluator::{
     extract_embeds_from_body, extract_links_from_body, extract_tags_from_body, EvalContext,
-    NoteNamespaceSource, ResolvedFileData,
+    NoteNamespaceSource,
 };
 use crate::query::cache_source::FileRecord;
 use crate::types::schema::TypeDef;
@@ -19,7 +19,7 @@ pub(super) type LinkGraph = Option<Arc<HashMap<String, Vec<String>>>>;
 pub(super) fn load_context(
     collection: &Collection,
     query: &Query,
-    all_files: Option<Arc<Vec<ResolvedFileData>>>,
+    all_files: Option<Arc<crate::links::linked_files::LinkedFiles>>,
     backlinks: LinkGraph,
     type_definitions: Arc<HashMap<String, TypeDef>>,
 ) -> Result<(Option<Box<EvalContext>>, usize), Box<Diagnostic>> {
@@ -92,7 +92,7 @@ pub(crate) fn candidate_context(
     effective: &Value,
     projections: &Map<String, Value>,
     this_context: Option<Box<EvalContext>>,
-    all_files: Option<Arc<Vec<ResolvedFileData>>>,
+    all_files: Option<Arc<crate::links::linked_files::LinkedFiles>>,
     backlinks: LinkGraph,
     type_definitions: Arc<HashMap<String, TypeDef>>,
 ) -> EvalContext {

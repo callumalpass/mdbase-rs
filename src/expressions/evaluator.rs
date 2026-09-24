@@ -221,8 +221,8 @@ pub struct EvalContext {
     pub file_ctime: Option<String>,
     /// Context for 'this' keyword (the containing file's data in embedded queries)
     pub this_context: Option<Box<EvalContext>>,
-    /// All files data for asFile() traversal. Key is basename (without extension).
-    pub all_files: Option<std::sync::Arc<Vec<ResolvedFileData>>>,
+    /// Records `asFile()` can traverse to, with their resolved links.
+    pub all_files: Option<std::sync::Arc<crate::links::linked_files::LinkedFiles>>,
     /// Current asFile() traversal depth (for depth limit enforcement).
     pub traversal_depth: std::cell::Cell<u32>,
     /// Backlinks index: target path → list of source paths that link to it.
@@ -2369,65 +2369,15 @@ fn resolve_as_file(link_str: &str, ctx: &EvalContext) -> Result<Value, EvalError
     }
     ctx.traversal_depth.set(depth + 1);
 
-    let all_files = match &ctx.all_files {
-        Some(f) => f,
-        None => return Ok(Value::Null),
-    };
-
-    // Extract the target from wikilink syntax
-    let target = if link_str.starts_with("[[") && link_str.ends_with("]]") {
-        let inner = &link_str[2..link_str.len() - 2];
-        // Strip display text after |
-        let inner = inner.split('|').next().unwrap_or(inner);
-        // Strip anchor after #
-        inner.split('#').next().unwrap_or(inner).trim()
-    } else {
-        link_str.trim()
-    };
-
-    if target.is_empty() {
+    let Some(all_files) = &ctx.all_files else {
         return Ok(Value::Null);
-    }
-
-    // Try to find the file:
-    // 1. Exact path match
-    // 2. Basename match (without extension)
-    // 3. ID field match
-    let mut found: Option<&ResolvedFileData> = None;
-
-    for file_data in all_files.iter() {
-        // Exact path match
-        if file_data.path == target || file_data.path == format!("{}.md", target) {
-            found = Some(file_data);
-            break;
-        }
-    }
-
-    if found.is_none() {
-        // Basename match
-        for file_data in all_files.iter() {
-            let basename = std::path::Path::new(&file_data.path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            if basename == target {
-                found = Some(file_data);
-                break;
-            }
-        }
-    }
-
-    if found.is_none() {
-        // ID field match
-        for file_data in all_files.iter() {
-            if let Some(id) = file_data.frontmatter.get("id").and_then(|v| v.as_str()) {
-                if id == target {
-                    found = Some(file_data);
-                    break;
-                }
-            }
-        }
-    }
+    };
+    let found = all_files
+        .resolve(link_str, ctx.file_path.as_deref())
+        .map_err(|error| EvalError {
+            code: error.code,
+            message: error.message,
+        })?;
 
     match found {
         Some(file_data) => {

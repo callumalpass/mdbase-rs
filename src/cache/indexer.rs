@@ -557,24 +557,44 @@ fn resolve_links(
     Ok(())
 }
 
-pub(crate) fn load_backlinks(
+/// Backlinks and each stored link's resolved target, from one read of the `links` table.
+/// A frontmatter link's target wins over a body link with the same text, as when the graph is
+/// built from records, because frontmatter links resolve with their declared target types.
+pub(crate) fn load_link_graph(
     conn: &Connection,
-) -> Result<std::collections::HashMap<String, Vec<String>>, CacheError> {
+) -> Result<
+    (
+        std::collections::HashMap<String, Vec<String>>,
+        crate::links::linked_files::StoredLinkTargets,
+    ),
+    CacheError,
+> {
     let mut statement = conn.prepare(
-        "SELECT target_path, source_path FROM links WHERE resolved = 1 ORDER BY target_path, source_path",
+        "SELECT target_path, source_path, raw_target, location FROM links WHERE resolved = 1 \
+         ORDER BY target_path, source_path",
     )?;
     let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
     })?;
     let mut backlinks = std::collections::HashMap::<String, Vec<String>>::new();
+    let mut stored = crate::links::linked_files::StoredLinkTargets::new();
     for row in rows {
-        let (target, source) = row?;
+        let (target, source, raw, location) = row?;
+        let targets = stored.entry(source.clone()).or_default();
+        if location == "frontmatter" || !targets.contains_key(&raw) {
+            targets.insert(raw, target.clone());
+        }
         let sources = backlinks.entry(target).or_default();
         if sources.last() != Some(&source) {
             sources.push(source);
         }
     }
-    Ok(backlinks)
+    Ok((backlinks, stored))
 }
 
 /// Full rebuild: delete everything and reindex all files.

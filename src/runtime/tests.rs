@@ -4079,7 +4079,7 @@ fn runtime_reverse_link_index_tracks_resolved_targets_incrementally() {
     .unwrap();
     let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
 
-    let before = runtime
+    let (before, stored_before) = runtime
         .provider()
         .with_collection_read(|collection| {
             let connection = crate::cache::sqlite::open_cache_db(
@@ -4087,11 +4087,11 @@ fn runtime_reverse_link_index_tracks_resolved_targets_incrementally() {
                 &collection.settings.cache_folder,
             )
             .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-            crate::cache::indexer::load_backlinks(&connection)
+            crate::cache::indexer::load_link_graph(&connection)
                 .map_err(|error| ProviderError::CollectionOpen(error.to_string()))
         })
         .unwrap();
-    assert!(before.is_empty());
+    assert!(before.is_empty() && stored_before.is_empty());
 
     let created = runtime
         .execute(&OperationRequest::new(
@@ -4101,7 +4101,7 @@ fn runtime_reverse_link_index_tracks_resolved_targets_incrementally() {
         .unwrap();
     assert!(created.valid, "{created:?}");
 
-    let after = runtime
+    let (after, stored) = runtime
         .provider()
         .with_collection_read(|collection| {
             let connection = crate::cache::sqlite::open_cache_db(
@@ -4109,11 +4109,13 @@ fn runtime_reverse_link_index_tracks_resolved_targets_incrementally() {
                 &collection.settings.cache_folder,
             )
             .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-            crate::cache::indexer::load_backlinks(&connection)
+            crate::cache::indexer::load_link_graph(&connection)
                 .map_err(|error| ProviderError::CollectionOpen(error.to_string()))
         })
         .unwrap();
     assert_eq!(after.get("future.md"), Some(&vec!["source.md".to_string()]));
+    // The forward direction `asFile()` reads is tracked with it.
+    assert_eq!(stored["source.md"]["future"], "future.md");
 }
 
 #[test]

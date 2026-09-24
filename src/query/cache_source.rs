@@ -9,6 +9,7 @@ use rusqlite::{params_from_iter, Connection, TransactionBehavior};
 
 use crate::cache::{indexer, sqlite, staleness, CacheError};
 use crate::expressions::evaluator::ResolvedFileData;
+use crate::links::linked_files::LinkedFiles;
 use crate::record_load::RecordLoadOutcome;
 use crate::snapshot::{CollectionSnapshot, SnapshotError};
 use crate::{Collection, OperationCancellation};
@@ -735,25 +736,37 @@ impl Collection {
             perf.build_all_files_ms = elapsed_ms(all_files_start);
 
             let backlinks_start = Instant::now();
-            let all_files_arc = Arc::new(all_files_data);
-            let cached_backlinks = (perf.cache_used && !refresh_from_filesystem).then(|| {
+            let cached_graph = (perf.cache_used && !refresh_from_filesystem).then(|| {
                 sqlite::open_cache_db(
                     self.held_root().cache_storage_path(),
                     &self.settings.cache_folder,
                 )
                 .map_err(CacheError::from)
-                .and_then(|connection| indexer::load_backlinks(&connection))
+                .and_then(|connection| indexer::load_link_graph(&connection))
             });
-            let (backlinks_index, backlinks_perf) = match cached_backlinks {
-                Some(Ok(backlinks)) => (backlinks, None),
-                _ => self
-                    .build_backlinks_index_profiled(&all_files_arc, profile)
-                    .map_err(|error| {
-                        SnapshotError::Cache(format!("{}: {}", error.code, error.message))
-                    })?,
-            };
+            // Cached links are already resolved; rebuilding them needs the typed index, which
+            // then also serves `asFile()` for links that are not stored.
+            let (backlinks_index, stored_links, resolution_index, backlinks_perf) =
+                match cached_graph {
+                    Some(Ok((backlinks, stored))) => (backlinks, stored, None, None),
+                    _ => {
+                        let index = self.build_link_resolution_index(&all_files_data);
+                        let (backlinks, stored, perf) = self
+                            .build_link_graph_with_resolution(&all_files_data, profile, &index)
+                            .map_err(|error| {
+                                SnapshotError::Cache(format!("{}: {}", error.code, error.message))
+                            })?;
+                        (backlinks, stored, Some(index), perf)
+                    }
+                };
             cancellation.check().map_err(|_| SnapshotError::Cancelled)?;
             let backlinks_arc = Arc::new(backlinks_index);
+            let all_files_arc = Arc::new(LinkedFiles::new(
+                all_files_data,
+                stored_links,
+                &self.settings.id_field,
+                resolution_index,
+            ));
             perf.build_backlinks_ms = elapsed_ms(backlinks_start);
             if let Some(bp) = backlinks_perf {
                 perf.backlinks_frontmatter_extract_ms = bp.frontmatter_extract_ms;
