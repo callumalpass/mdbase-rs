@@ -13,7 +13,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::expressions::ast::{BinOp, Expr, UnaryOp};
-use crate::expressions::evaluator::{path_is_in_folder, resolve_execution_timezone};
+use crate::expressions::evaluator::{
+    path_is_in_folder, resolve_execution_timezone, ResolvedFileData,
+};
 use crate::query::cache_source::FileRecord;
 use crate::query::canonical::context::{candidate_context, file_value, namespace_value};
 use crate::query::canonical::diagnostics;
@@ -22,6 +24,7 @@ use crate::query::canonical::preflight::{self, CompiledSelection};
 use crate::query::canonical::result::serialize_candidate;
 use crate::{cel, diagnostic::Diagnostic, v03::validate_query};
 
+use super::hosted_links::{hosted_link_graph, HostedRelationshipNeighborhood};
 use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
 
 pub const HOSTED_QUERY_PLAN_VERSION: u32 = 12;
@@ -790,6 +793,19 @@ impl CompiledCatalog {
         record: &CanonicalRecordInput,
         context_record: Option<&CanonicalRecordInput>,
     ) -> Result<HostedResidualEvaluation, CatalogError> {
+        self.evaluate_hosted_residual_with_neighborhood(plan, record, context_record, None)
+    }
+
+    /// Evaluate one retained exact record for a query that may follow links. A plan that
+    /// requires relationships needs the candidate's complete relationship neighborhood; other
+    /// plans ignore it.
+    pub fn evaluate_hosted_residual_with_neighborhood(
+        &self,
+        plan: &HostedQueryPlan,
+        record: &CanonicalRecordInput,
+        context_record: Option<&CanonicalRecordInput>,
+        neighborhood: Option<&HostedRelationshipNeighborhood>,
+    ) -> Result<HostedResidualEvaluation, CatalogError> {
         if plan.version != HOSTED_QUERY_PLAN_VERSION
             || plan.catalog_revision != self.resource_revision()
             || plan.semantic_engine_version != env!("CARGO_PKG_VERSION")
@@ -830,13 +846,6 @@ impl CompiledCatalog {
                     .join("; "),
             )
         })?;
-        if compiled.requires_link_graph() {
-            return Err(query_error(
-                "hosted_collection_context_required",
-                "This query requires a bounded relationship-graph residual.",
-            ));
-        }
-
         let this_context = match compiled
             .requires_this_context()
             .then_some(compiled.query.context.as_ref())
@@ -914,6 +923,21 @@ impl CompiledCatalog {
             file_mtime_iso: record.file_mtime.clone(),
             file_ctime_iso: None,
         };
+        let (all_files, backlinks) = if compiled.requires_link_graph() {
+            let (files, backlinks) = hosted_link_graph(
+                ResolvedFileData {
+                    path: record.path.clone(),
+                    frontmatter: effective.clone(),
+                    body: file_record.body.clone(),
+                },
+                neighborhood,
+                |projection| projection_is_current_for_plan(plan, projection),
+                &collection.settings.id_field,
+            )?;
+            (Some(files), Some(backlinks))
+        } else {
+            (None, None)
+        };
         let timezone = resolve_execution_timezone(
             compiled.query.timezone.as_deref(),
             collection.settings.timezone.as_deref(),
@@ -931,8 +955,8 @@ impl CompiledCatalog {
                 &effective,
                 &projections,
                 this_context.clone(),
-                None,
-                None,
+                all_files.clone(),
+                backlinks.clone(),
                 type_definitions.clone(),
             );
             match cel::evaluate_compiled(expression, &context, &clock) {
@@ -958,8 +982,8 @@ impl CompiledCatalog {
             &effective,
             &projections,
             this_context,
-            None,
-            None,
+            all_files,
+            backlinks,
             type_definitions,
         );
         let matched = match compiled.where_expression.as_ref() {

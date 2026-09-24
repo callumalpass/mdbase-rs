@@ -19,6 +19,7 @@ mod feed;
 mod filesystem;
 mod gate;
 mod hosted_base;
+mod hosted_links;
 mod hosted_mutation;
 mod hosted_query;
 mod hosted_resource;
@@ -61,6 +62,7 @@ pub use hosted_base::{
     HostedBaseRecordContext, HostedBaseRequirements, HostedBaseRow, HOSTED_BASE_PLAN_VERSION,
     MAX_HOSTED_BASE_RELATED_RECORDS,
 };
+pub use hosted_links::HostedRelationshipNeighborhood;
 pub use hosted_mutation::{
     HostedMutationChange, HostedMutationPlan, HostedMutationRequest, HostedRecordChange,
     TypedHostedMutationPlan,
