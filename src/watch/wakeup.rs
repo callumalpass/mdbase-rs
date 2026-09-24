@@ -1,9 +1,11 @@
 use std::sync::{Arc, Mutex};
 
+type Callback = Arc<dyn Fn() + Send + Sync>;
+
 /// A payload-free readiness hint. Events remain owned by the watcher queue;
 /// hints may be coalesced. Callbacks must be non-blocking and must not panic.
 #[derive(Clone, Default)]
-pub struct WatchWakeup(Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>);
+pub struct WatchWakeup(Arc<Mutex<Option<Callback>>>);
 
 impl std::fmt::Debug for WatchWakeup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
