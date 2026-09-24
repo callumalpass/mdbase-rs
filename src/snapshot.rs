@@ -30,7 +30,7 @@ use crate::{Collection, OperationCancellation};
 pub(crate) struct CollectionSnapshot {
     pub records: Vec<FileRecord>,
     pub invalid_records: Vec<InvalidRecordStub>,
-    pub all_files: Option<Arc<Vec<ResolvedFileData>>>,
+    pub all_files: Option<Arc<crate::links::linked_files::LinkedFiles>>,
     pub backlinks: Option<Arc<HashMap<String, Vec<String>>>>,
 }
 

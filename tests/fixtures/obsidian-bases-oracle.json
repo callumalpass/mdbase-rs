@@ -2672,6 +2672,111 @@
       "expected": {
         "error": "Cannot find function \"doesNotExist\""
       }
+    },
+    {
+      "name": "link replace regex",
+      "expression": "frontList[0].replace(/^\\[[^\\]]+\\]\\((.*)\\)$/, \"$1\")",
+      "expected": "Spaced Note",
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "link replace string",
+      "expression": "frontWiki.replace(\"Other\", \"X\")",
+      "expected": "X",
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "list map replace",
+      "expression": "frontList.map(value.replace(/^\\[[^\\]]+\\]\\((.*)\\)$/, \"$1\"))",
+      "expected": [
+        "Spaced Note",
+        "Other.md"
+      ],
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "tasknotes project expr",
+      "expression": "frontList.map(file(value.replace(/^\\[[^\\]]+\\]\\((.*)\\)$/, \"$1\").replace(/%20/g, \" \")).asLink())",
+      "expected": [
+        "__codex_bases_expression_oracle/Spaced Note.md",
+        "__codex_bases_expression_oracle/Other.md"
+      ],
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "tasknotes project paths",
+      "expression": "frontList.map(file(value.replace(/^\\[[^\\]]+\\]\\((.*)\\)$/, \"$1\").replace(/%20/g, \" \")).path)",
+      "expected": [
+        "__codex_bases_expression_oracle/Spaced Note.md",
+        "__codex_bases_expression_oracle/Other.md"
+      ],
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "file of link",
+      "expression": "file(frontWiki).path",
+      "expected": "__codex_bases_expression_oracle/Other.md",
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "file of wikilink string",
+      "expression": "file(\"[[Other]]\").path",
+      "expected": null,
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "file of markdown link string",
+      "expression": "file(\"[Front MD](Other.md)\").path",
+      "expected": null,
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "list of missing",
+      "expression": "list(missing)",
+      "expected": null,
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "list of missing length",
+      "expression": "list(missing).length",
+      "expected": null,
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "missing replace",
+      "expression": "missing.replace(\"a\", \"b\")",
+      "expected": null,
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "file of error",
+      "expression": "file(missing.replace(\"a\", \"b\"))",
+      "expected": null,
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "file of null",
+      "expression": "file(missing)",
+      "expected": null,
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "map over missing list",
+      "expression": "list(missing).map(file(value.replace(\"a\", \"b\")))",
+      "expected": null,
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "link type of front list string",
+      "expression": "frontList[1].isType(\"link\")",
+      "expected": false,
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
+    },
+    {
+      "name": "file links contains front wiki",
+      "expression": "file.links.contains(link(\"Other\"))",
+      "expected": true,
+      "source": "Obsidian 1.12.7, 2026-09-24: link string functions and missing-value methods"
     }
   ]
 }

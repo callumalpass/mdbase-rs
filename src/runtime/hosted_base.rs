@@ -19,7 +19,8 @@ use crate::views::{
     base_uses_backlinks, combined_filter_matches, evaluate_property, is_configured_obsidian_source,
     lower_hosted_candidate, serialize_bases_file, stable_named_view_ids, uses_file_ctime,
     uses_relationships, validate_base_expressions, BaseFilter, BasesEvaluationContext, BasesFile,
-    BasesLink, BasesTimezone, ObsidianBaseDocument, ObsidianBaseView, ViewReferenceInput,
+    BasesFiles, BasesLink, BasesTimezone, ObsidianBaseDocument, ObsidianBaseView,
+    ViewReferenceInput,
 };
 use crate::OperationCancellation;
 use crate::{diagnostic::Diagnostic, v03::OperationResult};
@@ -439,21 +440,18 @@ impl HostedBasePlan {
             .collect::<Vec<_>>();
         populate_backlinks(&mut files, &projections);
         let link_resolutions = Arc::new(link_resolutions(&projections));
-        let files = Arc::new(files);
+        let files = Arc::new(BasesFiles::new(files));
         let file = files
-            .iter()
-            .find(|file| file.path == input.projection.facts.path)
+            .by_path(&input.projection.facts.path)
             .cloned()
             .ok_or_else(|| CatalogError {
                 code: "hosted_base_projection_mismatch".to_string(),
                 message: "Candidate file facts are absent from the evaluation context.".to_string(),
             })?;
-        let this_file = input.query_context.as_ref().and_then(|context| {
-            files
-                .iter()
-                .find(|file| file.path == context.facts.path)
-                .cloned()
-        });
+        let this_file = input
+            .query_context
+            .as_ref()
+            .and_then(|context| files.by_path(&context.facts.path).cloned());
         let timezone =
             BasesTimezone::from_setting(self.timezone.as_deref()).map_err(|message| {
                 CatalogError {
@@ -805,11 +803,10 @@ fn projection_file(projection: &SemanticProjection) -> BasesFile {
             ))
         })
         .collect::<BTreeMap<_, _>>();
-    let links = projection
-        .structure
-        .body_links
-        .iter()
-        .map(|path| BasesLink {
+    // Frontmatter links resolve through the evaluation's link resolutions, like other links.
+    let mut links = crate::views::frontmatter_links(&projection.facts.effective_frontmatter);
+    links.extend(projection.structure.body_links.iter().map(|path| {
+        BasesLink {
             path: path.clone(),
             resolved_path: resolved
                 .get(path)
@@ -819,8 +816,8 @@ fn projection_file(projection: &SemanticProjection) -> BasesFile {
                 })
                 .cloned(),
             ..Default::default()
-        })
-        .collect();
+        }
+    }));
     let embeds = projection
         .structure
         .body_embeds

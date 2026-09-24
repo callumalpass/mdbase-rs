@@ -1,7 +1,7 @@
 //! Legacy v0.2 compatibility query engine (§10); canonical queries use `query::canonical`.
 
 use crate::expressions::ast::Expr;
-use crate::expressions::evaluator::{evaluate as eval_expr, EvalContext, ResolvedFileData};
+use crate::expressions::evaluator::{evaluate as eval_expr, EvalContext};
 use crate::expressions::is_truthy_value;
 use crate::expressions::parser::Parser as ExprParser;
 use crate::Collection;
@@ -21,7 +21,7 @@ pub(crate) struct QueryEvalContext<'a> {
     pub file_mtime: Option<&'a str>,
     pub file_ctime: Option<&'a str>,
     pub this_context: Option<Box<EvalContext>>,
-    pub all_files: Option<std::sync::Arc<Vec<ResolvedFileData>>>,
+    pub all_files: Option<std::sync::Arc<crate::links::linked_files::LinkedFiles>>,
     pub backlinks_index: Option<std::sync::Arc<HashMap<String, Vec<String>>>>,
 }
 
