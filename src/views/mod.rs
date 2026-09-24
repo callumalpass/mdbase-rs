@@ -2,6 +2,7 @@
 
 mod execute;
 mod expression;
+mod files;
 mod model;
 mod source;
 
@@ -48,6 +49,7 @@ pub(crate) use expression::{
     BasesEvaluationContext, BasesFile, BasesLink, BasesTimezone, BASES_OPERATION_CANCELLED,
     BASES_WORK_BUDGET_EXCEEDED,
 };
+pub(crate) use files::BasesFiles;
 pub(crate) use model::{
     stable_named_view_ids, BaseFilter, ObsidianBaseDocument, ObsidianBaseView, ViewReferenceInput,
 };

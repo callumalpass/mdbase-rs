@@ -23,7 +23,46 @@ settings:
   validation: "warn"
   timezone: "UTC"
   exclude: ["_types", ".mdbase"]
+x-obsidian:
+  bases:
+    include: ["views/**/*.base"]
 "#;
+
+/// Obsidian Bases views in the shape TaskNotes generates: its Relationships widget runs with the
+/// open note as `this`, and its Projects view follows each backlink with `asFile()`.
+const BASE: &str = r##"views:
+  - type: table
+    name: plain
+    filters:
+      and:
+        - file.inFolder("annotations")
+    order: [file.name]
+  - type: table
+    name: subtasks tasknotes
+    filters:
+      and:
+        - 'file.hasLink(this.file) && list(note.projects).map(file(value.replace(/^\[[^\]]+\]\((.*)\)$/, "$1").replace(/%20/g, " ")).asLink()).contains(this.file.asLink())'
+    order: [file.name]
+  - type: table
+    name: subtasks links
+    filters:
+      and:
+        - 'list(note.projects).map(file(value.replace(/^\[[^\]]+\]\((.*)\)$/, "$1").replace(/%20/g, " ")).asLink()).contains(this.file.asLink())'
+    order: [file.name]
+  - type: table
+    name: subtasks resolved
+    filters:
+      and:
+        - 'list(note.projects).map(file(value.replace("[[", "").replace("]]", "")).asLink()).contains(this.file.asLink())'
+    order: [file.name]
+  - type: table
+    name: projects
+    filters:
+      and:
+        - file.inFolder("sources")
+        - 'file.backlinks.filter((value.asFile().properties["status"].isEmpty() == false) && (value.asFile().properties["status"] != "done") && (value.asFile().hasTag("archived") != true) && (list(value.asFile().properties["projects"]).map(file(value.replace(/^\[[^\]]+\]\((.*)\)$/, "$1").replace("[[", "").replace("]]", "").split("|")[0].split("#")[0].replace(/%20/g, " ")).asLink()).contains(file.asLink()))).length > 0'
+    order: [file.name]
+"##;
 
 const SOURCE_TYPE: &str = r#"---
 kind: mdbase.type
@@ -59,6 +98,8 @@ schema:
       id: { type: string }
       source: { type: string }
       created_at: { type: string }
+      status: { type: string }
+      projects: { type: array, items: { type: string } }
       tags: { type: array, items: { type: string } }
 collection:
   links:
@@ -125,8 +166,8 @@ fn run() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         let open_ms = ms(started);
         let mut cases = Vec::new();
-        for (name, query) in queries() {
-            cases.push(profile_query(&runtime, name, &query)?);
+        for (name, kind, input) in queries() {
+            cases.push(profile_query(&runtime, name, kind, &input)?);
         }
         cases.push(profile_delete_check(&runtime)?);
         let entry = json!({
@@ -150,8 +191,16 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn queries() -> Vec<(&'static str, Value)> {
-    vec![
+fn queries() -> Vec<(&'static str, OperationKind, Value)> {
+    let base = |view: &str, context: Option<&str>| {
+        let mut input = json!({"path": "views/bench.base", "view": view});
+        if let Some(path) = context {
+            input["context"] = json!({"path": path});
+        }
+        input
+    };
+    let this_source = Some("sources/src-00000.md");
+    let queries = vec![
         (
             "plain_page",
             json!({"types": ["annotation"], "order_by": [{"field": "created_at", "direction": "desc"}], "limit": 100}),
@@ -176,7 +225,38 @@ fn queries() -> Vec<(&'static str, Value)> {
             "backlinks_where",
             json!({"types": ["source"], "where": "file.backlinks.size() > 5", "limit": 100}),
         ),
-    ]
+    ];
+    queries
+        .into_iter()
+        .map(|(name, input)| (name, OperationKind::Query, input))
+        .chain([
+            (
+                "base_plain",
+                OperationKind::ExecuteView,
+                base("plain", None),
+            ),
+            (
+                "base_subtasks_tasknotes",
+                OperationKind::ExecuteView,
+                base("subtasks-tasknotes", this_source),
+            ),
+            (
+                "base_subtasks_links",
+                OperationKind::ExecuteView,
+                base("subtasks-links", this_source),
+            ),
+            (
+                "base_subtasks_resolved",
+                OperationKind::ExecuteView,
+                base("subtasks-resolved", this_source),
+            ),
+            (
+                "base_projects",
+                OperationKind::ExecuteView,
+                base("projects", None),
+            ),
+        ])
+        .collect()
 }
 
 fn execute(
@@ -189,15 +269,20 @@ fn execute(
         .map_err(|error| error.to_string())
 }
 
-fn profile_query(runtime: &FilesystemRuntime, name: &str, query: &Value) -> Result<Value, String> {
+fn profile_query(
+    runtime: &FilesystemRuntime,
+    name: &str,
+    kind: OperationKind,
+    query: &Value,
+) -> Result<Value, String> {
     // The first run warms the runtime and its cache; the measured runs are warm.
-    let first = execute(runtime, OperationKind::Query, query)?;
+    let first = execute(runtime, kind, query)?;
     ensure_success(name, &first)?;
     let total = first.result["meta"]["total_count"].clone();
     let mut samples = Vec::new();
     for _ in 0..REPEATS {
         let started = Instant::now();
-        let result = execute(runtime, OperationKind::Query, query)?;
+        let result = execute(runtime, kind, query)?;
         ensure_success(name, &result)?;
         if result.result["meta"]["total_count"] != total {
             return Err(format!("{name}: total_count changed between runs"));
@@ -242,6 +327,7 @@ fn build_fixture(root: &Path, sources: usize, annotations: usize) -> Result<(), 
     write(&root.join("mdbase.yaml"), CONFIG)?;
     write(&root.join("_types/source.md"), SOURCE_TYPE)?;
     write(&root.join("_types/annotation.md"), ANNOTATION_TYPE)?;
+    write(&root.join("views/bench.base"), BASE)?;
     let kinds = ["book", "article", "chapter", "thesis"];
     for index in 0..sources {
         let body = "Notes about this source. ".repeat(8);
@@ -259,7 +345,7 @@ fn build_fixture(root: &Path, sources: usize, annotations: usize) -> Result<(), 
         write(
             &root.join(format!("annotations/{:02}/ann-{index:06}.md", index % 50)),
             &format!(
-                "---\nid: ann_{index:06}\nsource: '[[src_{source:05}]]'\ncreated_at: 2026-0{}-{:02}T00:00:00Z\ntags: []\n---\n\n> A highlighted passage number {index}.\n\nA short note.\n",
+                "---\nid: ann_{index:06}\nsource: '[[src_{source:05}]]'\nprojects: ['[[src-{source:05}]]']\nstatus: todo\ncreated_at: 2026-0{}-{:02}T00:00:00Z\ntags: [task]\n---\n\n> A highlighted passage number {index}.\n\nA short note.\n",
                 1 + index % 9,
                 10 + index % 18
             ),

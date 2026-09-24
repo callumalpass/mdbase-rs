@@ -727,14 +727,22 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
     };
     let records = snapshot.records;
     let backlinks = snapshot.backlinks;
-    let all_files = Arc::new(records.iter().map(record_file).collect::<Vec<_>>());
+    let all_files = records.iter().map(record_file).collect::<Vec<_>>();
     let link_resolutions = Arc::new(link_resolutions(&all_files));
+    let all_files = Arc::new(super::files::BasesFiles::new(all_files));
+    // The view's context file is the same for every row.
+    let this_file = request
+        .context
+        .as_ref()
+        .and_then(|context| context.as_ref())
+        .and_then(|context| all_files.by_path(&context.path))
+        .cloned();
     let formulas = Arc::new(document.formulas.clone());
     let property_types = Arc::new(BTreeMap::new());
     let clock = UtcClock::capture();
     let mut rows = Vec::new();
-    for record in &records {
-        let mut file = record_file(record);
+    for (record, file) in records.iter().zip(all_files.iter()) {
+        let mut file = file.clone();
         if let Some(index) = backlinks.as_ref() {
             file.backlinks = index
                 .get(&record.rel_path)
@@ -754,12 +762,7 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
                 .cloned()
                 .unwrap_or_default(),
             file: file.clone(),
-            this_file: request
-                .context
-                .as_ref()
-                .and_then(|context| context.as_ref())
-                .and_then(|context| all_files.iter().find(|file| file.path == context.path))
-                .cloned(),
+            this_file: this_file.clone(),
             files: all_files.clone(),
             formulas: formulas.clone(),
             property_types: property_types.clone(),
