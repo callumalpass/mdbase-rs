@@ -586,3 +586,64 @@ fn rejects_view_paths_through_symbolic_links() {
     assert!(!result.valid);
     assert_eq!(result.diagnostics[0].code, "path_traversal");
 }
+
+/// TaskNotes' Relationships widget runs with the open note as `this`. Obsidian reads a property
+/// that is a wikilink as a link, lists it in `file.links`, and applies string functions such as
+/// `replace` to its path, so its Subtasks filter finds tasks linked either way.
+#[test]
+fn tasknotes_subtasks_view_finds_tasks_by_frontmatter_project_links() {
+    let (root, collection) = collection();
+    fs::create_dir_all(root.path().join("Projects")).unwrap();
+    fs::write(
+        root.path().join("Projects/mobile.md"),
+        "---\ntitle: Mobile\n---\n",
+    )
+    .unwrap();
+    for (name, projects) in [
+        ("wikilink", "['[[Projects/mobile]]']"),
+        ("markdown", "['[Mobile](Projects/mobile.md)']"),
+        ("unrelated", "['[[Projects/other]]']"),
+        ("none", "[]"),
+    ] {
+        fs::write(
+            root.path().join(format!("tasks/sub-{name}.md")),
+            format!("---\nstatus: todo\ntags: [task]\nprojects: {projects}\n---\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.path().join("TaskNotes/Views/relationships.base"),
+        r##"views:
+  - type: tasknotesKanban
+    name: Subtasks
+    filters:
+      and:
+        - 'file.hasLink(this.file) && list(note.projects).map(file(value.replace(/^\[[^\]]+\]\((.*)\)$/, "$1").replace(/%20/g, " ")).asLink()).contains(this.file.asLink())'
+    order: [file.name]
+"##,
+    )
+    .unwrap();
+    let executed = Collection::open(root.path())
+        .unwrap()
+        .v03_operations()
+        .unwrap()
+        .execute_view(&json!({
+            "path": "TaskNotes/Views/relationships.base",
+            "view": "subtasks",
+            "context": {"path": "Projects/mobile.md"},
+        }));
+    assert!(executed.valid, "{:?}", executed.diagnostics);
+    let paths = executed.result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, ["tasks/sub-markdown.md", "tasks/sub-wikilink.md"]);
+    assert!(
+        executed.diagnostics.is_empty(),
+        "records without projects are not errors: {:?}",
+        executed.diagnostics
+    );
+    drop(collection);
+}

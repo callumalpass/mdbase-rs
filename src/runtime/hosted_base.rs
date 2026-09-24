@@ -803,11 +803,10 @@ fn projection_file(projection: &SemanticProjection) -> BasesFile {
             ))
         })
         .collect::<BTreeMap<_, _>>();
-    let links = projection
-        .structure
-        .body_links
-        .iter()
-        .map(|path| BasesLink {
+    // Frontmatter links resolve through the evaluation's link resolutions, like other links.
+    let mut links = crate::views::frontmatter_links(&projection.facts.effective_frontmatter);
+    links.extend(projection.structure.body_links.iter().map(|path| {
+        BasesLink {
             path: path.clone(),
             resolved_path: resolved
                 .get(path)
@@ -817,8 +816,8 @@ fn projection_file(projection: &SemanticProjection) -> BasesFile {
                 })
                 .cloned(),
             ..Default::default()
-        })
-        .collect();
+        }
+    }));
     let embeds = projection
         .structure
         .body_embeds

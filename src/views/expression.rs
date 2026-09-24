@@ -1057,7 +1057,18 @@ impl<'a> Evaluator<'a> {
                 self.make_link(&plain_string(&from_json(value, None)), None),
             );
         }
-        from_json(value, hint)
+        // Obsidian reads a property value, or list item, that is exactly one wikilink as a link.
+        let property_link =
+            |value: &Value| value.as_str().and_then(wikilink).map(RuntimeValue::Link);
+        match value {
+            Value::Array(items) => RuntimeValue::List(
+                items
+                    .iter()
+                    .map(|item| property_link(item).unwrap_or_else(|| from_json(item, None)))
+                    .collect(),
+            ),
+            value => property_link(value).unwrap_or_else(|| from_json(value, hint)),
+        }
     }
 
     fn binary(&mut self, operator: &str, left: &Expr, right: &Expr, scope: &Scope) -> RuntimeValue {
@@ -1215,7 +1226,7 @@ impl<'a> Evaluator<'a> {
                 self.make_link(&plain_string(&first), arguments.get(1).map(plain_string)),
             ),
             "list" => match first {
-                RuntimeValue::List(_) => first,
+                RuntimeValue::List(_) | RuntimeValue::Null => first,
                 value => RuntimeValue::List(vec![value]),
             },
             "max" | "min" => {
@@ -1275,6 +1286,8 @@ impl<'a> Evaluator<'a> {
             return RuntimeValue::Bool(value_type(&receiver).eq_ignore_ascii_case(&expected));
         }
         match receiver {
+            // As in Obsidian, a method on a missing value is missing rather than an error.
+            RuntimeValue::Null => RuntimeValue::Null,
             RuntimeValue::String(value) => {
                 let values = arguments
                     .iter()
@@ -1639,7 +1652,8 @@ impl<'a> Evaluator<'a> {
                 RuntimeValue::File(file) => self.file_method(&file, "hasLink", arguments),
                 _ => RuntimeValue::Error("Could not coerce link to file".to_string()),
             },
-            _ => method_not_found("Link", name),
+            // Obsidian applies string functions to a link's path, e.g. `link.replace(...)`.
+            _ => self.string_method(&link.path, name, arguments),
         }
     }
 
@@ -2468,6 +2482,20 @@ fn link_resolution_keys(target: &str) -> Vec<String> {
         .filter(|value| seen.insert(value.clone()))
         .collect()
 }
+/// A link for a value that is exactly one wikilink, such as `[[Note|Alias]]`.
+pub(super) fn wikilink(value: &str) -> Option<BasesLink> {
+    let inner = value.trim().strip_prefix("[[")?.strip_suffix("]]")?;
+    if inner.is_empty() || inner.contains("]]") || inner.contains("[[") {
+        return None;
+    }
+    let (path, display) = parse_link_text(value);
+    Some(BasesLink {
+        path,
+        display,
+        ..Default::default()
+    })
+}
+
 fn parse_link_text(value: &str) -> (String, Option<String>) {
     let value = value
         .trim()
