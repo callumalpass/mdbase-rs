@@ -714,14 +714,25 @@ impl Collection {
 
         let needs_link_graph = self.where_clause_uses_link_graph(where_value);
         let (all_files_arc, backlinks_arc) = if needs_link_graph {
-            let resolved_files = std::sync::Arc::new(snapshot.resolved_files_data());
-            let backlinks = std::sync::Arc::new(
-                self.build_backlinks_index_for_snapshot_files(snapshot, &resolved_files)
-                    .map_err(|error| crate::CollectionSnapshotError::CacheUnavailable {
-                        reason: format!("{}: {}", error.code, error.message),
-                    })?,
-            );
-            (Some(resolved_files), Some(backlinks))
+            let resolved_files = snapshot.resolved_files_data();
+            let resolution_index =
+                snapshot.link_resolution_index_from_resolved(self, &resolved_files);
+            let (backlinks, stored, _) = self
+                .build_link_graph_with_resolution(&resolved_files, false, &resolution_index)
+                .map_err(|error| crate::CollectionSnapshotError::CacheUnavailable {
+                    reason: format!("{}: {}", error.code, error.message),
+                })?;
+            (
+                Some(std::sync::Arc::new(
+                    crate::links::linked_files::LinkedFiles::new(
+                        resolved_files,
+                        stored,
+                        &self.settings.id_field,
+                        Some(resolution_index),
+                    ),
+                )),
+                Some(std::sync::Arc::new(backlinks)),
+            )
         } else {
             (None, None)
         };

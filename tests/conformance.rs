@@ -1303,11 +1303,14 @@ fn execute_operation(
                     .and_then(|v| v.as_str())
                     .map(String::from);
                 // Build all_files for asFile() traversal
-                let all_files = collection
-                    .build_all_files_data()
-                    .expect("collection snapshot");
-                let backlinks_index = collection.build_backlinks_index(&all_files).unwrap();
-                let all_files_arc = std::sync::Arc::new(all_files);
+                let (linked_files, backlinks_index) = collection
+                    .build_link_graph(
+                        collection
+                            .build_all_files_data()
+                            .expect("collection snapshot"),
+                    )
+                    .unwrap();
+                let all_files_arc = std::sync::Arc::new(linked_files);
                 let backlinks_arc = std::sync::Arc::new(backlinks_index);
                 let types_arc = std::sync::Arc::new(collection.types().clone());
                 let type_names_for_file = collection.determine_types_for_path(
