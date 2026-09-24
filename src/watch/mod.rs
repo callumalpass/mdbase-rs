@@ -5,6 +5,10 @@
 
 mod portable;
 mod real;
+mod wakeup;
+pub use wakeup::WatchWakeup;
+#[cfg(test)]
+mod wakeup_tests;
 
 pub use portable::{PortableWatchEvent, WatchKind};
 pub use real::{CollectionWatcher, WatchError};

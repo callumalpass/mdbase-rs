@@ -1,3 +1,5 @@
+mod readiness;
+
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -675,22 +677,6 @@ impl FilesystemRuntime {
                 context.check()?;
                 super::feed::ack_transfer(collection, transfer)
             })
-    }
-
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<WatchEvent>, ProviderError> {
-        if let Some(event) = self
-            .pending_watch
-            .lock()
-            .map_err(|_| ProviderError::LockPoisoned)?
-            .pop_front()
-        {
-            return Ok(Some(event));
-        }
-        self.watcher
-            .lock()
-            .map_err(|_| ProviderError::LockPoisoned)?
-            .recv_timeout(timeout)
-            .map_err(Into::into)
     }
 
     /// Normalize and durably append one external filesystem observation.
