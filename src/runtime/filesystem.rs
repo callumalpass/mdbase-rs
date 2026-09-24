@@ -677,6 +677,19 @@ impl FilesystemRuntime {
             })
     }
 
+    /// Install a non-blocking, payload-free watcher readiness hint. The durable
+    /// feed and watcher queue remain authoritative; hosts may coalesce hints.
+    pub fn set_event_waker(
+        &self,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), ProviderError> {
+        self.watcher
+            .lock()
+            .map_err(|_| ProviderError::LockPoisoned)?
+            .set_event_waker(callback);
+        Ok(())
+    }
+
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<WatchEvent>, ProviderError> {
         if let Some(event) = self
             .pending_watch

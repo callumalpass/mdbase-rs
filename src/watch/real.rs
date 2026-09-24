@@ -1,4 +1,4 @@
-use super::{PortableWatchEvent, WatchEvent};
+use super::{PortableWatchEvent, WatchEvent, WatchWakeup};
 use crate::record_load::RecordLoadOutcome;
 use crate::runtime::{CollectionSnapshotResourceKind, OperationContext, ProviderError};
 use crate::Collection;
@@ -37,6 +37,7 @@ pub enum WatchError {
 /// be completed before an event is forwarded.
 pub struct CollectionWatcher {
     events: mpsc::Receiver<WatchEvent>,
+    wakeup: WatchWakeup,
     commands: mpsc::Sender<WorkerInput>,
     worker: Option<thread::JoinHandle<()>>,
     pending_rescans: Arc<AtomicUsize>,
@@ -308,6 +309,11 @@ impl CollectionWatcher {
         let root = root.to_path_buf();
         let initial = Snapshot::load(&collection)?;
         let (events_tx, events) = mpsc::channel();
+        let wakeup = WatchWakeup::default();
+        let events_tx = EventSender {
+            sender: events_tx,
+            wakeup: wakeup.clone(),
+        };
         let (commands, command_rx) = mpsc::channel();
         let pending_rescans = Arc::new(AtomicUsize::new(0));
         let invalidation_revision = Arc::new(AtomicU64::new(0));
@@ -351,6 +357,7 @@ impl CollectionWatcher {
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 events,
+                wakeup,
                 commands,
                 worker: Some(worker),
                 pending_rescans,
@@ -369,6 +376,12 @@ impl CollectionWatcher {
                 Err(WatchError::Stopped)
             }
         }
+    }
+
+    /// Subscribe to queued-event readiness, including events already queued.
+    /// The callback is a non-blocking hint, not an event-delivery mechanism.
+    pub fn set_event_waker(&self, callback: Arc<dyn Fn() + Send + Sync>) {
+        self.wakeup.set(callback);
     }
 
     pub fn recv(&self) -> Result<WatchEvent, WatchError> {
@@ -695,10 +708,23 @@ impl Drop for CollectionWatcher {
     }
 }
 
+struct EventSender {
+    sender: mpsc::Sender<WatchEvent>,
+    wakeup: WatchWakeup,
+}
+
+impl EventSender {
+    fn send(&self, event: WatchEvent) -> Result<(), mpsc::SendError<WatchEvent>> {
+        self.sender.send(event)?;
+        self.wakeup.wake();
+        Ok(())
+    }
+}
+
 struct WorkerChannels {
     inputs: mpsc::Receiver<WorkerInput>,
     filesystem_callback: FilesystemCallback,
-    events: mpsc::Sender<WatchEvent>,
+    events: EventSender,
     ready: mpsc::SyncSender<Result<(), notify::Error>>,
     invalidation_revision: Arc<AtomicU64>,
     epoch: Arc<WatcherEpoch>,
@@ -795,7 +821,9 @@ fn watch_loop(
         let current_time = Instant::now();
         let wait = deadline
             .map(|deadline| deadline.saturating_duration_since(current_time).min(tick))
-            .unwrap_or(tick);
+            // Commands and filesystem callbacks wake the receiver. With no
+            // deadline there is no maintenance work requiring 20 idle wakes/s.
+            .unwrap_or(Duration::from_secs(60));
         match inputs.recv_timeout(wait) {
             Ok(WorkerInput::Command(Command::Stop)) => {
                 let _ = watcher.unwatch(&root);
@@ -2540,6 +2568,7 @@ mod tests {
         });
         let watcher = CollectionWatcher {
             events,
+            wakeup: WatchWakeup::default(),
             commands,
             worker: Some(worker),
             pending_rescans: pending,
