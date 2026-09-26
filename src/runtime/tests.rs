@@ -4400,16 +4400,13 @@ fn runtime_creates_continue_sequences_from_records_outside_the_sparse_stage() {
         .unwrap();
     }
     let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    let context = OperationContext::internal();
     for (path, expected) in [("items/a.md", 8), ("items/b.md", 9)] {
         crate::mutation::reset_mutation_path_probes();
         let request =
             OperationRequest::new(OperationKind::Create, json!({"path": path, "type": "item"}));
         let prepared = match runtime
-            .prepare(
-                &request,
-                &HostClaimId::generate(),
-                &OperationContext::legacy(),
-            )
+            .prepare(&request, &HostClaimId::generate(), &context)
             .unwrap()
         {
             PreparationOutcome::Prepared(prepared) => prepared,
@@ -4417,9 +4414,7 @@ fn runtime_creates_continue_sequences_from_records_outside_the_sparse_stage() {
         };
         assert_eq!(crate::mutation::mutation_path_probes().sparse_shadows, 1);
         assert!(matches!(
-            runtime
-                .commit(&prepared, &OperationContext::legacy())
-                .unwrap(),
+            runtime.commit(&prepared, &context).unwrap(),
             CommitAttempt::Committed(_)
         ));
         let written = fs::read_to_string(directory.path().join(path)).unwrap();

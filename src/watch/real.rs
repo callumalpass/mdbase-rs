@@ -1065,6 +1065,28 @@ fn watch_loop(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventPathKind {
+    File,
+    /// A directory itself, not a symlink to one.
+    Directory,
+    Other,
+}
+
+/// The watcher's one inspection of an event path, which may name a file,
+/// directory or symlink that the backend reported but has since changed.
+fn inspect_event_path(path: &Path) -> std::io::Result<EventPathKind> {
+    std::fs::symlink_metadata(path).map(|metadata| {
+        if metadata.is_file() {
+            EventPathKind::File
+        } else if metadata.is_dir() {
+            EventPathKind::Directory
+        } else {
+            EventPathKind::Other
+        }
+    })
+}
+
 fn merge_pending_paths(
     pending: &mut BTreeSet<PathBuf>,
     full_rescan: &mut bool,
@@ -1379,8 +1401,7 @@ impl Snapshot {
             event.kind,
             EventKind::Create(CreateKind::Any | CreateKind::Other)
         ) && visible.iter().any(|(path, _, _)| {
-            std::fs::symlink_metadata(path)
-                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            inspect_event_path(path).is_ok_and(|kind| kind == EventPathKind::Directory)
         }) {
             return None;
         }
@@ -1412,8 +1433,8 @@ impl Snapshot {
     /// directory or symlink now, or a vanished path under which the snapshot
     /// holds records or resources.
     fn renamed_path_may_hold_records(&self, path: &Path, normalized: &str) -> bool {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) => !metadata.is_file(),
+        match inspect_event_path(path) {
+            Ok(kind) => kind != EventPathKind::File,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let prefix = format!("{normalized}/");
                 let under = |key: &String| key.starts_with(&prefix);
