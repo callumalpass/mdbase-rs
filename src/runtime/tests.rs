@@ -4381,3 +4381,48 @@ fn held_authority_never_adopts_a_replacement_root_across_refresh_snapshot_cache_
     fs::remove_dir_all(&root).unwrap();
     fs::rename(&held, &root).unwrap();
 }
+
+#[test]
+fn runtime_creates_continue_sequences_from_records_outside_the_sparse_stage() {
+    let directory = collection();
+    fs::create_dir_all(directory.path().join("_types")).unwrap();
+    fs::create_dir_all(directory.path().join("items")).unwrap();
+    fs::write(
+        directory.path().join("_types/item.md"),
+        "---\nname: item\nmatch:\n  path_glob: \"items/*.md\"\nfields:\n  seq: { type: integer, generated: sequence }\n---\n",
+    )
+    .unwrap();
+    for value in [3, 7, 5] {
+        fs::write(
+            directory.path().join(format!("items/{value}.md")),
+            format!("---\ntype: item\nseq: {value}\n---\n"),
+        )
+        .unwrap();
+    }
+    let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
+    for (path, expected) in [("items/a.md", 8), ("items/b.md", 9)] {
+        crate::mutation::reset_mutation_path_probes();
+        let request =
+            OperationRequest::new(OperationKind::Create, json!({"path": path, "type": "item"}));
+        let prepared = match runtime
+            .prepare(
+                &request,
+                &HostClaimId::generate(),
+                &OperationContext::legacy(),
+            )
+            .unwrap()
+        {
+            PreparationOutcome::Prepared(prepared) => prepared,
+            other => panic!("expected create preparation: {other:?}"),
+        };
+        assert_eq!(crate::mutation::mutation_path_probes().sparse_shadows, 1);
+        assert!(matches!(
+            runtime
+                .commit(&prepared, &OperationContext::legacy())
+                .unwrap(),
+            CommitAttempt::Committed(_)
+        ));
+        let written = fs::read_to_string(directory.path().join(path)).unwrap();
+        assert!(written.contains(&format!("seq: {expected}\n")), "{written}");
+    }
+}

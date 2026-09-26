@@ -195,6 +195,7 @@ impl CompiledCatalog {
                 type_plans,
                 type_warnings: loaded.warnings,
                 data_contracts,
+                sequence_floor: std::collections::HashMap::new(),
             },
         })
     }

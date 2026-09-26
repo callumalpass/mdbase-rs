@@ -93,7 +93,7 @@ impl GeneratedValueContext {
         collection: &Collection,
         snapshot: &crate::snapshot::AuthoritativeCollectionSnapshot,
     ) -> Self {
-        let mut maxima = HashMap::<(String, String), i64>::new();
+        let mut maxima = collection.sequence_floor.clone();
         for entry in snapshot.entries() {
             let Some(frontmatter) = entry
                 .effective_frontmatter()
@@ -124,6 +124,21 @@ impl GeneratedValueContext {
         Self {
             sequence_maxima: maxima,
         }
+    }
+
+    /// Whether any type generates sequence values, which depend on every
+    /// record of that type rather than only the record being written.
+    pub(crate) fn collection_has_sequences(collection: &Collection) -> bool {
+        collection.types.values().any(|type_def| {
+            type_def
+                .fields
+                .values()
+                .any(|field| matches!(field.generated, Some(GeneratedStrategy::Sequence(_))))
+        })
+    }
+
+    pub(crate) fn into_sequence_maxima(self) -> HashMap<(String, String), i64> {
+        self.sequence_maxima
     }
 
     pub(crate) fn apply_generated(

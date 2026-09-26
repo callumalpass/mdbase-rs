@@ -221,6 +221,7 @@ impl CompiledCatalog {
             type_plans: self.collection.type_plans.clone(),
             type_warnings: self.collection.type_warnings.clone(),
             data_contracts,
+            sequence_floor: std::collections::HashMap::new(),
             authority: crate::collection_root::CollectionRoot::acquire(directory.path())
                 .map_err(validation_stage_error)?,
         };
