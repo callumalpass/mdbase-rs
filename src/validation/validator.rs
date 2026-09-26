@@ -310,6 +310,45 @@ impl Collection {
         self.check_uniqueness_in_corpus(frontmatter, type_names, exclude_path, &corpus)
     }
 
+    /// Uniqueness issues for a record being written. The check compares against
+    /// the whole collection, so it reads a snapshot (reusing `snapshot` when the
+    /// write already captured one) only when a known type declares unique
+    /// fields or the record carries an id; otherwise nothing can conflict.
+    pub(crate) fn write_uniqueness_issues(
+        &self,
+        frontmatter: &serde_json::Value,
+        type_names: &[String],
+        path: &str,
+        snapshot: Option<&crate::snapshot::AuthoritativeCollectionSnapshot>,
+    ) -> Result<Vec<Issue>, crate::mutation::MutationFailure> {
+        let has_id = frontmatter
+            .get(&self.settings.id_field)
+            .is_some_and(|value| !value.is_null());
+        let applies = type_names
+            .iter()
+            .filter_map(|type_name| self.types.get(type_name))
+            .any(|type_def| has_id || !unique_field_references(type_def).is_empty());
+        if !applies {
+            return Ok(Vec::new());
+        }
+        let captured;
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                captured = self
+                    .capture_collection_snapshot_current()
+                    .map_err(|error| {
+                        crate::mutation::MutationFailure::operation(
+                            "collection_snapshot_failed",
+                            error.to_string(),
+                        )
+                    })?;
+                &captured
+            }
+        };
+        Ok(self.check_uniqueness(frontmatter, type_names, path, snapshot))
+    }
+
     pub(crate) fn check_uniqueness_in_corpus(
         &self,
         frontmatter: &serde_json::Value,
@@ -887,6 +926,81 @@ pub(crate) fn unique_field_references(type_def: &TypeDef) -> Vec<String> {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+
+    fn strict_collection(type_fields: &str) -> (tempfile::TempDir, crate::Collection) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("mdbase.yaml"),
+            "spec_version: 0.2.0\nsettings:\n  validation: error\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.path().join("_types")).unwrap();
+        std::fs::write(
+            root.path().join("_types/item.md"),
+            format!("---\nname: item\nfields:\n{type_fields}---\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("one.md"),
+            "---\ntype: item\ntitle: One\nkey: taken\nid: first\n---\n",
+        )
+        .unwrap();
+        let collection = crate::Collection::open(root.path()).unwrap();
+        (root, collection)
+    }
+
+    fn captures() -> usize {
+        crate::snapshot::SNAPSHOT_CAPTURES.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn strict_writes_skip_the_collection_snapshot_when_nothing_can_conflict() {
+        let (_root, collection) = strict_collection("  title: { type: string }\n");
+        let before = captures();
+        let created = collection.create(&serde_json::json!({
+            "path": "two.md", "type": "item", "fields": {"title": "Two"}
+        }));
+        assert_eq!(created["valid"], true, "{created:#}");
+        let updated = collection
+            .update(&serde_json::json!({"path": "two.md", "fields": {"title": "Second"}}));
+        assert!(updated.get("error").is_none(), "{updated:#}");
+        assert_eq!(updated["frontmatter"]["title"], "Second");
+        assert_eq!(captures(), before);
+    }
+
+    #[test]
+    fn strict_writes_still_reject_duplicate_unique_fields() {
+        let (_root, collection) = strict_collection("  key: { type: string, unique: true }\n");
+        let created = collection.create(&serde_json::json!({
+            "path": "two.md", "type": "item", "fields": {"key": "taken"}
+        }));
+        assert_eq!(created["error"]["code"], "validation_failed", "{created:#}");
+        let fresh = collection.create(&serde_json::json!({
+            "path": "two.md", "type": "item", "fields": {"key": "free"}
+        }));
+        assert_eq!(fresh["valid"], true, "{fresh:#}");
+        let updated =
+            collection.update(&serde_json::json!({"path": "two.md", "fields": {"key": "taken"}}));
+        assert_eq!(updated["error"]["code"], "validation_failed", "{updated:#}");
+    }
+
+    #[test]
+    fn strict_writes_still_reject_duplicate_ids_without_unique_fields() {
+        let (_root, collection) = strict_collection("  title: { type: string }\n");
+        let created = collection.create(&serde_json::json!({
+            "path": "two.md", "type": "item", "fields": {"id": "first"}
+        }));
+        assert_eq!(created["error"]["code"], "validation_failed", "{created:#}");
+    }
+
+    #[test]
+    fn strict_writes_check_ids_supplied_by_defaults() {
+        let (_root, collection) = strict_collection("  id: { type: string, default: first }\n");
+        let created = collection.create(&serde_json::json!({
+            "path": "two.md", "type": "item", "fields": {}
+        }));
+        assert_eq!(created["error"]["code"], "validation_failed", "{created:#}");
+    }
 
     #[test]
     fn targeted_links_and_uniqueness_share_one_capture() {
