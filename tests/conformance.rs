@@ -19,6 +19,9 @@
 //!         expect: { valid: true, config: { ... } }
 //! ```
 
+#[path = "support/spec.rs"]
+mod spec;
+
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -34,7 +37,7 @@ fn spec_tests_dir() -> PathBuf {
         return PathBuf::from(path);
     }
 
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../mdbase-spec/tests")
+    spec::spec_root().join("tests")
 }
 
 // ---------------------------------------------------------------------------

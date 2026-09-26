@@ -141,12 +141,23 @@ Rust 1.94.0 is the minimum supported compiler and is pinned by
 
 ## Test
 
+Before pushing, run what CI runs:
+
 ```bash
-cargo test --locked --workspace --all-features
-cargo test --locked -p mdbase-runtime --no-default-features
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo deny check
+scripts/ci-local               # CI's quality, test and package jobs
+scripts/ci-local --job quality # one job
 ```
+
+It reads the steps from `.github/workflows/ci.yml`, so it cannot drift from CI,
+and reports every failing step at once. It tests against the spec revision CI
+pins (`MDBASE_SPEC_REVISION`) through a worktree of `../mdbase-spec`, leaving
+that checkout untouched. PostgreSQL contracts run when
+`MDBASE_RUNTIME_TEST_DATABASE_URL` is set, and the dependency policy when
+`cargo-deny` is installed.
+
+Spec-backed tests read `MDBASE_SPEC_REPO_DIR` when it is set. Otherwise they use
+`../mdbase-spec` and fail with the pinned revision if it is checked out at a
+different one.
 
 CI also runs the spec-owned interoperability testbed through
 `mdbase-testbed-adapter`. The adapter uses the public `Collection`, `Runtime`,

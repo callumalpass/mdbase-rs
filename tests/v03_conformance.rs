@@ -1,3 +1,6 @@
+#[path = "support/spec.rs"]
+mod spec;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -68,11 +71,7 @@ fn fixture_path(relative_path: &str) -> PathBuf {
     spec_root().join("tests/v0.3").join(relative_path)
 }
 
-fn spec_root() -> PathBuf {
-    std::env::var_os("MDBASE_SPEC_REPO_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../mdbase-spec"))
-}
+use spec::spec_root;
 
 fn materialize(setup: &Setup) -> TempDir {
     let directory = tempfile::tempdir().expect("create fixture collection");
