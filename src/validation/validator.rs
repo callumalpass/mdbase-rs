@@ -310,6 +310,45 @@ impl Collection {
         self.check_uniqueness_in_corpus(frontmatter, type_names, exclude_path, &corpus)
     }
 
+    /// Uniqueness issues for a record being written. The check compares against
+    /// the whole collection, so it reads a snapshot (reusing `snapshot` when the
+    /// write already captured one) only when a known type declares unique
+    /// fields or the record carries an id; otherwise nothing can conflict.
+    pub(crate) fn write_uniqueness_issues(
+        &self,
+        frontmatter: &serde_json::Value,
+        type_names: &[String],
+        path: &str,
+        snapshot: Option<&crate::snapshot::AuthoritativeCollectionSnapshot>,
+    ) -> Result<Vec<Issue>, crate::mutation::MutationFailure> {
+        let has_id = frontmatter
+            .get(&self.settings.id_field)
+            .is_some_and(|value| !value.is_null());
+        let applies = type_names
+            .iter()
+            .filter_map(|type_name| self.types.get(type_name))
+            .any(|type_def| has_id || !unique_field_references(type_def).is_empty());
+        if !applies {
+            return Ok(Vec::new());
+        }
+        let captured;
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                captured = self
+                    .capture_collection_snapshot_current()
+                    .map_err(|error| {
+                        crate::mutation::MutationFailure::operation(
+                            "collection_snapshot_failed",
+                            error.to_string(),
+                        )
+                    })?;
+                &captured
+            }
+        };
+        Ok(self.check_uniqueness(frontmatter, type_names, path, snapshot))
+    }
+
     pub(crate) fn check_uniqueness_in_corpus(
         &self,
         frontmatter: &serde_json::Value,

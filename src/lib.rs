@@ -173,6 +173,9 @@ pub struct Collection {
     pub(crate) type_plans: HashMap<String, crate::types::compiled::CompiledTypePlan>,
     pub(crate) type_warnings: Vec<String>,
     pub(crate) data_contracts: data_contracts::DataContractRegistry,
+    /// Sequence maxima observed in the authority when this collection is a
+    /// sparse working set that cannot see the records holding them.
+    pub(crate) sequence_floor: HashMap<(String, String), i64>,
 }
 
 impl Collection {
@@ -409,6 +412,7 @@ impl Collection {
                 type_plans: HashMap::new(),
                 type_warnings: Vec::new(),
                 data_contracts: data_contracts::DataContractRegistry::empty(),
+                sequence_floor: HashMap::new(),
             };
             crate::transactions::recover_pending(&recovery_collection).map_err(|error| {
                 serde_json::json!({
@@ -490,6 +494,7 @@ impl Collection {
             type_plans,
             type_warnings,
             data_contracts,
+            sequence_floor: HashMap::new(),
         };
         Ok(collection)
     }

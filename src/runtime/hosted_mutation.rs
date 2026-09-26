@@ -176,6 +176,7 @@ impl CompiledCatalog {
             type_plans: self.collection.type_plans.clone(),
             type_warnings: self.collection.type_warnings.clone(),
             data_contracts,
+            sequence_floor: std::collections::HashMap::new(),
         };
         let primary_before = before_by_stable.get(&request.primary_stable_id).cloned();
         let mut input = request.input.as_object().cloned().ok_or_else(|| {

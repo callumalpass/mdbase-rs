@@ -274,10 +274,7 @@ impl Collection {
                     .any(|field| field.generated.is_some())
             })
         });
-        let operation_snapshot = if prevalidated.is_none()
-            && (has_generated
-                || (validate_collection && self.settings.default_validation == "error"))
-        {
+        let operation_snapshot = if prevalidated.is_none() && has_generated {
             match self.capture_collection_snapshot_current() {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) => {
@@ -325,13 +322,13 @@ impl Collection {
                 &effective
             };
             let mut validation = self.validate(validation_frontmatter, &type_names, path.as_str());
-            let collection_snapshot = operation_snapshot
-                .as_ref()
-                .expect("validated updates capture one snapshot");
 
-            // Cross-file uniqueness checks for update
-            let uniqueness_issues =
-                self.check_uniqueness(&effective, &type_names, path.as_str(), collection_snapshot);
+            let uniqueness_issues = self.write_uniqueness_issues(
+                &effective,
+                &type_names,
+                path.as_str(),
+                operation_snapshot.as_ref(),
+            )?;
             validation.issues.extend(uniqueness_issues.iter().cloned());
             if !uniqueness_issues.is_empty() {
                 validation.valid = false;

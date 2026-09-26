@@ -236,7 +236,19 @@ fn prepare_sparse_runtime(
 ) -> Result<RuntimeSinglePreparation, ProviderError> {
     let kind = operation.parse::<OperationKind>()?;
     let input_path = input.get("path").and_then(Value::as_str);
-    let shadow = sparse_shadow_collection(collection, input_path, context)?;
+    let mut shadow = sparse_shadow_collection(collection, input_path, context)?;
+    // The sparse working set holds only the target record, so sequence values
+    // must continue from the maxima of the whole authority.
+    if matches!(kind, OperationKind::Create | OperationKind::Update)
+        && crate::generated::GeneratedValueContext::collection_has_sequences(collection)
+    {
+        let snapshot = collection
+            .capture_collection_snapshot_context(context)
+            .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+        shadow.collection.sequence_floor =
+            crate::generated::GeneratedValueContext::from_snapshot(collection, &snapshot)
+                .into_sequence_maxima();
+    }
     let captured_before = input_path
         .map(|path| targeted_snapshot(&shadow.collection, path, context))
         .transpose()?;

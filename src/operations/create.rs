@@ -151,7 +151,7 @@ impl Collection {
                     .any(|field| field.generated.is_some())
             })
         });
-        let operation_snapshot = if has_generated || self.settings.default_validation == "error" {
+        let operation_snapshot = if has_generated {
             match self.capture_collection_snapshot_current() {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) => {
@@ -337,14 +337,12 @@ impl Collection {
                 &effective
             };
             let mut validation = self.validate(validation_frontmatter, &type_names, path.as_str());
-            let uniqueness = self.check_uniqueness(
+            let uniqueness = self.write_uniqueness_issues(
                 &effective,
                 &type_names,
                 path.as_str(),
-                operation_snapshot
-                    .as_ref()
-                    .expect("validated creates capture one snapshot"),
-            );
+                operation_snapshot.as_ref(),
+            )?;
             validation.issues.extend(uniqueness);
             validation.valid = !validation
                 .issues

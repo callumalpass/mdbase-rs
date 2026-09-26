@@ -40,6 +40,12 @@ pub(crate) struct AuthoritativeCollectionSnapshotEntry {
     outcome: RecordLoadOutcome,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Whole-collection captures made on this thread, for tests that pin when they happen.
+    pub(crate) static SNAPSHOT_CAPTURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl AuthoritativeCollectionSnapshotEntry {
     pub(crate) fn relative_path(&self) -> &str {
         self.outcome.path()
@@ -228,6 +234,8 @@ impl Collection {
         &self,
         context: &crate::runtime::OperationContext,
     ) -> Result<AuthoritativeCollectionSnapshot, SnapshotError> {
+        #[cfg(test)]
+        SNAPSHOT_CAPTURES.with(|captures| captures.set(captures.get() + 1));
         context.check()?;
         let paths = self.scan_collection_all_relative_paths_context(context)?;
         context.check()?;

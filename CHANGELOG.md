@@ -6,11 +6,25 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Runtime creates and updates continue generated `sequence` values from every
+  record of the type. The runtime prepares these mutations in a sparse stage
+  holding only the target record, so a sequence previously restarted from its
+  start value and duplicated values already in the collection.
 - Permit selected-type and contract-selected creates in collections with empty
   explicit membership keys when final persisted data matches the selection.
   Retain auxiliary-type validation, matching errors, lifecycle membership checks,
   and explicit-declaration preservation when declaration keys are configured.
 - Apply empty-list write policy before final create membership validation.
+
+### Performance
+
+- The filesystem watcher reconciles atomic saves (temporary file, then rename)
+  incrementally. Only renames of directories, symlinks, or vanished paths with
+  indexed records or resources under them still trigger a full refresh.
+  Runtime update-plus-watch at 5,000 records: 158 → 44 ms.
+- Strict (`validation: error`) creates and updates capture a collection
+  snapshot only when a matched type declares unique fields or the written
+  record carries an id. Direct create at 5,000 records: 315 → 201 ms.
 
 ### Breaking
 
