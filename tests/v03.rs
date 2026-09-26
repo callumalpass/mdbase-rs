@@ -398,6 +398,28 @@ schema:
         .any(|diagnostic| diagnostic.code == "unsupported_profile"));
 }
 
+#[test]
+fn rejects_schema_ref_into_ancestor_schema_directory() {
+    let parent = tempfile::tempdir().expect("parent directory");
+    write(
+        parent.path(),
+        "schemas/v0.3/type-file.schema.json",
+        r#"{"type":"object"}"#,
+    );
+    let collection_root = parent.path().join("collection");
+    write(&collection_root, "mdbase.yaml", "spec_version: \"0.3.0\"\n");
+    write(
+        &collection_root,
+        "_types/meta.md",
+        "---\nkind: mdbase.type\nname: meta\nschema:\n  dialect: json-schema-2020-12\n  ref: ../../schemas/v0.3/type-file.schema.json\n---\n",
+    );
+    let report = v03::inspect_collection(&collection_root);
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "schema_ref_forbidden"));
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_schema_ref_symlink_escapes() {
