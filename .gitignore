@@ -1,5 +1,5 @@
 target/
-/mdbase-spec/
+/mdbase-spec
 
 PROMPT.md
 AGENTS.md

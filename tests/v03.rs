@@ -1,3 +1,6 @@
+#[path = "support/spec.rs"]
+mod spec;
+
 use std::fs;
 use std::path::Path;
 
@@ -279,11 +282,11 @@ fn v03_asserts_the_required_rfc3339_formats() {
 
 #[test]
 fn inspects_the_canonical_canvas_collection() {
-    let fixture = Path::new("../mdbase-spec/examples/v0.3/canvas-runtime");
+    let fixture = spec::spec_root().join("examples/v0.3/canvas-runtime");
     if !fixture.exists() {
         return;
     }
-    let report = v03::inspect_collection(fixture);
+    let report = v03::inspect_collection(&fixture);
     assert!(report.valid, "{:#?}", report.diagnostics);
     assert!(report
         .types

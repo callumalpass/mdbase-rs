@@ -1,3 +1,6 @@
+#[path = "support/spec.rs"]
+mod spec;
+
 use std::fs;
 use std::path::Path;
 
@@ -266,10 +269,7 @@ data_schema:
 #[test]
 fn canonical_tasknotes_digests_match_the_spec_fixture() {
     let configured_spec_root = std::env::var_os("MDBASE_SPEC_REPO_DIR");
-    let spec_root = configured_spec_root
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../mdbase-spec"));
+    let spec_root = spec::spec_root();
     let collection_root = spec_root.join("examples/v0.3/tasknotes-migration/v0.3");
     if configured_spec_root.is_none() && !collection_root.exists() {
         return;

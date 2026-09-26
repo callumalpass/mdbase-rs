@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Run CI's quality, test and package jobs locally before pushing.
+
+The steps are read from .github/workflows/ci.yml, not copied, so this cannot
+drift from CI. The spec is provided where CI checks it out (./mdbase-spec, at
+MDBASE_SPEC_REVISION) from a worktree of ../mdbase-spec, leaving that checkout
+untouched. Every step runs and all failures are reported together.
+
+  scripts/ci-local            quality, test and package jobs
+  scripts/ci-local --job test one job (repeatable)
+
+PostgreSQL contracts run only when MDBASE_RUNTIME_TEST_DATABASE_URL is set.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+WORKFLOW = ROOT / ".github/workflows/ci.yml"
+SPEC_LINK = ROOT / "mdbase-spec"
+SPEC_WORKTREE = ROOT / "target/ci-local/mdbase-spec"
+DEFAULT_JOBS = ["quality", "test", "package"]
+
+
+def indent(line):
+    return len(line) - len(line.lstrip())
+
+
+def parse_jobs(text):
+    """Each job's steps as dicts of run, env, working-directory and if."""
+    lines = text.split("\n")
+    jobs, job, step, step_indent = {}, None, None, None
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        header = re.match(r"^  ([a-z0-9_-]+):\s*$", line)
+        if header:
+            job = header.group(1)
+            jobs[job] = []
+            step = None
+        item = re.match(r"^(\s*)- (.*)$", line)
+        if job and item and indent(line) >= 6 and (step is None or indent(line) <= step_indent):
+            step, step_indent = {"env": {}}, indent(line)
+            jobs[job].append(step)
+            line = " " * (indent(line) + 2) + item.group(2)
+        field = re.match(r"^(\s*)(run|if|working-directory|env):\s*(.*)$", line)
+        if step is not None and field and indent(line) == step_indent + 2:
+            key, value = field.group(2), field.group(3).strip()
+            if key == "env":
+                while index + 1 < len(lines) and indent(lines[index + 1]) > step_indent + 2 and lines[index + 1].strip():
+                    index += 1
+                    name, _, env_value = lines[index].strip().partition(":")
+                    step["env"][name.strip()] = env_value.strip().strip('"')
+            elif key == "run" and re.match(r"^[|>][-+]?$", value):
+                body = []
+                while index + 1 < len(lines) and (not lines[index + 1].strip() or indent(lines[index + 1]) > step_indent + 2):
+                    index += 1
+                    body.append(lines[index].strip())
+                body = [part for part in body if part]
+                step["run"] = " ".join(body) if value.startswith(">") else "\n".join(body)
+            elif value:
+                step[key] = value
+        index += 1
+    return {name: [step for step in steps if "run" in step] for name, steps in jobs.items()}
+
+
+def pinned_spec_revision(text):
+    match = re.search(r"^\s*MDBASE_SPEC_REVISION:\s*([0-9a-f]{40})\s*$", text, re.M)
+    if not match:
+        sys.exit("ci.yml does not pin MDBASE_SPEC_REVISION")
+    return match.group(1)
+
+
+def provide_spec(revision):
+    """A detached worktree of the pinned spec, linked where CI checks it out."""
+    sibling = ROOT.parent / "mdbase-spec"
+    git = lambda *args, **kw: subprocess.run(["git", *args], check=True, **kw)
+    if SPEC_WORKTREE.exists():
+        head = subprocess.run(["git", "-C", SPEC_WORKTREE, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        if head != revision:
+            git("-C", SPEC_WORKTREE, "fetch", "--quiet", "origin")
+            git("-C", SPEC_WORKTREE, "checkout", "--quiet", "--detach", revision)
+    elif (sibling / ".git").exists():
+        if subprocess.run(["git", "-C", sibling, "cat-file", "-e", f"{revision}^{{commit}}"], capture_output=True).returncode:
+            git("-C", sibling, "fetch", "--quiet", "origin")
+        git("-C", sibling, "worktree", "add", "--quiet", "--detach", SPEC_WORKTREE, revision)
+    else:
+        git("clone", "--quiet", "https://github.com/mdbase-dev/mdbase-spec.git", SPEC_WORKTREE)
+        git("-C", SPEC_WORKTREE, "checkout", "--quiet", "--detach", revision)
+    if SPEC_LINK.is_symlink():
+        SPEC_LINK.unlink()
+    elif SPEC_LINK.exists():
+        sys.exit(f"{SPEC_LINK} exists and is not ci-local's link; move it aside.")
+    SPEC_LINK.symlink_to(SPEC_WORKTREE, target_is_directory=True)
+
+
+def expand(value):
+    return value.replace("${{ github.workspace }}", str(ROOT))
+
+
+def main():
+    arguments = sys.argv[1:]
+    if arguments and arguments[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    jobs_wanted = [arguments[i + 1] for i, arg in enumerate(arguments) if arg == "--job"] or DEFAULT_JOBS
+    text = WORKFLOW.read_text()
+    jobs = parse_jobs(text)
+    unknown = [job for job in jobs_wanted if job not in jobs]
+    if unknown:
+        sys.exit(f"unknown job(s): {', '.join(unknown)}; ci.yml has {', '.join(jobs)}")
+    database = os.environ.get("MDBASE_RUNTIME_TEST_DATABASE_URL")
+    if database and "postgres" not in jobs_wanted:
+        jobs_wanted.append("postgres")
+
+    provide_spec(pinned_spec_revision(text))
+    failures, skipped = [], []
+    dirty = subprocess.run(["git", "-C", ROOT, "status", "--porcelain", "--untracked-files=no"],
+                           capture_output=True, text=True).stdout.strip()
+    try:
+        for job in jobs_wanted:
+            for step in jobs[job]:
+                command = step["run"]
+                label = f"[{job}] {command.splitlines()[0]}"
+                condition = step.get("if", "")
+                if job == "package" and dirty:
+                    skipped.append(f"{label} (commit first: cargo package refuses uncommitted changes)")
+                    continue
+                if "Windows" in condition:
+                    skipped.append(f"{label} (Windows only)")
+                    continue
+                env = {**os.environ, **{key: expand(value) for key, value in step["env"].items()}}
+                if job == "postgres" and database:
+                    env["MDBASE_RUNTIME_TEST_DATABASE_URL"] = database
+                cwd = ROOT / step.get("working-directory", ".")
+                print(f"\n==> {label}", flush=True)
+                started = time.monotonic()
+                result = subprocess.run(["bash", "-eo", "pipefail", "-c", command], cwd=cwd, env=env)
+                seconds = round(time.monotonic() - started)
+                print(f"    {'ok' if result.returncode == 0 else 'FAILED'} in {seconds}s", flush=True)
+                if result.returncode:
+                    failures.append(label)
+    finally:
+        if SPEC_LINK.is_symlink():
+            SPEC_LINK.unlink()
+
+    for line in skipped:
+        print(f"skipped: {line}")
+    if not database:
+        print("skipped: [postgres] set MDBASE_RUNTIME_TEST_DATABASE_URL to run the PostgreSQL contracts")
+    if shutil.which("cargo-deny"):
+        print("\n==> [dependencies] cargo deny check")
+        if subprocess.run(["cargo", "deny", "check"], cwd=ROOT).returncode:
+            failures.append("[dependencies] cargo deny check")
+    else:
+        print("skipped: [dependencies] install cargo-deny to run the dependency policy")
+    if failures:
+        print(f"\n{len(failures)} step(s) would fail CI:")
+        for label in failures:
+            print(f"  - {label}")
+        return 1
+    print("\nEvery selected CI step passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
