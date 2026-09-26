@@ -1361,10 +1361,19 @@ impl Snapshot {
             return None;
         }
 
+        // A rename moves many records only when it moves a directory. Atomic
+        // saves rename a temporary file over one record, so reconcile just the
+        // visible paths instead of rescanning the collection on every write.
+        if matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)))
+            && visible
+                .iter()
+                .any(|(path, _, normalized)| self.renamed_path_may_hold_records(path, normalized))
+        {
+            return None;
+        }
         if matches!(
             event.kind,
-            EventKind::Modify(ModifyKind::Name(_))
-                | EventKind::Create(CreateKind::Folder)
+            EventKind::Create(CreateKind::Folder)
                 | EventKind::Remove(RemoveKind::Folder | RemoveKind::Any | RemoveKind::Other)
         ) || matches!(
             event.kind,
@@ -1397,6 +1406,34 @@ impl Snapshot {
             }
         }
         Some(records)
+    }
+
+    /// Whether a renamed path is, or was, something other than one file: a
+    /// directory or symlink now, or a vanished path under which the snapshot
+    /// holds records or resources.
+    fn renamed_path_may_hold_records(&self, path: &Path, normalized: &str) -> bool {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => !metadata.is_file(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let prefix = format!("{normalized}/");
+                let under = |key: &String| key.starts_with(&prefix);
+                self.records
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|(key, _)| under(key))
+                    || self
+                        .invalid_records
+                        .range(prefix.clone()..)
+                        .next()
+                        .is_some_and(under)
+                    || self
+                        .resources
+                        .range(prefix.clone()..)
+                        .next()
+                        .is_some_and(|(key, _)| under(key))
+            }
+            Err(_) => true,
+        }
     }
 
     fn is_ignored_path(&self, path: &str) -> bool {
@@ -1744,8 +1781,8 @@ mod tests {
                     .join("reported-root-alias"),
             ),
             Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)))
-                .add_path(directory.path().join("old"))
-                .add_path(directory.path().join("new")),
+                .add_path(directory.path().join("gone"))
+                .add_path(directory.path().join("extant")),
             Event::new(EventKind::Create(CreateKind::Folder))
                 .add_path(directory.path().join("folder")),
             Event::new(EventKind::Remove(RemoveKind::Folder))
@@ -1778,6 +1815,98 @@ mod tests {
                 Event::new(EventKind::Remove(kind)).add_path(directory.path().join("visible-gone"));
             assert_eq!(snapshot.invalidation_paths(directory.path(), &event), None);
         }
+    }
+
+    fn record_state_for_test() -> RecordState {
+        RecordState {
+            revision: "sha256:test".to_string(),
+            raw_frontmatter: Map::new(),
+            effective_frontmatter: json!({}),
+            types: json!([]),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn file_renames_reconcile_only_their_paths_but_directory_renames_rescan() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("note.md"), "---\ntitle: Note\n---\n").unwrap();
+        fs::write(root.join("renamed.md"), "---\ntitle: Renamed\n---\n").unwrap();
+        fs::create_dir(root.join("folder")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("folder"), root.join("linked")).unwrap();
+        let mut snapshot = Snapshot {
+            resources: BTreeMap::new(),
+            records: BTreeMap::new(),
+            invalid_records: Arc::new(BTreeSet::from(["broken/invalid.md".to_string()])),
+            types_folder: "_types".to_string(),
+            contracts_folder: "_contracts".to_string(),
+            cache_folder: ".mdbase/cache".to_string(),
+            migrations_folder: ".mdbase/migrations".to_string(),
+            exclude: Vec::new(),
+            include_subfolders: true,
+            record_extensions: BTreeSet::from(["md".to_string()]),
+        };
+        snapshot.resources.insert(
+            "views/all.base".to_string(),
+            ResourceState {
+                kind: CollectionSnapshotResourceKind::View,
+                revision: "r".to_string(),
+            },
+        );
+        let rename = |mode, paths: &[&str]| {
+            paths.iter().fold(
+                Event::new(EventKind::Modify(ModifyKind::Name(mode))),
+                |event, path| event.add_path(root.join(path)),
+            )
+        };
+        let records =
+            |paths: &[&str]| Some(paths.iter().map(PathBuf::from).collect::<BTreeSet<_>>());
+
+        // An atomic save: a hidden temporary file renamed over one record.
+        for event in [
+            rename(RenameMode::Both, &[".tmpA1b2C3", "note.md"]),
+            rename(RenameMode::To, &["note.md"]),
+            rename(RenameMode::From, &[".tmpA1b2C3"]),
+        ] {
+            let expected = if event.kind == EventKind::Modify(ModifyKind::Name(RenameMode::From)) {
+                Some(BTreeSet::new())
+            } else {
+                records(&["note.md"])
+            };
+            assert_eq!(
+                snapshot.invalidation_paths(root, &event),
+                expected,
+                "{event:?}"
+            );
+        }
+        // A record renamed away and to a new name.
+        assert_eq!(
+            snapshot.invalidation_paths(root, &rename(RenameMode::Both, &["was.md", "renamed.md"])),
+            records(&["renamed.md", "was.md"])
+        );
+
+        // Directories move many records at once.
+        for event in [
+            rename(RenameMode::To, &["folder"]),
+            rename(RenameMode::From, &["broken"]),
+            rename(RenameMode::From, &["views"]),
+            rename(RenameMode::Any, &["gone-with-records"]),
+        ] {
+            if event.paths[0].ends_with("gone-with-records") {
+                snapshot.records.insert(
+                    "gone-with-records/a.md".to_string(),
+                    record_state_for_test(),
+                );
+            }
+            assert_eq!(snapshot.invalidation_paths(root, &event), None, "{event:?}");
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            snapshot.invalidation_paths(root, &rename(RenameMode::To, &["linked"])),
+            None
+        );
     }
 
     #[test]
