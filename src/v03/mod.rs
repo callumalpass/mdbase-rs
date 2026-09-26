@@ -871,22 +871,9 @@ pub(crate) fn is_forbidden_reference(reference: &str) -> bool {
 }
 
 fn is_allowed_schema_path(candidate: &Path, collection_root: &Path) -> bool {
-    if let Ok(root) = collection_root.canonicalize() {
-        if candidate.starts_with(root) {
-            return true;
-        }
-    }
-    let mut current = Some(collection_root);
-    while let Some(directory) = current {
-        let schema_root = directory.join("schemas/v0.3");
-        if let Ok(schema_root) = schema_root.canonicalize() {
-            if candidate.starts_with(schema_root) {
-                return true;
-            }
-        }
-        current = directory.parent();
-    }
-    false
+    collection_root
+        .canonicalize()
+        .is_ok_and(|root| candidate.starts_with(root))
 }
 
 fn should_descend(entry: &DirEntry) -> bool {
