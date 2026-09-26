@@ -927,6 +927,7 @@ pub(crate) fn unique_field_references(type_def: &TypeDef) -> Vec<String> {
 mod snapshot_tests {
     use super::*;
 
+    #[cfg(feature = "legacy-collection-mutation")]
     fn strict_collection(type_fields: &str) -> (tempfile::TempDir, crate::Collection) {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -949,10 +950,12 @@ mod snapshot_tests {
         (root, collection)
     }
 
+    #[cfg(feature = "legacy-collection-mutation")]
     fn captures() -> usize {
         crate::snapshot::SNAPSHOT_CAPTURES.with(std::cell::Cell::get)
     }
 
+    #[cfg(feature = "legacy-collection-mutation")]
     #[test]
     fn strict_writes_skip_the_collection_snapshot_when_nothing_can_conflict() {
         let (_root, collection) = strict_collection("  title: { type: string }\n");
@@ -968,6 +971,7 @@ mod snapshot_tests {
         assert_eq!(captures(), before);
     }
 
+    #[cfg(feature = "legacy-collection-mutation")]
     #[test]
     fn strict_writes_still_reject_duplicate_unique_fields() {
         let (_root, collection) = strict_collection("  key: { type: string, unique: true }\n");
@@ -984,6 +988,7 @@ mod snapshot_tests {
         assert_eq!(updated["error"]["code"], "validation_failed", "{updated:#}");
     }
 
+    #[cfg(feature = "legacy-collection-mutation")]
     #[test]
     fn strict_writes_still_reject_duplicate_ids_without_unique_fields() {
         let (_root, collection) = strict_collection("  title: { type: string }\n");
@@ -993,6 +998,7 @@ mod snapshot_tests {
         assert_eq!(created["error"]["code"], "validation_failed", "{created:#}");
     }
 
+    #[cfg(feature = "legacy-collection-mutation")]
     #[test]
     fn strict_writes_check_ids_supplied_by_defaults() {
         let (_root, collection) = strict_collection("  id: { type: string, default: first }\n");
