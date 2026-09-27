@@ -39,26 +39,26 @@ pub(crate) struct ProgramFacts {
 
 impl Program {
     pub(crate) fn parse(source: &str, max_depth: u32) -> Result<Self, String> {
-        // The generated parser recurses once per nesting level; give it room so
-        // the AST depth check below, not the stack, decides the limit.
-        let ast = stacker::grow(STACK_SIZE, || {
-            Parser::default()
+        // Parsing and the AST passes below recurse once per nesting level; give
+        // them room so the depth check, not the thread's stack, decides the limit.
+        stacker::grow(STACK_SIZE, || {
+            let ast = Parser::default()
                 .enable_optional_syntax(true)
                 .max_recursion_depth(u16::try_from(max_depth.saturating_mul(2)).unwrap_or(u16::MAX))
                 .parse(source)
-        })
-        .map_err(|errors| errors.to_string())?;
-        if depth(&ast) > max_depth as usize {
-            return Err("expression_depth_exceeded".to_string());
-        }
-        let mut facts = ProgramFacts::default();
-        collect(&ast, &mut Vec::new(), &mut facts);
-        let ast = Arc::new(ast);
-        let executable = super::provenance::rewrite(&ast).map_or_else(|| ast.clone(), Arc::new);
-        Ok(Self {
-            ast,
-            executable,
-            facts: Arc::new(facts),
+                .map_err(|errors| errors.to_string())?;
+            if depth(&ast) > max_depth as usize {
+                return Err("expression_depth_exceeded".to_string());
+            }
+            let mut facts = ProgramFacts::default();
+            collect(&ast, &mut Vec::new(), &mut facts);
+            let ast = Arc::new(ast);
+            let executable = super::provenance::rewrite(&ast).map_or_else(|| ast.clone(), Arc::new);
+            Ok(Self {
+                ast,
+                executable,
+                facts: Arc::new(facts),
+            })
         })
     }
 

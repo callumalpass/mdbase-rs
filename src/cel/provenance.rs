@@ -204,12 +204,10 @@ fn source_of(node: &IdedExpr, scope: &Scope) -> Option<Source> {
 }
 
 fn max_id(node: &IdedExpr) -> u64 {
-    let mut max = node.id;
-    map_children(node, &mut |child| {
-        max = max.max(max_id(child));
-        child.clone()
-    });
-    max
+    children(node)
+        .into_iter()
+        .map(max_id)
+        .fold(node.id, u64::max)
 }
 
 fn find(node: &IdedExpr, id: u64) -> Option<&IdedExpr> {
