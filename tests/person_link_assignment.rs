@@ -70,9 +70,14 @@ fn projections_return_resolved_targets_and_null_for_unresolved_links() {
     let result = collection.v03_operations().unwrap().query(&json!({
         "types": ["task"],
         "where": "file.path == 'tasks/b.md'",
-        "projections": { "targets": { "expr": "assignees.map(a, a.asFile() == null ? null : a.asFile().file.path)" } },
-        "select": ["projection.targets"]
+        "projections": {
+            "links": { "expr": "\"assignees\" in raw ? raw[\"assignees\"] : []" },
+            "targets": { "expr": "\"assignees\" in record ? record[\"assignees\"].map(a, a.asFile() == null ? null : a.asFile().file.path) : []" }
+        },
+        "select": ["projection.links", "projection.targets"]
     }));
     assert!(result.valid, "{result:#?}");
+    // Raw link text and resolved targets line up by index.
+    assert_eq!(result.result["results"][0]["values"]["links"], json!(["[[people/bob]]", "[[Nobody]]"]));
     assert_eq!(result.result["results"][0]["values"]["targets"], json!(["people/bob.md", null]));
 }
