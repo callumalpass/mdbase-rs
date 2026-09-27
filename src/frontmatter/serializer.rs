@@ -131,6 +131,33 @@ pub fn merge_fields(
     result
 }
 
+/// Remove the keys addressed by `unset` field references from a mapping.
+///
+/// References were validated as object paths when the request was decoded, so
+/// an invalid reference or a path through a non-mapping value removes nothing.
+pub fn remove_fields(existing: &serde_yaml::Mapping, unset: &[String]) -> serde_yaml::Mapping {
+    let mut result = existing.clone();
+    for reference in unset {
+        let Ok(keys) = crate::field_references::object_path(reference) else {
+            continue;
+        };
+        remove_path(&mut result, &keys);
+    }
+    result
+}
+
+fn remove_path(mapping: &mut serde_yaml::Mapping, keys: &[String]) {
+    let Some((first, rest)) = keys.split_first() else {
+        return;
+    };
+    let key = YamlValue::String(first.clone());
+    if rest.is_empty() {
+        mapping.remove(&key);
+    } else if let Some(YamlValue::Mapping(child)) = mapping.get_mut(&key) {
+        remove_path(child, rest);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{serialize_document, serialize_document_with_bom};

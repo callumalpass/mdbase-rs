@@ -347,10 +347,13 @@ impl CreateRequest {
 pub struct UpdateRequest {
     /// Existing record path.
     pub path: CollectionPath,
-    /// Frontmatter merge patch.
+    /// Top-level keys to set. A null value persists an explicit null.
     pub patch: Value,
-    /// Complete replacement Markdown source, mutually exclusive with `patch`
-    /// and `body`.
+    /// Field references whose keys are removed from persisted frontmatter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unset: Vec<String>,
+    /// Complete replacement Markdown source, mutually exclusive with `patch`,
+    /// `unset`, and `body`.
     #[serde(default)]
     pub document: Option<String>,
     /// Complete replacement body, or `None` to preserve the current body.
@@ -370,6 +373,7 @@ impl UpdateRequest {
         Self {
             path,
             patch,
+            unset: Vec::new(),
             document: None,
             body: None,
             if_revision: None,
@@ -382,6 +386,7 @@ impl UpdateRequest {
         Self {
             path,
             patch: json!({}),
+            unset: Vec::new(),
             document: Some(document.into()),
             body: None,
             if_revision: None,
@@ -395,6 +400,12 @@ impl UpdateRequest {
         self
     }
 
+    /// Remove the keys addressed by these field references.
+    pub fn with_unset(mut self, references: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.unset = references.into_iter().map(Into::into).collect();
+        self
+    }
+
     fn into_wire(self) -> Value {
         #[cfg(test)]
         crate::mutation::probe_request_value();
@@ -403,6 +414,9 @@ impl UpdateRequest {
             input["document"] = Value::String(document);
         } else {
             input["patch"] = self.patch;
+            if !self.unset.is_empty() {
+                input["unset"] = json!(self.unset);
+            }
             set_optional(&mut input, "body", self.body.map(Value::String));
         }
         set_optional(

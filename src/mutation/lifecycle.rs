@@ -34,13 +34,6 @@ impl LifecycleEvent {
     }
 }
 
-#[derive(Debug, Clone)]
-struct AppliedAssignment {
-    provider: Value,
-    type_name: String,
-    lifecycle_path: String,
-}
-
 impl Collection {
     /// Apply the lifecycle policy for the already-frozen type membership.
     ///
@@ -63,7 +56,6 @@ impl Collection {
         })?;
         let now_value = Value::String(clock.now().to_string());
         let today_value = Value::String(clock.today().to_string());
-        let mut assignments: HashMap<String, AppliedAssignment> = HashMap::new();
         let mut ordered_types = type_names.to_vec();
         ordered_types.sort();
         ordered_types.dedup();
@@ -72,28 +64,30 @@ impl Collection {
             .filter_map(|type_name| self.types.get(type_name))
             .flat_map(|definition| definition.fields.keys().cloned())
             .collect::<BTreeSet<_>>();
+        let policies = ordered_types
+            .iter()
+            .filter_map(|type_name| {
+                let policy = self
+                    .types
+                    .get(type_name)?
+                    .lifecycle
+                    .as_ref()?
+                    .get(event.key())?;
+                let actions: Vec<&Value> = match policy {
+                    Value::Array(actions) => actions.iter().collect(),
+                    action => vec![action],
+                };
+                Some((type_name, actions))
+            })
+            .collect::<Vec<_>>();
+        let shared = cross_type_assignments(&policies, event, path)?;
 
-        for type_name in &ordered_types {
-            let Some(type_definition) = self.types.get(type_name) else {
-                continue;
-            };
-            let Some(policy) = type_definition
-                .lifecycle
-                .as_ref()
-                .and_then(|lifecycle| lifecycle.get(event.key()))
-            else {
-                continue;
-            };
-            let actions: Vec<&Value> = match policy {
-                Value::Array(actions) => actions.iter().collect(),
-                action => vec![action],
-            };
-
-            for (action_index, action) in actions.into_iter().enumerate() {
+        for (type_name, actions) in &policies {
+            for (action_index, action) in actions.iter().enumerate() {
                 if let Some(source) = action.get("if").and_then(Value::as_str) {
                     let Some(expression) = self
                         .type_plans
-                        .get(type_name)
+                        .get(*type_name)
                         .and_then(|plan| plan.lifecycle_guard(event.key(), action_index))
                     else {
                         return Err(vec![Diagnostic::error(
@@ -119,7 +113,7 @@ impl Collection {
                                 message,
                                 Some(path.to_string()),
                             );
-                            diagnostic.type_name = Some(type_name.clone());
+                            diagnostic.type_name = Some((*type_name).clone());
                             diagnostic.details = Some(json!({
                                 "event": event.key(),
                                 "action": action_index,
@@ -133,58 +127,31 @@ impl Collection {
                 let Some(set) = action.get("set").and_then(Value::as_object) else {
                     continue;
                 };
+                // Every provider in one `set` reads the draft as it was before
+                // this action, so YAML key order never changes the result.
+                let snapshot = draft.clone();
                 for (field, provider) in set {
-                    let lifecycle_path = format!(
-                        "types/{}/lifecycle/{}/{}/set/{}",
-                        type_name,
-                        event.key(),
-                        action_index,
-                        field
-                    );
-                    if let Some(previous) = assignments.get(field) {
-                        if previous.type_name != *type_name && previous.provider != *provider {
-                            let mut diagnostic = Diagnostic::error(
-                                "type_conflict",
-                                format!(
-                                    "Types '{}' and '{}' assign different lifecycle values to '{}'.",
-                                    previous.type_name, type_name, field
-                                ),
-                                Some(path.to_string()),
-                            );
-                            diagnostic.field = Some(field.clone());
-                            diagnostic.details = Some(json!({
-                                "event": event.key(),
-                                "types": [previous.type_name, type_name],
-                                "lifecycle_paths": [previous.lifecycle_path, lifecycle_path],
-                            }));
-                            return Err(vec![diagnostic]);
-                        }
-                        if previous.type_name != *type_name && previous.provider == *provider {
-                            continue;
-                        }
+                    if shared.get(field).is_some_and(|owner| owner != *type_name) {
+                        // An identical assignment from an earlier type already ran.
+                        continue;
                     }
-
-                    let value = resolve_provider(provider, &draft, &now_value, &today_value);
-                    if let Err(message) =
-                        field_references::set_object_value(&mut draft, field, value)
-                    {
+                    let result =
+                        match resolve_provider(provider, &snapshot, &now_value, &today_value) {
+                            Some(value) => {
+                                field_references::set_object_value(&mut draft, field, value)
+                            }
+                            None => field_references::remove_object_value(&mut draft, field),
+                        };
+                    if let Err(message) = result {
                         let mut diagnostic = Diagnostic::error(
                             "invalid_lifecycle_path",
                             message,
                             Some(path.to_string()),
                         );
                         diagnostic.field = Some(field.clone());
-                        diagnostic.type_name = Some(type_name.clone());
+                        diagnostic.type_name = Some((*type_name).clone());
                         return Err(vec![diagnostic]);
                     }
-                    assignments.insert(
-                        field.clone(),
-                        AppliedAssignment {
-                            provider: provider.clone(),
-                            type_name: type_name.clone(),
-                            lifecycle_path,
-                        },
-                    );
                 }
             }
         }
@@ -225,38 +192,87 @@ fn evaluate_guard_compiled(
     Ok(result == Value::Bool(true))
 }
 
+/// Map each field assigned by more than one matched type to the first type
+/// that assigns it. Different providers for one field are a `type_conflict`
+/// whether or not their guards would run (Chapter 09).
+fn cross_type_assignments(
+    policies: &[(&String, Vec<&Value>)],
+    event: LifecycleEvent,
+    path: &str,
+) -> Result<HashMap<String, String>, Vec<Diagnostic>> {
+    let mut first: HashMap<&String, (&String, &Value, String)> = HashMap::new();
+    let mut shared = HashMap::new();
+    for (type_name, actions) in policies {
+        for (action_index, action) in actions.iter().enumerate() {
+            let Some(set) = action.get("set").and_then(Value::as_object) else {
+                continue;
+            };
+            for (field, provider) in set {
+                let lifecycle_path = format!(
+                    "types/{type_name}/lifecycle/{}/{action_index}/set/{field}",
+                    event.key()
+                );
+                match first.get(field) {
+                    None => {
+                        first.insert(field, (type_name, provider, lifecycle_path));
+                    }
+                    Some((owner, _, _)) if owner == type_name => {}
+                    Some((owner, existing, _)) if *existing == provider => {
+                        shared.insert(field.clone(), (*owner).clone());
+                    }
+                    Some((owner, _, owner_path)) => {
+                        let mut diagnostic = Diagnostic::error(
+                            "type_conflict",
+                            format!(
+                                "Types '{owner}' and '{type_name}' assign different lifecycle values to '{field}'."
+                            ),
+                            Some(path.to_string()),
+                        );
+                        diagnostic.field = Some(field.clone());
+                        diagnostic.details = Some(json!({
+                            "event": event.key(),
+                            "types": [owner, type_name],
+                            "lifecycle_paths": [owner_path, lifecycle_path],
+                        }));
+                        return Err(vec![diagnostic]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(shared)
+}
+
+/// The value a provider assigns, or `None` when the target key is removed.
 fn resolve_provider(
     provider: &Value,
     draft: &Map<String, Value>,
     now: &Value,
     today: &Value,
-) -> Value {
+) -> Option<Value> {
     if provider.get("now") == Some(&Value::Bool(true)) {
-        return now.clone();
+        return Some(now.clone());
     }
     if provider.get("today") == Some(&Value::Bool(true)) {
-        return today.clone();
+        return Some(today.clone());
     }
     if provider.get("uuid") == Some(&Value::Bool(true)) {
-        return Value::String(uuid::Uuid::new_v4().to_string());
+        return Some(Value::String(uuid::Uuid::new_v4().to_string()));
     }
     if provider.get("ulid") == Some(&Value::Bool(true)) {
-        return Value::String(ulid::Ulid::new().to_string());
+        return Some(Value::String(ulid::Ulid::new().to_string()));
     }
     if let Some(path) = provider.get("slugify").and_then(Value::as_str) {
-        return field_references::get_value_from_object(draft, path)
-            .map(|value| match value {
-                Value::String(value) => Value::String(slugify(value)),
-                value => Value::String(slugify(&value.to_string())),
-            })
-            .unwrap_or(Value::Null);
+        return Some(
+            field_references::get_value_from_object(draft, path)
+                .and_then(Value::as_str)
+                .map_or(Value::Null, |value| Value::String(slugify(value))),
+        );
     }
     if let Some(path) = provider.get("copy").and_then(Value::as_str) {
-        return field_references::get_value_from_object(draft, path)
-            .cloned()
-            .unwrap_or(Value::Null);
+        return field_references::get_value_from_object(draft, path).cloned();
     }
-    provider.get("literal").cloned().unwrap_or(Value::Null)
+    Some(provider.get("literal").cloned().unwrap_or(Value::Null))
 }
 
 #[cfg(test)]
