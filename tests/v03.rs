@@ -54,6 +54,38 @@ collection:
 }
 
 #[test]
+fn record_paths_follow_v03_discovery() {
+    let directory = v03_collection();
+    write(
+        directory.path(),
+        "mdbase.yaml",
+        "spec_version: \"0.3.0\"\nsettings:\n  exclude: [\"archive/*.md\"]\n",
+    );
+    write(
+        directory.path(),
+        "nested/mdbase.yaml",
+        "spec_version: \"0.3.0\"\n",
+    );
+    let collection = Collection::open(directory.path()).expect("open collection");
+    for record in ["tasks/a.md", "a.md", "archive/2025/old.md"] {
+        assert!(collection.is_record_path(record), "{record}");
+    }
+    for skipped in [
+        "tasks/a.txt",
+        "_types/task.md",
+        ".obsidian/a.md",
+        "notes/.hidden.md",
+        "node_modules/pkg/readme.md",
+        "archive/old.md",
+        "nested/a.md",
+    ] {
+        assert!(!collection.is_record_path(skipped), "{skipped}");
+    }
+    assert!(collection.is_excluded_path(".git"));
+    assert!(!collection.is_excluded_path("tasks"));
+}
+
+#[test]
 fn canonical_v03_schemas_compile() {
     v03::validate_canonical_schemas().expect("canonical schemas compile");
 }

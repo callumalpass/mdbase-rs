@@ -198,6 +198,19 @@ impl Collection {
         &self.settings
     }
 
+    /// Whether record discovery skips a collection-relative path, file or
+    /// directory: built-in and configured exclusions, control folders, and
+    /// nested collections (spec Chapter 02).
+    pub fn is_excluded_path(&self, rel_path: &str) -> bool {
+        self.is_excluded(rel_path)
+    }
+
+    /// Whether a collection-relative file path names a record: it is not
+    /// excluded and has a record extension.
+    pub fn is_record_path(&self, rel_path: &str) -> bool {
+        !self.is_excluded(rel_path) && self.is_valid_extension(rel_path)
+    }
+
     /// Specification profile detected at open time.
     pub fn spec_profile(&self) -> SpecProfile {
         self.spec_profile
