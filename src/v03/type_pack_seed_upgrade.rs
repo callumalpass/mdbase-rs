@@ -3,7 +3,33 @@ use super::{frontmatter_bounds, replace_yaml_node};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn merge(base: &str, current: &str, desired: &str) -> Result<String, String> {
+/// An explicit, digest-pinned previous publisher baseline for one seed type.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct Base {
+    digest: String,
+    document: String,
+}
+
+impl Base {
+    pub(super) fn verify(&self, kind: &str, mode: &str) -> Result<(), &'static str> {
+        if kind != "type"
+            || mode != "seed"
+            || super::revision(self.document.as_bytes()) != self.digest
+        {
+            return Err("Seed upgrade requires a digest-pinned type baseline.");
+        }
+        Ok(())
+    }
+
+    /// The live type merged with the desired publisher changes.
+    pub(super) fn plan(&self, current: &[u8], desired: &[u8]) -> Result<Vec<u8>, String> {
+        let current = std::str::from_utf8(current).map_err(|error| error.to_string())?;
+        let desired = std::str::from_utf8(desired).map_err(|error| error.to_string())?;
+        merge(&self.document, current, desired).map(String::into_bytes)
+    }
+}
+
+fn merge(base: &str, current: &str, desired: &str) -> Result<String, String> {
     fn parse(document: &str) -> Result<Value, String> {
         let (start, end) = frontmatter_bounds(document).map_err(|d| d.message.clone())?;
         serde_yaml::from_str(&document[start..end]).map_err(|e| e.to_string())
