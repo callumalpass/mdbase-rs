@@ -27,7 +27,7 @@ fn implementation() -> Value {
     json!({
         "id": "mdbase-rs",
         "name": "mdbase Rust core and durable runtime",
-        "version": "0.4.0-rc.3",
+        "version": mdbase::VERSION,
         "language": "Rust",
         "target": "native",
         "x-runtime-version": mdbase_runtime::VERSION

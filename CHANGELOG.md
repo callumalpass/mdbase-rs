@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## 0.4.0-rc.5 - 2026-09-27
+
+### Changed
+
+- Implement mdbase spec v0.3.0-rc.4. Expressions use standard CEL (`cel`
+  0.14): missing fields are null, selection on null is an error, optional
+  types, `has()`, string dates with the date helpers, and `lower()`/`upper()`.
+- Links resolve relative to the record they were read from, including `this`
+  and `asFile()` results. Markdown and bare-path links resolve from the
+  containing folder, and `file.links` holds alias-free link values.
+- Update takes `patch` and `unset`; the `fields` alias is rejected.
+- Validation defaults to `error` for v0.3 collections; lifecycle actions run in
+  order with typed guards; v0.3 discovery uses built-in exclusions and portable
+  globs; wikilinks resolve by ID only when `id_field` is configured;
+  `duplicate_id` applies to v0.2 collections only.
+- `implements.version` accepts portable version requirements, implementation
+  digests exclude `collection.display`, and a type implements each contract ID
+  once. Collection projections report `unsupported_feature`.
+- v0.2 configuration migration follows spec Chapter 13.
+- Semantic projection format 7.
+
+### Added
+
+- `Collection::is_excluded_path` and `Collection::is_record_path` for tools
+  that follow record discovery.
+
 ### Fixed
 
 - Runtime creates and updates continue generated `sequence` values from every
