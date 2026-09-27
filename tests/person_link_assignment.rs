@@ -14,7 +14,11 @@ fn write(root: &TempDir, path: &str, contents: &str) {
 
 fn collection() -> (TempDir, Collection) {
     let root = tempfile::tempdir().unwrap();
-    write(&root, "mdbase.yaml", "spec_version: 0.3.0\nsettings:\n  timezone: UTC\n");
+    write(
+        &root,
+        "mdbase.yaml",
+        "spec_version: 0.3.0\nsettings:\n  timezone: UTC\n",
+    );
     write(
         &root,
         "_types/task.md",
@@ -25,19 +29,43 @@ fn collection() -> (TempDir, Collection) {
         "_types/person.md",
         "---\nkind: mdbase.type\nname: person\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    properties:\n      type: { const: person }\n      name: { type: string }\n---\n",
     );
-    write(&root, "people/Alice Smith.md", "---\ntype: person\nname: Alice\n---\n");
-    write(&root, "people/bob.md", "---\ntype: person\nname: Bob\n---\n");
-    write(&root, "tasks/a.md", "---\ntype: task\nassignees: [\"[[Alice Smith]]\"]\nowners: [\"[[Alice Smith]]\"]\n---\n");
-    write(&root, "tasks/b.md", "---\ntype: task\nassignees: [\"[[people/bob]]\", \"[[Nobody]]\"]\n---\n");
-    write(&root, "tasks/c.md", "---\ntype: task\nassignees: [\"[[people/Alice Smith|Al]]\"]\n---\n");
+    write(
+        &root,
+        "people/Alice Smith.md",
+        "---\ntype: person\nname: Alice\n---\n",
+    );
+    write(
+        &root,
+        "people/bob.md",
+        "---\ntype: person\nname: Bob\n---\n",
+    );
+    write(
+        &root,
+        "tasks/a.md",
+        "---\ntype: task\nassignees: [\"[[Alice Smith]]\"]\nowners: [\"[[Alice Smith]]\"]\n---\n",
+    );
+    write(
+        &root,
+        "tasks/b.md",
+        "---\ntype: task\nassignees: [\"[[people/bob]]\", \"[[Nobody]]\"]\n---\n",
+    );
+    write(
+        &root,
+        "tasks/c.md",
+        "---\ntype: task\nassignees: [\"[[people/Alice Smith|Al]]\"]\n---\n",
+    );
     let opened = Collection::open(root.path()).unwrap();
     (root, opened)
 }
 
 fn paths(result: &mdbase::v03::OperationResult) -> Vec<String> {
     assert!(result.valid, "{result:#?}");
-    result.result["results"].as_array().unwrap().iter()
-        .map(|record| record["path"].as_str().unwrap().to_owned()).collect()
+    result.result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["path"].as_str().unwrap().to_owned())
+        .collect()
 }
 
 #[test]
@@ -78,6 +106,12 @@ fn projections_return_resolved_targets_and_null_for_unresolved_links() {
     }));
     assert!(result.valid, "{result:#?}");
     // Raw link text and resolved targets line up by index.
-    assert_eq!(result.result["results"][0]["values"]["links"], json!(["[[people/bob]]", "[[Nobody]]"]));
-    assert_eq!(result.result["results"][0]["values"]["targets"], json!(["people/bob.md", null]));
+    assert_eq!(
+        result.result["results"][0]["values"]["links"],
+        json!(["[[people/bob]]", "[[Nobody]]"])
+    );
+    assert_eq!(
+        result.result["results"][0]["values"]["targets"],
+        json!(["people/bob.md", null])
+    );
 }
