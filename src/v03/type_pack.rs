@@ -320,7 +320,7 @@ pub(crate) fn plan_type_pack(
         .iter()
         .find(|receipt| receipt.id == pack_id)
         .cloned();
-    let desired = TypePackReceipt {
+    let mut desired = TypePackReceipt {
         id: pack_id.clone(),
         version: pack_version.clone(),
         digest: jcs_digest(&provision.manifest)?,
@@ -358,9 +358,19 @@ pub(crate) fn plan_type_pack(
                 .resources
                 .iter()
                 .filter(|resource| resource.mode == "managed")
-                .map(|resource| (resource.target.as_str(), receipt.id.as_str()))
+                .map(|resource| {
+                    (
+                        resource.target.as_str(),
+                        (receipt.id.as_str(), resource.digest.as_str()),
+                    )
+                })
         })
         .collect::<BTreeMap<_, _>>();
+    // Managed targets another pack already manages with the same bytes. This
+    // pack defers to that owner and records them as seeds, so the lock keeps
+    // one owner per target (Reader's source contract, shipped identically by
+    // Reader and by apps that cite from it, is the case this serves).
+    let mut deferred = BTreeSet::new();
 
     let mut targets = BTreeSet::new();
     let mut planned = Vec::new();
@@ -418,11 +428,30 @@ pub(crate) fn plan_type_pack(
         let owner = other_owners.get(resource.target.as_str()).copied();
         let mut adopted_from_digest = None;
         let mut planned_bytes = (*bytes).to_vec();
-        let (action, reason) = if let Some(owner) = owner {
-            (
-                "conflict",
-                Some(format!("{} is managed by {}.", resource.target, owner)),
-            )
+        let (action, reason) = if let Some((owner, owned_digest)) = owner {
+            // Once deferred (recorded as a seed), keep deferring as the owner
+            // moves the file forward, as seeds do.
+            let identical = owned_digest == resource.digest
+                && current_digest.as_deref() == Some(resource.digest.as_str());
+            let already_deferred = installed.is_some_and(|installed| installed.mode != "managed");
+            if resource.mode == "managed" && (identical || already_deferred) {
+                deferred.insert(resource.target.clone());
+                ("preserve", None)
+            } else {
+                (
+                    "conflict",
+                    Some(format!(
+                        "{} is managed by {}{}.",
+                        resource.target,
+                        owner,
+                        if resource.mode == "managed" {
+                            " with different content"
+                        } else {
+                            ""
+                        }
+                    )),
+                )
+            }
         } else if let Some(merged) = resource
             .upgrade_from
             .as_ref()
@@ -473,6 +502,13 @@ pub(crate) fn plan_type_pack(
                     )),
                 )
             }
+        } else if installed.is_some_and(|installed| installed.mode != "managed")
+            && current_digest.as_deref() == Some(resource.digest.as_str())
+        {
+            // Deferred to another pack that has since let it go, and still
+            // exactly this pack's bytes: claim it.
+            adopted_from_digest = current_digest.clone();
+            ("adopt", None)
         } else if installed.is_some_and(|installed| installed.mode != "managed") {
             (
                 "conflict",
@@ -515,6 +551,12 @@ pub(crate) fn plan_type_pack(
         });
     }
 
+    for resource in &mut desired.resources {
+        if deferred.contains(&resource.target) {
+            resource.mode = "seed".to_string();
+        }
+    }
+
     if let Some(current) = &current {
         for resource in &current.resources {
             // A publisher may rename a source while retaining its installed
@@ -537,7 +579,15 @@ pub(crate) fn plan_type_pack(
                     ))
                 })?;
             let current_digest = before.as_deref().map(revision);
-            let (action, reason) = if resource.mode != "managed" {
+            let listed_elsewhere = lock.packs.iter().any(|receipt| {
+                receipt.id != pack_id
+                    && receipt
+                        .resources
+                        .iter()
+                        .any(|other| other.target == resource.target)
+            });
+            let (action, reason) = if resource.mode != "managed" || listed_elsewhere {
+                // A pack that deferred to this one still relies on the file.
                 ("preserve", None)
             } else if current_digest.as_deref() == Some(resource.digest.as_str()) {
                 ("delete", None)
@@ -1567,6 +1617,10 @@ fn failed(diagnostics: Vec<Diagnostic>) -> OperationResult {
 mod seed_upgrade_tests;
 
 #[cfg(test)]
+#[path = "type_pack_shared_target_tests.rs"]
+mod shared_target_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
@@ -1667,7 +1721,7 @@ mod tests {
         )
     }
 
-    fn assessment_options() -> TypePackAssessmentOptions {
+    pub(super) fn assessment_options() -> TypePackAssessmentOptions {
         TypePackAssessmentOptions {
             installed_by: "dev.mdbase.tests".to_string(),
             adopt_resources: BTreeMap::new(),
