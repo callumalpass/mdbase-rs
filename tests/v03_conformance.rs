@@ -860,7 +860,7 @@ fn shared_v03_core_write_fixture_passes() {
 
 #[test]
 fn shared_v03_links_and_discovery_fixture_passes() {
-    run_suite("core/links-and-discovery.yaml", "core_collection", 7);
+    run_suite("core/links-and-discovery.yaml", "core_collection", 8);
 }
 
 #[test]
@@ -870,7 +870,7 @@ fn shared_v03_lifecycle_fixture_passes() {
 
 #[test]
 fn shared_v03_cel_fixture_passes() {
-    run_suite("cel/cel-profile.yaml", "cel", 26);
+    run_suite("cel/cel-profile.yaml", "cel", 27);
 }
 
 #[test]

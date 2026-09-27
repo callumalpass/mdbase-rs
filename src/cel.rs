@@ -12,6 +12,7 @@ use crate::Collection;
 
 mod host;
 mod program;
+mod provenance;
 
 pub(crate) use host::RESERVED;
 pub(crate) use program::Program;

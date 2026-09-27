@@ -2883,10 +2883,10 @@ mod tests {
             );
         }
         assert_eq!(projected["file"]["tags"], json!(["frontmatter", "body"]));
-        assert_eq!(projected["file"]["links"], json!(["target", "other.md"]));
+        assert_eq!(projected["file"]["links"], json!(["target", "./other.md"]));
         assert_eq!(
             projected["file"]["embeds"],
-            json!(["embed#part", "asset.png"])
+            json!(["embed#part", "./asset.png"])
         );
         assert!(!projected.to_string().contains("Alias"));
     }

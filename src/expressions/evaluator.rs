@@ -725,6 +725,9 @@ fn eval_file_method(method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Va
                     .unwrap_or("");
 
                 for link in &all_links {
+                    // Extraction marks markdown and bare-path targets with ./;
+                    // this legacy matcher compares the path text.
+                    let link = &link.strip_prefix("./").unwrap_or(link).to_string();
                     // Direct match
                     if link == link_target {
                         return Ok(Value::Bool(true));
@@ -2858,7 +2861,9 @@ pub fn extract_tags_from_body(body: &str) -> Vec<String> {
 /// Links inside inline code spans are excluded.
 pub fn extract_links_from_body(body: &str) -> Vec<String> {
     let clean = strip_code_blocks_and_inline_code(body);
+    // Body wikilinks come before body markdown links (spec Chapter 08).
     let mut links = Vec::new();
+    let mut markdown_links = Vec::new();
 
     let chars: Vec<char> = clean.chars().collect();
     let len = chars.len();
@@ -2938,7 +2943,7 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
                     // Strip anchor
                     let path = path.split('#').next().unwrap_or(&path).to_string();
                     if !path.is_empty() {
-                        links.push(path);
+                        markdown_links.push(source_relative(path));
                     }
                 }
             }
@@ -2947,6 +2952,7 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
         }
     }
 
+    links.extend(markdown_links);
     links
 }
 
@@ -3021,7 +3027,7 @@ pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
                 {
                     let path = path.split('#').next().unwrap_or(&path).to_string();
                     if !path.is_empty() {
-                        embeds.push(path);
+                        embeds.push(source_relative(path));
                     }
                 }
             }
@@ -3031,6 +3037,37 @@ pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
     }
 
     embeds
+}
+
+/// The link value that CEL exposes for an extracted target (spec Chapter 08,
+/// `file.links`): a wikilink target as `[[target]]`, and a markdown or
+/// bare-path target, which extraction marks as relative, unchanged. Aliases
+/// and anchors are dropped, and the value resolves exactly as the original.
+pub fn link_value(target: &str) -> String {
+    if target.starts_with('/') || target.starts_with("./") || target.starts_with("../") {
+        target.to_string()
+    } else {
+        format!("[[{target}]]")
+    }
+}
+
+/// Mark a markdown or bare-path link target as relative to the containing
+/// folder (spec Chapter 08). The explicit `./` keeps it distinct from a
+/// wikilink path such as `people/alice`, which resolves from the collection
+/// root.
+fn source_relative(target: String) -> String {
+    if target.starts_with('/') || target.starts_with("./") || target.starts_with("../") {
+        target
+    } else {
+        format!("./{target}")
+    }
+}
+
+/// The destination of a whole-value markdown link, `[text](path)`.
+fn markdown_link_destination(value: &str) -> Option<String> {
+    let inner = value.strip_prefix('[')?.strip_suffix(')')?;
+    let (_, destination) = inner.split_once("](")?;
+    markdown_destination_target(destination)
 }
 
 fn markdown_destination_target(value: &str) -> Option<String> {
@@ -3086,9 +3123,14 @@ pub fn extract_links_from_fm_value(val: &Value, links: &mut Vec<String>) {
                 && !s.starts_with("https://")
                 && (s.contains('.') || s.contains('/'))
             {
-                let path = s.trim().to_string();
-                if !path.is_empty() && !links.contains(&path) {
-                    links.push(path);
+                let path =
+                    markdown_link_destination(s.trim()).unwrap_or_else(|| s.trim().to_string());
+                let path = path.split('#').next().unwrap_or(&path).to_string();
+                if !path.is_empty() {
+                    let path = source_relative(path);
+                    if !links.contains(&path) {
+                        links.push(path);
+                    }
                 }
             }
         }
@@ -3108,8 +3150,8 @@ mod limit_tests {
     #[test]
     fn markdown_body_fact_extractors_exclude_labels_and_destination_titles() {
         let body = "[private label](notes/one.md \"private title\") ![private alt](assets/one.png \"private image title\") [malformed](<notes/leak.md \"leaked title\")";
-        assert_eq!(extract_links_from_body(body), ["notes/one.md"]);
-        assert_eq!(extract_embeds_from_body(body), ["assets/one.png"]);
+        assert_eq!(extract_links_from_body(body), ["./notes/one.md"]);
+        assert_eq!(extract_embeds_from_body(body), ["./assets/one.png"]);
     }
 
     #[test]

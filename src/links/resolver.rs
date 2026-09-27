@@ -110,7 +110,7 @@ use crate::runtime::{
 use crate::types::schema::FieldDef;
 use crate::Collection;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Which frontmatter keys a simple wikilink may resolve through besides the
 /// filename. The default resolves by filename only.
@@ -218,57 +218,43 @@ impl LinkResolutionIndex {
         target_types: &[String],
     ) -> Result<Option<String>, CatalogError> {
         let resolution_index = self;
-        // Strip wikilink syntax
-        let target = if target.starts_with("[[") && target.ends_with("]]") {
-            let inner = &target[2..target.len() - 2];
-            inner
-                .split('|')
-                .next()
-                .unwrap_or(inner)
-                .split('#')
-                .next()
-                .unwrap_or(inner)
-                .trim()
-        } else {
-            // Strip anchor from markdown links
-            target.split('#').next().unwrap_or(target).trim()
-        };
-
+        // Spec Chapter 08: markdown links and bare paths resolve from the
+        // containing folder, as do wikilinks beginning with ./ or ../; other
+        // wikilinks containing / resolve from the collection root; a leading
+        // / is always root-relative.
+        let (target, from_source) = link_path(target);
+        let target = target.as_str();
         if target.is_empty() {
             return Ok(None);
         }
-
-        // Handle relative paths (./foo, ../foo)
-        let resolved_target = if target.starts_with("./") || target.starts_with("../") {
-            let source_dir = std::path::Path::new(source_path)
-                .parent()
-                .unwrap_or(std::path::Path::new(""));
-            let joined = source_dir.join(target);
-            // Normalize path
-            let mut components = Vec::new();
-            for c in joined.components() {
-                match c {
-                    std::path::Component::ParentDir => {
-                        if components.pop().is_none() {
-                            return Ok(None);
-                        }
-                    }
-                    std::path::Component::CurDir => {}
-                    _ => {
-                        components.push(c);
-                    }
-                }
-            }
-            let normalized: PathBuf = components.iter().collect();
-            normalized.to_string_lossy().to_string().replace('\\', "/")
+        let resolved_target = if let Some(rooted) = target.strip_prefix('/') {
+            crate::links::parser::normalize_segments(rooted)
+        } else if from_source {
+            let source_dir = source_path
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent);
+            let joined = if source_dir.is_empty() {
+                target.to_string()
+            } else {
+                format!("{source_dir}/{target}")
+            };
+            crate::links::parser::normalize_segments(&joined)
         } else {
-            target.to_string()
+            // A simple wikilink may name the file with its record extension.
+            target
+                .strip_suffix(".md")
+                .filter(|name| !name.contains('/'))
+                .unwrap_or(target)
+                .to_string()
         };
+        if resolved_target == ".." || resolved_target.starts_with("../") {
+            return Ok(None);
+        }
 
         // Simple-name lookup follows the same priority and ranking as hosted
         // resolution. A populated ambiguous ID class never falls through.
-        let simple_name = !resolved_target.contains('/')
-            && std::path::Path::new(&resolved_target).extension().is_none();
+        let simple_name =
+            !from_source && !target.starts_with('/') && !resolved_target.contains('/');
         if simple_name {
             let target_lower = resolved_target.to_lowercase();
             if let Some(paths) = resolution_index.id_lower_to_paths.get(&target_lower) {
@@ -335,6 +321,44 @@ impl LinkResolutionIndex {
 
         Ok(None)
     }
+}
+
+/// The path a link names, and whether it resolves from the containing folder.
+///
+/// Input is either a raw link value or a target produced by link extraction,
+/// which marks markdown and bare-path targets with `./` (spec Chapter 08).
+fn link_path(link: &str) -> (String, bool) {
+    let link = link.trim();
+    let target = if let Some(inner) = link
+        .strip_prefix("[[")
+        .and_then(|rest| rest.strip_suffix("]]"))
+    {
+        let target = inner.split('|').next().unwrap_or(inner);
+        target
+            .split('#')
+            .next()
+            .unwrap_or(target)
+            .trim()
+            .to_string()
+    } else if let Some(destination) = link
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|inner| inner.split_once("]("))
+        .map(|(_, destination)| destination.split('#').next().unwrap_or(destination).trim())
+    {
+        if destination.starts_with('/')
+            || destination.starts_with("./")
+            || destination.starts_with("../")
+        {
+            destination.to_string()
+        } else {
+            format!("./{destination}")
+        }
+    } else {
+        link.split('#').next().unwrap_or(link).trim().to_string()
+    };
+    let from_source = target.starts_with("./") || target.starts_with("../");
+    (target, from_source)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

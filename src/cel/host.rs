@@ -14,8 +14,8 @@ use serde_json::{Map, Value};
 
 use super::program::Program;
 use crate::expressions::evaluator::{
-    extract_embeds_from_body, extract_links_from_body, extract_tags_from_body, EvalContext,
-    EvaluationClock,
+    extract_embeds_from_body, extract_links_from_body, extract_tags_from_body, link_value,
+    EvalContext, EvaluationClock,
 };
 use crate::links::linked_files::LinkedFiles;
 
@@ -101,7 +101,7 @@ pub(crate) fn evaluate(
         cel_context.set_variable_resolver(&resolver);
     }
     let result = stacker::maybe_grow(super::program::RED_ZONE, super::program::STACK_SIZE, || {
-        CelValue::resolve(program.ast(), &cel_context)
+        CelValue::resolve(program.executable(), &cel_context)
     })
     .map_err(|error| error.to_string())?;
     to_json(&result)
@@ -243,15 +243,18 @@ impl Host {
         let host = self.clone();
         context.add_function(
             "hasLink",
-            move |This(file): This<CelValue>, link: Arc<String>| {
+            // A second argument, added by link provenance rewriting, names the
+            // record the link was read from.
+            move |This(file): This<CelValue>, Arguments(args): Arguments| {
+                let (link, link_source) = link_and_source("hasLink", &args, 1)?;
                 let source = member_str(&file, "path").unwrap_or_default();
-                let wanted = host.resolve_path(&link, &source);
-                member_strings(&file, "links").iter().any(|candidate| {
-                    match (&wanted, host.resolve_path(candidate, &source)) {
+                let wanted = host.resolve_path(&link, link_source.as_deref().unwrap_or(&source));
+                Ok::<_, ExecutionError>(member_strings(&file, "links").iter().any(
+                    |candidate| match (&wanted, host.resolve_path(candidate, &source)) {
                         (Some(wanted), Some(actual)) => *wanted == actual,
                         _ => link_target(candidate) == link_target(&link),
-                    }
-                })
+                    },
+                ))
             },
         );
         context.add_function("asLink", |This(file): This<CelValue>| {
@@ -267,13 +270,26 @@ impl Host {
             )),
         });
         let host = self.clone();
-        context.add_function("asFile", move |This(link): This<Arc<String>>| {
-            host.as_file(&link)
-        });
+        context.add_function(
+            "asFile",
+            move |This(link): This<Arc<String>>, Arguments(args): Arguments| {
+                let source = match args.as_slice() {
+                    [] => host.source.clone(),
+                    [CelValue::String(source)] => source.to_string(),
+                    _ => {
+                        return Err(ExecutionError::function_error(
+                            "asFile",
+                            "expected no argument or a source path",
+                        ))
+                    }
+                };
+                host.as_file(&link, &source)
+            },
+        );
     }
 
     /// The record a link resolves to, in query-candidate shape, or null.
-    fn as_file(&self, link: &str) -> Result<CelValue, ExecutionError> {
+    fn as_file(&self, link: &str, source: &str) -> Result<CelValue, ExecutionError> {
         if self.traversals.fetch_add(1, Ordering::Relaxed) >= MAX_LINK_TRAVERSALS {
             return Err(ExecutionError::function_error(
                 "asFile",
@@ -284,7 +300,7 @@ impl Host {
             return Ok(CelValue::Null);
         };
         let resolved = links
-            .resolve(link, Some(&self.source))
+            .resolve(link, Some(source))
             .map_err(|error| ExecutionError::function_error("asFile", error.message))?;
         Ok(resolved.map_or(CelValue::Null, |target| {
             let frontmatter = target.frontmatter.as_object().cloned().unwrap_or_default();
@@ -389,7 +405,13 @@ impl Host {
             );
             file.insert(
                 "embeds".to_string(),
-                list(body.map(extract_embeds_from_body).unwrap_or_default()),
+                list(
+                    body.map(extract_embeds_from_body)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|target| link_value(target))
+                        .collect::<Vec<_>>(),
+                ),
             );
             let mut backlinks = self
                 .backlinks
@@ -468,16 +490,21 @@ fn links(frontmatter: &Map<String, Value>, body: Option<&str>, declared: &[Strin
             push_link_values(value, &mut links, false);
         }
     }
-    links.extend(body.map(extract_links_from_body).unwrap_or_default());
+    links.extend(
+        body.map(extract_links_from_body)
+            .unwrap_or_default()
+            .iter()
+            .map(|target| link_value(target)),
+    );
     links
 }
 
 fn push_link_values(value: &Value, links: &mut Vec<String>, declared: bool) {
     match value {
         Value::String(text) if declared || is_wikilink(text) => {
-            if let Some(target) = link_target(text) {
-                links.push(target);
-            }
+            let mut targets = Vec::new();
+            crate::expressions::evaluator::extract_links_from_fm_value(value, &mut targets);
+            links.extend(targets.iter().map(|target| link_value(target)));
         }
         Value::Array(items) => {
             for item in items {
@@ -728,4 +755,28 @@ fn add_months(date: NaiveDate, months: i64) -> Option<NaiveDate> {
     (1..=date.day())
         .rev()
         .find_map(|day| NaiveDate::from_ymd_opt(year, month, day))
+}
+
+/// The link argument of a link helper and the optional source path that link
+/// provenance rewriting appends after `arity` arguments.
+fn link_and_source(
+    function: &str,
+    args: &[CelValue],
+    arity: usize,
+) -> Result<(Arc<String>, Option<Arc<String>>), ExecutionError> {
+    let text = |value: &CelValue| match value {
+        CelValue::String(text) => Ok(text.clone()),
+        other => Err(ExecutionError::function_error(
+            function,
+            format!("expected a string, got {}", other.type_of()),
+        )),
+    };
+    match args {
+        [link] if arity == 1 => Ok((text(link)?, None)),
+        [link, source] if arity == 1 => Ok((text(link)?, Some(text(source)?))),
+        _ => Err(ExecutionError::function_error(
+            function,
+            "expected a link and an optional source path",
+        )),
+    }
 }

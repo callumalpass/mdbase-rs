@@ -18,6 +18,8 @@ const BODY_FACTS: [&str; 4] = ["tags", "links", "embeds", "backlinks"];
 #[derive(Clone, Debug)]
 pub(crate) struct Program {
     ast: Arc<IdedExpr>,
+    /// The AST that is evaluated: `ast` with link provenance made explicit.
+    executable: Arc<IdedExpr>,
     facts: Arc<ProgramFacts>,
 }
 
@@ -51,14 +53,23 @@ impl Program {
         }
         let mut facts = ProgramFacts::default();
         collect(&ast, &mut Vec::new(), &mut facts);
+        let ast = Arc::new(ast);
+        let executable = super::provenance::rewrite(&ast).map_or_else(|| ast.clone(), Arc::new);
         Ok(Self {
-            ast: Arc::new(ast),
+            ast,
+            executable,
             facts: Arc::new(facts),
         })
     }
 
+    /// The expression as written, for static analysis and query lowering.
     pub(crate) fn ast(&self) -> &IdedExpr {
         &self.ast
+    }
+
+    /// The expression to evaluate.
+    pub(crate) fn executable(&self) -> &IdedExpr {
+        &self.executable
     }
 
     pub(crate) fn facts(&self) -> &ProgramFacts {

@@ -102,3 +102,64 @@ fn match_evaluation_errors_are_reported_and_do_not_match() {
     assert_eq!(read.result["types"], json!([]));
     assert_eq!(read.diagnostics[0].code, "expression_evaluation_error");
 }
+
+#[test]
+fn links_resolve_relative_to_the_record_they_were_read_from() {
+    let (_root, collection) = v03_collection(
+        "---\nkind: mdbase.type\nname: test\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n",
+        &[
+            (
+                "projects/alpha.md",
+                "---\nlead: \"[Bob](people/bob.md)\"\nrelated: [\"[[./beta]]\"]\n---\nSee [the plan](plan.md) and [[projects/beta|Beta]].\n",
+            ),
+            ("projects/beta.md", "---\ntitle: Beta\n---\n"),
+            ("projects/plan.md", "---\ntitle: Plan\n---\n"),
+            ("projects/people/bob.md", "---\nname: Bob\n---\n"),
+            ("tasks/t1.md", "---\nproject: \"[[alpha]]\"\n---\n"),
+        ],
+    );
+    let operations = collection.v03_operations().unwrap();
+    let evaluate = |expression: &str| {
+        let evaluated =
+            operations.evaluate_cel(&json!({"path": "tasks/t1.md", "expression": expression}));
+        assert!(evaluated.valid, "{expression}: {evaluated:#?}");
+        evaluated.result["value"].clone()
+    };
+    // Links read from an asFile() result resolve relative to that target.
+    assert_eq!(
+        evaluate("project.asFile().lead.asFile().name"),
+        json!("Bob")
+    );
+    assert_eq!(
+        evaluate("project.asFile().related.map(r, r.asFile().file.path)"),
+        json!(["projects/beta.md"])
+    );
+    assert_eq!(
+        evaluate("project.asFile().file.links.exists(l, l.asFile().title == \"Plan\")"),
+        json!(true)
+    );
+    // file.links holds link values that resolve as the originals did.
+    assert_eq!(
+        evaluate("project.asFile().file.links"),
+        json!(["./beta", "[[projects/beta]]", "./plan.md"])
+    );
+    assert_eq!(
+        evaluate(
+            "project.asFile().file.links.map(l, l.asFile() == null ? \"\" : l.asFile().file.path)"
+        ),
+        json!(["projects/beta.md", "projects/beta.md", "projects/plan.md"])
+    );
+    assert_eq!(
+        evaluate("project.asFile().file.hasLink(link(project.asFile().related[0]))"),
+        json!(true)
+    );
+
+    // Links read from the invocation context resolve relative to it.
+    let query = operations.query(&json!({
+        "context": {"this": {"path": "projects/alpha.md"}},
+        "where": "file.inFolder(\"tasks\") && this.related.exists(r, r.asFile().title == \"Beta\")",
+        "select": [{"name": "lead", "expr": "this.lead.asFile().name"}],
+    }));
+    assert!(query.valid, "{query:#?}");
+    assert_eq!(query.result["results"][0]["values"], json!({"lead": "Bob"}));
+}
