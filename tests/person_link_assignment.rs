@@ -52,6 +52,19 @@ fn declared_link_lists_filter_by_resolved_person_path() {
 }
 
 #[test]
+fn record_index_form_works_for_any_field_name() {
+    // Applications build filters from each type's local field name, which may
+    // not be a CEL identifier, so they index `record` instead.
+    let (_root, collection) = collection();
+    let result = collection.v03_operations().unwrap().query(&json!({
+        "types": ["task"],
+        "where": "\"assignees\" in record && record[\"assignees\"].exists(a, a.asFile() != null && a.asFile().file.path == \"people/Alice Smith.md\")",
+        "order_by": [{ "field": "file.path" }]
+    }));
+    assert_eq!(paths(&result), ["tasks/a.md", "tasks/c.md"]);
+}
+
+#[test]
 fn projections_return_resolved_targets_and_null_for_unresolved_links() {
     let (_root, collection) = collection();
     let result = collection.v03_operations().unwrap().query(&json!({
