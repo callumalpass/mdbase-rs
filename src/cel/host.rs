@@ -64,7 +64,7 @@ pub(crate) fn evaluate(
     let mut bound = HashSet::new();
     for (name, value) in &bindings {
         let converted = match name.as_str() {
-            "record" | "raw" => typed_object(value, &date_times),
+            "record" | "raw" | "old" => typed_object(value, &date_times),
             _ if date_times.contains(name) => typed_scalar(value),
             _ => to_cel(value),
         };

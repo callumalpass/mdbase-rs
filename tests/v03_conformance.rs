@@ -865,7 +865,7 @@ fn shared_v03_links_and_discovery_fixture_passes() {
 
 #[test]
 fn shared_v03_lifecycle_fixture_passes() {
-    run_suite("lifecycle/lifecycle.yaml", "lifecycle", 7);
+    run_suite("lifecycle/lifecycle.yaml", "lifecycle", 8);
 }
 
 #[test]

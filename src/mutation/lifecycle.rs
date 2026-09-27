@@ -75,6 +75,9 @@ impl Collection {
             })
             .collect::<Vec<_>>();
         let shared = cross_type_assignments(&policies, event, path)?;
+        // Guards type date-time fields as timestamps (spec Chapter 10); the
+        // type map is shared once, when the first guard runs.
+        let mut guard_types = None;
 
         for (type_name, actions) in &policies {
             for (action_index, action) in actions.iter().enumerate() {
@@ -90,7 +93,22 @@ impl Collection {
                             Some(path.to_string()),
                         )]);
                     };
-                    match evaluate_guard_compiled(expression, &draft, old, path, event, &clock) {
+                    let types = guard_types
+                        .get_or_insert_with(|| std::sync::Arc::new(self.types.clone()))
+                        .clone();
+                    let typing = GuardTyping {
+                        type_names: &ordered_types,
+                        types,
+                    };
+                    match evaluate_guard_compiled(
+                        expression,
+                        &draft,
+                        old,
+                        path,
+                        event,
+                        &clock,
+                        Some(typing),
+                    ) {
                         Ok(true) => {}
                         Ok(false) => continue,
                         Err(message) => {
@@ -146,6 +164,12 @@ impl Collection {
     }
 }
 
+/// The matched types whose schemas type guard values.
+struct GuardTyping<'a> {
+    type_names: &'a [String],
+    types: std::sync::Arc<HashMap<String, crate::types::schema::TypeDef>>,
+}
+
 fn evaluate_guard_compiled(
     expression: &crate::cel::Program,
     draft: &Map<String, Value>,
@@ -153,6 +177,7 @@ fn evaluate_guard_compiled(
     path: &str,
     event: LifecycleEvent,
     clock: &EvaluationClock,
+    typing: Option<GuardTyping<'_>>,
 ) -> Result<bool, String> {
     let draft_value = Value::Object(draft.clone());
     let old_value = old.cloned().map(Value::Object).unwrap_or(Value::Null);
@@ -170,6 +195,10 @@ fn evaluate_guard_compiled(
     context.raw_frontmatter = Some(Value::Object(draft.clone()));
     context.file_path = Some(path.to_string());
     context.string_concat = false;
+    if let Some(typing) = typing {
+        context.type_names = Some(typing.type_names.to_vec());
+        context.types = Some(typing.types);
+    }
 
     let result = evaluate_compiled(expression, &context, clock)
         .map_err(|error| format!("Lifecycle guard evaluation failed: {}", error.message))?;
@@ -297,6 +326,7 @@ mod tests {
             "task.md",
             LifecycleEvent::Update,
             &clock,
+            None,
         )
         .unwrap());
     }
