@@ -1,13 +1,12 @@
 //! Deterministic v0.3 lifecycle policy evaluation.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use serde_json::{json, Map, Value};
 
 use crate::cel::{enrich_record_bindings, evaluate_compiled, operation_clock};
 use crate::diagnostic::Diagnostic;
-use crate::expressions::ast::Expr;
-use crate::expressions::evaluator::{EvalContext, EvaluationClock, NoteNamespaceSource};
+use crate::expressions::evaluator::{EvalContext, EvaluationClock};
 use crate::field_references;
 use crate::generated::slugify;
 use crate::Collection;
@@ -59,11 +58,6 @@ impl Collection {
         let mut ordered_types = type_names.to_vec();
         ordered_types.sort();
         ordered_types.dedup();
-        let known_fields = ordered_types
-            .iter()
-            .filter_map(|type_name| self.types.get(type_name))
-            .flat_map(|definition| definition.fields.keys().cloned())
-            .collect::<BTreeSet<_>>();
         let policies = ordered_types
             .iter()
             .filter_map(|type_name| {
@@ -96,15 +90,7 @@ impl Collection {
                             Some(path.to_string()),
                         )]);
                     };
-                    match evaluate_guard_compiled(
-                        expression,
-                        &draft,
-                        old,
-                        &known_fields,
-                        path,
-                        event,
-                        &clock,
-                    ) {
+                    match evaluate_guard_compiled(expression, &draft, old, path, event, &clock) {
                         Ok(true) => {}
                         Ok(false) => continue,
                         Err(message) => {
@@ -161,17 +147,16 @@ impl Collection {
 }
 
 fn evaluate_guard_compiled(
-    expression: &Expr,
+    expression: &crate::cel::Program,
     draft: &Map<String, Value>,
     old: Option<&Map<String, Value>>,
-    known_fields: &BTreeSet<String>,
     path: &str,
     event: LifecycleEvent,
     clock: &EvaluationClock,
 ) -> Result<bool, String> {
     let draft_value = Value::Object(draft.clone());
     let old_value = old.cloned().map(Value::Object).unwrap_or(Value::Null);
-    let mut bindings = enrich_record_bindings(&draft_value, &draft_value, known_fields.iter())
+    let mut bindings = enrich_record_bindings(&draft_value, &draft_value)
         .as_object()
         .cloned()
         .expect("record bindings are always an object");
@@ -184,7 +169,6 @@ fn evaluate_guard_compiled(
     context.frontmatter = Value::Object(bindings);
     context.raw_frontmatter = Some(Value::Object(draft.clone()));
     context.file_path = Some(path.to_string());
-    context.note_namespace_source = NoteNamespaceSource::Effective;
     context.string_concat = false;
 
     let result = evaluate_compiled(expression, &context, clock)
@@ -297,21 +281,19 @@ mod tests {
     }
 
     #[test]
-    fn guards_receive_effective_note_presence_old_and_operation_bindings() {
+    fn guards_receive_record_raw_old_and_operation_bindings() {
         let draft =
             serde_json::from_value::<Map<String, Value>>(json!({"status": "done"})).unwrap();
         let old = serde_json::from_value::<Map<String, Value>>(json!({"status": "open"})).unwrap();
-        let known = BTreeSet::from(["status".to_string(), "missing".to_string()]);
         let clock = EvaluationClock::capture(Some("UTC")).unwrap();
         let expression = crate::cel::compile(
-            "note.status == 'done' && record.status == 'done' && !present.raw.missing && old.status == 'open' && operation.name == 'update'",
+            "status == 'done' && record.status == 'done' && !has(raw.missing) && old.status == 'open' && operation.name == 'update'",
         )
         .unwrap();
         assert!(evaluate_guard_compiled(
             &expression,
             &draft,
             Some(&old),
-            &known,
             "task.md",
             LifecycleEvent::Update,
             &clock,

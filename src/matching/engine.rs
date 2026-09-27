@@ -28,7 +28,7 @@ pub(crate) fn matches_rules_checked(
 
 pub(crate) fn matches_rules_checked_compiled(
     rules: &MatchRules,
-    match_expression: Option<&crate::expressions::ast::Expr>,
+    match_expression: Option<&crate::cel::Program>,
     rel_path: &str,
     frontmatter: &serde_json::Value,
     timezone: Option<&str>,
@@ -45,7 +45,7 @@ pub(crate) fn matches_rules_checked_compiled(
 
 pub(crate) fn matches_rules_checked_compiled_with_clock(
     rules: &MatchRules,
-    match_expression: Option<&crate::expressions::ast::Expr>,
+    match_expression: Option<&crate::cel::Program>,
     rel_path: &str,
     frontmatter: &serde_json::Value,
     clock: &crate::expressions::evaluator::EvaluationClock,

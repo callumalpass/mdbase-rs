@@ -8,7 +8,6 @@ use crate::cel;
 use crate::diagnostic::Diagnostic;
 use crate::expressions::evaluator::{
     extract_embeds_from_body, extract_links_from_body, extract_tags_from_body, EvalContext,
-    NoteNamespaceSource,
 };
 use crate::query::cache_source::FileRecord;
 use crate::types::schema::TypeDef;
@@ -51,11 +50,7 @@ pub(super) fn load_context(
     let effective = read.effective_frontmatter.clone();
     let persisted = read.frontmatter.clone();
     let types = read.types.clone();
-    let mut bindings = cel::enrich_record_bindings(
-        &effective,
-        &persisted,
-        cel::known_fields(collection, &types).iter(),
-    );
+    let mut bindings = cel::enrich_record_bindings(&effective, &persisted);
     if let Some(object) = bindings.as_object_mut() {
         object.insert(
             "types".to_string(),
@@ -77,7 +72,6 @@ pub(super) fn load_context(
             backlinks_index: backlinks,
             type_names: Some(types),
             types: Some(type_definitions),
-            note_namespace_source: NoteNamespaceSource::Effective,
             string_concat: false,
         })),
         1,
@@ -86,7 +80,6 @@ pub(super) fn load_context(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn candidate_context(
-    collection: &Collection,
     record: &FileRecord,
     types: &[String],
     effective: &Value,
@@ -96,11 +89,7 @@ pub(crate) fn candidate_context(
     backlinks: LinkGraph,
     type_definitions: Arc<HashMap<String, TypeDef>>,
 ) -> EvalContext {
-    let mut bindings = cel::enrich_record_bindings(
-        effective,
-        &record.raw_frontmatter,
-        cel::known_fields(collection, types).iter(),
-    );
+    let mut bindings = cel::enrich_record_bindings(effective, &record.raw_frontmatter);
     if let Some(object) = bindings.as_object_mut() {
         object.insert("projection".to_string(), Value::Object(projections.clone()));
         object.insert(
@@ -122,7 +111,6 @@ pub(crate) fn candidate_context(
         backlinks_index: backlinks,
         type_names: Some(types.to_vec()),
         types: Some(type_definitions),
-        note_namespace_source: NoteNamespaceSource::Effective,
         string_concat: false,
     }
 }

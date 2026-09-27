@@ -32,7 +32,7 @@ fn portable_cel_accepts_the_required_depth_and_rejects_excess_depth() {
 
     let nested = |depth| {
         (0..depth).fold("true".to_string(), |inner, _| {
-            format!("if(true, {inner}, false)")
+            format!("(true ? {inner} : false)")
         })
     };
     let supported = operations.evaluate_cel(&json!({"expression": nested(100)}));
@@ -45,7 +45,7 @@ fn portable_cel_accepts_the_required_depth_and_rejects_excess_depth() {
 }
 
 #[test]
-fn portable_cel_bounds_source_and_supports_iso8601_durations() {
+fn portable_cel_bounds_source_and_uses_standard_durations() {
     let (_root, collection) = v03_collection(
         "---\nkind: mdbase.type\nname: test\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n",
         &[],
@@ -53,7 +53,7 @@ fn portable_cel_bounds_source_and_supports_iso8601_durations() {
     let operations = collection.v03_operations().unwrap();
 
     let duration = operations.evaluate_cel(&json!({
-        "expression": "duration('P1DT2H30M') == 95400000"
+        "expression": "duration('26h30m') == duration('95400s')"
     }));
     assert!(duration.valid, "{duration:#?}");
     assert_eq!(duration.result["value"], true);

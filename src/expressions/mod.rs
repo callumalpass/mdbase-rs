@@ -151,7 +151,6 @@ impl Collection {
                     backlinks_index: None,
                     type_names: None,
                     types: None,
-                    note_namespace_source: Default::default(),
                     string_concat: true,
                 };
                 match eval_expr(&field.expression, &ctx) {

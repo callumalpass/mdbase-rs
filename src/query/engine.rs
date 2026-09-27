@@ -195,7 +195,6 @@ impl Collection {
                     backlinks_index: None,
                     type_names: None,
                     types: None,
-                    note_namespace_source: Default::default(),
                     string_concat: true,
                 }))
             });
@@ -321,7 +320,6 @@ impl Collection {
                     backlinks_index: None,
                     type_names: None,
                     types: None,
-                    note_namespace_source: Default::default(),
                     string_concat: true,
                 };
                 match ExprParser::parse(fexpr) {
@@ -1023,19 +1021,9 @@ impl Collection {
         };
 
         let mut enriched_fm = if self.spec_profile == crate::SpecProfile::V03 {
-            let known_fields = ctx
-                .type_names
-                .iter()
-                .filter_map(|type_name| self.types.get(type_name))
-                .flat_map(|type_definition| type_definition.fields.keys().cloned())
-                .collect::<std::collections::BTreeSet<_>>();
-            // Build the v0.3 record/raw/presence namespaces while retaining
+            // Build the v0.3 record and raw namespaces while retaining
             // top-level effective field access.
-            crate::cel::enrich_record_bindings(
-                ctx.frontmatter,
-                ctx.raw_frontmatter,
-                known_fields.iter(),
-            )
+            crate::cel::enrich_record_bindings(ctx.frontmatter, ctx.raw_frontmatter)
         } else {
             ctx.frontmatter.clone()
         };
@@ -1074,7 +1062,6 @@ impl Collection {
             backlinks_index: ctx.backlinks_index.clone(),
             type_names: Some(ctx.type_names.to_vec()),
             types: Some(std::sync::Arc::new(self.types.clone())),
-            note_namespace_source: Default::default(),
             string_concat: false,
         };
 

@@ -286,7 +286,7 @@ fn target_scoped_links_drive_backlinks_to_the_same_winner() {
     let cached = collection
         .v03_operations()
         .unwrap()
-        .query(&json!({"where": "file.backlinks.length > 0"}));
+        .query(&json!({"where": "file.backlinks.size() > 0"}));
     assert!(cached.valid, "{cached:#?}");
     assert_eq!(
         cached.result["results"][0]["file"]["path"],

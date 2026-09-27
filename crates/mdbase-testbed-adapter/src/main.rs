@@ -48,7 +48,7 @@ async fn execute() -> Result<(), String> {
             "kind": "mdbase.testbed.adapter",
             "protocol_version": "0.1",
             "implementation": implementation(),
-            "profiles": ["core_read", "runtime/0.2"],
+            "profiles": ["data_contracts", "runtime/0.2"],
             "roles": [
                 "contract_store",
                 "record_consumer",

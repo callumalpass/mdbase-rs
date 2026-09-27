@@ -151,7 +151,7 @@ fn invocation_timezone_controls_datetime_calendar_conversion() {
         json!({
             "types": ["task"],
             "timezone": "Australia/Melbourne",
-            "where": "date(scheduled) == date('2026-08-06')"
+            "where": "date(timestamp(scheduled)) == '2026-08-06'"
         }),
     );
     assert!(melbourne.valid, "{melbourne:#?}");
@@ -162,7 +162,7 @@ fn invocation_timezone_controls_datetime_calendar_conversion() {
         json!({
             "types": ["task"],
             "timezone": "America/Los_Angeles",
-            "where": "date(scheduled) == date('2026-08-05')"
+            "where": "date(timestamp(scheduled)) == '2026-08-05'"
         }),
     );
     assert!(los_angeles.valid, "{los_angeles:#?}");
