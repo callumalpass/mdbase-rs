@@ -112,6 +112,44 @@ use crate::Collection;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Which frontmatter keys a simple wikilink may resolve through besides the
+/// filename. The default resolves by filename only.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResolutionKeys {
+    /// Configured ID field, tried before the filename.
+    pub id_field: Option<String>,
+    /// Whether a title match is tried after the filename (v0.2 only).
+    pub titles: bool,
+}
+
+impl ResolutionKeys {
+    /// The v0.2 behavior: IDs, then filenames, then titles.
+    pub(crate) fn legacy(id_field: &str) -> Self {
+        Self {
+            id_field: Some(id_field.to_string()),
+            titles: true,
+        }
+    }
+}
+
+impl Collection {
+    /// v0.3 resolves simple wikilinks by filename and uses IDs only when
+    /// `settings.id_field` is configured (spec Chapter 08).
+    pub(crate) fn resolution_keys(&self) -> ResolutionKeys {
+        if self.spec_profile == crate::SpecProfile::V03 {
+            ResolutionKeys {
+                id_field: self
+                    .settings
+                    .id_field_explicit
+                    .then(|| self.settings.id_field.clone()),
+                titles: false,
+            }
+        } else {
+            ResolutionKeys::legacy(&self.settings.id_field)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LinkResolutionIndex {
     pub known_paths: HashSet<String>,
@@ -125,7 +163,7 @@ impl LinkResolutionIndex {
     /// Paths, basenames, IDs and titles: enough to resolve links without declared target types.
     pub(crate) fn untyped(
         all_files: &[crate::expressions::evaluator::ResolvedFileData],
-        id_field: &str,
+        keys: &ResolutionKeys,
     ) -> Self {
         let mut index = Self::default();
         for file_data in all_files {
@@ -142,10 +180,10 @@ impl LinkResolutionIndex {
                 );
             }
             let text = |field: &str| file_data.frontmatter.get(field).and_then(|v| v.as_str());
-            if let Some(id) = text(id_field) {
+            if let Some(id) = keys.id_field.as_deref().and_then(text) {
                 insert_resolution_key(&mut index.id_lower_to_paths, id.to_lowercase(), path);
             }
-            if let Some(title) = text("title") {
+            if let Some(title) = keys.titles.then(|| text("title")).flatten() {
                 insert_resolution_key(&mut index.title_lower_to_paths, title.to_lowercase(), path);
             }
         }
@@ -392,7 +430,7 @@ impl Collection {
         &self,
         all_files: &[crate::expressions::evaluator::ResolvedFileData],
     ) -> LinkResolutionIndex {
-        let mut index = LinkResolutionIndex::untyped(all_files, &self.settings.id_field);
+        let mut index = LinkResolutionIndex::untyped(all_files, &self.resolution_keys());
         for file_data in all_files {
             if index.known_paths.contains(&file_data.path) {
                 index.types_by_path.insert(

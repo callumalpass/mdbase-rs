@@ -764,7 +764,7 @@ impl Collection {
             let all_files_arc = Arc::new(LinkedFiles::new(
                 all_files_data,
                 stored_links,
-                &self.settings.id_field,
+                self.resolution_keys(),
                 resolution_index,
             ));
             perf.build_backlinks_ms = elapsed_ms(backlinks_start);

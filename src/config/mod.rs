@@ -111,6 +111,17 @@ fn parse_config_document(content: &str, allow_future_minor: bool) -> serde_json:
         Ok(s) => s,
         Err(e) => return e,
     };
+    if spec_profile == "v0.3"
+        && map
+            .get(ykey("settings"))
+            .and_then(|settings| settings.get("include_subfolders"))
+            .is_some()
+    {
+        warnings.push(
+            "settings.include_subfolders is not part of v0.3 and is ignored; exclude \"*/**\" instead"
+                .to_string(),
+        );
+    }
 
     // Unknown top-level keys
     let known_top = ["spec_version", "name", "description", "settings", "runtime"];

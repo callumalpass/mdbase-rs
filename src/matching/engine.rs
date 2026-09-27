@@ -107,94 +107,9 @@ pub(crate) fn matches_rules_checked_compiled_with_clock(
         || rules.match_expr.is_some())
 }
 
-/// Check if a relative path matches a glob pattern.
-/// Supports: * (single level), ** (any depth), ? (single char)
+/// Check if a relative path matches a portable path glob.
 fn matches_path_glob(rel_path: &str, pattern: &str) -> bool {
-    // Normalize separators
-    let path = rel_path.replace('\\', "/");
-    let pattern = pattern.replace('\\', "/");
-
-    glob_match(&path, &pattern)
-}
-
-/// Recursive glob matcher.
-fn glob_match(path: &str, pattern: &str) -> bool {
-    let path_parts: Vec<&str> = path.split('/').collect();
-    let pattern_parts: Vec<&str> = pattern.split('/').collect();
-
-    glob_match_parts(&path_parts, &pattern_parts)
-}
-
-fn glob_match_parts(path_parts: &[&str], pattern_parts: &[&str]) -> bool {
-    if pattern_parts.is_empty() {
-        return path_parts.is_empty();
-    }
-
-    if path_parts.is_empty() {
-        // Remaining pattern parts must all be ** to match empty
-        return pattern_parts.iter().all(|p| *p == "**");
-    }
-
-    let pat = pattern_parts[0];
-
-    if pat == "**" {
-        // ** matches zero or more path segments
-        // Try matching 0 segments (skip **)
-        if glob_match_parts(path_parts, &pattern_parts[1..]) {
-            return true;
-        }
-        // Try matching 1+ segments (consume one path part, keep **)
-        if glob_match_parts(&path_parts[1..], pattern_parts) {
-            return true;
-        }
-        return false;
-    }
-
-    // Match current segment
-    if segment_matches(path_parts[0], pat) {
-        return glob_match_parts(&path_parts[1..], &pattern_parts[1..]);
-    }
-
-    false
-}
-
-/// Check if a single path segment matches a glob pattern segment.
-/// Supports * (any chars) and ? (single char).
-fn segment_matches(segment: &str, pattern: &str) -> bool {
-    segment_match_chars(segment.as_bytes(), pattern.as_bytes())
-}
-
-fn segment_match_chars(seg: &[u8], pat: &[u8]) -> bool {
-    if pat.is_empty() {
-        return seg.is_empty();
-    }
-    if seg.is_empty() {
-        // Remaining pattern must all be * to match empty
-        return pat.iter().all(|&c| c == b'*');
-    }
-
-    match pat[0] {
-        b'*' => {
-            // * matches zero or more characters in this segment
-            // Try zero chars
-            if segment_match_chars(seg, &pat[1..]) {
-                return true;
-            }
-            // Try one+ chars
-            segment_match_chars(&seg[1..], pat)
-        }
-        b'?' => {
-            // ? matches exactly one character
-            segment_match_chars(&seg[1..], &pat[1..])
-        }
-        c => {
-            if seg[0] == c {
-                segment_match_chars(&seg[1..], &pat[1..])
-            } else {
-                false
-            }
-        }
-    }
+    crate::matching::glob::portable_glob_match(pattern, &rel_path.replace('\\', "/"))
 }
 
 /// Check that all listed fields are present and non-null in frontmatter.
@@ -430,7 +345,7 @@ fn to_f64(v: &serde_json::Value) -> Option<f64> {
 
 // --- impl Collection methods for matching ---
 
-use crate::matching::glob::match_glob_pattern;
+use crate::matching::glob::{match_glob_pattern, portable_glob_match};
 use crate::Collection;
 
 impl Collection {
@@ -481,6 +396,19 @@ impl Collection {
         // Check mdbase.yaml
         if rel_path == "mdbase.yaml" {
             return true;
+        }
+
+        if self.spec_profile == crate::SpecProfile::V03 {
+            // Built-in exclusions apply to every v0.3 collection, and
+            // settings.exclude adds portable globs to them (spec Chapter 02).
+            return rel_path
+                .split('/')
+                .any(|component| component.starts_with('.') || component == "node_modules")
+                || self
+                    .settings
+                    .exclude
+                    .iter()
+                    .any(|pattern| portable_glob_match(pattern, rel_path));
         }
 
         // Check exclude patterns

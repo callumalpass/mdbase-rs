@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use serde_json::Value;
 
 use crate::expressions::evaluator::{extract_links_from_fm_value, ResolvedFileData};
-use crate::links::resolver::LinkResolutionIndex;
+use crate::links::resolver::{LinkResolutionIndex, ResolutionKeys};
 use crate::runtime::CatalogError;
 
 /// Stored links resolved while building the link graph: source path → stored target → target path.
@@ -25,7 +25,7 @@ pub struct LinkedFiles {
     files: Vec<ResolvedFileData>,
     by_path: HashMap<String, usize>,
     stored: StoredLinkTargets,
-    id_field: String,
+    keys: ResolutionKeys,
     index: OnceLock<LinkResolutionIndex>,
 }
 
@@ -34,7 +34,7 @@ impl LinkedFiles {
     pub(crate) fn new(
         files: Vec<ResolvedFileData>,
         stored: StoredLinkTargets,
-        id_field: &str,
+        keys: ResolutionKeys,
         index: Option<LinkResolutionIndex>,
     ) -> Self {
         let by_path = files
@@ -46,7 +46,7 @@ impl LinkedFiles {
             files,
             by_path,
             stored,
-            id_field: id_field.to_string(),
+            keys,
             index: index.map(OnceLock::from).unwrap_or_default(),
         }
     }
@@ -77,7 +77,7 @@ impl LinkedFiles {
         }
         let index = self
             .index
-            .get_or_init(|| LinkResolutionIndex::untyped(&self.files, &self.id_field));
+            .get_or_init(|| LinkResolutionIndex::untyped(&self.files, &self.keys));
         let path = index.resolve(link, source_path.unwrap_or_default(), &[])?;
         Ok(path.and_then(|path| self.get(&path)))
     }

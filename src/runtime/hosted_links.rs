@@ -127,7 +127,12 @@ pub(super) fn hosted_link_graph(
         }
     }
     Ok((
-        Arc::new(LinkedFiles::new(files, stored, id_field, None)),
+        Arc::new(LinkedFiles::new(
+            files,
+            stored,
+            crate::links::resolver::ResolutionKeys::legacy(id_field),
+            None,
+        )),
         Arc::new(backlinks),
     ))
 }
