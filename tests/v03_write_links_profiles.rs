@@ -109,7 +109,7 @@ fn writes_validate_the_persisted_draft_and_never_materialize_read_defaults() {
 
     let failed_update = operations.update(&json!({
         "path": "tasks/valid.md",
-        "fields": {"status": null},
+        "patch": {"status": null},
         "if_revision": created.result["revision"]
     }));
     assert!(!failed_update.valid);
@@ -134,7 +134,7 @@ fn batch_preflight_and_dry_run_never_partially_mutate_the_collection() {
         "operations": [
             {
                 "kind": "update",
-                "input": {"path": "tasks/existing.md", "fields": {"title": "Changed"}}
+                "input": {"path": "tasks/existing.md", "patch": {"title": "Changed"}}
             },
             {
                 "kind": "create",

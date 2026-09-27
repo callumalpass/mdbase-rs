@@ -600,7 +600,7 @@ fn v03_mutations_enforce_opaque_revision_preconditions() {
 
     let updated = operations.update(&serde_json::json!({
         "path": "tasks/conditional.md",
-        "fields": {"title": "Updated"},
+        "patch": {"title": "Updated"},
         "if_revision": original_revision,
     }));
     assert!(updated.valid, "{:#?}", updated.diagnostics);
@@ -619,7 +619,7 @@ fn v03_mutations_enforce_opaque_revision_preconditions() {
     for conflict in [
         operations.update(&serde_json::json!({
             "path": "tasks/conditional.md",
-            "fields": {"title": "Lost update"},
+            "patch": {"title": "Lost update"},
             "if_revision": updated_revision,
         })),
         operations.delete(&serde_json::json!({
@@ -654,7 +654,7 @@ fn v03_mutations_enforce_opaque_revision_preconditions() {
 }
 
 #[test]
-fn v03_update_accepts_the_canonical_patch_and_keeps_legacy_fields_compatible() {
+fn v03_update_accepts_patch_and_unset_and_rejects_legacy_aliases() {
     let directory = v03_collection();
     write(
         directory.path(),
@@ -666,19 +666,21 @@ fn v03_update_accepts_the_canonical_patch_and_keeps_legacy_fields_compatible() {
     let operations = collection.v03_operations().expect("v0.3 operations");
     let patched = operations.update(&serde_json::json!({
         "path": "tasks/update-shapes.md",
-        "patch": {"title": "Canonical", "status": "done"},
-        "fields": {"title": "Legacy must not win"}
+        "patch": {"title": "Canonical"},
+        "unset": ["status"]
     }));
     assert!(patched.valid, "{:#?}", patched.diagnostics);
     assert_eq!(patched.result["frontmatter"]["title"], "Canonical");
-    assert_eq!(patched.result["frontmatter"]["status"], "done");
+    assert!(patched.result["frontmatter"].get("status").is_none());
 
-    let legacy = operations.update(&serde_json::json!({
-        "path": "tasks/update-shapes.md",
-        "fields": {"title": "Legacy still works"}
-    }));
-    assert!(legacy.valid, "{:#?}", legacy.diagnostics);
-    assert_eq!(legacy.result["frontmatter"]["title"], "Legacy still works");
+    for alias in ["fields", "frontmatter"] {
+        let legacy = operations.update(&serde_json::json!({
+            "path": "tasks/update-shapes.md",
+            alias: {"title": "Silently ignored"}
+        }));
+        assert!(!legacy.valid, "{alias} must not be accepted");
+        assert_eq!(legacy.diagnostics[0].code, "invalid_request");
+    }
 }
 
 #[test]

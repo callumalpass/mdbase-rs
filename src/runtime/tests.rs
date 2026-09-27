@@ -906,7 +906,7 @@ fn runtime_atomic_batch_cancel_cas_claim_and_prepared_reopen_are_durable() {
         OperationKind::Batch,
         json!({"operations": [
             {"kind": "update", "input": {
-                "path": "cas.md", "fields": {"title": "Planned"}
+                "path": "cas.md", "patch": {"title": "Planned"}
             }},
             {"kind": "create", "input": {"path": "cas-sibling.md"}}
         ]}),
@@ -1754,7 +1754,7 @@ fn runtime_cancel_and_commit_time_conflict_are_durable_final_states() {
         OperationKind::Update,
         json!({
             "path": "task.md",
-            "frontmatter": {"title": "Prepared"},
+            "patch": {"title": "Prepared"},
             "body": "Body\n"
         }),
     );
@@ -2663,7 +2663,7 @@ fn provider_serializes_conditional_writers() {
                     OperationKind::Update,
                     json!({
                         "path": "task.md",
-                        "fields": {"title": title},
+                        "patch": {"title": title},
                         "if_revision": revision,
                     }),
                 ))

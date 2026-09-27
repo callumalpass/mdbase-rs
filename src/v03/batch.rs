@@ -1277,11 +1277,11 @@ mod tests {
                     let collection = Collection::open(source.path()).unwrap();
                     let duplicate = json!({
                         "kind": "update",
-                        "input": {"path": "same.md", "fields": {"title": "Would reserve"}}
+                        "input": {"path": "same.md", "patch": {"title": "Would reserve"}}
                     });
                     let middle = json!({
                         "kind": "update",
-                        "input": {"path": "other.md", "fields": {"title": "Changed"}}
+                        "input": {"path": "other.md", "patch": {"title": "Changed"}}
                     });
                     let operations = if adjacent {
                         vec![duplicate.clone(), duplicate]
@@ -1480,7 +1480,7 @@ mod tests {
         let prepared = prepare_single_runtime(
             &collection,
             "update",
-            &json!({"path": "target.md", "fields": {"title": "After"}}),
+            &json!({"path": "target.md", "patch": {"title": "After"}}),
             &crate::runtime::OperationContext::legacy(),
         )
         .unwrap();
@@ -1517,7 +1517,7 @@ mod tests {
             "update",
             &json!({
                 "path": "target.md",
-                "fields": {"title": "After"},
+                "patch": {"title": "After"},
                 "dry_run": true
             }),
             &crate::runtime::OperationContext::legacy(),

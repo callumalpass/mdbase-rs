@@ -193,9 +193,6 @@ impl CompiledCatalog {
                 let path = primary_before.as_ref().ok_or_else(|| {
                     mutation_error("record_not_found", "The hosted record does not exist.")
                 })?;
-                if let Some(patch) = input.remove("patch") {
-                    input.insert("fields".to_string(), patch);
-                }
                 input.insert("path".to_string(), Value::String(path.clone()));
             }
             "rename" => {
@@ -266,9 +263,6 @@ impl CompiledCatalog {
                     let path = primary_before
                         .as_ref()
                         .expect("hosted update target was validated above");
-                    if let Some(patch) = committed_input.remove("patch") {
-                        committed_input.insert("fields".to_string(), patch);
-                    }
                     committed_input.insert("path".to_string(), Value::String(path.clone()));
                 }
                 "rename" => {
@@ -886,7 +880,7 @@ mod tests {
                 primary_stable_id: "record-2".to_string(),
                 input: json!({
                     "operations": [
-                        {"kind": "update", "input": {"path": "tasks/one.md", "fields": {"status": "done"}, "if_revision": revision}},
+                        {"kind": "update", "input": {"path": "tasks/one.md", "patch": {"status": "done"}, "if_revision": revision}},
                         {"kind": "create", "stable_id": "record-2", "input": {"path": "tasks/two.md", "type": "task", "body": "Created"}}
                     ]
                 }),
@@ -1046,8 +1040,8 @@ mod tests {
                     "operations": [
                         {"kind": "create", "stable_id": "record-new", "input": {"path": "tasks/new.md", "type": "task", "frontmatter": {"status": "new"}, "body": "New"}},
                         {"kind": "create", "stable_id": "failed-create", "input": {"path": "tasks/d.md", "type": "task"}},
-                        {"kind": "update", "input": {"path": "tasks/a.md", "fields": {"status": "done"}, "if_revision": a_revision}},
-                        {"kind": "update", "input": {"path": "tasks/e.md", "fields": {"status": "wrong"}, "if_revision": stale}},
+                        {"kind": "update", "input": {"path": "tasks/a.md", "patch": {"status": "done"}, "if_revision": a_revision}},
+                        {"kind": "update", "input": {"path": "tasks/e.md", "patch": {"status": "wrong"}, "if_revision": stale}},
                         {"kind": "delete", "input": {"path": "tasks/missing.md"}},
                         {"kind": "delete", "input": {"path": "tasks/c.md"}},
                         {"kind": "rename", "input": {"from": "tasks/b.md", "to": "tasks/b-two.md", "update_refs": false}},

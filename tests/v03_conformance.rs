@@ -901,7 +901,7 @@ fn run_suite(relative_path: &str, fixture_set: &str, expected_cases: usize) {
             executed += 1;
             let case_name = case.name.clone();
             let outcome =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_case(&group, case)));
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_case(group, case)));
             if let Err(panic) = outcome {
                 let message = panic
                     .downcast_ref::<String>()
@@ -925,33 +925,29 @@ fn run_suite(relative_path: &str, fixture_set: &str, expected_cases: usize) {
 }
 
 fn run_case(group: &Group, case: &Case) {
-    {
-        {
-            let mut setup = group.setup.clone();
-            if let Some(config) = case.setup.as_ref().and_then(|setup| setup.config.clone()) {
-                setup.config = config;
-            }
-            let directory = materialize(&setup);
-            let collection = Collection::open(directory.path())
-                .unwrap_or_else(|error| panic!("{}: open collection: {error:#}", group.name));
-            let expected = yaml_to_json(&case.expect);
-            let actual = execute(&collection, &setup, &case, &expected);
-            assert_expectation(&actual, &expected, &case.name);
-            if let Some(verification) = &case.verify_after {
-                let collection = Collection::open(directory.path())
-                    .unwrap_or_else(|error| panic!("{}: reopen collection: {error:#}", case.name));
-                let follow_up = Case {
-                    name: format!("{} (verify_after)", case.name),
-                    operation: verification.operation.clone(),
-                    input: verification.input.clone(),
-                    expect: verification.expect.clone(),
-                    setup: None,
-                    verify_after: None,
-                };
-                let expected = yaml_to_json(&follow_up.expect);
-                let actual = execute(&collection, &setup, &follow_up, &expected);
-                assert_expectation(&actual, &expected, &follow_up.name);
-            }
-        }
+    let mut setup = group.setup.clone();
+    if let Some(config) = case.setup.as_ref().and_then(|setup| setup.config.clone()) {
+        setup.config = config;
+    }
+    let directory = materialize(&setup);
+    let collection = Collection::open(directory.path())
+        .unwrap_or_else(|error| panic!("{}: open collection: {error:#}", group.name));
+    let expected = yaml_to_json(&case.expect);
+    let actual = execute(&collection, &setup, case, &expected);
+    assert_expectation(&actual, &expected, &case.name);
+    if let Some(verification) = &case.verify_after {
+        let collection = Collection::open(directory.path())
+            .unwrap_or_else(|error| panic!("{}: reopen collection: {error:#}", case.name));
+        let follow_up = Case {
+            name: format!("{} (verify_after)", case.name),
+            operation: verification.operation.clone(),
+            input: verification.input.clone(),
+            expect: verification.expect.clone(),
+            setup: None,
+            verify_after: None,
+        };
+        let expected = yaml_to_json(&follow_up.expect);
+        let actual = execute(&collection, &setup, &follow_up, &expected);
+        assert_expectation(&actual, &expected, &follow_up.name);
     }
 }

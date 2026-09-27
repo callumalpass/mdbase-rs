@@ -172,7 +172,7 @@ fn ordinary_explicit_update_cannot_change_to_equal_implicit_authority() {
     let before = fs::read(root.path().join("ordinary.md")).unwrap();
     let collection = Collection::open(root.path()).unwrap();
     let result = collection.v03_operations().unwrap().update(&json!({
-        "path":"ordinary.md", "fields":{"title":"changed"}
+        "path":"ordinary.md", "patch":{"title":"changed"}
     }));
     assert!(!result.valid, "{result:#?}");
     assert_eq!(
@@ -541,14 +541,14 @@ schema:
         let result = collection
             .v03_operations()
             .unwrap()
-            .update(&json!({"path":path,"fields":{"title":"new"}}));
+            .update(&json!({"path":path,"patch":{"title":"new"}}));
         assert!(result.valid, "{path}: {result:#?}");
     }
     let bytes = fs::read(root.path().join("notes/a.md")).unwrap();
     let rejected = collection
         .v03_operations()
         .unwrap()
-        .update(&json!({"path":"../notes/a.md","fields":{"title":"bad"}}));
+        .update(&json!({"path":"../notes/a.md","patch":{"title":"bad"}}));
     assert!(!rejected.valid);
     assert_eq!(fs::read(root.path().join("notes/a.md")).unwrap(), bytes);
 }

@@ -335,6 +335,16 @@ pub(super) fn decode_update(
             Some(raw_path.to_string()),
         )]
     })?;
+    if let Some(alias) = ["fields", "frontmatter"]
+        .into_iter()
+        .find(|alias| input.get(*alias).is_some())
+    {
+        return Err(vec![Diagnostic::error(
+            "invalid_request",
+            format!("update takes patch and unset; '{alias}' is not a v0.3 update member"),
+            Some(raw_path.to_string()),
+        )]);
+    }
     let has_patch = input.get("patch").is_some();
     let unset = decode_unset(input, raw_path)?;
     let body = input
