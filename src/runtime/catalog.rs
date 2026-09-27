@@ -300,8 +300,8 @@ impl CompiledCatalog {
         self.collection.type_warnings()
     }
 
-    pub(crate) fn id_field(&self) -> &str {
-        &self.collection.settings().id_field
+    pub(crate) fn link_resolution_keys(&self) -> crate::links::resolver::ResolutionKeys {
+        self.collection.resolution_keys()
     }
 
     pub(crate) fn record_extensions(&self) -> Vec<String> {
