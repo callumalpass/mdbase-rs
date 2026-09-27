@@ -41,6 +41,7 @@ pub(crate) mod transactions;
 pub mod types;
 pub mod v03;
 pub mod validation;
+pub(crate) mod version_requirement;
 pub mod views;
 pub mod watch;
 

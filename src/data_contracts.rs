@@ -532,19 +532,46 @@ impl DataContractRegistry {
         type_definition: &TypeDef,
         implementation: &DataContractImplementation,
     ) -> Result<(), DataContractLoadError> {
-        let identity = (
-            implementation.contract.clone(),
-            implementation.version.clone(),
-        );
-        let Some(contract) = self.contracts.get(&identity) else {
+        let registered_versions = self
+            .contracts
+            .keys()
+            .filter(|(id, _)| *id == implementation.contract)
+            .map(|(_, version)| version.as_str())
+            .collect::<Vec<_>>();
+        if registered_versions.is_empty() {
             return Err(load_error(
                 "data_contract_not_found",
                 format!(
-                    "Type '{}' implements missing exact data contract '{}' {}",
-                    type_definition.name, implementation.contract, implementation.version
+                    "Type '{}' implements data contract '{}', which is not registered",
+                    type_definition.name, implementation.contract
                 ),
             ));
-        };
+        }
+        let resolved = crate::version_requirement::resolve(
+            &implementation.version,
+            registered_versions,
+        )
+        .map_err(|message| {
+            load_error(
+                "invalid_type_definition",
+                format!("Type '{}': {message}", type_definition.name),
+            )
+        })?
+        .ok_or_else(|| {
+            load_error(
+                "data_contract_version_mismatch",
+                format!(
+                    "Type '{}' requires data contract '{}' {}, but no registered version satisfies it",
+                    type_definition.name, implementation.contract, implementation.version
+                ),
+            )
+        })?
+        .to_string();
+        let identity = (implementation.contract.clone(), resolved.clone());
+        let contract = self
+            .contracts
+            .get(&identity)
+            .expect("the resolved version is a registered contract");
         if contract.definition.contract_type != "record" {
             return Err(load_error(
                 "data_contract_field_invalid",
@@ -636,7 +663,7 @@ impl DataContractRegistry {
 
         let descriptor = DataContractImplementationDescriptor {
             contract: implementation.contract.clone(),
-            version: implementation.version.clone(),
+            version: resolved,
             contract_digest: contract.definition.digest.clone(),
             type_name: type_definition.name.clone(),
             type_version: type_definition.version.unwrap_or(1),
@@ -963,6 +990,10 @@ fn implementation_digest(
         if let Some(value) = frontmatter.and_then(|value| value.get(key)) {
             type_semantics.insert(key.to_string(), value.clone());
         }
+    }
+    // Advisory display metadata never changes implementation identity.
+    if let Some(Value::Object(collection)) = type_semantics.get_mut("collection") {
+        collection.remove("display");
     }
     digest_value(&json!({
         "contract_digest": contract_digest,
