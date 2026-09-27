@@ -13,7 +13,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  MDBASE_SPEC_REVISION: 884d8616efe43da0fdcde817d15c9411badc509f
+  MDBASE_SPEC_REVISION: 0dd606c02576586dbb3970fcea29a5b85234e540
 
 jobs:
   quality:

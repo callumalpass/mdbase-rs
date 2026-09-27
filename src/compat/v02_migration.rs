@@ -191,15 +191,28 @@ fn canonical_config(
         "id_field".to_string(),
         Value::String(collection.settings.id_field.clone()),
     );
-    settings.insert(
-        "include_subfolders".to_string(),
-        Value::Bool(collection.settings.include_subfolders),
-    );
-    settings.insert("exclude".to_string(), json!(collection.settings.exclude));
-    settings.insert(
-        "default_strict".to_string(),
-        collection.settings.default_strict.clone(),
-    );
+    // Chapter 13, "Configuration": translate exclusions to portable globs and
+    // express include_subfolders: false as an exclusion.
+    let mut exclude = Vec::new();
+    for pattern in &collection.settings.exclude {
+        let Some(migrated) = migrate_exclude(pattern, &collection.settings.types_folder) else {
+            continue;
+        };
+        if !is_portable_glob(&migrated) {
+            diagnostics.push(behavior_change_diagnostic(
+                &format!("exclude pattern '{pattern}' is not a portable v0.3 glob; review it"),
+                Some("mdbase.yaml"),
+                None,
+            ));
+        }
+        exclude.push(Value::String(migrated));
+    }
+    if !collection.settings.include_subfolders {
+        exclude.push(Value::String("*/**".to_string()));
+    }
+    if !exclude.is_empty() {
+        settings.insert("exclude".to_string(), Value::Array(exclude));
+    }
     if let Some(timezone) = &collection.settings.timezone {
         settings.insert("timezone".to_string(), Value::String(timezone.clone()));
     }
@@ -221,6 +234,17 @@ fn canonical_config(
                 config.insert(key.clone(), value.clone());
             }
         }
+    }
+    if !matches!(
+        collection.settings.default_strict,
+        Value::Null | Value::Bool(false)
+    ) {
+        // Strictness migrates into each type's additionalProperties; the
+        // setting itself has no v0.3 meaning.
+        config.insert(
+            "x-legacy-v0.2".to_string(),
+            json!({"settings": {"default_strict": collection.settings.default_strict}}),
+        );
     }
     config.insert(
         "x-mdbase-v02-migration".to_string(),
@@ -848,9 +872,36 @@ fn error_path_from_transaction(error: &crate::transactions::TransactionError) ->
     }
 }
 
+/// The portable glob that excludes what a v0.2 exclude pattern excluded, or
+/// `None` when the built-in exclusions or the types folder already cover it.
+fn migrate_exclude(pattern: &str, types_folder: &str) -> Option<String> {
+    if !pattern.contains(['/', '*', '?', '[']) {
+        // A bare name excluded that root path and everything below it.
+        if pattern.starts_with('.') || pattern == "node_modules" || pattern == types_folder {
+            return None;
+        }
+        return Some(format!("{pattern}/**"));
+    }
+    if !pattern.contains('/') {
+        // A wildcard pattern without a slash matched file names at any depth.
+        return Some(format!("**/{pattern}"));
+    }
+    Some(pattern.to_string())
+}
+
+/// Whether a glob uses only the portable grammar of spec Chapter 02.
+fn is_portable_glob(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && !pattern.starts_with('/')
+        && !pattern.contains(['{', '}', '\\'])
+        && pattern
+            .split('/')
+            .all(|component| component == "**" || !component.contains("**"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::missing_field_guard;
+    use super::{is_portable_glob, migrate_exclude, missing_field_guard};
 
     #[test]
     fn generated_field_guards_test_raw_presence() {
@@ -859,5 +910,27 @@ mod tests {
             missing_field_guard("created-at"),
             r#"!("created-at" in raw)"#
         );
+    }
+
+    #[test]
+    fn exclude_patterns_become_equivalent_portable_globs() {
+        assert_eq!(
+            migrate_exclude("archive", "_types").as_deref(),
+            Some("archive/**")
+        );
+        assert_eq!(
+            migrate_exclude("*.draft.md", "_types").as_deref(),
+            Some("**/*.draft.md")
+        );
+        assert_eq!(
+            migrate_exclude("drafts/**", "_types").as_deref(),
+            Some("drafts/**")
+        );
+        for covered in [".git", ".mdbase", "node_modules", "_types"] {
+            assert_eq!(migrate_exclude(covered, "_types"), None);
+        }
+        assert!(is_portable_glob("tasks/**/*.md"));
+        assert!(!is_portable_glob("{a,b}/*.md"));
+        assert!(!is_portable_glob("a**/b"));
     }
 }
