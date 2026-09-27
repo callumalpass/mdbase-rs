@@ -54,6 +54,38 @@ collection:
 }
 
 #[test]
+fn unsupported_collection_projections_are_reported_not_ignored() {
+    let directory = tempfile::tempdir().expect("temp collection");
+    write(directory.path(), "mdbase.yaml", "spec_version: \"0.3.0\"\n");
+    write(
+        directory.path(),
+        "_types/task.md",
+        "---\nkind: mdbase.type\nname: task\nversion: 1\nmatch:\n  path_glob: \"tasks/**/*.md\"\n\
+         schema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n\
+         collection:\n  projections:\n    is_overdue:\n      expr: 'due != null && due < today()'\n---\n",
+    );
+    write(directory.path(), "tasks/a.md", "---\ntitle: A\n---\n");
+    write(directory.path(), "notes/b.md", "---\ntitle: B\n---\n");
+    let collection = Collection::open(directory.path()).expect("open collection");
+    let operations = collection.v03_operations().expect("v0.3 operations");
+    let warned = |result: &v03::OperationResult| {
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == "warning"
+                && diagnostic.code == "unsupported_feature"
+                && diagnostic.path.as_deref() == Some("_types/task.md")
+                && diagnostic.type_name.as_deref() == Some("task")
+                && diagnostic.details
+                    == Some(serde_json::json!({"feature": "collection_projections"}))
+        })
+    };
+    assert!(warned(&operations.validate(&serde_json::json!({}))));
+    let record = operations.validate(&serde_json::json!({"path": "tasks/a.md"}));
+    assert!(record.valid && warned(&record), "{record:#?}");
+    let other = operations.validate(&serde_json::json!({"path": "notes/b.md"}));
+    assert!(other.diagnostics.is_empty(), "{other:#?}");
+}
+
+#[test]
 fn record_paths_follow_v03_discovery() {
     let directory = v03_collection();
     write(
