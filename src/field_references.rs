@@ -181,6 +181,49 @@ pub(crate) fn set_object_value(
     set_segments(child, remaining, reference, value, None, false)
 }
 
+/// Object keys addressed by a reference that `unset` may remove.
+///
+/// Array selectors (`[]`) are rejected here; a JSON Pointer that reaches an
+/// array item is rejected by [`remove_object_value`] because only the data
+/// reveals it.
+pub(crate) fn object_path(reference: &str) -> Result<Vec<String>, String> {
+    let segments =
+        parse(reference).ok_or_else(|| format!("Invalid field reference '{reference}'"))?;
+    if segments.iter().any(|segment| segment.each) {
+        return Err(format!("Cannot unset array items through '{reference}'"));
+    }
+    Ok(segments.into_iter().map(|segment| segment.key).collect())
+}
+
+/// Remove the object member addressed by `reference`. A missing member or
+/// missing intermediate object is not an error; addressing an array item is.
+pub(crate) fn remove_object_value(
+    target: &mut Map<String, Value>,
+    reference: &str,
+) -> Result<(), String> {
+    let keys = object_path(reference)?;
+    let Some((last, parents)) = keys.split_last() else {
+        return Err(format!("Invalid field reference '{reference}'"));
+    };
+    let mut current = target;
+    for key in parents {
+        current = match current.get_mut(key) {
+            Some(Value::Object(object)) => object,
+            Some(Value::Array(_)) => {
+                return Err(format!("Cannot unset array items through '{reference}'"))
+            }
+            _ => return Ok(()),
+        };
+    }
+    current.remove(last);
+    Ok(())
+}
+
+/// The JSON Pointer that addresses one top-level key exactly.
+pub(crate) fn top_level_pointer(key: &str) -> String {
+    format!("/{}", key.replace('~', "~0").replace('/', "~1"))
+}
+
 pub(crate) fn set_value_with_schema(
     target: &mut Value,
     reference: &str,

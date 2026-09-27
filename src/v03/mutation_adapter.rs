@@ -285,6 +285,32 @@ pub(super) fn decode_rename(
     ))
 }
 
+fn decode_unset(input: &Value, raw_path: &str) -> Result<Vec<String>, Vec<Diagnostic>> {
+    let invalid = |message: String| {
+        vec![Diagnostic::error(
+            "invalid_request",
+            message,
+            Some(raw_path.to_string()),
+        )]
+    };
+    let Some(value) = input.get("unset") else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| invalid("unset must be an array of field references".to_string()))?;
+    items
+        .iter()
+        .map(|item| {
+            let reference = item
+                .as_str()
+                .ok_or_else(|| invalid("unset entries must be strings".to_string()))?;
+            crate::field_references::object_path(reference).map_err(invalid)?;
+            Ok(reference.to_string())
+        })
+        .collect()
+}
+
 pub(super) fn decode_update(
     input: &Value,
 ) -> Result<
@@ -309,9 +335,18 @@ pub(super) fn decode_update(
             Some(raw_path.to_string()),
         )]
     })?;
-    let has_patch = input.get("patch").is_some()
-        || input.get("fields").is_some()
-        || input.get("frontmatter").is_some();
+    if let Some(alias) = ["fields", "frontmatter"]
+        .into_iter()
+        .find(|alias| input.get(*alias).is_some())
+    {
+        return Err(vec![Diagnostic::error(
+            "invalid_request",
+            format!("update takes patch and unset; '{alias}' is not a v0.3 update member"),
+            Some(raw_path.to_string()),
+        )]);
+    }
+    let has_patch = input.get("patch").is_some();
+    let unset = decode_unset(input, raw_path)?;
     let body = input
         .get("body")
         .and_then(Value::as_str)
@@ -327,12 +362,27 @@ pub(super) fn decode_update(
         }
         None => None,
     };
-    if document.is_some() && (has_patch || body.is_some()) {
+    if document.is_some() && (has_patch || !unset.is_empty() || body.is_some()) {
         return Err(vec![Diagnostic::error(
             "invalid_request",
-            "document cannot be combined with patch, fields, frontmatter, or body",
+            "document cannot be combined with patch, unset, or body",
             Some(raw_path.to_string()),
         )]);
+    }
+    if let Some(patch) = input.get("patch").and_then(Value::as_object) {
+        let conflict = unset.iter().find(|reference| {
+            crate::field_references::object_path(reference)
+                .ok()
+                .and_then(|keys| keys.first().cloned())
+                .is_some_and(|key| patch.contains_key(&key))
+        });
+        if let Some(reference) = conflict {
+            return Err(vec![Diagnostic::error(
+                "invalid_request",
+                format!("unset '{reference}' overlaps a key set by patch"),
+                Some(raw_path.to_string()),
+            )]);
+        }
     }
     let if_revision = parse_optional_revision(input, Some(raw_path))?;
     Ok((
@@ -340,10 +390,9 @@ pub(super) fn decode_update(
             path,
             patch: input
                 .get("patch")
-                .or_else(|| input.get("fields"))
-                .or_else(|| input.get("frontmatter"))
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({})),
+            unset,
             document,
             body,
             if_revision,

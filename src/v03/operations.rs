@@ -135,6 +135,19 @@ impl<'a> Operations<'a> {
                 }
             }
         }
+        let types = input.get("path").map(|_| {
+            self.read(input).result["types"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>()
+        });
+        result.diagnostics.extend(unsupported_feature_diagnostics(
+            self.collection,
+            types.as_deref(),
+        ));
         result
     }
 
@@ -754,4 +767,43 @@ fn deduplicate_diagnostics(diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
         }
     }
     result
+}
+
+/// `unsupported_feature` warnings for type sections this engine loads but does
+/// not implement (spec Chapter 07, "Projections"). With `types`, only those
+/// types are reported.
+fn unsupported_feature_diagnostics(
+    collection: &Collection,
+    types: Option<&[String]>,
+) -> Vec<Diagnostic> {
+    let mut declaring = collection
+        .types()
+        .iter()
+        .filter(|(name, _)| types.is_none_or(|types| types.contains(name)))
+        .filter(|(_, definition)| {
+            definition
+                .v03_frontmatter
+                .as_ref()
+                .and_then(|frontmatter| frontmatter.pointer("/collection/projections"))
+                .is_some()
+        })
+        .map(|(_, definition)| definition)
+        .collect::<Vec<_>>();
+    declaring.sort_by(|left, right| left.name.cmp(&right.name));
+    declaring
+        .into_iter()
+        .map(|definition| Diagnostic {
+            severity: "warning".to_string(),
+            code: "unsupported_feature".to_string(),
+            message: format!(
+                "Type '{}' declares collection.projections, which this implementation does not evaluate; projection values are absent.",
+                definition.name
+            ),
+            path: definition.source_path.clone(),
+            field: None,
+            type_name: Some(definition.name.clone()),
+            schema_location: None,
+            details: Some(serde_json::json!({"feature": "collection_projections"})),
+        })
+        .collect()
 }

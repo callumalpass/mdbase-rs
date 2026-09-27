@@ -25,7 +25,7 @@ fn collection() -> (TempDir, Collection) {
     write(
         &root,
         "mdbase.yaml",
-        "spec_version: 0.3.0\nsettings:\n  timezone: UTC\n  validation: warn\n",
+        "spec_version: 0.3.0\nsettings:\n  timezone: UTC\n  validation: warn\n  id_field: id\n",
     );
     write(
         &root,

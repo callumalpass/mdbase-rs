@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::expressions::ast::Expr;
+use crate::cel::Program;
 
 use super::model::{Query, Selection};
 use crate::cel;
@@ -8,10 +8,10 @@ use crate::diagnostic::Diagnostic;
 
 pub(crate) struct CompiledQuery {
     pub query: Query,
-    pub projections: Vec<(String, Expr)>,
-    pub where_expression: Option<Expr>,
+    pub projections: Vec<(String, Program)>,
+    pub where_expression: Option<Program>,
     pub selections: Vec<CompiledSelection>,
-    pub summary_functions: BTreeMap<String, Expr>,
+    pub summary_functions: BTreeMap<String, Program>,
 }
 
 impl CompiledQuery {
@@ -36,21 +36,21 @@ impl CompiledQuery {
     /// expressions that explicitly traverse records or request backlinks.
     pub fn requires_link_graph(&self) -> bool {
         self.record_expressions()
-            .any(expression_requires_link_graph)
+            .any(|program| program.facts().needs_link_graph)
     }
 
     /// Invocation context is metadata-only unless an expression actually
     /// reads the `this` binding.
     pub fn requires_this_context(&self) -> bool {
         self.record_expressions()
-            .any(|expression| expression_uses_identifier(expression, "this"))
+            .any(|program| program.facts().free_identifiers.contains("this"))
     }
 
     /// Body-derived file metadata can be deferred until after pagination when
     /// no filter, projection, ordering, grouping, or summary reads it.
     pub fn requires_file_body_metadata(&self) -> bool {
         self.record_expressions()
-            .any(expression_requires_file_body_metadata)
+            .any(|program| program.facts().needs_file_body)
             || self.selections.iter().any(|selection| match selection {
                 CompiledSelection::Field { source, .. } => file_body_field(source),
                 CompiledSelection::Expression { .. } => false,
@@ -72,7 +72,7 @@ impl CompiledQuery {
                 .any(|summary| file_body_field(&summary.field))
     }
 
-    fn record_expressions(&self) -> impl Iterator<Item = &Expr> {
+    fn record_expressions(&self) -> impl Iterator<Item = &Program> {
         self.projections
             .iter()
             .map(|(_, expression)| expression)
@@ -90,7 +90,7 @@ impl CompiledQuery {
 
 pub(crate) enum CompiledSelection {
     Field { source: String, name: String },
-    Expression { expression: Expr, name: String },
+    Expression { expression: Program, name: String },
 }
 
 pub(crate) fn compile(query: Query) -> Result<CompiledQuery, Vec<Diagnostic>> {
@@ -250,13 +250,12 @@ pub(crate) fn compile(query: Query) -> Result<CompiledQuery, Vec<Diagnostic>> {
     }
 }
 
-fn projection_order(projections: &BTreeMap<String, Expr>) -> Result<Vec<String>, String> {
+fn projection_order(projections: &BTreeMap<String, Program>) -> Result<Vec<String>, String> {
     let names = projections.keys().cloned().collect::<BTreeSet<_>>();
     let dependencies = projections
         .iter()
-        .map(|(name, expression)| {
-            let mut referenced = BTreeSet::new();
-            collect_projection_references(expression, &mut referenced);
+        .map(|(name, program)| {
+            let referenced = program.facts().projection_references.clone();
             if let Some(unknown) = referenced
                 .iter()
                 .find(|reference| !names.contains(*reference))
@@ -290,48 +289,6 @@ fn projection_order(projections: &BTreeMap<String, Expr>) -> Result<Vec<String>,
     Ok(order)
 }
 
-fn collect_projection_references(expression: &Expr, references: &mut BTreeSet<String>) {
-    match expression {
-        Expr::Dot(object, field) => {
-            if matches!(object.as_ref(), Expr::Ident(name) if name == "projection") {
-                references.insert(field.clone());
-            }
-            collect_projection_references(object, references);
-        }
-        Expr::Index(object, index) => {
-            if matches!(object.as_ref(), Expr::Ident(name) if name == "projection") {
-                if let Expr::Str(name) = index.as_ref() {
-                    references.insert(name.clone());
-                }
-            }
-            collect_projection_references(object, references);
-            collect_projection_references(index, references);
-        }
-        Expr::BinOp(left, _, right) | Expr::NullCoalesce(left, right) => {
-            collect_projection_references(left, references);
-            collect_projection_references(right, references);
-        }
-        Expr::UnaryOp(_, inner) => collect_projection_references(inner, references),
-        Expr::Call(function, arguments) => {
-            collect_projection_references(function, references);
-            for argument in arguments {
-                collect_projection_references(argument, references);
-            }
-        }
-        Expr::Conditional(condition, then_expression, else_expression) => {
-            collect_projection_references(condition, references);
-            collect_projection_references(then_expression, references);
-            collect_projection_references(else_expression, references);
-        }
-        Expr::Array(values) => {
-            for value in values {
-                collect_projection_references(value, references);
-            }
-        }
-        Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) | Expr::Ident(_) => {}
-    }
-}
-
 #[derive(Clone, Copy)]
 enum QueryExpressionContext {
     Record,
@@ -341,9 +298,7 @@ enum QueryExpressionContext {
 const SYSTEM_BINDINGS: &[&str] = &[
     "record",
     "raw",
-    "present",
     "file",
-    "note",
     "projection",
     "this",
     "values",
@@ -358,26 +313,16 @@ const SYSTEM_BINDINGS: &[&str] = &[
 ];
 
 fn check_system_bindings(
-    expression: &Expr,
+    program: &Program,
     field: &str,
     context: QueryExpressionContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let mut identifiers = BTreeSet::new();
-    collect_identifiers(expression, &mut identifiers);
     let allowed: &[&str] = match context {
-        QueryExpressionContext::Record => &[
-            "record",
-            "raw",
-            "present",
-            "file",
-            "note",
-            "projection",
-            "this",
-        ],
+        QueryExpressionContext::Record => &["record", "raw", "file", "projection", "this"],
         QueryExpressionContext::Summary => &["values"],
     };
-    for identifier in identifiers {
+    for identifier in &program.facts().free_identifiers {
         if SYSTEM_BINDINGS.contains(&identifier.as_str()) && !allowed.contains(&identifier.as_str())
         {
             diagnostics.push(invalid_query(
@@ -388,129 +333,6 @@ fn check_system_bindings(
                 None,
             ));
         }
-    }
-}
-
-fn collect_identifiers(expression: &Expr, identifiers: &mut BTreeSet<String>) {
-    match expression {
-        Expr::Ident(name) => {
-            identifiers.insert(name.clone());
-        }
-        Expr::Dot(object, _) | Expr::UnaryOp(_, object) => {
-            collect_identifiers(object, identifiers);
-        }
-        Expr::Index(left, right)
-        | Expr::BinOp(left, _, right)
-        | Expr::NullCoalesce(left, right) => {
-            collect_identifiers(left, identifiers);
-            collect_identifiers(right, identifiers);
-        }
-        Expr::Call(function, arguments) => {
-            collect_identifiers(function, identifiers);
-            for argument in arguments {
-                collect_identifiers(argument, identifiers);
-            }
-        }
-        Expr::Conditional(condition, then_expression, else_expression) => {
-            collect_identifiers(condition, identifiers);
-            collect_identifiers(then_expression, identifiers);
-            collect_identifiers(else_expression, identifiers);
-        }
-        Expr::Array(values) => {
-            for value in values {
-                collect_identifiers(value, identifiers);
-            }
-        }
-        Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) => {}
-    }
-}
-
-fn expression_requires_link_graph(expression: &Expr) -> bool {
-    match expression {
-        Expr::Dot(object, field) => {
-            (field == "backlinks" && matches!(object.as_ref(), Expr::Ident(name) if name == "file"))
-                || expression_requires_link_graph(object)
-        }
-        Expr::Call(function, arguments) => {
-            matches!(function.as_ref(), Expr::Dot(_, method) if method == "asFile")
-                || expression_requires_link_graph(function)
-                || arguments.iter().any(expression_requires_link_graph)
-        }
-        Expr::Index(left, right)
-        | Expr::BinOp(left, _, right)
-        | Expr::NullCoalesce(left, right) => {
-            expression_requires_link_graph(left) || expression_requires_link_graph(right)
-        }
-        Expr::UnaryOp(_, inner) => expression_requires_link_graph(inner),
-        Expr::Conditional(condition, then_expression, else_expression) => {
-            expression_requires_link_graph(condition)
-                || expression_requires_link_graph(then_expression)
-                || expression_requires_link_graph(else_expression)
-        }
-        Expr::Array(values) => values.iter().any(expression_requires_link_graph),
-        Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) | Expr::Ident(_) => false,
-    }
-}
-
-fn expression_uses_identifier(expression: &Expr, identifier: &str) -> bool {
-    match expression {
-        Expr::Ident(name) => name == identifier,
-        Expr::Dot(object, _) | Expr::UnaryOp(_, object) => {
-            expression_uses_identifier(object, identifier)
-        }
-        Expr::Index(left, right)
-        | Expr::BinOp(left, _, right)
-        | Expr::NullCoalesce(left, right) => {
-            expression_uses_identifier(left, identifier)
-                || expression_uses_identifier(right, identifier)
-        }
-        Expr::Call(function, arguments) => {
-            expression_uses_identifier(function, identifier)
-                || arguments
-                    .iter()
-                    .any(|argument| expression_uses_identifier(argument, identifier))
-        }
-        Expr::Conditional(condition, then_expression, else_expression) => {
-            expression_uses_identifier(condition, identifier)
-                || expression_uses_identifier(then_expression, identifier)
-                || expression_uses_identifier(else_expression, identifier)
-        }
-        Expr::Array(values) => values
-            .iter()
-            .any(|value| expression_uses_identifier(value, identifier)),
-        Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) => false,
-    }
-}
-
-fn expression_requires_file_body_metadata(expression: &Expr) -> bool {
-    match expression {
-        Expr::Dot(object, field) => {
-            (["body", "tags", "links", "embeds"].contains(&field.as_str())
-                && matches!(object.as_ref(), Expr::Ident(name) if name == "file"))
-                || expression_requires_file_body_metadata(object)
-        }
-        Expr::Index(object, index) => {
-            (matches!(object.as_ref(), Expr::Ident(name) if name == "file")
-                && matches!(index.as_ref(), Expr::Str(field) if file_body_field(field)))
-                || expression_requires_file_body_metadata(object)
-                || expression_requires_file_body_metadata(index)
-        }
-        Expr::BinOp(left, _, right) | Expr::NullCoalesce(left, right) => {
-            expression_requires_file_body_metadata(left)
-                || expression_requires_file_body_metadata(right)
-        }
-        Expr::UnaryOp(_, inner) => expression_requires_file_body_metadata(inner),
-        Expr::Call(function, arguments) => {
-            expression_requires_file_body_metadata(function)
-                || arguments.iter().any(expression_requires_file_body_metadata)
-        }
-        Expr::Conditional(condition, then_expression, else_expression) => {
-            expression_requires_file_body_metadata(condition)
-                || expression_requires_file_body_metadata(then_expression)
-                || expression_requires_file_body_metadata(else_expression)
-        }
-        Expr::Array(values) => values.iter().any(expression_requires_file_body_metadata),
-        Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) | Expr::Ident(_) => false,
     }
 }
 

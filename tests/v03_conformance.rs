@@ -24,7 +24,7 @@ struct Group {
     tests: Vec<Case>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Setup {
     #[serde(default = "default_config")]
     config: String,
@@ -60,6 +60,26 @@ impl Default for Setup {
 #[derive(Debug, Deserialize)]
 struct Case {
     name: String,
+    operation: String,
+    #[serde(default)]
+    input: serde_yaml::Value,
+    #[serde(default)]
+    expect: serde_yaml::Value,
+    /// Test-level setup; a supplied config replaces the group config.
+    #[serde(default)]
+    setup: Option<CaseSetup>,
+    /// A follow-up operation whose result must match after the primary one.
+    #[serde(default)]
+    verify_after: Option<Verification>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CaseSetup {
+    config: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Verification {
     operation: String,
     #[serde(default)]
     input: serde_yaml::Value,
@@ -160,6 +180,19 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
             result
         }
         "read" => flatten_envelope(operations.read(&input)),
+        "batch" => {
+            let mut result = flatten_envelope(operations.batch(&input));
+            expose_operation_issues(&mut result);
+            result
+        }
+        "resolve_link" => {
+            let resolution = collection.resolve_link(&input);
+            serde_json::json!({
+                "valid": resolution.get("error").is_none(),
+                "resolved": resolution.get("resolved_path").cloned().unwrap_or(Value::Null),
+                "error": resolution.get("error").cloned().unwrap_or(Value::Null),
+            })
+        }
         "query" => {
             let mut result = flatten_envelope(operations.query(&input));
             let body_returned = result
@@ -698,6 +731,25 @@ fn assert_expectation(actual: &Value, expected: &Value, case_name: &str) {
                     );
                 }
             }
+            "diagnostics_contain" => assert_array_contains(
+                actual.get("diagnostics").and_then(Value::as_array),
+                expected_value.as_array(),
+                case_name,
+                "diagnostics",
+            ),
+            "body_contains" => {
+                let expected = expected_value
+                    .as_str()
+                    .expect("body_contains must be a string");
+                let body = actual
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("{case_name}: missing body: {actual:#}"));
+                assert!(
+                    body.contains(expected),
+                    "{case_name}: body does not contain {expected:?}: {body:?}"
+                );
+            }
             "frontmatter_contains" => {
                 let frontmatter = actual
                     .get("frontmatter")
@@ -802,13 +854,23 @@ fn shared_v03_optional_membership_fixture_passes() {
 }
 
 #[test]
+fn shared_v03_core_write_fixture_passes() {
+    run_suite("core/core-write.yaml", "core_collection", 17);
+}
+
+#[test]
+fn shared_v03_links_and_discovery_fixture_passes() {
+    run_suite("core/links-and-discovery.yaml", "core_collection", 8);
+}
+
+#[test]
 fn shared_v03_lifecycle_fixture_passes() {
-    run_suite("lifecycle/lifecycle.yaml", "lifecycle", 7);
+    run_suite("lifecycle/lifecycle.yaml", "lifecycle", 8);
 }
 
 #[test]
 fn shared_v03_cel_fixture_passes() {
-    run_suite("cel/cel-profile.yaml", "cel", 15);
+    run_suite("cel/cel-profile.yaml", "cel", 27);
 }
 
 #[test]
@@ -818,7 +880,7 @@ fn shared_v03_saved_views_fixture_passes() {
 
 #[test]
 fn shared_v03_data_contract_fixture_passes() {
-    run_suite("data-contracts/data-contracts.yaml", "data_contracts", 17);
+    run_suite("data-contracts/data-contracts.yaml", "data_contracts", 18);
 }
 
 #[test]
@@ -833,19 +895,59 @@ fn run_suite(relative_path: &str, fixture_set: &str, expected_cases: usize) {
     assert_eq!(suite.fixture_set, fixture_set);
 
     let mut executed = 0;
-    for group in suite.groups {
-        for case in group.tests {
-            let directory = materialize(&group.setup);
-            let collection = Collection::open(directory.path())
-                .unwrap_or_else(|error| panic!("{}: open collection: {error:#}", group.name));
-            let expected = yaml_to_json(&case.expect);
-            let actual = execute(&collection, &group.setup, &case, &expected);
-            assert_expectation(&actual, &expected, &case.name);
+    let mut failures = Vec::new();
+    for group in &suite.groups {
+        for case in &group.tests {
             executed += 1;
+            let case_name = case.name.clone();
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_case(group, case)));
+            if let Err(panic) = outcome {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()))
+                    .unwrap_or_default();
+                failures.push(format!("{case_name}: {message}"));
+            }
         }
     }
+    assert!(
+        failures.is_empty(),
+        "{} of {executed} {relative_path} cases failed:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
     assert_eq!(
         executed, expected_cases,
         "pinned v0.3 fixture case count changed for {fixture_set}"
     );
+}
+
+fn run_case(group: &Group, case: &Case) {
+    let mut setup = group.setup.clone();
+    if let Some(config) = case.setup.as_ref().and_then(|setup| setup.config.clone()) {
+        setup.config = config;
+    }
+    let directory = materialize(&setup);
+    let collection = Collection::open(directory.path())
+        .unwrap_or_else(|error| panic!("{}: open collection: {error:#}", group.name));
+    let expected = yaml_to_json(&case.expect);
+    let actual = execute(&collection, &setup, case, &expected);
+    assert_expectation(&actual, &expected, &case.name);
+    if let Some(verification) = &case.verify_after {
+        let collection = Collection::open(directory.path())
+            .unwrap_or_else(|error| panic!("{}: reopen collection: {error:#}", case.name));
+        let follow_up = Case {
+            name: format!("{} (verify_after)", case.name),
+            operation: verification.operation.clone(),
+            input: verification.input.clone(),
+            expect: verification.expect.clone(),
+            setup: None,
+            verify_after: None,
+        };
+        let expected = yaml_to_json(&follow_up.expect);
+        let actual = execute(&collection, &setup, &follow_up, &expected);
+        assert_expectation(&actual, &expected, &follow_up.name);
+    }
 }

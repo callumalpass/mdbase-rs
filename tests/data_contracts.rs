@@ -288,6 +288,6 @@ fn canonical_tasknotes_digests_match_the_spec_fixture() {
     let implementations = collection.get_data_contract_implementations("tasknotes.task", "0.2.0");
     assert_eq!(
         implementations[0].implementation_digest,
-        "sha256:54a839d00a740e29bca41e3440f56c84337ffc2f4b79e0c6c618a00455959902"
+        "sha256:b994d1fdbc6e7a787393e033520afbcfbe6b715ae87ab62a09e24981811c4730"
     );
 }

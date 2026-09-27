@@ -24,12 +24,16 @@ pub(crate) struct CompiledComputed {
 pub(crate) struct CompiledTypePlan {
     pub computed: BTreeMap<String, CompiledComputed>,
     pub computed_order: Vec<String>,
-    pub match_expression: Option<Arc<Expr>>,
-    lifecycle_guards: HashMap<(String, usize), Arc<Expr>>,
+    pub match_expression: Option<Arc<crate::cel::Program>>,
+    lifecycle_guards: HashMap<(String, usize), Arc<crate::cel::Program>>,
 }
 
 impl CompiledTypePlan {
-    pub(crate) fn lifecycle_guard(&self, event: &str, index: usize) -> Option<&Expr> {
+    pub(crate) fn lifecycle_guard(
+        &self,
+        event: &str,
+        index: usize,
+    ) -> Option<&crate::cel::Program> {
         self.lifecycle_guards
             .get(&(event.to_string(), index))
             .map(AsRef::as_ref)

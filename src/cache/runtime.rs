@@ -546,8 +546,9 @@ pub(crate) fn uniqueness_conflicts(
         &collection.settings.cache_folder,
     )?;
     let mut conflicts = Vec::new();
-    if let Some(value) = frontmatter
-        .get(&collection.settings.id_field)
+    if let Some(value) = collection
+        .identity_field()
+        .and_then(|field| frontmatter.get(field))
         .and_then(indexer::canonical_unique_value)
     {
         if let Some(path) = connection

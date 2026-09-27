@@ -467,7 +467,6 @@ pub(crate) fn execute_model_profiled_cancellable(
         let mut projections = Map::new();
         for (name, expression) in &compiled.projections {
             let context = candidate_context(
-                collection,
                 record,
                 &types,
                 &effective,
@@ -495,7 +494,6 @@ pub(crate) fn execute_model_profiled_cancellable(
         }
 
         let expression_context = candidate_context(
-            collection,
             record,
             &types,
             &effective,

@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::expressions::ast::{BinOp, Expr, UnaryOp};
 use crate::expressions::evaluator::{
     path_is_in_folder, resolve_execution_timezone, ResolvedFileData,
 };
@@ -23,6 +22,7 @@ use crate::query::canonical::model::{Candidate, Query};
 use crate::query::canonical::preflight::{self, CompiledSelection};
 use crate::query::canonical::result::serialize_candidate;
 use crate::{cel, diagnostic::Diagnostic, v03::validate_query};
+use ::cel::common::ast::{Expr, IdedExpr, LiteralValue};
 
 use super::hosted_links::{hosted_link_graph, HostedRelationshipNeighborhood};
 use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
@@ -522,7 +522,9 @@ impl CompiledCatalog {
             })?;
             // Lowering may only prove candidate exclusion. The canonical
             // residual remains authoritative for every retained record.
-            let lowered = lower_expression(&expression, &mut requirements);
+            let lowered = cel::with_stack_for(expression.facts().depth, || {
+                lower_expression(expression.ast(), &mut requirements)
+            });
             fully_projected = false;
             requirements.canonical_residual = true;
             match lowered {
@@ -949,7 +951,6 @@ impl CompiledCatalog {
         let mut projections = serde_json::Map::new();
         for (name, expression) in &compiled.projections {
             let context = candidate_context(
-                collection,
                 &file_record,
                 &types,
                 &effective,
@@ -976,7 +977,6 @@ impl CompiledCatalog {
             }
         }
         let context = candidate_context(
-            collection,
             &file_record,
             &types,
             &effective,
@@ -1070,7 +1070,7 @@ impl CompiledCatalog {
         &self,
         record: &CanonicalRecordInput,
     ) -> Result<Box<crate::expressions::evaluator::EvalContext>, CatalogError> {
-        use crate::expressions::evaluator::{EvalContext, NoteNamespaceSource};
+        use crate::expressions::evaluator::EvalContext;
 
         let read = self.read_record_typed(&serde_json::json!({"path": record.path}), record)?;
         let Some(document) = read.record().cloned().filter(|_| read.valid) else {
@@ -1085,11 +1085,7 @@ impl CompiledCatalog {
         let effective = document.effective_frontmatter;
         let persisted = document.frontmatter;
         let types = document.types;
-        let mut bindings = cel::enrich_record_bindings(
-            &effective,
-            &persisted,
-            cel::known_fields(self.collection(), &types).iter(),
-        );
+        let mut bindings = cel::enrich_record_bindings(&effective, &persisted);
         if let Some(object) = bindings.as_object_mut() {
             object.insert(
                 "types".to_string(),
@@ -1114,7 +1110,6 @@ impl CompiledCatalog {
             backlinks_index: None,
             type_names: Some(types),
             types: Some(Arc::new(self.collection().types.clone())),
-            note_namespace_source: NoteNamespaceSource::Effective,
             string_concat: false,
         }))
     }
@@ -1239,7 +1234,6 @@ impl CompiledCatalog {
         let effective = Value::Object(projection.facts.effective_frontmatter.clone());
         let projections = serde_json::Map::new();
         let context = candidate_context(
-            collection,
             &file_record,
             &projection.facts.types,
             &effective,
@@ -1917,13 +1911,23 @@ enum Truth {
 }
 
 fn lower_expression(
-    expression: &Expr,
+    expression: &IdedExpr,
     requirements: &mut HostedQueryRequirements,
 ) -> Option<LoweredPredicate> {
-    match expression {
-        Expr::Bool(true) => Some(LoweredPredicate::complete(CandidatePredicate::All)),
-        Expr::Bool(false) => Some(LoweredPredicate::complete(CandidatePredicate::None)),
-        Expr::BinOp(left, BinOp::And, right) => {
+    let Expr::Call(call) = &expression.expr else {
+        return match &expression.expr {
+            Expr::Literal(LiteralValue::Boolean(value)) if **value => {
+                Some(LoweredPredicate::complete(CandidatePredicate::All))
+            }
+            Expr::Literal(LiteralValue::Boolean(_)) => {
+                Some(LoweredPredicate::complete(CandidatePredicate::None))
+            }
+            _ => None,
+        };
+    };
+    let args = call.args.as_slice();
+    match (call.func_name.as_str(), call.target.as_deref(), args) {
+        ("_&&_", None, [left, right]) => {
             let left = lower_expression(left, requirements);
             let right = lower_expression(right, requirements);
             match (left, right) {
@@ -1942,7 +1946,7 @@ fn lower_expression(
                 (None, None) => None,
             }
         }
-        Expr::BinOp(left, BinOp::Or, right) => {
+        ("_||_", None, [left, right]) => {
             let left = lower_expression(left, requirements)?;
             let right = lower_expression(right, requirements)?;
             if !left.complete || !right.complete {
@@ -1952,7 +1956,7 @@ fn lower_expression(
                 terms: vec![left.predicate, right.predicate],
             }))
         }
-        Expr::UnaryOp(UnaryOp::Not, inner) => {
+        ("!_", None, [inner]) => {
             let inner = lower_expression(inner, requirements)?;
             if !inner.complete {
                 return None;
@@ -1961,7 +1965,7 @@ fn lower_expression(
                 term: Box::new(inner.predicate),
             }))
         }
-        Expr::BinOp(left, operator, right) => {
+        (operator, None, [left, right]) => {
             let (field, value, reversed) =
                 if let Some((field, value)) = field_and_literal(left, right) {
                     (field, value, false)
@@ -1970,18 +1974,14 @@ fn lower_expression(
                     (field, value, true)
                 };
             let operator = match (operator, reversed) {
-                (BinOp::Eq, _) => CandidateComparisonOperator::Equal,
-                (BinOp::Neq, _) => CandidateComparisonOperator::NotEqual,
-                (BinOp::Lt, false) | (BinOp::Gt, true) => CandidateComparisonOperator::LessThan,
-                (BinOp::Lte, false) | (BinOp::Gte, true) => {
-                    CandidateComparisonOperator::LessThanOrEqual
-                }
-                (BinOp::Gt, false) | (BinOp::Lt, true) => CandidateComparisonOperator::GreaterThan,
-                (BinOp::Gte, false) | (BinOp::Lte, true) => {
-                    CandidateComparisonOperator::GreaterThanOrEqual
-                }
-                (BinOp::In, false) => CandidateComparisonOperator::In,
-                (BinOp::In, true) => CandidateComparisonOperator::Contains,
+                ("_==_", _) => CandidateComparisonOperator::Equal,
+                ("_!=_", _) => CandidateComparisonOperator::NotEqual,
+                ("_<_", false) | ("_>_", true) => CandidateComparisonOperator::LessThan,
+                ("_<=_", false) | ("_>=_", true) => CandidateComparisonOperator::LessThanOrEqual,
+                ("_>_", false) | ("_<_", true) => CandidateComparisonOperator::GreaterThan,
+                ("_>=_", false) | ("_<=_", true) => CandidateComparisonOperator::GreaterThanOrEqual,
+                ("@in", false) => CandidateComparisonOperator::In,
+                ("@in", true) => CandidateComparisonOperator::Contains,
                 _ => return None,
             };
             accumulate_field_requirement(&field, requirements);
@@ -1995,25 +1995,21 @@ fn lower_expression(
                 },
             }))
         }
-        Expr::Call(function, arguments) if arguments.len() == 1 => {
-            let Expr::Dot(receiver, method) = function.as_ref() else {
+        ("inFolder", Some(receiver), [argument])
+            if expression_path(receiver).as_deref() == Some("file") =>
+        {
+            let Value::String(folder) = literal(argument)? else {
                 return None;
             };
-            if method == "inFolder" && expression_path(receiver).as_deref() == Some("file") {
-                let Value::String(folder) = literal(&arguments[0])? else {
-                    return None;
-                };
-                return Some(LoweredPredicate::complete(
-                    CandidatePredicate::PathInFolder {
-                        folder: folder.trim_end_matches('/').to_string(),
-                    },
-                ));
-            }
-            if method != "contains" {
-                return None;
-            }
+            Some(LoweredPredicate::complete(
+                CandidatePredicate::PathInFolder {
+                    folder: folder.trim_end_matches('/').to_string(),
+                },
+            ))
+        }
+        ("contains", Some(receiver), [argument]) => {
             let field = lower_field(receiver)?;
-            let value = literal(&arguments[0])?;
+            let value = literal(argument)?;
             accumulate_field_requirement(&field, requirements);
             Some(LoweredPredicate::complete(CandidatePredicate::Compare {
                 comparison: CandidateComparison {
@@ -2043,11 +2039,11 @@ impl LoweredPredicate {
     }
 }
 
-fn field_and_literal(field: &Expr, value: &Expr) -> Option<(CandidateField, Value)> {
+fn field_and_literal(field: &IdedExpr, value: &IdedExpr) -> Option<(CandidateField, Value)> {
     Some((lower_field(field)?, literal(value)?))
 }
 
-fn lower_field(expression: &Expr) -> Option<CandidateField> {
+fn lower_field(expression: &IdedExpr) -> Option<CandidateField> {
     let path = expression_path(expression)?;
     lower_query_field(&path)
 }
@@ -2056,7 +2052,7 @@ fn lower_query_field(path: &str) -> Option<CandidateField> {
     let segments = path.split('.').map(str::to_string).collect::<Vec<_>>();
     match segments.as_slice() {
         [single] if single == "types" => Some(CandidateField::Types),
-        [root, rest @ ..] if root == "record" || root == "note" => {
+        [root, rest @ ..] if root == "record" => {
             Some(CandidateField::EffectiveFrontmatter(rest.to_vec()))
         }
         [root, rest @ ..] if root == "raw" => {
@@ -2178,27 +2174,41 @@ fn semantic_query_input(input: &Value) -> Result<Value, CatalogError> {
     Ok(Value::Object(object))
 }
 
-fn expression_path(expression: &Expr) -> Option<String> {
-    match expression {
+fn expression_path(expression: &IdedExpr) -> Option<String> {
+    match &expression.expr {
         Expr::Ident(name) => Some(name.clone()),
-        Expr::Dot(parent, field) => Some(format!("{}.{}", expression_path(parent)?, field)),
-        Expr::Index(parent, index) => {
-            let Expr::Str(field) = index.as_ref() else {
+        Expr::Select(select) if !select.test => Some(format!(
+            "{}.{}",
+            expression_path(&select.operand)?,
+            select.field
+        )),
+        Expr::Call(call) if call.func_name == "_[_]" && call.target.is_none() => {
+            let [parent, index] = call.args.as_slice() else {
                 return None;
             };
-            Some(format!("{}.{}", expression_path(parent)?, field))
+            let Expr::Literal(LiteralValue::String(field)) = &index.expr else {
+                return None;
+            };
+            Some(format!("{}.{}", expression_path(parent)?, field.inner()))
         }
         _ => None,
     }
 }
 
-fn literal(expression: &Expr) -> Option<Value> {
-    match expression {
-        Expr::Null => Some(Value::Null),
-        Expr::Bool(value) => Some(Value::Bool(*value)),
-        Expr::Number(value) => serde_json::Number::from_f64(*value).map(Value::Number),
-        Expr::Str(value) => Some(Value::String(value.clone())),
-        Expr::Array(values) => values
+fn literal(expression: &IdedExpr) -> Option<Value> {
+    match &expression.expr {
+        Expr::Literal(LiteralValue::Null) => Some(Value::Null),
+        Expr::Literal(LiteralValue::Boolean(value)) => Some(Value::Bool(**value)),
+        Expr::Literal(LiteralValue::Int(value)) => Some(Value::from(**value)),
+        Expr::Literal(LiteralValue::UInt(value)) => Some(Value::from(**value)),
+        Expr::Literal(LiteralValue::Double(value)) => {
+            serde_json::Number::from_f64(**value).map(Value::Number)
+        }
+        Expr::Literal(LiteralValue::String(value)) => {
+            Some(Value::String(value.inner().to_string()))
+        }
+        Expr::List(list) if list.optional_indices.is_empty() => list
+            .elements
             .iter()
             .map(literal)
             .collect::<Option<Vec<_>>>()
@@ -2506,9 +2516,7 @@ fn is_reserved_root(value: &str) -> bool {
         value,
         "record"
             | "raw"
-            | "present"
             | "file"
-            | "note"
             | "projection"
             | "this"
             | "values"
@@ -2877,10 +2885,10 @@ mod tests {
             );
         }
         assert_eq!(projected["file"]["tags"], json!(["frontmatter", "body"]));
-        assert_eq!(projected["file"]["links"], json!(["target", "other.md"]));
+        assert_eq!(projected["file"]["links"], json!(["target", "./other.md"]));
         assert_eq!(
             projected["file"]["embeds"],
-            json!(["embed#part", "asset.png"])
+            json!(["embed#part", "./asset.png"])
         );
         assert!(!projected.to_string().contains("Alias"));
     }

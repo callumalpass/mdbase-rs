@@ -1,23 +1,26 @@
 //! Version-neutral portable expression host bindings built on the shared evaluator.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
 use crate::diagnostic::Diagnostic;
-use crate::expressions::ast::Expr;
-use crate::expressions::evaluator::{
-    evaluate_with_limits, EvalContext, EvaluationClock, NoteNamespaceSource,
-};
-use crate::expressions::parser::Parser;
+use crate::expressions::evaluator::{EvalContext, EvaluationClock};
 use crate::v03::OperationResult;
 use crate::Collection;
 
+mod host;
+mod program;
+mod provenance;
+
+pub(crate) use program::with_stack_for;
+
+pub(crate) use host::RESERVED;
+pub(crate) use program::Program;
+
 pub(crate) const MAX_SOURCE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_AST_DEPTH: u32 = 128;
-pub(crate) const MAX_EVALUATION_STEPS: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct CelFailure {
@@ -90,7 +93,8 @@ impl From<CelFailure> for WorkflowCelError {
     }
 }
 
-pub(crate) fn compile(source: &str) -> Result<Expr, CelFailure> {
+/// Parse a standard CEL expression without evaluating it.
+pub(crate) fn compile(source: &str) -> Result<Program, CelFailure> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err(CelFailure {
             code: "expression_source_limit_exceeded".to_string(),
@@ -100,7 +104,7 @@ pub(crate) fn compile(source: &str) -> Result<Expr, CelFailure> {
             ),
         });
     }
-    Parser::parse_with_max_depth(source, MAX_AST_DEPTH).map_err(|message| CelFailure {
+    Program::parse(source, MAX_AST_DEPTH).map_err(|message| CelFailure {
         code: if message == "expression_depth_exceeded" {
             "expression_depth_exceeded".to_string()
         } else {
@@ -118,20 +122,13 @@ pub(crate) fn operation_clock(timezone: Option<&str>) -> Result<EvaluationClock,
 }
 
 pub(crate) fn evaluate_compiled(
-    expression: &Expr,
+    program: &Program,
     context: &EvalContext,
     clock: &EvaluationClock,
 ) -> Result<Value, CelFailure> {
-    evaluate_with_limits(
-        expression,
-        context,
-        MAX_AST_DEPTH,
-        MAX_EVALUATION_STEPS,
-        clock,
-    )
-    .map_err(|error| CelFailure {
-        code: error.code,
-        message: error.message,
+    host::evaluate(program, context, clock).map_err(|message| CelFailure {
+        code: "expression_evaluation_error".to_string(),
+        message,
     })
 }
 
@@ -154,48 +151,73 @@ pub(crate) fn evaluate_record(collection: &Collection, input: &Value) -> Operati
         Ok(request) => request,
         Err(error) => return failed("invalid_path", error.to_string(), Some(path.to_string())),
     };
-    let read = match crate::operations::read::evaluate_typed_read(
+    // Evaluation does not depend on validity: an invalid record still has
+    // persisted and effective values (spec Chapter 04).
+    let evaluation = crate::operations::read::evaluate_typed_read(
         collection,
         &request,
         crate::operations::read::TypedReadSource::Filesystem,
-    )
-    .into_outcome()
-    {
-        Ok(outcome) => outcome.value,
+    );
+    let Some(read) = evaluation.value else {
+        let diagnostic = evaluation.diagnostics.first();
+        return failed(
+            diagnostic
+                .map(|diagnostic| diagnostic.code.as_str())
+                .unwrap_or("operation_failed"),
+            diagnostic
+                .map(|diagnostic| diagnostic.message.as_str())
+                .unwrap_or("Record could not be read."),
+            Some(path.to_string()),
+        );
+    };
+    let program = match compile(source) {
+        Ok(program) => program,
         Err(error) => {
-            let diagnostic = error.diagnostics().first();
             return failed(
-                diagnostic
-                    .map(|diagnostic| diagnostic.code.as_str())
-                    .unwrap_or("operation_failed"),
-                diagnostic
-                    .map(|diagnostic| diagnostic.message.as_str())
-                    .unwrap_or("Record could not be read."),
+                &error.code,
+                format!("CEL expression did not compile: {}", error.message),
                 Some(path.to_string()),
-            );
+            )
         }
     };
 
     let effective = read.effective_frontmatter.clone();
     let raw = read.frontmatter.clone();
-    let type_names = read.types;
-    let known_fields = known_fields(collection, &type_names);
     let mut context = EvalContext::empty();
-    context.frontmatter = enrich_record_bindings(&effective, &raw, known_fields.iter());
+    context.frontmatter = enrich_record_bindings(&effective, &raw);
     context.raw_frontmatter = Some(raw);
     context.file_path = Some(path.to_string());
     context.body = Some(read.body);
     context.file_size = Some(read.file.size);
     context.file_mtime = Some(read.file.mtime);
-    context.type_names = Some(type_names);
+    context.type_names = Some(read.types);
     context.types = Some(Arc::new(collection.types.clone()));
-    context.note_namespace_source = NoteNamespaceSource::Effective;
     context.string_concat = false;
-    let clock = match operation_clock(collection.settings.timezone.as_deref()) {
+    if program.facts().needs_link_graph {
+        let graph = match collection.build_all_files_data() {
+            Ok(files) => collection
+                .build_link_graph(files)
+                .map_err(|error| (error.code, error.message)),
+            Err(error) => Err(("operation_failed".to_string(), error.to_string())),
+        };
+        match graph {
+            Ok((linked, backlinks)) => {
+                context.all_files = Some(Arc::new(linked));
+                context.backlinks_index = Some(Arc::new(backlinks));
+            }
+            Err((code, message)) => return failed(&code, message, Some(path.to_string())),
+        }
+    }
+    let clock = match operation_clock(
+        input
+            .get("timezone")
+            .and_then(Value::as_str)
+            .or(collection.settings.timezone.as_deref()),
+    ) {
         Ok(clock) => clock,
         Err(error) => return failed(&error.code, error.message, Some(path.to_string())),
     };
-    evaluate_source(source, &context, &clock, Some(path))
+    evaluate_program(&program, &context, &clock, Some(path))
 }
 
 pub(crate) fn evaluate_bindings(input: &Value) -> OperationResult {
@@ -256,7 +278,7 @@ pub(crate) fn evaluate_match_expression(
 
 #[allow(dead_code)]
 pub(crate) fn evaluate_match_expression_compiled(
-    parsed: &Expr,
+    parsed: &Program,
     raw: &Value,
     path: &str,
     timezone: Option<&str>,
@@ -266,80 +288,35 @@ pub(crate) fn evaluate_match_expression_compiled(
 }
 
 pub(crate) fn evaluate_match_expression_compiled_with_clock(
-    parsed: &Expr,
+    parsed: &Program,
     raw: &Value,
     path: &str,
     clock: &EvaluationClock,
 ) -> Result<bool, CelFailure> {
     let mut context = EvalContext::empty();
-    let known = raw.as_object().into_iter().flat_map(|object| object.keys());
-    context.frontmatter = enrich_record_bindings(raw, raw, known);
+    context.frontmatter = enrich_record_bindings(raw, raw);
     context.raw_frontmatter = Some(raw.clone());
-    context.note_namespace_source = NoteNamespaceSource::Effective;
     context.file_path = Some(path.to_string());
     context.string_concat = false;
     let value = evaluate_compiled(parsed, &context, clock)?;
     Ok(value == Value::Bool(true))
 }
 
-pub(crate) fn enrich_record_bindings<'a>(
-    effective: &Value,
-    raw: &Value,
-    known_fields: impl Iterator<Item = &'a String>,
-) -> Value {
+/// Record bindings for a CEL host: unreserved effective fields at the top
+/// level, `record` for effective values, and `raw` for persisted frontmatter.
+pub(crate) fn enrich_record_bindings(effective: &Value, raw: &Value) -> Value {
     let record = effective.as_object().cloned().unwrap_or_default();
-    let raw_object = raw.as_object().cloned().unwrap_or_default();
-    let mut binding = record.clone();
-    for reserved in [
-        "record",
-        "raw",
-        "present",
-        "note",
-        "this",
-        "old",
-        "operation",
-        "event",
-        "workflow",
-        "trigger",
-        "steps",
-        "vars",
-        "item",
-    ] {
-        binding.remove(reserved);
-    }
-
-    let mut names = BTreeSet::new();
-    names.extend(known_fields.cloned());
-    names.extend(record.keys().cloned());
-    names.extend(raw_object.keys().cloned());
-    let raw_presence = names
+    let mut binding = record
         .iter()
-        .map(|field| (field.clone(), Value::Bool(raw_object.contains_key(field))))
+        .filter(|(key, _)| !RESERVED.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Map<_, _>>();
-    let record_presence = names
-        .iter()
-        .map(|field| (field.clone(), Value::Bool(record.contains_key(field))))
-        .collect::<Map<_, _>>();
-
-    binding.insert("record".to_string(), Value::Object(record.clone()));
-    binding.insert("note".to_string(), Value::Object(record));
-    binding.insert("raw".to_string(), Value::Object(raw_object));
+    binding.insert("record".to_string(), Value::Object(record));
     binding.insert(
-        "present".to_string(),
-        json!({
-            "raw": raw_presence,
-            "record": record_presence,
-        }),
+        "raw".to_string(),
+        Value::Object(raw.as_object().cloned().unwrap_or_default()),
     );
     Value::Object(binding)
-}
-
-pub(crate) fn known_fields(collection: &Collection, type_names: &[String]) -> BTreeSet<String> {
-    type_names
-        .iter()
-        .filter_map(|type_name| collection.types.get(type_name))
-        .flat_map(|type_definition| type_definition.fields.keys().cloned())
-        .collect()
 }
 
 fn evaluate_source(
@@ -348,17 +325,23 @@ fn evaluate_source(
     clock: &EvaluationClock,
     path: Option<&str>,
 ) -> OperationResult {
-    let expression = match compile(source) {
-        Ok(expression) => expression,
-        Err(error) => {
-            return failed(
-                &error.code,
-                format!("CEL expression did not compile: {}", error.message),
-                path.map(String::from),
-            )
-        }
-    };
-    match evaluate_compiled(&expression, context, clock) {
+    match compile(source) {
+        Ok(program) => evaluate_program(&program, context, clock, path),
+        Err(error) => failed(
+            &error.code,
+            format!("CEL expression did not compile: {}", error.message),
+            path.map(String::from),
+        ),
+    }
+}
+
+fn evaluate_program(
+    program: &Program,
+    context: &EvalContext,
+    clock: &EvaluationClock,
+    path: Option<&str>,
+) -> OperationResult {
+    match evaluate_compiled(program, context, clock) {
         Ok(value) => OperationResult {
             valid: true,
             result: json!({"value": value}),
@@ -484,18 +467,18 @@ fn failed(code: &str, message: impl Into<String>, path: Option<String>) -> Opera
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::evaluator::evaluate;
 
     #[test]
-    fn presence_maps_include_known_missing_fields() {
-        let known = BTreeSet::from(["status".to_string(), "title".to_string()]);
+    fn record_bindings_expose_record_and_raw_without_shadowing_system_names() {
         let bindings = enrich_record_bindings(
-            &json!({"title": "Hello", "status": "open"}),
+            &json!({"title": "Hello", "status": "open", "file": "frontmatter"}),
             &json!({"title": "Hello"}),
-            known.iter(),
         );
-        assert_eq!(bindings["present"]["raw"]["status"], false);
-        assert_eq!(bindings["present"]["record"]["status"], true);
+        assert_eq!(bindings["status"], "open");
+        assert_eq!(bindings["record"]["file"], "frontmatter");
+        assert!(bindings["raw"].get("status").is_none());
+        assert!(bindings.get("file").is_none());
+        assert!(bindings.get("present").is_none() && bindings.get("note").is_none());
     }
 
     #[test]
@@ -571,8 +554,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error.code, "type_error");
-        assert_eq!(error.message, "Right operand of 'in' must be a list or map");
+        assert_eq!(error.code, "expression_evaluation_error");
     }
 
     #[test]
@@ -615,22 +597,18 @@ mod tests {
     }
 
     #[test]
-    fn v03_note_namespace_does_not_change_legacy_note_resolution() {
-        let known = BTreeSet::from(["title".to_string()]);
-        let mut v03 = EvalContext::empty();
-        v03.frontmatter = enrich_record_bindings(
-            &json!({"title": "Effective"}),
-            &json!({"title": "Raw"}),
-            known.iter(),
+    fn missing_fields_are_null_but_missing_keys_are_errors() {
+        let mut context = EvalContext::empty();
+        context.frontmatter =
+            enrich_record_bindings(&json!({"title": "A"}), &json!({"title": "A"}));
+        let clock = EvaluationClock::capture(Some("UTC")).unwrap();
+        let evaluate =
+            |source: &str| evaluate_compiled(&compile(source).unwrap(), &context, &clock);
+        assert_eq!(evaluate("note == null && !has(raw.note)").unwrap(), true);
+        assert_eq!(
+            evaluate("raw.note == null").unwrap_err().code,
+            "expression_evaluation_error"
         );
-        v03.raw_frontmatter = Some(json!({"title": "Raw"}));
-        v03.note_namespace_source = NoteNamespaceSource::Effective;
-        let expression = Parser::parse("note.title").unwrap();
-        assert_eq!(evaluate(&expression, &v03).unwrap(), "Effective");
-
-        let mut legacy = EvalContext::empty();
-        legacy.frontmatter = json!({"note": {"title": "Persisted object"}});
-        legacy.raw_frontmatter = Some(json!({"title": "Legacy raw"}));
-        assert_eq!(evaluate(&expression, &legacy).unwrap(), "Legacy raw");
+        assert_eq!(evaluate(r#"raw.?note.orValue("none")"#).unwrap(), "none");
     }
 }

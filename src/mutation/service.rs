@@ -411,13 +411,14 @@ fn execute_shadow(
 fn validate_update_shape(request: &UpdateRequest) -> Result<(), MdbaseError> {
     if request.document.is_some()
         && (request.body.is_some()
+            || !request.unset.is_empty()
             || request
                 .patch
                 .as_object()
                 .is_none_or(|patch| !patch.is_empty()))
     {
         return Err(MdbaseError::InvalidRequest {
-            message: "document cannot be combined with patch or body".to_string(),
+            message: "document cannot be combined with patch, unset, or body".to_string(),
         });
     }
     Ok(())

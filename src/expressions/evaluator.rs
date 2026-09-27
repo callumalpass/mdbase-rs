@@ -3,7 +3,7 @@
 use super::ast::*;
 use chrono::{FixedOffset, Local, Utc};
 use serde_json::Value;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
 /// Error types from expression evaluation.
 #[derive(Debug)]
@@ -43,12 +43,6 @@ impl EvalError {
             message: "Expression nesting depth limit exceeded".to_string(),
         }
     }
-    fn expression_work_exceeded(limit: u64) -> Self {
-        EvalError {
-            code: "expression_work_exceeded".to_string(),
-            message: format!("Expression evaluation exceeded the {limit}-step work limit"),
-        }
-    }
 }
 
 const MAX_EVAL_DEPTH: u32 = 64;
@@ -56,14 +50,12 @@ const MAX_EVAL_DEPTH: u32 = 64;
 thread_local! {
     static EVAL_DEPTH: Cell<u32> = const { Cell::new(0) };
     static EVAL_LIMIT: Cell<u32> = const { Cell::new(MAX_EVAL_DEPTH) };
-    static EVAL_WORK: Cell<u64> = const { Cell::new(0) };
-    static EVAL_WORK_LIMIT: Cell<u64> = const { Cell::new(u64::MAX) };
-    static EVAL_CLOCK: RefCell<Option<EvaluationClock>> = const { RefCell::new(None) };
 }
 
 /// A time snapshot shared by every expression in one logical operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvaluationClock {
+    instant: chrono::DateTime<Utc>,
     now: String,
     today: String,
     timezone: EvaluationTimezone,
@@ -105,6 +97,7 @@ impl EvaluationClock {
         };
         let today = timezone.date(now);
         Ok(Self {
+            instant: now,
             now: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             today: today.format("%Y-%m-%d").to_string(),
             timezone,
@@ -119,17 +112,38 @@ impl EvaluationClock {
         &self.today
     }
 
-    fn date_value(&self, value: &str) -> Option<String> {
-        if chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok() {
-            return Some(value.to_string());
-        }
-        let instant = chrono::DateTime::parse_from_rfc3339(value).ok()?;
-        Some(
-            self.timezone
-                .date(instant.with_timezone(&Utc))
-                .format("%Y-%m-%d")
-                .to_string(),
-        )
+    /// The captured current instant.
+    pub(crate) fn instant(&self) -> chrono::DateTime<Utc> {
+        self.instant
+    }
+
+    /// The calendar date of an instant in the effective timezone.
+    pub(crate) fn date_of(&self, instant: chrono::DateTime<Utc>) -> chrono::NaiveDate {
+        self.timezone.date(instant)
+    }
+
+    /// The first instant of a calendar date in the effective timezone.
+    pub(crate) fn start_of_day(&self, date: chrono::NaiveDate) -> Option<chrono::DateTime<Utc>> {
+        use chrono::TimeZone;
+        let midnight = date.and_hms_opt(0, 0, 0)?;
+        let start = match &self.timezone {
+            EvaluationTimezone::Local => Local.from_local_datetime(&midnight).earliest()?.to_utc(),
+            EvaluationTimezone::Utc => Utc.from_utc_datetime(&midnight),
+            EvaluationTimezone::Fixed(offset) => {
+                offset.from_local_datetime(&midnight).earliest()?.to_utc()
+            }
+            EvaluationTimezone::Named(timezone) => {
+                // A daylight-saving gap can skip midnight; the day then starts
+                // at the first representable local time.
+                (0..24 * 60)
+                    .find_map(|minutes| {
+                        let local = midnight + chrono::Duration::minutes(minutes);
+                        timezone.from_local_datetime(&local).earliest()
+                    })?
+                    .to_utc()
+            }
+        };
+        Some(start)
     }
 }
 
@@ -198,17 +212,6 @@ pub struct ResolvedFileData {
     pub body: String,
 }
 
-/// Selects which frontmatter view backs the `note` namespace.
-///
-/// The legacy expression profile exposes persisted frontmatter through
-/// `note`; the v0.3 CEL host defines `note` as an alias for `record`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum NoteNamespaceSource {
-    #[default]
-    Raw,
-    Effective,
-}
-
 /// Context for expression evaluation.
 #[derive(Clone)]
 pub struct EvalContext {
@@ -232,7 +235,6 @@ pub struct EvalContext {
     /// Types map for display_name_key lookup.
     pub types:
         Option<std::sync::Arc<std::collections::HashMap<String, crate::types::schema::TypeDef>>>,
-    pub note_namespace_source: NoteNamespaceSource,
     /// Whether string + number should concatenate (true in formulas) or return type error (false in where clauses).
     pub string_concat: bool,
 }
@@ -253,7 +255,6 @@ impl EvalContext {
             backlinks_index: None,
             type_names: None,
             types: None,
-            note_namespace_source: NoteNamespaceSource::Raw,
             string_concat: true,
         }
     }
@@ -266,43 +267,11 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext) -> Result<Value, EvalError> {
         if EVAL_LIMIT.with(std::cell::Cell::get) < depth {
             return Err(EvalError::expression_depth_exceeded());
         }
-        let work = EVAL_WORK.with(Cell::get);
-        let work_limit = EVAL_WORK_LIMIT.with(Cell::get);
-        if work >= work_limit {
-            return Err(EvalError::expression_work_exceeded(work_limit));
-        }
-        EVAL_WORK.with(|counter| counter.set(work + 1));
         d.set(depth + 1);
         let result = evaluate_inner(expr, ctx);
         d.set(depth);
         result
     })
-}
-
-/// Evaluate with a profile-specific recursive depth limit.
-///
-/// Nested evaluator calls inherit the limit selected by the outer operation.
-pub fn evaluate_with_limits(
-    expr: &Expr,
-    ctx: &EvalContext,
-    max_depth: u32,
-    max_work: u64,
-    clock: &EvaluationClock,
-) -> Result<Value, EvalError> {
-    let is_outermost = EVAL_DEPTH.with(|depth| depth.get() == 0);
-    if !is_outermost {
-        return evaluate(expr, ctx);
-    }
-    let previous_depth_limit = EVAL_LIMIT.with(|limit| limit.replace(max_depth));
-    let previous_work_limit = EVAL_WORK_LIMIT.with(|limit| limit.replace(max_work));
-    let previous_work = EVAL_WORK.with(|work| work.replace(0));
-    let previous_clock = EVAL_CLOCK.with(|value| value.replace(Some(clock.clone())));
-    let result = evaluate(expr, ctx);
-    EVAL_LIMIT.with(|limit| limit.set(previous_depth_limit));
-    EVAL_WORK_LIMIT.with(|limit| limit.set(previous_work_limit));
-    EVAL_WORK.with(|work| work.set(previous_work));
-    EVAL_CLOCK.with(|value| value.replace(previous_clock));
-    result
 }
 
 fn evaluate_inner(expr: &Expr, ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -378,10 +347,6 @@ fn eval_dot(obj_expr: &Expr, field: &str, ctx: &EvalContext) -> Result<Value, Ev
         }
         // note.* namespace accesses raw frontmatter (pre-defaults)
         if name == "note" {
-            if ctx.note_namespace_source == NoteNamespaceSource::Effective {
-                let note = ctx.frontmatter.get("note").unwrap_or(&Value::Null);
-                return Ok(note.get(field).cloned().unwrap_or(Value::Null));
-            }
             let fm = ctx.raw_frontmatter.as_ref().unwrap_or(&ctx.frontmatter);
             return Ok(fm.get(field).cloned().unwrap_or(Value::Null));
         }
@@ -760,6 +725,9 @@ fn eval_file_method(method: &str, args: &[Expr], ctx: &EvalContext) -> Result<Va
                     .unwrap_or("");
 
                 for link in &all_links {
+                    // Extraction marks markdown and bare-path targets with ./;
+                    // this legacy matcher compares the path text.
+                    let link = &link.strip_prefix("./").unwrap_or(link).to_string();
                     // Direct match
                     if link == link_target {
                         return Ok(Value::Bool(true));
@@ -829,10 +797,6 @@ fn eval_index(obj_expr: &Expr, idx_expr: &Expr, ctx: &EvalContext) -> Result<Val
         if name == "note" {
             let idx = evaluate(idx_expr, ctx)?;
             if let Some(key) = idx.as_str() {
-                if ctx.note_namespace_source == NoteNamespaceSource::Effective {
-                    let note = ctx.frontmatter.get("note").unwrap_or(&Value::Null);
-                    return Ok(note.get(key).cloned().unwrap_or(Value::Null));
-                }
                 let fm = ctx.raw_frontmatter.as_ref().unwrap_or(&ctx.frontmatter);
                 return Ok(fm.get(key).cloned().unwrap_or(Value::Null));
             }
@@ -1272,28 +1236,12 @@ fn eval_function(name: &str, args: &[Expr], ctx: &EvalContext) -> Result<Value, 
             let Some(value) = val.as_str() else {
                 return Ok(val);
             };
-            Ok(Value::String(EVAL_CLOCK.with(|clock| {
-                clock
-                    .borrow()
-                    .as_ref()
-                    .and_then(|clock| clock.date_value(value))
-                    .unwrap_or_else(|| value.split('T').next().unwrap_or(value).to_string())
-            })))
+            Ok(Value::String(
+                value.split('T').next().unwrap_or(value).to_string(),
+            ))
         }
-        "today" => Ok(Value::String(EVAL_CLOCK.with(|clock| {
-            clock
-                .borrow()
-                .as_ref()
-                .map(|clock| clock.today.clone())
-                .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string())
-        }))),
-        "now" => Ok(Value::String(EVAL_CLOCK.with(|clock| {
-            clock
-                .borrow()
-                .as_ref()
-                .map(|clock| clock.now.clone())
-                .unwrap_or_else(|| Utc::now().to_rfc3339())
-        }))),
+        "today" => Ok(Value::String(Local::now().format("%Y-%m-%d").to_string())),
+        "now" => Ok(Value::String(Utc::now().to_rfc3339())),
         "abs" => {
             if args.len() != 1 {
                 return Err(EvalError::wrong_argument_count("abs() requires 1 argument"));
@@ -1779,13 +1727,7 @@ fn eval_string_method(
                     "date() takes no arguments as method",
                 ));
             }
-            Ok(Value::String(EVAL_CLOCK.with(|clock| {
-                clock
-                    .borrow()
-                    .as_ref()
-                    .and_then(|clock| clock.date_value(s))
-                    .unwrap_or_else(|| s.split('T').next().unwrap_or(s).to_string())
-            })))
+            Ok(Value::String(s.split('T').next().unwrap_or(s).to_string()))
         }
         "time" => {
             // .time() extracts time portion from datetime string
@@ -2066,7 +2008,6 @@ fn eval_array_method(
                     backlinks_index: ctx.backlinks_index.clone(),
                     type_names: ctx.type_names.clone(),
                     types: ctx.types.clone(),
-                    note_namespace_source: ctx.note_namespace_source,
                     string_concat: ctx.string_concat,
                 };
                 acc = evaluate(&args[0], &item_ctx)?;
@@ -2920,7 +2861,9 @@ pub fn extract_tags_from_body(body: &str) -> Vec<String> {
 /// Links inside inline code spans are excluded.
 pub fn extract_links_from_body(body: &str) -> Vec<String> {
     let clean = strip_code_blocks_and_inline_code(body);
+    // Body wikilinks come before body markdown links (spec Chapter 08).
     let mut links = Vec::new();
+    let mut markdown_links = Vec::new();
 
     let chars: Vec<char> = clean.chars().collect();
     let len = chars.len();
@@ -3000,7 +2943,7 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
                     // Strip anchor
                     let path = path.split('#').next().unwrap_or(&path).to_string();
                     if !path.is_empty() {
-                        links.push(path);
+                        markdown_links.push(source_relative(path));
                     }
                 }
             }
@@ -3009,6 +2952,7 @@ pub fn extract_links_from_body(body: &str) -> Vec<String> {
         }
     }
 
+    links.extend(markdown_links);
     links
 }
 
@@ -3083,7 +3027,7 @@ pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
                 {
                     let path = path.split('#').next().unwrap_or(&path).to_string();
                     if !path.is_empty() {
-                        embeds.push(path);
+                        embeds.push(source_relative(path));
                     }
                 }
             }
@@ -3093,6 +3037,37 @@ pub fn extract_embeds_from_body(body: &str) -> Vec<String> {
     }
 
     embeds
+}
+
+/// The link value that CEL exposes for an extracted target (spec Chapter 08,
+/// `file.links`): a wikilink target as `[[target]]`, and a markdown or
+/// bare-path target, which extraction marks as relative, unchanged. Aliases
+/// and anchors are dropped, and the value resolves exactly as the original.
+pub fn link_value(target: &str) -> String {
+    if target.starts_with('/') || target.starts_with("./") || target.starts_with("../") {
+        target.to_string()
+    } else {
+        format!("[[{target}]]")
+    }
+}
+
+/// Mark a markdown or bare-path link target as relative to the containing
+/// folder (spec Chapter 08). The explicit `./` keeps it distinct from a
+/// wikilink path such as `people/alice`, which resolves from the collection
+/// root.
+fn source_relative(target: String) -> String {
+    if target.starts_with('/') || target.starts_with("./") || target.starts_with("../") {
+        target
+    } else {
+        format!("./{target}")
+    }
+}
+
+/// The destination of a whole-value markdown link, `[text](path)`.
+fn markdown_link_destination(value: &str) -> Option<String> {
+    let inner = value.strip_prefix('[')?.strip_suffix(')')?;
+    let (_, destination) = inner.split_once("](")?;
+    markdown_destination_target(destination)
 }
 
 fn markdown_destination_target(value: &str) -> Option<String> {
@@ -3148,9 +3123,14 @@ pub fn extract_links_from_fm_value(val: &Value, links: &mut Vec<String>) {
                 && !s.starts_with("https://")
                 && (s.contains('.') || s.contains('/'))
             {
-                let path = s.trim().to_string();
-                if !path.is_empty() && !links.contains(&path) {
-                    links.push(path);
+                let path =
+                    markdown_link_destination(s.trim()).unwrap_or_else(|| s.trim().to_string());
+                let path = path.split('#').next().unwrap_or(&path).to_string();
+                if !path.is_empty() {
+                    let path = source_relative(path);
+                    if !links.contains(&path) {
+                        links.push(path);
+                    }
                 }
             }
         }
@@ -3166,23 +3146,12 @@ pub fn extract_links_from_fm_value(val: &Value, links: &mut Vec<String>) {
 #[cfg(test)]
 mod limit_tests {
     use super::*;
-    use crate::expressions::parser::Parser;
-
-    #[test]
-    fn profile_specific_work_budget_stops_evaluation() {
-        let expression = Parser::parse("[1, 2, 3].map(value + 1)").unwrap();
-        let clock = EvaluationClock::capture(Some("UTC")).unwrap();
-        let error =
-            evaluate_with_limits(&expression, &EvalContext::empty(), 128, 3, &clock).unwrap_err();
-        assert_eq!(error.code, "expression_work_exceeded");
-        assert!(error.message.contains("3-step"));
-    }
 
     #[test]
     fn markdown_body_fact_extractors_exclude_labels_and_destination_titles() {
         let body = "[private label](notes/one.md \"private title\") ![private alt](assets/one.png \"private image title\") [malformed](<notes/leak.md \"leaked title\")";
-        assert_eq!(extract_links_from_body(body), ["notes/one.md"]);
-        assert_eq!(extract_embeds_from_body(body), ["assets/one.png"]);
+        assert_eq!(extract_links_from_body(body), ["./notes/one.md"]);
+        assert_eq!(extract_embeds_from_body(body), ["./assets/one.png"]);
     }
 
     #[test]

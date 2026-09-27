@@ -1025,7 +1025,7 @@ fn registry_with(idempotent: bool, mutate: impl FnOnce(&mut Value)) -> Admission
         "triggers": [{
             "id": "changed",
             "event": {"id": "test.changed", "version": "^1.0.0"},
-            "if": {"$expr": "event.data.items.length > 0"}
+            "if": {"$expr": "event.data.items.size() > 0"}
         }],
         "steps": [{
             "id": "echo",

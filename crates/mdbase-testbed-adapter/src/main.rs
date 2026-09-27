@@ -27,7 +27,7 @@ fn implementation() -> Value {
     json!({
         "id": "mdbase-rs",
         "name": "mdbase Rust core and durable runtime",
-        "version": "0.4.0-rc.3",
+        "version": mdbase::VERSION,
         "language": "Rust",
         "target": "native",
         "x-runtime-version": mdbase_runtime::VERSION
@@ -48,7 +48,7 @@ async fn execute() -> Result<(), String> {
             "kind": "mdbase.testbed.adapter",
             "protocol_version": "0.1",
             "implementation": implementation(),
-            "profiles": ["core_read", "runtime/0.2"],
+            "profiles": ["data_contracts", "runtime/0.2"],
             "roles": [
                 "contract_store",
                 "record_consumer",

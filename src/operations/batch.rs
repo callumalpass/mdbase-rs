@@ -727,7 +727,7 @@ impl Collection {
                     crate::links::linked_files::LinkedFiles::new(
                         resolved_files,
                         stored,
-                        &self.settings.id_field,
+                        self.resolution_keys(),
                         Some(resolution_index),
                     ),
                 )),

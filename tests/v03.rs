@@ -54,6 +54,70 @@ collection:
 }
 
 #[test]
+fn unsupported_collection_projections_are_reported_not_ignored() {
+    let directory = tempfile::tempdir().expect("temp collection");
+    write(directory.path(), "mdbase.yaml", "spec_version: \"0.3.0\"\n");
+    write(
+        directory.path(),
+        "_types/task.md",
+        "---\nkind: mdbase.type\nname: task\nversion: 1\nmatch:\n  path_glob: \"tasks/**/*.md\"\n\
+         schema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n\
+         collection:\n  projections:\n    is_overdue:\n      expr: 'due != null && due < today()'\n---\n",
+    );
+    write(directory.path(), "tasks/a.md", "---\ntitle: A\n---\n");
+    write(directory.path(), "notes/b.md", "---\ntitle: B\n---\n");
+    let collection = Collection::open(directory.path()).expect("open collection");
+    let operations = collection.v03_operations().expect("v0.3 operations");
+    let warned = |result: &v03::OperationResult| {
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == "warning"
+                && diagnostic.code == "unsupported_feature"
+                && diagnostic.path.as_deref() == Some("_types/task.md")
+                && diagnostic.type_name.as_deref() == Some("task")
+                && diagnostic.details
+                    == Some(serde_json::json!({"feature": "collection_projections"}))
+        })
+    };
+    assert!(warned(&operations.validate(&serde_json::json!({}))));
+    let record = operations.validate(&serde_json::json!({"path": "tasks/a.md"}));
+    assert!(record.valid && warned(&record), "{record:#?}");
+    let other = operations.validate(&serde_json::json!({"path": "notes/b.md"}));
+    assert!(other.diagnostics.is_empty(), "{other:#?}");
+}
+
+#[test]
+fn record_paths_follow_v03_discovery() {
+    let directory = v03_collection();
+    write(
+        directory.path(),
+        "mdbase.yaml",
+        "spec_version: \"0.3.0\"\nsettings:\n  exclude: [\"archive/*.md\"]\n",
+    );
+    write(
+        directory.path(),
+        "nested/mdbase.yaml",
+        "spec_version: \"0.3.0\"\n",
+    );
+    let collection = Collection::open(directory.path()).expect("open collection");
+    for record in ["tasks/a.md", "a.md", "archive/2025/old.md"] {
+        assert!(collection.is_record_path(record), "{record}");
+    }
+    for skipped in [
+        "tasks/a.txt",
+        "_types/task.md",
+        ".obsidian/a.md",
+        "notes/.hidden.md",
+        "node_modules/pkg/readme.md",
+        "archive/old.md",
+        "nested/a.md",
+    ] {
+        assert!(!collection.is_record_path(skipped), "{skipped}");
+    }
+    assert!(collection.is_excluded_path(".git"));
+    assert!(!collection.is_excluded_path("tasks"));
+}
+
+#[test]
 fn canonical_v03_schemas_compile() {
     v03::validate_canonical_schemas().expect("canonical schemas compile");
 }
@@ -600,7 +664,7 @@ fn v03_mutations_enforce_opaque_revision_preconditions() {
 
     let updated = operations.update(&serde_json::json!({
         "path": "tasks/conditional.md",
-        "fields": {"title": "Updated"},
+        "patch": {"title": "Updated"},
         "if_revision": original_revision,
     }));
     assert!(updated.valid, "{:#?}", updated.diagnostics);
@@ -619,7 +683,7 @@ fn v03_mutations_enforce_opaque_revision_preconditions() {
     for conflict in [
         operations.update(&serde_json::json!({
             "path": "tasks/conditional.md",
-            "fields": {"title": "Lost update"},
+            "patch": {"title": "Lost update"},
             "if_revision": updated_revision,
         })),
         operations.delete(&serde_json::json!({
@@ -654,7 +718,7 @@ fn v03_mutations_enforce_opaque_revision_preconditions() {
 }
 
 #[test]
-fn v03_update_accepts_the_canonical_patch_and_keeps_legacy_fields_compatible() {
+fn v03_update_accepts_patch_and_unset_and_rejects_legacy_aliases() {
     let directory = v03_collection();
     write(
         directory.path(),
@@ -666,19 +730,21 @@ fn v03_update_accepts_the_canonical_patch_and_keeps_legacy_fields_compatible() {
     let operations = collection.v03_operations().expect("v0.3 operations");
     let patched = operations.update(&serde_json::json!({
         "path": "tasks/update-shapes.md",
-        "patch": {"title": "Canonical", "status": "done"},
-        "fields": {"title": "Legacy must not win"}
+        "patch": {"title": "Canonical"},
+        "unset": ["status"]
     }));
     assert!(patched.valid, "{:#?}", patched.diagnostics);
     assert_eq!(patched.result["frontmatter"]["title"], "Canonical");
-    assert_eq!(patched.result["frontmatter"]["status"], "done");
+    assert!(patched.result["frontmatter"].get("status").is_none());
 
-    let legacy = operations.update(&serde_json::json!({
-        "path": "tasks/update-shapes.md",
-        "fields": {"title": "Legacy still works"}
-    }));
-    assert!(legacy.valid, "{:#?}", legacy.diagnostics);
-    assert_eq!(legacy.result["frontmatter"]["title"], "Legacy still works");
+    for alias in ["fields", "frontmatter"] {
+        let legacy = operations.update(&serde_json::json!({
+            "path": "tasks/update-shapes.md",
+            alias: {"title": "Silently ignored"}
+        }));
+        assert!(!legacy.valid, "{alias} must not be accepted");
+        assert_eq!(legacy.diagnostics[0].code, "invalid_request");
+    }
 }
 
 #[test]

@@ -129,6 +129,7 @@ impl Collection {
         let canonical_path = request.path.to_string();
         let path = legacy_path.unwrap_or(canonical_path);
         let fields = request.patch;
+        let unset = request.unset;
         let new_body = request.body;
         let document = request.document;
         let canonical_revision = request.if_revision.as_ref().map(ToString::to_string);
@@ -251,7 +252,9 @@ impl Collection {
         let merged = if document.is_some() {
             existing_mapping.clone()
         } else {
-            serializer::merge_fields(&existing_mapping, &fields, &self.settings.write_nulls)
+            let merged =
+                serializer::merge_fields(&existing_mapping, &fields, &self.settings.write_nulls);
+            serializer::remove_fields(&merged, &unset)
         };
         let merged_json = yaml_mapping_to_json(&merged);
 
@@ -475,6 +478,7 @@ fn legacy_prepared_update(input: UpdateInput) -> PreparedUpdate {
     let request = UpdateRequest {
         path,
         patch: input.fields,
+        unset: Vec::new(),
         document: input.document,
         body: input.body,
         if_revision: input

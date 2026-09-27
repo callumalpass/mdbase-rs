@@ -19,11 +19,13 @@ use super::{
     RECORD_STRUCTURE_SCHEMA_VERSION,
 };
 
-/// Format v6 adds bounded selector evidence to resolved structural occurrences.
-/// The evidence is persisted as part of the projection, so v5 projections are
-/// still deserializable for explicit stale-data handling but are never accepted
-/// by a v6 executor or mixed into a v6 storage/digest binding.
-pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 6;
+/// Format v6 added bounded selector evidence to resolved structural occurrences.
+/// Format v7 derives resolution keys from the collection's link rules: v0.3
+/// collections key IDs only when `settings.id_field` is configured and never
+/// key titles. Older projections stay deserializable for explicit stale-data
+/// handling but are never accepted by a v7 executor or mixed into a v7
+/// storage/digest binding.
+pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 7;
 pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v5";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -215,7 +217,8 @@ impl CompiledCatalog {
         types.sort();
         types.dedup();
         let file = file_facts(&record.path, exact_size, record.file_mtime.clone());
-        let resolution_keys = resolution_keys(&file, &effective_frontmatter, self.id_field());
+        let resolution_keys =
+            resolution_keys(&file, &effective_frontmatter, &self.link_resolution_keys());
 
         Ok(PreparedSemanticProjection {
             facts: SemanticProjectionFacts {
@@ -381,7 +384,7 @@ fn file_facts(path: &str, size: u64, mtime: Option<String>) -> SemanticFileFacts
 fn resolution_keys(
     file: &SemanticFileFacts,
     effective_frontmatter: &Map<String, Value>,
-    id_field: &str,
+    link_keys: &crate::links::resolver::ResolutionKeys,
 ) -> Vec<RecordResolutionKey> {
     let mut keys = vec![
         RecordResolutionKey {
@@ -393,13 +396,23 @@ fn resolution_keys(
             value: file.basename.to_lowercase(),
         },
     ];
-    if let Some(id) = effective_frontmatter.get(id_field).and_then(Value::as_str) {
+    if let Some(id) = link_keys
+        .id_field
+        .as_deref()
+        .and_then(|field| effective_frontmatter.get(field))
+        .and_then(Value::as_str)
+    {
         keys.push(RecordResolutionKey {
             kind: RecordResolutionKeyKind::Id,
             value: id.to_lowercase(),
         });
     }
-    if let Some(title) = effective_frontmatter.get("title").and_then(Value::as_str) {
+    if let Some(title) = link_keys
+        .titles
+        .then(|| effective_frontmatter.get("title"))
+        .flatten()
+        .and_then(Value::as_str)
+    {
         keys.push(RecordResolutionKey {
             kind: RecordResolutionKeyKind::Title,
             value: title.to_lowercase(),

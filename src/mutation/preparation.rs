@@ -111,6 +111,17 @@ pub(crate) fn prepare_update(
         let patch = request.patch.as_object().cloned().unwrap_or_default();
         let mut draft = old.clone();
         apply_patch(&mut draft, &patch, &collection.settings.write_nulls);
+        for reference in &request.unset {
+            crate::field_references::remove_object_value(&mut draft, reference).map_err(
+                |message| {
+                    vec![Diagnostic::error(
+                        "invalid_request",
+                        message,
+                        Some(path.clone()),
+                    )]
+                },
+            )?;
+        }
         draft
     };
     let membership = ResolvedWriteMembership::resolve_update(collection, &draft, &path)?;
@@ -145,7 +156,9 @@ pub(crate) fn prepare_update(
         }
         request.include_document = true;
     } else {
-        request.patch = Value::Object(diff_frontmatter(&old, &lifecycle));
+        let (changed, removed) = diff_frontmatter(&old, &lifecycle);
+        request.patch = Value::Object(changed);
+        request.unset = removed;
     }
     if request.if_revision.is_none() {
         request.if_revision = Revision::parse(prepared_revision.clone()).ok();
@@ -501,19 +514,23 @@ fn apply_patch(draft: &mut Map<String, Value>, patch: &Map<String, Value>, write
     }
 }
 
-fn diff_frontmatter(before: &Map<String, Value>, after: &Map<String, Value>) -> Map<String, Value> {
-    let mut fields = Map::new();
+/// Top-level keys whose values changed, and pointers to keys that were removed.
+fn diff_frontmatter(
+    before: &Map<String, Value>,
+    after: &Map<String, Value>,
+) -> (Map<String, Value>, Vec<String>) {
+    let mut changed = Map::new();
     for (field, value) in after {
         if before.get(field) != Some(value) {
-            fields.insert(field.clone(), value.clone());
+            changed.insert(field.clone(), value.clone());
         }
     }
-    for field in before.keys() {
-        if !after.contains_key(field) {
-            fields.insert(field.clone(), Value::Null);
-        }
-    }
-    fields
+    let removed = before
+        .keys()
+        .filter(|field| !after.contains_key(*field))
+        .map(|field| crate::field_references::top_level_pointer(field))
+        .collect();
+    (changed, removed)
 }
 
 fn invalid_record(path: &str, reason: &str) -> Diagnostic {
