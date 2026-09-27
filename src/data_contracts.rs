@@ -170,7 +170,19 @@ impl DataContractRegistry {
         type_names.sort();
         for type_name in type_names {
             let type_definition = &types[&type_name];
+            // A type implements each contract ID once, whatever versions the
+            // entries request (spec Chapter 05A).
+            let mut implemented = std::collections::HashSet::new();
             for implementation in &type_definition.implementations {
+                if !implemented.insert(implementation.contract.as_str()) {
+                    return Err(load_error(
+                        "invalid_type_definition",
+                        format!(
+                            "Type '{}' implements data contract '{}' more than once",
+                            type_definition.name, implementation.contract
+                        ),
+                    ));
+                }
                 registry.register_implementation(type_definition, implementation)?;
             }
         }
