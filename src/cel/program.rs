@@ -17,10 +17,31 @@ const BODY_FACTS: [&str; 4] = ["tags", "links", "embeds", "backlinks"];
 /// A parsed standard CEL expression (spec Chapter 10), shareable across threads.
 #[derive(Clone, Debug)]
 pub(crate) struct Program {
-    ast: Arc<IdedExpr>,
+    ast: Arc<Ast>,
     /// The AST that is evaluated: `ast` with link provenance made explicit.
-    executable: Arc<IdedExpr>,
+    executable: Arc<Ast>,
     facts: Arc<ProgramFacts>,
+}
+
+/// An AST whose recursive drop runs on a grown stack, so dropping a deeply
+/// nested expression cannot overflow a small thread stack.
+#[derive(Debug)]
+struct Ast(Option<IdedExpr>);
+
+impl Ast {
+    fn get(&self) -> &IdedExpr {
+        self.0
+            .as_ref()
+            .expect("an AST is present until it is dropped")
+    }
+}
+
+impl Drop for Ast {
+    fn drop(&mut self) {
+        if let Some(ast) = self.0.take() {
+            stacker::maybe_grow(RED_ZONE, STACK_SIZE, move || drop(ast));
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -52,8 +73,10 @@ impl Program {
             }
             let mut facts = ProgramFacts::default();
             collect(&ast, &mut Vec::new(), &mut facts);
-            let ast = Arc::new(ast);
-            let executable = super::provenance::rewrite(&ast).map_or_else(|| ast.clone(), Arc::new);
+            let executable =
+                super::provenance::rewrite(&ast).map(|rewritten| Arc::new(Ast(Some(rewritten))));
+            let ast = Arc::new(Ast(Some(ast)));
+            let executable = executable.unwrap_or_else(|| ast.clone());
             Ok(Self {
                 ast,
                 executable,
@@ -64,12 +87,12 @@ impl Program {
 
     /// The expression as written, for static analysis and query lowering.
     pub(crate) fn ast(&self) -> &IdedExpr {
-        &self.ast
+        self.ast.get()
     }
 
     /// The expression to evaluate.
     pub(crate) fn executable(&self) -> &IdedExpr {
-        &self.executable
+        self.executable.get()
     }
 
     pub(crate) fn facts(&self) -> &ProgramFacts {
