@@ -14,6 +14,8 @@ mod host;
 mod program;
 mod provenance;
 
+pub(crate) use program::with_stack_for;
+
 pub(crate) use host::RESERVED;
 pub(crate) use program::Program;
 

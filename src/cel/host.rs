@@ -100,7 +100,7 @@ pub(crate) fn evaluate(
     if record_context {
         cel_context.set_variable_resolver(&resolver);
     }
-    let result = stacker::maybe_grow(super::program::RED_ZONE, super::program::STACK_SIZE, || {
+    let result = super::program::with_stack_for(program.facts().depth, || {
         CelValue::resolve(program.executable(), &cel_context)
     })
     .map_err(|error| error.to_string())?;

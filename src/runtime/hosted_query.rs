@@ -522,7 +522,9 @@ impl CompiledCatalog {
             })?;
             // Lowering may only prove candidate exclusion. The canonical
             // residual remains authoritative for every retained record.
-            let lowered = lower_expression(expression.ast(), &mut requirements);
+            let lowered = cel::with_stack_for(expression.facts().depth, || {
+                lower_expression(expression.ast(), &mut requirements)
+            });
             fully_projected = false;
             requirements.canonical_residual = true;
             match lowered {

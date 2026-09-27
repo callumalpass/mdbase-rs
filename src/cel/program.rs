@@ -6,10 +6,23 @@ use std::sync::Arc;
 use cel::common::ast::{EntryExpr, Expr, IdedExpr, LiteralValue};
 use cel::parser::Parser;
 
-/// Stack for recursive parsing and evaluation of deep expressions. Parsing
-/// always runs on a fresh stack; evaluation grows only near the red zone.
-pub(crate) const RED_ZONE: usize = 2 * 1024 * 1024;
+/// Stack for recursive work on deep expressions. Parsing always runs on a
+/// fresh stack of this size; evaluation and drop do too when the expression
+/// is deeper than [`DEEP_AST`], decided from the expression rather than from
+/// a platform estimate of the remaining stack.
 pub(crate) const STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// AST depth above which evaluation and drop run on a fresh stack.
+const DEEP_AST: usize = 32;
+
+/// Run `work` on a fresh stack when `depth` is deep enough to need one.
+pub(crate) fn with_stack_for<T>(depth: usize, work: impl FnOnce() -> T) -> T {
+    if depth > DEEP_AST {
+        stacker::grow(STACK_SIZE, work)
+    } else {
+        work()
+    }
+}
 
 /// Whole-`file` members whose values depend on parsing the record body.
 const BODY_FACTS: [&str; 4] = ["tags", "links", "embeds", "backlinks"];
@@ -26,7 +39,7 @@ pub(crate) struct Program {
 /// An AST whose recursive drop runs on a grown stack, so dropping a deeply
 /// nested expression cannot overflow a small thread stack.
 #[derive(Debug)]
-struct Ast(Option<IdedExpr>);
+struct Ast(Option<IdedExpr>, usize);
 
 impl Ast {
     fn get(&self) -> &IdedExpr {
@@ -39,13 +52,15 @@ impl Ast {
 impl Drop for Ast {
     fn drop(&mut self) {
         if let Some(ast) = self.0.take() {
-            stacker::maybe_grow(RED_ZONE, STACK_SIZE, move || drop(ast));
+            with_stack_for(self.1, move || drop(ast));
         }
     }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct ProgramFacts {
+    /// Nesting depth of the expression.
+    pub depth: usize,
     /// Identifiers that are not comprehension variables.
     pub free_identifiers: BTreeSet<String>,
     /// Names read through `projection.<name>` or `projection["name"]`.
@@ -68,14 +83,18 @@ impl Program {
                 .max_recursion_depth(u16::try_from(max_depth.saturating_mul(2)).unwrap_or(u16::MAX))
                 .parse(source)
                 .map_err(|errors| errors.to_string())?;
-            if depth(&ast) > max_depth as usize {
+            let ast_depth = depth(&ast);
+            if ast_depth > max_depth as usize {
                 return Err("expression_depth_exceeded".to_string());
             }
-            let mut facts = ProgramFacts::default();
+            let mut facts = ProgramFacts {
+                depth: ast_depth,
+                ..ProgramFacts::default()
+            };
             collect(&ast, &mut Vec::new(), &mut facts);
-            let executable =
-                super::provenance::rewrite(&ast).map(|rewritten| Arc::new(Ast(Some(rewritten))));
-            let ast = Arc::new(Ast(Some(ast)));
+            let executable = super::provenance::rewrite(&ast)
+                .map(|rewritten| Arc::new(Ast(Some(rewritten), ast_depth)));
+            let ast = Arc::new(Ast(Some(ast), ast_depth));
             let executable = executable.unwrap_or_else(|| ast.clone());
             Ok(Self {
                 ast,
