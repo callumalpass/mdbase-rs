@@ -85,12 +85,17 @@ pub struct ContractSetupChoice {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ManifestResource {
+    #[serde(default)]
+    upgrade_from: Option<seed_upgrade::Base>,
     kind: String,
     mode: String,
     source: String,
     target: String,
     digest: String,
 }
+
+#[path = "type_pack_seed_upgrade.rs"]
+mod seed_upgrade;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct TypePackReceiptResource {
@@ -378,6 +383,10 @@ pub(crate) fn plan_type_pack(
                 resource.source, actual, resource.digest
             )));
         }
+        if let Some(base) = &resource.upgrade_from {
+            base.verify(&resource.kind, &resource.mode)
+                .map_err(pack_plan_error)?;
+        }
         let target = validate_resource_target(collection, &resource.kind, &resource.target, bytes)
             .map_err(pack_plan_error)?;
         collection
@@ -395,14 +404,41 @@ pub(crate) fn plan_type_pack(
         let installed = current_resources
             .get(resource.source.as_str())
             .copied()
-            .filter(|installed| installed.target == resource.target);
+            .filter(|installed| installed.target == resource.target)
+            .or_else(|| {
+                // A renamed seed source must not resurrect a user-deleted type.
+                (resource.mode == "seed")
+                    .then(|| {
+                        current_resources.values().copied().find(|installed| {
+                            installed.mode == "seed" && installed.target == resource.target
+                        })
+                    })
+                    .flatten()
+            });
         let owner = other_owners.get(resource.target.as_str()).copied();
         let mut adopted_from_digest = None;
+        let mut planned_bytes = (*bytes).to_vec();
         let (action, reason) = if let Some(owner) = owner {
             (
                 "conflict",
                 Some(format!("{} is managed by {}.", resource.target, owner)),
             )
+        } else if let Some(merged) = resource
+            .upgrade_from
+            .as_ref()
+            .filter(|_| resource.mode == "seed")
+            .filter(|_| !options.preserve_seed_targets.contains(&resource.target))
+            .zip(before.as_deref())
+            .map(|(base, current)| base.plan(current, bytes))
+        {
+            match merged {
+                Ok(document) => {
+                    let unchanged = before.as_deref() == Some(document.as_slice());
+                    planned_bytes = document;
+                    (if unchanged { "preserve" } else { "update" }, None)
+                }
+                Err(reason) => ("conflict", Some(format!("{}: {reason}", resource.target))),
+            }
         } else if resource.mode == "seed" {
             (
                 if before.is_none()
@@ -470,12 +506,12 @@ pub(crate) fn plan_type_pack(
             source: resource.source.clone(),
             target: resource.target.clone(),
             action: action.to_string(),
-            digest: resource.digest.clone(),
+            digest: revision(&planned_bytes),
             current_digest,
             installed_digest: installed.map(|installed| installed.digest.clone()),
             adopted_from_digest,
             reason,
-            bytes: Some((*bytes).to_vec()),
+            bytes: Some(planned_bytes),
         });
     }
 
@@ -1527,25 +1563,29 @@ fn failed(diagnostics: Vec<Diagnostic>) -> OperationResult {
 }
 
 #[cfg(test)]
+#[path = "type_pack_seed_upgrade_tests.rs"]
+mod seed_upgrade_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
-    fn write(path: &std::path::Path, contents: &str) {
+    pub(super) fn write(path: &std::path::Path, contents: &str) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, contents).unwrap();
     }
 
-    fn resource(source: &str, document: &str) -> TypePackResource {
+    pub(super) fn resource(source: &str, document: &str) -> TypePackResource {
         TypePackResource {
             source: source.to_string(),
             document: document.to_string(),
         }
     }
 
-    fn manifest(resources: &[(&str, &str, &str, &str)]) -> Value {
+    pub(super) fn manifest(resources: &[(&str, &str, &str, &str)]) -> Value {
         json!({
             "kind": "mdbase.type-pack",
             "id": "example.tasks",
@@ -1560,14 +1600,20 @@ mod tests {
         })
     }
 
-    fn provision(manifest: Value, resources: Vec<TypePackResource>) -> TypePackProvision {
+    pub(super) fn provision(
+        manifest: Value,
+        resources: Vec<TypePackResource>,
+    ) -> TypePackProvision {
         TypePackProvision {
             manifest,
             resources,
         }
     }
 
-    fn apply_pack(collection: &Collection, provision: &TypePackProvision) -> OperationResult {
+    pub(super) fn apply_pack(
+        collection: &Collection,
+        provision: &TypePackProvision,
+    ) -> OperationResult {
         let assessment = collection.assess_type_pack(provision, &assessment_options());
         if !assessment.valid {
             return assessment;
@@ -1631,7 +1677,7 @@ mod tests {
         }
     }
 
-    fn collection() -> (tempfile::TempDir, Collection) {
+    pub(super) fn collection() -> (tempfile::TempDir, Collection) {
         let root = tempfile::tempdir().unwrap();
         write(
             &root.path().join("mdbase.yaml"),
@@ -1700,7 +1746,8 @@ schema:
 Existing documentation.
 "#;
 
-    fn task_resources() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+    pub(super) fn task_resources() -> Vec<(&'static str, &'static str, &'static str, &'static str)>
+    {
         vec![
             (
                 "schema",
