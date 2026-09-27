@@ -261,8 +261,8 @@ fn canonical_type_file(
     let mut defaults = Map::new();
     let mut unique = Vec::new();
     let mut links = Map::new();
-    let mut lifecycle_create = Map::new();
-    let mut lifecycle_update = Map::new();
+    let mut lifecycle_create = Vec::new();
+    let mut lifecycle_update = Vec::new();
     let mut field_names = definition.fields.keys().cloned().collect::<Vec<_>>();
     field_names.sort();
     for field_name in field_names {
@@ -296,10 +296,17 @@ fn canonical_type_file(
         if let Some(generated) = &field.generated {
             match generated_provider(generated) {
                 Some((create, update)) => {
-                    lifecycle_create.insert(field_name.clone(), create);
-                    if let Some(update) = update {
-                        lifecycle_update.insert(field_name.clone(), update);
-                    }
+                    let set = json!({ field_name.clone(): create });
+                    lifecycle_create.push(match update {
+                        // now_on_write assigns on every write, including create.
+                        Some(update) => {
+                            lifecycle_update.push(json!({"set": { field_name.clone(): update }}));
+                            json!({"set": set})
+                        }
+                        // v0.2 generated values apply only when the field is missing,
+                        // while lifecycle `set` always assigns.
+                        None => json!({"if": missing_field_guard(&field_name), "set": set}),
+                    });
                 }
                 None => diagnostics.push(lossy_diagnostic(
                     &format!(
@@ -411,10 +418,10 @@ fn canonical_type_file(
     }
     let mut lifecycle = Map::new();
     if !lifecycle_create.is_empty() {
-        lifecycle.insert("on_create".to_string(), json!({"set": lifecycle_create}));
+        lifecycle.insert("on_create".to_string(), Value::Array(lifecycle_create));
     }
     if !lifecycle_update.is_empty() {
-        lifecycle.insert("on_update".to_string(), json!({"set": lifecycle_update}));
+        lifecycle.insert("on_update".to_string(), Value::Array(lifecycle_update));
     }
     if !lifecycle.is_empty() {
         frontmatter.insert("lifecycle".to_string(), Value::Object(lifecycle));
@@ -518,6 +525,22 @@ fn field_schema(field: &FieldDef) -> MdbaseResult<Value> {
         }),
     );
     Ok(Value::Object(schema))
+}
+
+/// A CEL guard that holds when `field` is missing from the persisted draft.
+fn missing_field_guard(field: &str) -> String {
+    let identifier = field
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && field
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_');
+    if identifier {
+        format!("!has(raw.{field})")
+    } else {
+        format!("!({} in raw)", Value::String(field.to_string()))
+    }
 }
 
 fn generated_provider(generated: &GeneratedStrategy) -> Option<(Value, Option<Value>)> {
@@ -822,5 +845,19 @@ fn error_path_from_transaction(error: &crate::transactions::TransactionError) ->
         crate::transactions::TransactionError::ConcurrentModification(path)
         | crate::transactions::TransactionError::UnsafePath(path) => Some(path),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::missing_field_guard;
+
+    #[test]
+    fn generated_field_guards_test_raw_presence() {
+        assert_eq!(missing_field_guard("dateCreated"), "!has(raw.dateCreated)");
+        assert_eq!(
+            missing_field_guard("created-at"),
+            r#"!("created-at" in raw)"#
+        );
     }
 }

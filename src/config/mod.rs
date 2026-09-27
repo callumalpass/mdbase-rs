@@ -107,10 +107,18 @@ fn parse_config_document(content: &str, allow_future_minor: bool) -> serde_json:
         .map(String::from);
 
     // Settings
-    let settings = match parse_settings(map, &mut warnings) {
+    let mut settings = match parse_settings(map, &mut warnings) {
         Ok(s) => s,
         Err(e) => return e,
     };
+    let validation_configured = map.get(ykey("default_validation")).is_some()
+        || map.get(ykey("settings")).is_some_and(|settings| {
+            settings.get("validation").is_some() || settings.get("default_validation").is_some()
+        });
+    if spec_profile == "v0.3" && !validation_configured {
+        // v0.3 defaults to validation level `error` (spec Chapter 04).
+        settings["default_validation"] = serde_json::Value::String("error".to_string());
+    }
     if spec_profile == "v0.3"
         && map
             .get(ykey("settings"))
