@@ -870,7 +870,7 @@ fn shared_v03_lifecycle_fixture_passes() {
 
 #[test]
 fn shared_v03_cel_fixture_passes() {
-    run_suite("cel/cel-profile.yaml", "cel", 25);
+    run_suite("cel/cel-profile.yaml", "cel", 26);
 }
 
 #[test]

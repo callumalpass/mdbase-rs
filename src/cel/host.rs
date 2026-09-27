@@ -210,6 +210,13 @@ impl Host {
             full_date("dayOfWeek", &text)
                 .map(|date| CelValue::Int(date.weekday().number_from_monday().into()))
         });
+        // Unicode default full case mappings, without locale tailoring.
+        context.add_function("lower", |This(text): This<Arc<String>>| {
+            Ok::<_, ExecutionError>(CelValue::String(Arc::new(text.to_lowercase())))
+        });
+        context.add_function("upper", |This(text): This<Arc<String>>| {
+            Ok::<_, ExecutionError>(CelValue::String(Arc::new(text.to_uppercase())))
+        });
         context.add_function(
             "inFolder",
             |This(file): This<CelValue>, folder: Arc<String>| {
