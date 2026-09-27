@@ -3054,6 +3054,14 @@ fn public_runtime_prepare_rejects_erased_authority_without_staging_or_generation
 #[test]
 fn runtime_uniqueness_uses_the_generation_bound_index() {
     let directory = collection();
+    fs::create_dir(directory.path().join("_types")).unwrap();
+    fs::write(
+        directory.path().join("_types/note.md"),
+        "---\nkind: mdbase.type\nname: note\nversion: 1\nmatch:\n  path_glob: \"*.md\"\n\
+         schema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n\
+         collection:\n  unique:\n    - field: id\n      scope: type\n---\n",
+    )
+    .unwrap();
     fs::write(
         directory.path().join("existing.md"),
         "---\nid: duplicate\ntitle: Existing\n---\n",
@@ -3081,14 +3089,14 @@ fn runtime_uniqueness_uses_the_generation_bound_index() {
         )
         .unwrap();
     let PreparationOutcome::NoMutation(outcome) = outcome else {
-        panic!("duplicate identity must be rejected before durable prepare")
+        panic!("a duplicate unique value must be rejected before durable prepare")
     };
     assert!(!outcome.operation.valid);
     assert!(outcome
         .operation
         .diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code.as_str() == "duplicate_id"));
+        .any(|diagnostic| diagnostic.code.as_str() == "duplicate_value"));
     assert!(!directory.path().join("candidate.md").exists());
 }
 

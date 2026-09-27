@@ -288,6 +288,13 @@ impl Collection {
         }
     }
 
+    /// The field whose values must be unique across the collection, if any.
+    /// v0.3 defines no ID validator: a duplicated configured ID only makes
+    /// ID-based wikilink resolution ambiguous (spec Chapter 08).
+    pub(crate) fn identity_field(&self) -> Option<&str> {
+        (self.spec_profile != crate::SpecProfile::V03).then_some(self.settings.id_field.as_str())
+    }
+
     /// Check cross-file uniqueness for a file being created or updated.
     /// Returns issues for duplicate id_field and unique field values.
     /// `exclude_path` is the relative path of the file being updated (to exclude self from checks).
@@ -321,8 +328,9 @@ impl Collection {
         path: &str,
         snapshot: Option<&crate::snapshot::AuthoritativeCollectionSnapshot>,
     ) -> Result<Vec<Issue>, crate::mutation::MutationFailure> {
-        let has_id = frontmatter
-            .get(&self.settings.id_field)
+        let has_id = self
+            .identity_field()
+            .and_then(|field| frontmatter.get(field))
             .is_some_and(|value| !value.is_null());
         let applies = type_names
             .iter()
@@ -385,16 +393,19 @@ impl Collection {
 
             // Check id_field
             let id_field = &self.settings.id_field;
-            let id_value = frontmatter.get(id_field).and_then(|v| {
-                if v.is_null() {
-                    None
-                } else {
-                    Some(match v.as_str() {
-                        Some(s) => s.to_string(),
-                        None => v.to_string(),
-                    })
-                }
-            });
+            let id_value = self
+                .identity_field()
+                .and_then(|field| frontmatter.get(field))
+                .and_then(|v| {
+                    if v.is_null() {
+                        None
+                    } else {
+                        Some(match v.as_str() {
+                            Some(s) => s.to_string(),
+                            None => v.to_string(),
+                        })
+                    }
+                });
 
             // Check against all other files using the preloaded frontmatter snapshot.
             for (rel_path, other_fm) in corpus {
@@ -819,8 +830,8 @@ impl Collection {
                     }
 
                     // Track id_field
-                    let id_field = &self.settings.id_field;
-                    if let Some(val) = effective.get(id_field) {
+                    if let Some(val) = self.identity_field().and_then(|field| effective.get(field))
+                    {
                         if !val.is_null() {
                             let val_str = match val.as_str() {
                                 Some(s) => s.to_string(),

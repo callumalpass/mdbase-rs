@@ -860,7 +860,7 @@ fn shared_v03_core_write_fixture_passes() {
 
 #[test]
 fn shared_v03_links_and_discovery_fixture_passes() {
-    run_suite("core/links-and-discovery.yaml", "core_collection", 5);
+    run_suite("core/links-and-discovery.yaml", "core_collection", 7);
 }
 
 #[test]
