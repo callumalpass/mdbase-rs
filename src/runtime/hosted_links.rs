@@ -297,4 +297,90 @@ mod tests {
             assert_eq!(error.code, code);
         }
     }
+
+    /// Task assignments as declared link lists, as TaskNotes stores them.
+    fn assignment_catalog() -> CompiledCatalog {
+        let task_schema = json!({"type": "object", "properties": {
+            "assignees": {"type": "array", "items": {"type": "string"}}
+        }});
+        let task = ResolvedTypeResource {
+            path: "_types/task.md".to_string(),
+            revision: "task-1".to_string(),
+            definition: json!({
+                "kind": "mdbase.type", "name": "task", "version": 1,
+                "match": {"path_glob": "tasks/*.md"},
+                "schema": {"dialect": "json-schema-2020-12", "value": task_schema.clone()},
+                "collection": {"links": {"assignees[]": {}}}
+            }),
+            schema: task_schema,
+        };
+        CompiledCatalog::compile(CatalogInput {
+            resource_revision: "catalog-assignments".to_string(),
+            configuration_document: "spec_version: 0.3.0\n".to_string(),
+            types: vec![task, record_type("person", "people")],
+            contracts: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn assignment_fixture() -> (
+        CompiledCatalog,
+        CanonicalRecordInput,
+        HostedRelationshipNeighborhood,
+    ) {
+        let catalog = assignment_catalog();
+        let task = record(
+            "tasks/a.md",
+            "assignees: ['[[people/alice]]', '[[Nobody]]']",
+        );
+        let alice = record("people/alice.md", "title: Alice");
+        let neighborhood = HostedRelationshipNeighborhood {
+            projection: Some(projection(&catalog, &task, "people/alice.md")),
+            related: vec![projection(&catalog, &alice, "")],
+            complete: true,
+        };
+        (catalog, task, neighborhood)
+    }
+
+    #[test]
+    fn filters_assignee_link_lists_by_resolved_person() {
+        let (catalog, task, neighborhood) = assignment_fixture();
+        for (person, expected) in [("people/alice.md", true), ("people/bob.md", false)] {
+            let plan = catalog
+                .compile_hosted_query(&json!({"types": ["task"], "where": format!(
+                    "\"assignees\" in record && record[\"assignees\"].exists(a, a.asFile() != null && a.asFile().file.path == \"{person}\")"
+                )}))
+                .unwrap();
+            let evaluation = catalog
+                .evaluate_hosted_residual_with_neighborhood(&plan, &task, None, Some(&neighborhood))
+                .unwrap();
+            assert_eq!(
+                evaluation.matched, expected,
+                "{person}: {:?}",
+                evaluation.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn projects_raw_assignee_links_with_their_resolved_targets() {
+        let (catalog, task, neighborhood) = assignment_fixture();
+        let plan = catalog
+            .compile_hosted_query(&json!({
+                "types": ["task"],
+                "projections": {
+                    "links": {"expr": "\"assignees\" in raw ? raw[\"assignees\"] : []"},
+                    "targets": {"expr": "\"assignees\" in record ? record[\"assignees\"].map(a, a.asFile() == null ? null : a.asFile().file.path) : []"}
+                },
+                "select": ["projection.links", "projection.targets"]
+            }))
+            .unwrap();
+        let evaluation = catalog
+            .evaluate_hosted_residual_with_neighborhood(&plan, &task, None, Some(&neighborhood))
+            .unwrap();
+        assert!(evaluation.matched, "{:?}", evaluation.diagnostics);
+        let values = &evaluation.record.expect("selected record")["values"];
+        assert_eq!(values["links"], json!(["[[people/alice]]", "[[Nobody]]"]));
+        assert_eq!(values["targets"], json!(["people/alice.md", null]));
+    }
 }
