@@ -16,6 +16,9 @@ All notable changes to this project are documented in this file.
   `obsidian.base` is listed and executed as a saved view alongside configured
   `x-obsidian.bases.include` sources, and is written with the ordinary record
   operations. Hosted Bases execution still uses configured sources.
+- Collection setup may require and provision `md` or `base` on
+  `/settings/record_extensions`, the one configuration target outside an
+  `x-*` namespace. Any other value there is `invalid_collection_setup`.
 
 ### Changed
 
