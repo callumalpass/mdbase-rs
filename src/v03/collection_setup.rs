@@ -401,7 +401,7 @@ fn plan_collection_setup(
     let mut configuration = Vec::new();
     let mut receipt_configuration = Vec::new();
     for provision in &setup.provisions.configuration {
-        let segments = decode_configuration_pointer(&provision.path)
+        let segments = decode_configuration_pointer(&provision.path, &provision.value)
             .map_err(|diagnostic| vec![*diagnostic])?;
         let assessment = assess_and_stage_configuration(&mut config, provision, &segments);
         if assessment.conflict.is_none() {
@@ -548,7 +548,7 @@ fn plan_unchanged_collection_setup(
     let mut configuration = Vec::new();
     let mut receipt_configuration = Vec::new();
     for provision in &setup.provisions.configuration {
-        let segments = decode_configuration_pointer(&provision.path)
+        let segments = decode_configuration_pointer(&provision.path, &provision.value)
             .map_err(|diagnostic| vec![*diagnostic])?;
         let assessment = assess_and_stage_configuration(&mut config, provision, &segments);
         if assessment.conflict.is_none() {
@@ -744,7 +744,7 @@ fn validate_setup(setup: &CollectionSetup) -> Result<(), Box<Diagnostic>> {
             )));
         }
         validate_scalar(&requirement.value)?;
-        decode_configuration_pointer(&requirement.path)?;
+        decode_configuration_pointer(&requirement.path, &requirement.value)?;
         if requirements.insert(&requirement.id, requirement).is_some() {
             return Err(invalid_setup_diagnostic(format!(
                 "Configuration requirement '{}' is duplicated.",
@@ -755,7 +755,7 @@ fn validate_setup(setup: &CollectionSetup) -> Result<(), Box<Diagnostic>> {
     let mut linked = BTreeSet::new();
     for provision in &setup.provisions.configuration {
         validate_scalar(&provision.value)?;
-        decode_configuration_pointer(&provision.path)?;
+        decode_configuration_pointer(&provision.path, &provision.value)?;
         let Some(requirement) = requirements.get(&provision.requirement) else {
             return Err(invalid_setup_diagnostic(format!(
                 "Configuration provision references unknown requirement '{}'.",
@@ -796,7 +796,24 @@ fn validate_scalar(value: &Value) -> Result<(), Box<Diagnostic>> {
     }
 }
 
-fn decode_configuration_pointer(path: &str) -> Result<Vec<String>, Box<Diagnostic>> {
+/// The one core target an application may contribute to: adding a record
+/// format it depends on, so its files become records (spec Chapter 03).
+const RECORD_EXTENSIONS_PATH: &str = "/settings/record_extensions";
+const APPLICATION_RECORD_EXTENSIONS: [&str; 2] = ["md", "base"];
+
+fn decode_configuration_pointer(path: &str, value: &Value) -> Result<Vec<String>, Box<Diagnostic>> {
+    if path == RECORD_EXTENSIONS_PATH {
+        return match value.as_str() {
+            Some(extension) if APPLICATION_RECORD_EXTENSIONS.contains(&extension) => Ok(vec![
+                "settings".to_string(),
+                "record_extensions".to_string(),
+            ]),
+            _ => Err(invalid_setup_diagnostic(format!(
+                "Configuration path '{path}' accepts only the record extensions {}.",
+                APPLICATION_RECORD_EXTENSIONS.join(", ")
+            ))),
+        };
+    }
     if path.len() > MAX_POINTER_BYTES || !path.starts_with('/') {
         return Err(invalid_setup_diagnostic(format!(
             "Configuration path '{path}' must be a bounded RFC 6901 JSON pointer."
@@ -1710,6 +1727,41 @@ mod tests {
             assert!(!result.valid, "{path}");
             assert_eq!(result.diagnostics[0].code, "invalid_collection_setup");
         }
+    }
+
+    #[test]
+    fn record_extensions_accept_only_known_record_formats() {
+        let (directory, collection) =
+            collection("spec_version: 0.3.0\nsettings:\n  record_extensions: [md]\n");
+        for value in [json!("txt"), json!(["base"]), json!(1)] {
+            let mut declaration = setup("dev.example.tasknotes");
+            declaration.requirements.configuration[0].path = RECORD_EXTENSIONS_PATH.to_string();
+            declaration.requirements.configuration[0].value = value.clone();
+            declaration.provisions.configuration[0].path = RECORD_EXTENSIONS_PATH.to_string();
+            declaration.provisions.configuration[0].value = value.clone();
+            let result = collection.assess_collection_setup(&declaration);
+            assert!(!result.valid, "{value}");
+            assert_eq!(result.diagnostics[0].code, "invalid_collection_setup");
+        }
+
+        let mut declaration = setup("dev.example.tasknotes");
+        declaration.requirements.configuration[0].path = RECORD_EXTENSIONS_PATH.to_string();
+        declaration.requirements.configuration[0].value = json!("base");
+        declaration.provisions.configuration[0].path = RECORD_EXTENSIONS_PATH.to_string();
+        declaration.provisions.configuration[0].value = json!("base");
+        let assessment = collection.assess_collection_setup(&declaration);
+        assert!(assessment.valid, "{:?}", assessment.diagnostics);
+        let applied =
+            collection.apply_collection_setup(&declaration, &apply_options(&assessment.result));
+        assert!(applied.valid, "{:?}", applied.diagnostics);
+        let config: Value = serde_yaml::from_str(
+            &fs::read_to_string(directory.path().join("mdbase.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config["settings"]["record_extensions"],
+            json!(["md", "base"])
+        );
     }
 
     #[test]

@@ -25,6 +25,12 @@ extension namespace. This is sufficient for declarations such as adding
 `views/tasknotes/**/*.base` to `/x-obsidian/bases/include` without granting
 an application arbitrary configuration writes.
 
+The one core target is `/settings/record_extensions`, and only with the value
+`md` or `base`: an application that stores its data as another record format
+must be able to make those files records. Because `set_add` on an absent
+sequence creates it with only the added value, an application that adds `base`
+also requires and provisions `md`.
+
 ## Public engine model
 
 The canonical input is equivalent to:
