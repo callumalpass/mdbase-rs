@@ -69,8 +69,11 @@ impl CompiledCatalog {
             ));
         }
         let classified_view = self.classify_record(view_record)?;
-        let document = Value::Object(classified_view.frontmatter.clone());
-        let mut prepared = match crate::views::prepare_hosted_canonical_view(&document, input) {
+        let mut prepared = match crate::views::prepare_hosted_canonical_view(
+            &self.collection,
+            &classified_view,
+            input,
+        ) {
             Ok(prepared) => prepared,
             Err(result) => return typed_invalid_result(result),
         };
@@ -248,27 +251,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::runtime::{CatalogInput, ResolvedTypeResource};
 
     fn catalog() -> CompiledCatalog {
-        CompiledCatalog::compile(CatalogInput {
-            resource_revision: "semantic:test".to_string(),
-            configuration_document: "spec_version: 0.3.0\n".to_string(),
-            types: vec![ResolvedTypeResource {
-                path: "_types/task.md".to_string(),
-                revision: "task:1".to_string(),
-                definition: json!({
-                    "kind": "mdbase.type",
-                    "name": "task",
-                    "version": 1,
-                    "match": {"path_glob": "tasks/*.md"},
-                    "schema": {"dialect": "json-schema-2020-12", "value": {"type": "object"}}
-                }),
-                schema: json!({"type": "object"}),
-            }],
-            contracts: Vec::new(),
-        })
-        .unwrap()
+        let fixture = crate::views::view_contract_fixture::documents();
+        super::super::hosted_resource::catalog_from_documents(
+            &[
+                ("mdbase.yaml", "spec_version: 0.3.0\n"),
+                (
+                    "_types/task.md",
+                    "---\nkind: mdbase.type\nname: task\nversion: 1\nmatch:\n  path_glob: tasks/*.md\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n",
+                ),
+            ]
+            .into_iter()
+            .chain(fixture)
+            .map(|(path, document)| (path.to_string(), document.to_string()))
+            .collect::<Vec<_>>(),
+        )
     }
 
     #[test]

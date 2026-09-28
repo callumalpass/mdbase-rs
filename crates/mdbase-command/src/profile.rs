@@ -17,6 +17,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+const VIEW_CONTRACT_DEF: &str = "---\nkind: mdbase.contract\ncontract_type: record\nid: mdbase.view\nversion: 1.0.0\nrecord_schema: {dialect: json-schema-2020-12, value: {type: object, properties: {id: {}, version: {}, name: {}, query: {}, views: {}}}}\n---\n";
+const VIEW_TYPE_DEF: &str = "---\nkind: mdbase.type\nname: view\nversion: 1\nmatch: {where: {type: view}}\nschema: {dialect: json-schema-2020-12, value: {type: object, properties: {id: {}, version: {}, name: {}, query: {}, views: {}}}}\nimplements: [{contract: mdbase.view, version: 1.0.0, fields: {id: id, version: version, name: name, query: query, views: views}}]\n---\n";
+
 const TASK_TYPE_DEF: &str = r#"---
 kind: mdbase.type
 name: task
@@ -608,6 +611,8 @@ x-obsidian:
         .map_err(|e| format!("Failed to write _types/task.md: {e}"))?;
     fs::write(root.join("_types/project.md"), PROJECT_TYPE_DEF)
         .map_err(|e| format!("Failed to write _types/project.md: {e}"))?;
+    write_plain_markdown_file(&root.join("_contracts/mdbase.view.md"), VIEW_CONTRACT_DEF)?;
+    write_plain_markdown_file(&root.join("_types/view.md"), VIEW_TYPE_DEF)?;
 
     let mut project_ids = Vec::with_capacity(args.projects);
     for i in 0..args.projects {

@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use super::execute::is_configured_obsidian_source;
 use super::model::ObsidianBaseDocument;
+use super::{effective_frontmatter, resolve_view_record, ViewRecord, VIEW_CONTRACT};
 use crate::diagnostic::Diagnostic;
 use crate::frontmatter::parser::{is_parse_error, parse_document, yaml_mapping_to_json};
 use crate::operations::ensure_safe_relative_path;
@@ -301,15 +302,19 @@ fn validate_document(
                     .held_root()
                     .read_string(path)
                     .map_err(|error| vec![io_diagnostic(path, error)])?;
-                validate_canonical_document(path, &current)?;
+                validate_canonical_document(collection, path, &current)?;
             }
-            validate_canonical_document(path, document)
+            validate_canonical_document(collection, path, document)
         }
         _ => unreachable!("path validation rejects other source formats"),
     }
 }
 
-fn validate_canonical_document(path: &str, document: &str) -> Result<(), Vec<Diagnostic>> {
+fn validate_canonical_document(
+    collection: &Collection,
+    path: &str,
+    document: &str,
+) -> Result<(), Vec<Diagnostic>> {
     let parsed = parse_document(document);
     let frontmatter = match parsed.frontmatter {
         Some(serde_yaml::Value::Mapping(mapping)) => yaml_mapping_to_json(&mapping),
@@ -328,14 +333,16 @@ fn validate_canonical_document(path: &str, document: &str) -> Result<(), Vec<Dia
             )])
         }
     };
-    let diagnostics = v03::validate_view(&frontmatter, path);
-    if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.severity == "error")
-    {
-        Err(diagnostics)
-    } else {
-        Ok(())
+    let types = collection.determine_types_for_path(&frontmatter, Some(path));
+    let effective = || effective_frontmatter(collection, &types, &frontmatter);
+    match resolve_view_record(collection, path, &types, effective) {
+        ViewRecord::View(_) => Ok(()),
+        ViewRecord::Invalid(diagnostics) => Err(diagnostics),
+        ViewRecord::NotView => Err(vec![Diagnostic::error(
+            "invalid_view",
+            format!("Saved-view source matches no type implementing {VIEW_CONTRACT}."),
+            Some(path.to_string()),
+        )]),
     }
 }
 

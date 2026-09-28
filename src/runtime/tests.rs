@@ -539,6 +539,7 @@ fn provider_snapshot_includes_configured_saved_view_sources() {
 #[test]
 fn provider_snapshot_classifies_only_valid_canonical_markdown_views_as_resources() {
     let directory = collection();
+    crate::views::view_contract_fixture::install(directory.path());
     fs::create_dir(directory.path().join("views")).unwrap();
     fs::write(
         directory.path().join("views/tasks.md"),
@@ -552,7 +553,7 @@ fn provider_snapshot_classifies_only_valid_canonical_markdown_views_as_resources
     .unwrap();
     fs::write(
         directory.path().join("views/lookalike.md"),
-        "---\ntype: [view]\nid: lookalike\nversion: 1\nname: Not a view resource\nviews:\n  - id: all\n    name: All\n---\n",
+        "---\ntype: note\nid: lookalike\nversion: 1\nname: Not a view resource\nviews:\n  - id: all\n    name: All\n---\n",
     ).unwrap();
     fs::write(
         directory.path().join("note.md"),
@@ -2951,6 +2952,7 @@ fn runtime_commits_saved_view_resources_through_the_single_writer() {
     )
     .unwrap();
     fs::create_dir(directory.path().join("views")).unwrap();
+    crate::views::view_contract_fixture::install(directory.path());
     let runtime = FilesystemRuntime::open(directory.path(), Duration::from_millis(5)).unwrap();
     let documents = [
         ("views/inbox.base", "views:\n  - type: table\n    name: Inbox\n"),
