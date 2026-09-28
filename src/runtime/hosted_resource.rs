@@ -820,6 +820,32 @@ fn resource_stage_error(error: std::io::Error) -> CatalogError {
     )
 }
 
+/// Compile a catalog the way the hosted resource stage does, from definition
+/// documents written to a disposable collection.
+#[cfg(test)]
+pub(super) fn catalog_from_documents(documents: &[(String, String)]) -> CompiledCatalog {
+    let directory = tempfile::tempdir().unwrap();
+    for (path, document) in documents {
+        let destination = directory.path().join(path);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(destination, document).unwrap();
+    }
+    let staged = load_definition_stage(directory.path()).unwrap();
+    let (types, contracts) = resolve_definition_catalog(directory.path(), &staged).unwrap();
+    let configuration = documents
+        .iter()
+        .find(|(path, _)| path == "mdbase.yaml")
+        .map(|(_, document)| document.clone())
+        .expect("catalog documents include mdbase.yaml");
+    CompiledCatalog::compile(super::CatalogInput {
+        resource_revision: "catalog-1".to_string(),
+        configuration_document: configuration,
+        types,
+        contracts,
+    })
+    .unwrap()
+}
+
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
@@ -834,36 +860,24 @@ mod tests {
     fn reads_types_and_views_without_record_documents() {
         let configuration = "spec_version: 0.3.0\nsettings:\n  types_folder: _types\n";
         let type_document = "---\nkind: mdbase.type\nname: task\nversion: 1\nschema:\n  dialect: json-schema-2020-12\n  value: {type: object}\n---\n";
-        let type_definition = json!({
-            "kind": "mdbase.type",
-            "name": "task",
-            "version": 1,
-            "schema": {
-                "dialect": "json-schema-2020-12",
-                "value": {"type": "object"}
-            }
-        });
-        let catalog = CompiledCatalog::compile(CatalogInput {
-            resource_revision: "catalog-1".to_string(),
-            configuration_document: configuration.to_string(),
-            types: vec![ResolvedTypeResource {
-                path: "_types/task.md".to_string(),
-                revision: "type-1".to_string(),
-                definition: type_definition,
-                schema: json!({"type": "object"}),
-            }],
-            contracts: Vec::new(),
-        })
-        .unwrap();
         let resources = vec![
             ("mdbase.yaml".to_string(), configuration.to_string()),
             ("_types/task.md".to_string(), type_document.to_string()),
+            (
+                crate::views::view_contract_fixture::CONTRACT_PATH.to_string(),
+                crate::views::view_contract_fixture::CONTRACT.to_string(),
+            ),
+            (
+                crate::views::view_contract_fixture::TYPE_PATH.to_string(),
+                crate::views::view_contract_fixture::TYPE.to_string(),
+            ),
             (
                 "views/open.md".to_string(),
                 "---\ntype: view\nid: open.views\nversion: 1\nname: Open\nquery: {}\nviews:\n  - id: all\n    name: All\n---\n"
                     .to_string(),
             ),
         ];
+        let catalog = catalog_from_documents(&resources);
         let type_result = catalog
             .execute_hosted_resource_read("read_type", &json!({"name": "task"}), &resources)
             .unwrap();
@@ -884,6 +898,8 @@ mod tests {
                 path: path.clone(),
                 kind: if path == "mdbase.yaml" {
                     HostedResourceKind::Configuration
+                } else if path.starts_with("_contracts/") {
+                    HostedResourceKind::Contract
                 } else if path.starts_with("_types/") {
                     HostedResourceKind::Type
                 } else {
@@ -903,7 +919,7 @@ mod tests {
             )
             .unwrap();
         assert!(type_mutation.result.valid);
-        assert_eq!(type_mutation.types.len(), 2);
+        assert_eq!(type_mutation.types.len(), 3);
         assert!(type_mutation
             .documents
             .iter()

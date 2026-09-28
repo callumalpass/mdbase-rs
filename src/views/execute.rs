@@ -14,12 +14,13 @@ use super::model::{
     NamedViewDescriptor, ObsidianBaseDocument, ObsidianBaseView, ViewDocumentDescriptor,
     ViewPresentation, ViewPropertyDescriptor, ViewReferenceInput, ViewSourceDescriptor,
 };
+use super::{effective_frontmatter, resolve_view_record, ViewRecord};
 use crate::diagnostic::Diagnostic;
 use crate::expressions::evaluator::{
     extract_embeds_from_body, extract_links_from_body, extract_tags_from_body,
 };
 use crate::query::cache_source::FileRecord;
-use crate::v03::{validate_view, OperationResult};
+use crate::v03::OperationResult;
 use crate::Collection;
 pub(super) fn list_views(collection: &Collection, _input: &Value) -> OperationResult {
     let mut diagnostics = Vec::new();
@@ -73,10 +74,6 @@ fn canonical_documents(
     snapshot
         .records
         .iter()
-        .filter(|record| {
-            record.type_names.iter().any(|name| name == "view")
-                || record.raw_frontmatter.get("type").and_then(Value::as_str) == Some("view")
-        })
         .filter_map(|record| canonical_descriptor(collection, record, diagnostics))
         .collect()
 }
@@ -86,28 +83,29 @@ fn canonical_descriptor(
     record: &FileRecord,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<ViewDocumentDescriptor> {
-    let schema_diagnostics = validate_view(&record.raw_frontmatter, &record.rel_path);
-    if schema_diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.severity == "error")
-    {
-        diagnostics.extend(schema_diagnostics.into_iter().map(|mut diagnostic| {
-            diagnostic.severity = "warning".to_string();
-            diagnostic
-        }));
-        return None;
-    }
-    let named_views = record
-        .raw_frontmatter
+    let effective = || record.effective_frontmatter.clone();
+    let view =
+        match resolve_view_record(collection, &record.rel_path, &record.type_names, effective) {
+            ViewRecord::NotView => return None,
+            ViewRecord::View(view) => view,
+            ViewRecord::Invalid(invalid) => {
+                diagnostics.extend(invalid.into_iter().map(|mut diagnostic| {
+                    diagnostic.severity = "warning".to_string();
+                    diagnostic
+                }));
+                return None;
+            }
+        };
+    let named_views = view
         .get("views")
         .and_then(Value::as_array)?
         .iter()
-        .filter_map(|view| {
+        .filter_map(|named| {
             Some(NamedViewDescriptor {
-                id: view.get("id")?.as_str()?.to_string(),
-                name: view.get("name")?.as_str()?.to_string(),
-                properties: canonical_properties(&record.raw_frontmatter, view),
-                presentation: canonical_presentation(view.get("presentation")),
+                id: named.get("id")?.as_str()?.to_string(),
+                name: named.get("name")?.as_str()?.to_string(),
+                properties: canonical_properties(&view, named),
+                presentation: canonical_presentation(named.get("presentation")),
             })
         })
         .collect::<Vec<_>>();
@@ -132,17 +130,15 @@ fn canonical_descriptor(
             revision: file_revision(collection, &record.rel_path).unwrap_or_default(),
             writable: true,
         },
-        id: record
-            .raw_frontmatter
+        id: view
             .get("id")
             .and_then(Value::as_str)
-            .unwrap_or(&record.rel_path)
+            .expect("mdbase.view requires id")
             .to_string(),
-        name: record
-            .raw_frontmatter
+        name: view
             .get("name")
             .and_then(Value::as_str)
-            .unwrap_or(&record.rel_path)
+            .expect("mdbase.view requires name")
             .to_string(),
         views: named_views,
     })
@@ -353,7 +349,8 @@ pub(crate) struct CanonicalViewQuery {
 }
 
 pub(crate) fn prepare_hosted_canonical_view(
-    document: &Value,
+    collection: &Collection,
+    record: &crate::runtime::CollectionSnapshotRecord,
     input: &Value,
 ) -> Result<CanonicalViewQuery, OperationResult> {
     let mut request =
@@ -367,7 +364,11 @@ pub(crate) fn prepare_hosted_canonical_view(
     if input.get("context") == Some(&Value::Null) {
         request.context = Some(None);
     }
-    prepare_canonical_view_query(document, &request)
+    let raw = Value::Object(record.frontmatter.clone());
+    let effective = || effective_frontmatter(collection, &record.types, &raw);
+    let document = resolve_view_record(collection, &record.path, &record.types, effective)
+        .into_view(&record.path)?;
+    prepare_canonical_view_query(&document, &request)
 }
 
 pub(crate) fn verify_canonical_view_context(
@@ -422,7 +423,13 @@ fn execute_canonical(collection: &Collection, request: &ViewReferenceInput) -> O
             )
         }
     };
-    let document = read.frontmatter;
+    let effective = || read.effective_frontmatter.clone();
+    let document = match resolve_view_record(collection, &request.path, &read.types, effective)
+        .into_view(&request.path)
+    {
+        Ok(document) => document,
+        Err(result) => return result,
+    };
     let prepared = match prepare_canonical_view_query(&document, request) {
         Ok(prepared) => prepared,
         Err(result) => return result,
@@ -453,6 +460,7 @@ fn execute_canonical(collection: &Collection, request: &ViewReferenceInput) -> O
     result
 }
 
+/// `document` is a validated `mdbase.view` contract view from `resolve_view_record`.
 fn prepare_canonical_view_query(
     document: &Value,
     request: &ViewReferenceInput,
@@ -463,14 +471,6 @@ fn prepare_canonical_view_query(
             "This provider supports headless view execution.",
             Some(request.path.clone()),
         ));
-    }
-    let schema_diagnostics = validate_view(document, &request.path);
-    if !schema_diagnostics.is_empty() {
-        return Err(OperationResult {
-            valid: false,
-            result: json!({}),
-            diagnostics: schema_diagnostics,
-        });
     }
     let views = document
         .get("views")
