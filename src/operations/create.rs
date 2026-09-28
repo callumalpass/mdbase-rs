@@ -8,6 +8,7 @@ use crate::api::CreateRequest;
 use crate::api::{CollectionPath, Revision};
 use crate::errors::*;
 use crate::frontmatter;
+use crate::frontmatter::parser::{parse_record_for_rewrite, RecordFormat};
 use crate::frontmatter::serializer;
 use crate::generated::derive_path;
 use crate::matching::engine::matches_rules_checked_compiled;
@@ -71,8 +72,10 @@ impl Collection {
         } = prepared;
         let raw_document = membership.as_ref().and_then(|_| {
             exact_document.as_deref().map(|source| {
-                let (document, had_bom) =
-                    crate::frontmatter::parser::parse_document_for_rewrite(source);
+                let (document, had_bom) = parse_record_for_rewrite(
+                    RecordFormat::for_path(request.path.as_ref().map_or("", |path| path.as_str())),
+                    source,
+                );
                 (source.to_string(), document, had_bom)
             })
         });
@@ -424,6 +427,12 @@ impl Collection {
         let canonical_mapping = frontmatter::parser::json_to_yaml_mapping(
             &serde_json::Value::Object(write_obj.clone()),
         );
+        if RecordFormat::for_path(path.as_str()) == RecordFormat::YamlDocument && !body.is_empty() {
+            return Err(crate::mutation::MutationFailure::operation(
+                "invalid_request",
+                "A YAML document record has no body.".to_string(),
+            ));
+        }
         let content = match raw_document {
             Some((source, candidate, had_bom)) => {
                 let candidate_mapping = match candidate.frontmatter.as_ref() {
@@ -442,10 +451,20 @@ impl Collection {
                 if mapping_unchanged && candidate.body == body {
                     Ok(source)
                 } else {
-                    serializer::serialize_document_with_bom(had_bom, &yaml_mapping, body)
+                    serializer::serialize_record(
+                        RecordFormat::for_path(path.as_str()),
+                        had_bom,
+                        &yaml_mapping,
+                        body,
+                    )
                 }
             }
-            None => serializer::serialize_document(&canonical_mapping, body),
+            None => serializer::serialize_record(
+                RecordFormat::for_path(path.as_str()),
+                false,
+                &canonical_mapping,
+                body,
+            ),
         };
         let content = match content {
             Ok(content) => content,

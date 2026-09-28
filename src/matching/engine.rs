@@ -393,8 +393,8 @@ impl Collection {
             return true;
         }
 
-        // Check mdbase.yaml
-        if rel_path == "mdbase.yaml" {
+        // Collection control files are never records (spec Chapter 02).
+        if matches!(rel_path, "mdbase.yaml" | "mdbase.lock.yaml") {
             return true;
         }
 

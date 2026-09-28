@@ -1,5 +1,6 @@
 //! Backfill operation (§12.8).
 
+use crate::frontmatter::parser::{parse_record, RecordFormat};
 use std::collections::{HashMap, HashSet};
 
 use crate::errors::*;
@@ -324,14 +325,18 @@ impl Collection {
                 .outcome()
                 .document()
                 .and_then(|document| {
-                    crate::frontmatter::parser::parse_document(document)
+                    parse_record(RecordFormat::for_path(path), document)
                         .frontmatter
                         .and_then(|value| value.as_mapping().cloned())
                 })
                 .unwrap_or_default();
             let yaml_mapping = serializer::reconcile_json_object(&authored_mapping, &write_obj);
-            let output = match serializer::serialize_document_with_bom(had_bom, &yaml_mapping, body)
-            {
+            let output = match serializer::serialize_record(
+                RecordFormat::for_path(path),
+                had_bom,
+                &yaml_mapping,
+                body,
+            ) {
                 Ok(output) => output,
                 Err(error) => {
                     planning_failed += 1;

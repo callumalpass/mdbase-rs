@@ -859,6 +859,11 @@ fn shared_v03_core_write_fixture_passes() {
 }
 
 #[test]
+fn shared_v03_yaml_document_records_fixture_passes() {
+    run_suite("core/yaml-document-records.yaml", "core_collection", 6);
+}
+
+#[test]
 fn shared_v03_links_and_discovery_fixture_passes() {
     run_suite("core/links-and-discovery.yaml", "core_collection", 8);
 }

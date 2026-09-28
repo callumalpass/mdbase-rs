@@ -6,7 +6,9 @@ use crate::api::{
     ReadRequest, RecordDocument, RecordFile, Revision, Severity,
 };
 use crate::errors::*;
-use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json, FrontmatterState};
+use crate::frontmatter::parser::{
+    parse_record, yaml_mapping_to_json, FrontmatterState, RecordFormat,
+};
 use crate::operations::{ensure_safe_relative_path, readable_record_path};
 use crate::record_load::{InvalidRecordView, RecordLoadView};
 use crate::Collection;
@@ -155,7 +157,7 @@ fn evaluate_document(
     file_facts: RecordFileFacts,
     include_document: bool,
 ) -> TypedReadEvaluation {
-    let parsed = parse_document(&document);
+    let parsed = parse_record(RecordFormat::for_path(path), &document);
     let mut diagnostics = Vec::new();
     let persisted_frontmatter = match parsed.frontmatter_state() {
         FrontmatterState::InvalidYaml => {
@@ -394,7 +396,7 @@ impl Collection {
         file_facts: &RecordFileFacts,
         include_document: bool,
     ) -> serde_json::Value {
-        let doc = parse_document(content);
+        let doc = parse_record(RecordFormat::for_path(path), content);
 
         // Get frontmatter as JSON
         let mut warnings: Vec<serde_json::Value> = Vec::new();

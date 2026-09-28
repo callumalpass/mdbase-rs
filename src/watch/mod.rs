@@ -16,6 +16,7 @@ pub use real::{CollectionWatcher, WatchError};
 pub(crate) use real::{LinearizationPoint, LinearizationRace, WatcherTestControl};
 pub(crate) use real::{ReconciliationToken, WatcherEpoch};
 
+use crate::frontmatter::parser::{parse_record, RecordFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -222,7 +223,7 @@ fn read_raw_frontmatter_ordered(
         Ok(c) => c,
         Err(_) => return vec![],
     };
-    let doc = crate::frontmatter::parser::parse_document(&content);
+    let doc = parse_record(RecordFormat::for_path(rel_path), &content);
     match &doc.frontmatter {
         Some(serde_yaml::Value::Mapping(m)) => m
             .iter()

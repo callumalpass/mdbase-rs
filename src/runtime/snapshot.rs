@@ -1,4 +1,6 @@
-use crate::frontmatter::parser::{parse_document, yaml_mapping_to_json, FrontmatterState};
+use crate::frontmatter::parser::{
+    parse_record, yaml_mapping_to_json, FrontmatterState, RecordFormat,
+};
 use crate::operations::{ensure_safe_relative_path, readable_record_path};
 use crate::record_load::RecordLoadOutcome;
 use crate::Collection;
@@ -78,6 +80,7 @@ impl Collection {
         } else if extension == Some("json") && is_schema_resource_path(portable) {
             Some(CollectionSnapshotResourceKind::Schema)
         } else if extension == Some("base")
+            && !self.is_valid_extension(portable)
             && !crate::record_path::has_hidden_component(portable)
             && crate::views::is_configured_obsidian_source(self, portable)
         {
@@ -367,7 +370,7 @@ pub(crate) fn materialize_snapshot_record(
     path: &str,
     document: String,
 ) -> CollectionSnapshotRecord {
-    let parsed = parse_document(&document);
+    let parsed = parse_record(RecordFormat::for_path(path), &document);
     let (frontmatter, body, frontmatter_error) = match parsed.frontmatter_state() {
         FrontmatterState::Absent => (Map::new(), parsed.body, None),
         FrontmatterState::Mapping(mapping) => (

@@ -277,7 +277,19 @@ fn obsidian_documents(
     collection: &Collection,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<ViewDocumentDescriptor> {
-    obsidian_source_paths(collection)
+    let mut paths = obsidian_source_paths(collection);
+    if let Ok((snapshot, _)) = collection.load_query_data_profiled(false, false) {
+        paths.extend(
+            snapshot
+                .records
+                .iter()
+                .filter(|record| super::implements_base_contract(collection, &record.type_names))
+                .map(|record| PathBuf::from(&record.rel_path)),
+        );
+    }
+    paths.sort();
+    paths.dedup();
+    paths
         .into_iter()
         .filter_map(|path| {
             let relative = path.to_string_lossy().replace('\\', "/");
@@ -652,10 +664,15 @@ fn execute_obsidian(collection: &Collection, request: &ViewReferenceInput) -> Op
             }
         }
     };
-    if !obsidian_source_paths(collection).contains(&relative) {
+    let base_record = || {
+        let request = crate::api::ReadRequest::new(relative.to_string_lossy().as_ref()).ok()?;
+        let read = collection.typed().ok()?.read(request).ok()?.value;
+        Some(super::implements_base_contract(collection, &read.types))
+    };
+    if !obsidian_source_paths(collection).contains(&relative) && base_record() != Some(true) {
         return failed(
             "view_not_found",
-            "The requested Obsidian Base is not enabled by collection configuration.",
+            "The requested Obsidian Base is neither a configured source nor a record implementing obsidian.base.",
             Some(request.path.clone()),
         );
     }

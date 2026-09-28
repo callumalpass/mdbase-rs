@@ -5,7 +5,7 @@ use crate::api::operations::{UpdateInput, UpdateOutput};
 #[cfg(feature = "legacy-collection-mutation")]
 use crate::api::{CollectionPath, Revision, UpdateRequest};
 use crate::errors::*;
-use crate::frontmatter::parser::{parse_document_for_rewrite, yaml_mapping_to_json};
+use crate::frontmatter::parser::{parse_record_for_rewrite, yaml_mapping_to_json, RecordFormat};
 use crate::frontmatter::serializer;
 use crate::mutation::{PlannedRecord, PreparedUpdate};
 use crate::operations::mutation_record_path_diagnostic;
@@ -195,7 +195,10 @@ impl Collection {
                 format!("File '{}' was modified externally", path.as_str()),
             ));
         }
-        let replacement = document.as_deref().map(parse_document_for_rewrite);
+        let format = RecordFormat::for_path(path.as_str());
+        let replacement = document
+            .as_deref()
+            .map(|document| parse_record_for_rewrite(format, document));
         let existing = match loaded {
             crate::record_load::RecordLoadOutcome::Parsed {
                 document, layout, ..
@@ -206,7 +209,10 @@ impl Collection {
             crate::record_load::RecordLoadOutcome::Invalid {
                 state: crate::record_load::InvalidRecordState::Frontmatter { document: raw, .. },
                 ..
-            } => Some(parse_document_for_rewrite(&raw)),
+            } => Some(parse_record_for_rewrite(
+                RecordFormat::for_path(path.as_str()),
+                &raw,
+            )),
             crate::record_load::RecordLoadOutcome::Invalid {
                 state: crate::record_load::InvalidRecordState::InvalidUtf8,
                 ..
@@ -384,7 +390,13 @@ impl Collection {
             let had_bom = replacement
                 .as_ref()
                 .map_or(existing_had_bom, |(_, had_bom)| *had_bom);
-            serializer::serialize_document_with_bom(had_bom, &write_mapping, body)
+            if format == RecordFormat::YamlDocument && !body.is_empty() {
+                return Err(crate::mutation::MutationFailure::operation(
+                    "invalid_request",
+                    "A YAML document record has no body.".to_string(),
+                ));
+            }
+            serializer::serialize_record(format, had_bom, &write_mapping, body)
         };
         let output = match output {
             Ok(output) => output,

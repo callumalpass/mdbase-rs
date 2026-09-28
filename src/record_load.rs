@@ -6,7 +6,7 @@ use std::time::UNIX_EPOCH;
 use serde_json::{json, Value};
 
 use crate::frontmatter::parser::{
-    parse_document_layout, yaml_mapping_to_json, FrontmatterState, ParsedDocumentLayout,
+    parse_record_layout, yaml_mapping_to_json, FrontmatterState, ParsedDocumentLayout, RecordFormat,
 };
 use crate::runtime::{OperationContext, ProviderError};
 use crate::{Collection, OperationCancellation};
@@ -509,7 +509,7 @@ fn classify_bytes(
             };
         }
     };
-    let layout = parse_document_layout(&document);
+    let layout = parse_record_layout(RecordFormat::for_path(rel_path), &document);
     let raw_frontmatter = match layout.frontmatter_state() {
         FrontmatterState::Absent => json!({}),
         FrontmatterState::Mapping(mapping) => yaml_mapping_to_json(mapping),
