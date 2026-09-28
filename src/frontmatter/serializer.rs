@@ -58,6 +58,29 @@ pub fn serialize_document_with_bom(
     }
 }
 
+/// Serialize a record in its format. A YAML document has no body.
+pub fn serialize_record(
+    format: super::parser::RecordFormat,
+    had_bom: bool,
+    frontmatter: &serde_yaml::Mapping,
+    body: &str,
+) -> Result<String, FrontmatterSerializationError> {
+    match format {
+        super::parser::RecordFormat::Markdown => {
+            serialize_document_with_bom(had_bom, frontmatter, body)
+        }
+        super::parser::RecordFormat::YamlDocument => {
+            assert!(body.is_empty(), "YAML document records have no body");
+            let yaml = serde_yaml::to_string(&YamlValue::Mapping(frontmatter.clone()))?;
+            Ok(if had_bom {
+                format!("\u{FEFF}{yaml}")
+            } else {
+                yaml
+            })
+        }
+    }
+}
+
 fn serialize_inner(
     frontmatter: &serde_yaml::Mapping,
     body: &str,

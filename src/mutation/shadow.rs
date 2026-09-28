@@ -332,7 +332,7 @@ fn should_copy_file(collection: &Collection, relative: &Path, schemas: &BTreeSet
     {
         return matches!(extension, Some("md" | "yaml" | "yml"));
     }
-    if extension == Some("base") {
+    if extension == Some("base") && !collection.is_valid_extension(&portable_path(relative)) {
         let relative = portable_path(relative);
         return !collection.is_excluded(&relative)
             && crate::views::is_configured_obsidian_source(collection, &relative);

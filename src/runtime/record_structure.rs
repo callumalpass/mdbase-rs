@@ -21,7 +21,7 @@ use crate::expressions::evaluator::{
     extract_embeds_from_body, extract_links_from_body, extract_tags_from_body,
     strip_code_blocks_and_inline_code,
 };
-use crate::frontmatter::parser::{parse_document, yaml_to_json, FrontmatterState};
+use crate::frontmatter::parser::{parse_record, yaml_to_json, FrontmatterState, RecordFormat};
 use crate::links::parser::normalize_link_path;
 
 /// Version of the provider-neutral structural envelope.
@@ -133,7 +133,7 @@ impl RecordStructureParser {
     }
 
     pub fn parse(&self, document: &str) -> RecordStructure {
-        let parsed = parse_document(document);
+        let parsed = parse_record(RecordFormat::for_path(&self.path), document);
         let mut occurrences = Vec::new();
 
         if let FrontmatterState::Mapping(mapping) = parsed.frontmatter_state() {

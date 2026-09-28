@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Added
+
+- YAML document records (spec `b3883f9`): a record's format is fixed by its
+  extension, and `base` files listed in `record_extensions` are records whose
+  whole file is the frontmatter, with no body. Read, query, validation,
+  snapshots, and every write path parse and serialize by format; a body for a
+  YAML document record is `invalid_request`, and a whole-document `update` is
+  written exactly as supplied. `mdbase.lock.yaml` is never a record.
+- Obsidian Bases as records: a `.base` record whose type implements
+  `obsidian.base` is listed and executed as a saved view alongside configured
+  `x-obsidian.bases.include` sources, and is written with the ordinary record
+  operations. Hosted Bases execution still uses configured sources.
+
 ### Changed
 
 - Saved views are identified through the `mdbase.view` record contract rather

@@ -9,7 +9,7 @@ use crate::api::{
 };
 use crate::diagnostic::Diagnostic;
 use crate::frontmatter::parser::{
-    parse_document_for_rewrite, yaml_mapping_to_json, FrontmatterState,
+    parse_record_for_rewrite, yaml_mapping_to_json, FrontmatterState, RecordFormat,
 };
 use crate::frontmatter::serializer;
 use crate::record_load::RecordLoadOutcome;
@@ -140,7 +140,8 @@ pub(crate) fn prepare_update(
                 serializer::reconcile_json_object(authored, &lifecycle)
             });
             request.document = Some(
-                serializer::serialize_document_with_bom(
+                serializer::serialize_record(
+                    RecordFormat::for_path(path.as_str()),
                     candidate.had_bom,
                     &mapping,
                     &candidate.body,
@@ -471,7 +472,7 @@ struct Candidate {
 }
 
 fn classify_document(source: &str, path: &str) -> Result<Candidate, Vec<Diagnostic>> {
-    let (document, had_bom) = parse_document_for_rewrite(source);
+    let (document, had_bom) = parse_record_for_rewrite(RecordFormat::for_path(path), source);
     let (frontmatter, authored) = match document.frontmatter_state() {
         FrontmatterState::Absent => (Map::new(), None),
         FrontmatterState::Mapping(mapping) => (

@@ -18,6 +18,20 @@ use serde_json::{json, Value};
 
 pub(crate) const VIEW_CONTRACT: &str = "mdbase.view";
 const VIEW_CONTRACT_VERSION: &str = "1.0.0";
+const BASE_CONTRACT: &str = "obsidian.base";
+const BASE_CONTRACT_VERSION: &str = "1.0.0";
+
+/// Whether a record with these matched types is an Obsidian Base stored as a
+/// record: one of its types implements `obsidian.base` (spec Obsidian Bases
+/// adapter, "Bases as records").
+pub(crate) fn implements_base_contract(collection: &Collection, types: &[String]) -> bool {
+    let implementing = collection
+        .data_contracts
+        .implementations(BASE_CONTRACT, BASE_CONTRACT_VERSION);
+    types
+        .iter()
+        .any(|name| implementing.iter().any(|entry| &entry.type_name == name))
+}
 
 /// A record resolved through the `mdbase.view` record contract (spec Chapter 11).
 pub(crate) enum ViewRecord {
