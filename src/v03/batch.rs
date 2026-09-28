@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -547,44 +547,75 @@ fn copy_sparse_controls(
     captured_entries: &mut u64,
     resource_entries: &mut u64,
 ) -> Result<(), ProviderError> {
-    for relative in ["mdbase.yaml", "mdbase.lock.yaml"] {
-        if collection.held_root().exists_file(Path::new(relative)) {
-            *captured_entries = checked_capture_increment(*captured_entries)?;
-            *resource_entries = checked_capture_increment(*resource_entries)?;
-            context.check_entries(*captured_entries)?;
-            context.check_resource_entries(*resource_entries)?;
-            let bytes = read_held_bounded(collection, Path::new(relative), context)?;
-            fs::write(destination.join(relative), bytes)
-                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-        }
-    }
+    let mut paths = ["mdbase.yaml", "mdbase.lock.yaml"]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| collection.held_root().exists_file(path))
+        .collect::<Vec<_>>();
     for folder in [
         collection.settings.types_folder.as_str(),
         collection.settings.contracts_folder.as_str(),
-        "_schemas",
     ] {
-        let paths = collection
-            .held_root()
-            .files_recursive(Path::new(folder))
-            .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-        for relative in paths {
-            context.check()?;
-            *captured_entries = checked_capture_increment(*captured_entries)?;
-            *resource_entries = checked_capture_increment(*resource_entries)?;
-            context.check_entries(*captured_entries)?;
-            context.check_resource_entries(*resource_entries)?;
-            context.check_depth(relative.components().count().saturating_sub(1) as u64)?;
-            let target = destination.join(&relative);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
-            }
-            let bytes = read_held_bounded(collection, &relative, context)?;
-            fs::write(&target, bytes)
-                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+        paths.extend(
+            collection
+                .held_root()
+                .files_recursive(Path::new(folder))
+                .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?,
+        );
+    }
+    // Definitions reach their schemas through relative references, which may
+    // point anywhere in the collection; copy exactly what they reference.
+    let mut schemas = crate::definition_stage::SchemaDependencies::default();
+    let mut copy = |relative: &Path| {
+        copy_sparse_resource(
+            collection,
+            destination,
+            relative,
+            context,
+            captured_entries,
+            resource_entries,
+        )
+    };
+    for relative in &paths {
+        let bytes = copy(relative)?;
+        schemas.extend(crate::definition_stage::schema_dependencies(
+            relative, &bytes,
+        ));
+    }
+    schemas
+        .stage_directories(collection.held_root(), destination)
+        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+    for relative in &schemas.files {
+        // A missing reference stays the canonical parser's diagnostic.
+        if !destination.join(relative).is_file() && collection.held_root().exists_file(relative) {
+            copy(relative)?;
         }
     }
     Ok(())
+}
+
+fn copy_sparse_resource(
+    collection: &Collection,
+    destination: &Path,
+    relative: &Path,
+    context: &OperationContext,
+    captured_entries: &mut u64,
+    resource_entries: &mut u64,
+) -> Result<Vec<u8>, ProviderError> {
+    context.check()?;
+    *captured_entries = checked_capture_increment(*captured_entries)?;
+    *resource_entries = checked_capture_increment(*resource_entries)?;
+    context.check_entries(*captured_entries)?;
+    context.check_resource_entries(*resource_entries)?;
+    context.check_depth(relative.components().count().saturating_sub(1) as u64)?;
+    let target = destination.join(relative);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+    }
+    let bytes = read_held_bounded(collection, relative, context)?;
+    fs::write(&target, &bytes).map_err(|error| ProviderError::CollectionOpen(error.to_string()))?;
+    Ok(bytes)
 }
 
 fn checked_capture_increment(value: u64) -> Result<u64, ProviderError> {

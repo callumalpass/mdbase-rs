@@ -1,6 +1,6 @@
 {
   "rustSourceFileCountMax": 191,
-  "rustSourceLineCountMax": 105832,
+  "rustSourceLineCountMax": 105863,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-architecture-check/src/main.rs": 1188,
@@ -24,7 +24,7 @@
     "src/api/typed.rs": 1089,
     "src/transactions.rs": 1029,
     "src/transactions/runtime.rs": 2746,
-    "src/v03/batch.rs": 1532,
+    "src/v03/batch.rs": 1563,
     "src/v03/collection_setup.rs": 1791,
     "src/v03/type_pack.rs": 2236,
     "src/views/execute.rs": 1374,
@@ -69,7 +69,7 @@
     "src/runtime/hosted_validation.rs": {"std::fs": 3, "tempfile": 1},
     "src/transactions.rs": {"std::fs::File": 3},
     "src/types/loader.rs": {"std::fs": 3},
-    "src/v03/batch.rs": {"std::fs": 6, "tempfile": 1},
+    "src/v03/batch.rs": {"std::fs": 5, "tempfile": 1},
     "src/v03/collection_setup.rs": {"std::fs": 5},
     "src/v03/mod.rs": {"std::fs": 4, "walkdir": 4},
     "src/v03/type_pack.rs": {"std::fs": 6},
