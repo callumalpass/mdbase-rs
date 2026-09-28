@@ -155,7 +155,10 @@ fn evaluate_document(
     file_facts: RecordFileFacts,
     include_document: bool,
 ) -> TypedReadEvaluation {
-    let parsed = parse_document(&document);
+    let parsed = crate::frontmatter::parser::parse_record(
+        crate::frontmatter::parser::RecordFormat::for_path(path),
+        &document,
+    );
     let mut diagnostics = Vec::new();
     let persisted_frontmatter = match parsed.frontmatter_state() {
         FrontmatterState::InvalidYaml => {
@@ -394,7 +397,10 @@ impl Collection {
         file_facts: &RecordFileFacts,
         include_document: bool,
     ) -> serde_json::Value {
-        let doc = parse_document(content);
+        let doc = crate::frontmatter::parser::parse_record(
+            crate::frontmatter::parser::RecordFormat::for_path(path),
+            content,
+        );
 
         // Get frontmatter as JSON
         let mut warnings: Vec<serde_json::Value> = Vec::new();

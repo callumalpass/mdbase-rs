@@ -133,7 +133,10 @@ impl RecordStructureParser {
     }
 
     pub fn parse(&self, document: &str) -> RecordStructure {
-        let parsed = parse_document(document);
+        let parsed = crate::frontmatter::parser::parse_record(
+            crate::frontmatter::parser::RecordFormat::for_path(&self.path),
+            document,
+        );
         let mut occurrences = Vec::new();
 
         if let FrontmatterState::Mapping(mapping) = parsed.frontmatter_state() {

@@ -509,7 +509,10 @@ fn classify_bytes(
             };
         }
     };
-    let layout = parse_document_layout(&document);
+    let layout = crate::frontmatter::parser::parse_record_layout(
+        crate::frontmatter::parser::RecordFormat::for_path(rel_path),
+        &document,
+    );
     let raw_frontmatter = match layout.frontmatter_state() {
         FrontmatterState::Absent => json!({}),
         FrontmatterState::Mapping(mapping) => yaml_mapping_to_json(mapping),

@@ -71,8 +71,12 @@ impl Collection {
         } = prepared;
         let raw_document = membership.as_ref().and_then(|_| {
             exact_document.as_deref().map(|source| {
-                let (document, had_bom) =
-                    crate::frontmatter::parser::parse_document_for_rewrite(source);
+                let (document, had_bom) = crate::frontmatter::parser::parse_record_for_rewrite(
+                    crate::frontmatter::parser::RecordFormat::for_path(
+                        request.path.as_ref().map_or("", |path| path.as_str()),
+                    ),
+                    source,
+                );
                 (source.to_string(), document, had_bom)
             })
         });
@@ -442,10 +446,20 @@ impl Collection {
                 if mapping_unchanged && candidate.body == body {
                     Ok(source)
                 } else {
-                    serializer::serialize_document_with_bom(had_bom, &yaml_mapping, body)
+                    serializer::serialize_record(
+                        crate::frontmatter::parser::RecordFormat::for_path(path.as_str()),
+                        had_bom,
+                        &yaml_mapping,
+                        body,
+                    )
                 }
             }
-            None => serializer::serialize_document(&canonical_mapping, body),
+            None => serializer::serialize_record(
+                crate::frontmatter::parser::RecordFormat::for_path(path.as_str()),
+                false,
+                &canonical_mapping,
+                body,
+            ),
         };
         let content = match content {
             Ok(content) => content,

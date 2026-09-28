@@ -73,6 +73,54 @@ impl ParsedDocumentLayout {
     }
 }
 
+/// How a record file's bytes hold frontmatter and body, fixed by its extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordFormat {
+    /// Markdown with optional `---` frontmatter (§3).
+    Markdown,
+    /// The whole file is the frontmatter mapping; there is no body.
+    YamlDocument,
+}
+
+impl RecordFormat {
+    pub fn for_path(path: &str) -> Self {
+        match path.rsplit_once('.').map(|(_, extension)| extension) {
+            Some("base" | "yaml" | "yml") => Self::YamlDocument,
+            _ => Self::Markdown,
+        }
+    }
+}
+
+/// Parse a record in its format.
+pub fn parse_record(format: RecordFormat, content: &str) -> ParsedDocument {
+    parse_record_layout(format, content).into_parsed_document(content)
+}
+
+pub(crate) fn parse_record_for_rewrite(
+    format: RecordFormat,
+    content: &str,
+) -> (ParsedDocument, bool) {
+    let layout = parse_record_layout(format, content);
+    let had_bom = layout.had_bom();
+    (layout.into_parsed_document(content), had_bom)
+}
+
+pub(crate) fn parse_record_layout(format: RecordFormat, content: &str) -> ParsedDocumentLayout {
+    match format {
+        RecordFormat::Markdown => parse_document_layout(content),
+        RecordFormat::YamlDocument => {
+            let had_bom = content.starts_with('\u{FEFF}');
+            let source = &content[if had_bom { '\u{FEFF}'.len_utf8() } else { 0 }..];
+            ParsedDocumentLayout {
+                frontmatter: Some(parse_yaml_source(source)),
+                body_range: content.len()..content.len(),
+                has_frontmatter: true,
+                had_bom,
+            }
+        }
+    }
+}
+
 /// Parse a markdown document into frontmatter and body.
 pub fn parse_document(content: &str) -> ParsedDocument {
     parse_document_layout(content).into_parsed_document(content)
@@ -139,24 +187,24 @@ pub(crate) fn parse_document_layout(content: &str) -> ParsedDocumentLayout {
         0
     };
     let body_start = bom_len + after_close + newline_len;
-    let parsed_yaml = if yaml_source.trim().is_empty() {
-        Ok(YamlValue::Mapping(serde_yaml::Mapping::new()))
-    } else {
-        serde_yaml::from_str(yaml_source)
-    };
-    let frontmatter = Some(parsed_yaml.unwrap_or_else(|_| {
-        YamlValue::Tagged(Box::new(serde_yaml::value::TaggedValue {
-            tag: serde_yaml::value::Tag::new("!parse_error"),
-            value: YamlValue::String(yaml_source.to_string()),
-        }))
-    }));
-
     ParsedDocumentLayout {
-        frontmatter,
+        frontmatter: Some(parse_yaml_source(yaml_source)),
         body_range: body_start..content.len(),
         has_frontmatter: true,
         had_bom,
     }
+}
+
+fn parse_yaml_source(source: &str) -> YamlValue {
+    if source.trim().is_empty() {
+        return YamlValue::Mapping(serde_yaml::Mapping::new());
+    }
+    serde_yaml::from_str(source).unwrap_or_else(|_| {
+        YamlValue::Tagged(Box::new(serde_yaml::value::TaggedValue {
+            tag: serde_yaml::value::Tag::new("!parse_error"),
+            value: YamlValue::String(source.to_string()),
+        }))
+    })
 }
 
 pub fn is_parse_error(value: &YamlValue) -> bool {

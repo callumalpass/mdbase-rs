@@ -140,7 +140,8 @@ pub(crate) fn prepare_update(
                 serializer::reconcile_json_object(authored, &lifecycle)
             });
             request.document = Some(
-                serializer::serialize_document_with_bom(
+                serializer::serialize_record(
+                    crate::frontmatter::parser::RecordFormat::for_path(path.as_str()),
                     candidate.had_bom,
                     &mapping,
                     &candidate.body,
@@ -471,7 +472,10 @@ struct Candidate {
 }
 
 fn classify_document(source: &str, path: &str) -> Result<Candidate, Vec<Diagnostic>> {
-    let (document, had_bom) = parse_document_for_rewrite(source);
+    let (document, had_bom) = crate::frontmatter::parser::parse_record_for_rewrite(
+        crate::frontmatter::parser::RecordFormat::for_path(path),
+        source,
+    );
     let (frontmatter, authored) = match document.frontmatter_state() {
         FrontmatterState::Absent => (Map::new(), None),
         FrontmatterState::Mapping(mapping) => (

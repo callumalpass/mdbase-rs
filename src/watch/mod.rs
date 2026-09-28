@@ -222,7 +222,10 @@ fn read_raw_frontmatter_ordered(
         Ok(c) => c,
         Err(_) => return vec![],
     };
-    let doc = crate::frontmatter::parser::parse_document(&content);
+    let doc = crate::frontmatter::parser::parse_record(
+        crate::frontmatter::parser::RecordFormat::for_path(rel_path),
+        &content,
+    );
     match &doc.frontmatter {
         Some(serde_yaml::Value::Mapping(m)) => m
             .iter()

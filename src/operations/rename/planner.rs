@@ -102,7 +102,12 @@ impl Collection {
                     .as_ref()
                     .and_then(serde_yaml::Value::as_mapping)
                     .expect("changed frontmatter is a mapping");
-                serializer::serialize_document_with_bom(layout.had_bom(), mapping, &new_body)
+                serializer::serialize_record(
+                    crate::frontmatter::parser::RecordFormat::for_path(&execution_path),
+                    layout.had_bom(),
+                    mapping,
+                    &new_body,
+                )
             } else if doc.has_frontmatter {
                 // Preserve malformed/nonmapping or untouched mapping frontmatter
                 // exactly for body-only rewrites.

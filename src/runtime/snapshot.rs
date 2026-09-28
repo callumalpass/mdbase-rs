@@ -367,7 +367,10 @@ pub(crate) fn materialize_snapshot_record(
     path: &str,
     document: String,
 ) -> CollectionSnapshotRecord {
-    let parsed = parse_document(&document);
+    let parsed = crate::frontmatter::parser::parse_record(
+        crate::frontmatter::parser::RecordFormat::for_path(path),
+        &document,
+    );
     let (frontmatter, body, frontmatter_error) = match parsed.frontmatter_state() {
         FrontmatterState::Absent => (Map::new(), parsed.body, None),
         FrontmatterState::Mapping(mapping) => (
