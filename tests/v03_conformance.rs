@@ -875,7 +875,7 @@ fn shared_v03_cel_fixture_passes() {
 
 #[test]
 fn shared_v03_saved_views_fixture_passes() {
-    run_suite("views/view-records.yaml", "views", 17);
+    run_suite("views/view-records.yaml", "views", 20);
 }
 
 #[test]

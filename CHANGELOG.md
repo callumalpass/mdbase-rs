@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Saved views are identified through the `mdbase.view` record contract rather
+  than the `view` type name or `type: view` frontmatter. Listing, execution,
+  hosted planning, snapshot classification, and view-source validation all
+  read the record's `mdbase.view` contract view, so an implementing type may
+  use any name, match rule, and field mapping. A record matching several
+  implementing types reports `invalid_view`; `type: view` records without an
+  implementing type are no longer views.
+
 ## 0.4.0-rc.5 - 2026-09-27
 
 ### Changed

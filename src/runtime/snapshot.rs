@@ -250,7 +250,7 @@ fn collection_snapshot(
                 continue;
             }
         };
-        if path.ends_with(".md") && is_canonical_view(&record) {
+        if path.ends_with(".md") && is_canonical_view(collection, &record) {
             resources.push(CollectionSnapshotResource {
                 path: record.path,
                 kind: CollectionSnapshotResourceKind::View,
@@ -287,17 +287,14 @@ fn collection_snapshot(
     })
 }
 
-fn is_canonical_view(record: &CollectionSnapshotRecord) -> bool {
+fn is_canonical_view(collection: &Collection, record: &CollectionSnapshotRecord) -> bool {
+    let raw = Value::Object(record.frontmatter.clone());
+    let effective = || crate::views::effective_frontmatter(collection, &record.types, &raw);
     record.frontmatter_error.is_none()
-        // The view schema requires this exact discriminator. Ordinary notes
-        // must not compile and run the complete view validator on every scan.
-        && record.frontmatter.get("type").and_then(Value::as_str) == Some("view")
-        && !crate::v03::validate_view(
-            &Value::Object(record.frontmatter.clone()),
-            record.path.as_str(),
+        && matches!(
+            crate::views::resolve_view_record(collection, &record.path, &record.types, effective),
+            crate::views::ViewRecord::View(_)
         )
-        .iter()
-        .any(|diagnostic| diagnostic.severity == "error")
 }
 
 enum SnapshotRecordLoad {
