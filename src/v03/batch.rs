@@ -56,6 +56,11 @@ fn pause_sparse_preparation(root: &Path) {
     }
 }
 
+#[path = "batch_definitions.rs"]
+mod definitions;
+pub(crate) use definitions::definition_workspace;
+use definitions::prepare_definition_runtime;
+
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum RuntimeSinglePreparation {
     NoMutation(CanonicalOperationOutcome),
@@ -86,6 +91,9 @@ pub(crate) fn prepare_single_runtime(
     }
     if operation == "apply_collection_setup" {
         return super::collection_setup::prepare_runtime(collection, input, context);
+    }
+    if matches!(operation, "create_type" | "update_type" | "apply_type_pack") {
+        return prepare_definition_runtime(collection, operation, input, context);
     }
 
     let before = collection.snapshot_with_context(context)?;
@@ -204,27 +212,11 @@ fn execute_non_record_runtime_operation(
         "delete_view_source" => operations.delete_view_source(input),
         "create_type" => operations.create_type(input),
         "update_type" => operations.update_type(input),
-        "apply_type_pack" => execute_type_pack(operations.collection(), input),
         _ => failed(vec![Diagnostic::error(
             "invalid_request",
             format!("Unsupported mutation operation '{operation}'."),
             None,
         )]),
-    }
-}
-
-fn execute_type_pack(collection: &Collection, input: &Value) -> OperationResult {
-    let provision = input
-        .get("provision")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<super::TypePackProvision>(value).ok());
-    let options = input
-        .get("options")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<super::TypePackApplyOptions>(value).ok());
-    match (provision, options) {
-        (Some(provision), Some(options)) => collection.apply_type_pack(&provision, &options),
-        _ => invalid_request("Type-pack apply input requires valid provision and options."),
     }
 }
 
@@ -547,7 +539,7 @@ fn copy_sparse_controls(
     captured_entries: &mut u64,
     resource_entries: &mut u64,
 ) -> Result<(), ProviderError> {
-    let mut paths = ["mdbase.yaml", "mdbase.lock.yaml"]
+    let mut paths = ["mdbase.yaml", "mdbase.lock.yaml", "mdbase.provisions.yaml"]
         .into_iter()
         .map(PathBuf::from)
         .filter(|path| collection.held_root().exists_file(path))

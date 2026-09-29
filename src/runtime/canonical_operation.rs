@@ -1496,9 +1496,7 @@ mod tests {
                 "provision_digest": "sha256:p", "collection_revision": "sha256:c",
                 "final_collection_revision": "sha256:c", "configuration": [],
                 "type_packs": [], "final_resource_revisions": {},
-                "baseline_diagnostic_count": 0, "final_diagnostic_count": 0,
-                "resolved_diagnostic_count": 0, "introduced_diagnostic_count": 0,
-                "baseline_diagnostic_digest": "sha256:b", "assessment_digest": "sha256:a"
+                "assessment_digest": "sha256:a"
             }),
         );
         assert!(matches!(

@@ -97,6 +97,10 @@ struct ManifestResource {
 #[path = "type_pack_seed_upgrade.rs"]
 mod seed_upgrade;
 
+#[path = "type_pack_staging.rs"]
+mod staging;
+pub(crate) use staging::{definition_targets, stage_reviewed_type_pack};
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct TypePackReceiptResource {
     kind: String,
@@ -172,39 +176,29 @@ impl Collection {
         provision: &TypePackProvision,
         options: &TypePackApplyOptions,
     ) -> OperationResult {
-        let assessment_options = TypePackAssessmentOptions {
-            installed_by: options.installed_by.clone(),
-            adopt_resources: options.adopt_resources.clone(),
-            preserve_seed_targets: options.preserve_seed_targets.clone(),
-            target_overrides: options.target_overrides.clone(),
-            contract_setups: options.contract_setups.clone(),
+        let context = crate::runtime::OperationContext::current_or_legacy();
+        let staged = match stage_reviewed_type_pack(self, provision, options, &context) {
+            Ok(Ok(staged)) => staged,
+            Ok(Err(rejected)) => return rejected,
+            Err(error) => return pack_diagnostic(error.code(), error.to_string()),
         };
-        let plan = match plan_type_pack(self, provision, &assessment_options) {
-            Ok(plan) => plan,
-            Err(diagnostic) => return failed(vec![*diagnostic]),
+        let commit = match crate::transactions::commit_migration(
+            self,
+            &staged.workspace.baseline,
+            &staged.desired,
+        ) {
+            Ok(commit) => commit,
+            Err(error) => return pack_diagnostic(error.code(), error.to_string()),
         };
-        if plan.assessment_digest != options.expected_assessment_digest {
+        if let Err(error) = self.reopen_held(true) {
             return pack_diagnostic(
-                "concurrent_modification",
-                "The managed type-pack assessment is stale. Assess the collection again before applying it.",
+                "type_pack_apply_failed",
+                format!("The committed type pack could not be reopened: {error:?}"),
             );
         }
-        if plan.assessment["applicable"].as_bool() != Some(true) {
-            let reason = plan
-                .resources
-                .iter()
-                .find(|resource| resource.action == "conflict")
-                .and_then(|resource| resource.reason.as_deref())
-                .unwrap_or("The managed type pack has unresolved conflicts.");
-            return pack_diagnostic("type_pack_conflict", reason);
-        }
-        if plan.assessment["status"].as_str() == Some("downgrade") && !options.allow_downgrade {
-            return pack_diagnostic(
-                "type_pack_downgrade",
-                "A managed type-pack downgrade requires explicit approval.",
-            );
-        }
-        apply_type_pack_plan(self, plan)
+        let mut result = staged.result;
+        result.result["cleanup_deferred"] = Value::Bool(commit.cleanup_deferred);
+        result
     }
 }
 
@@ -741,51 +735,6 @@ pub(crate) fn plan_type_pack(
         resources: planned,
         contract_setup,
     })
-}
-
-fn apply_type_pack_plan(collection: &Collection, plan: TypePackPlan) -> OperationResult {
-    let mut shadow = match mutation_shadow::shadow_collection(collection) {
-        Ok(shadow) => shadow,
-        Err(diagnostic) => return failed(vec![*diagnostic]),
-    };
-    if let Err(diagnostic) = stage_type_pack_plan(&mut shadow, &plan) {
-        return failed(vec![*diagnostic]);
-    }
-    let desired = match mutation_shadow::collect_collection_files(&shadow.collection) {
-        Ok(desired) => desired,
-        Err(diagnostic) => return failed(vec![*diagnostic]),
-    };
-    let commit = match crate::transactions::commit_migration(collection, &shadow.baseline, &desired)
-    {
-        Ok(commit) => commit,
-        Err(error) => return pack_diagnostic(error.code(), error.to_string()),
-    };
-    let _reopened = match collection.reopen_held(true) {
-        Ok(reopened) => reopened,
-        Err(error) => {
-            return pack_diagnostic(
-                "type_pack_apply_failed",
-                format!("The committed type pack could not be reopened: {error:?}"),
-            )
-        }
-    };
-    // Reopening verifies structural integrity. Record schema diagnostics are
-    // data quality signals and do not make a type-pack installation invalid.
-    let mut result = plan.assessment;
-    result["receipt"] = serde_json::to_value(
-        plan.next_lock
-            .packs
-            .iter()
-            .find(|receipt| receipt.id == result["desired"]["id"])
-            .expect("desired receipt retained"),
-    )
-    .expect("receipt serializes");
-    result["cleanup_deferred"] = Value::Bool(commit.cleanup_deferred);
-    OperationResult {
-        valid: true,
-        result,
-        diagnostics: Vec::new(),
-    }
 }
 
 pub(crate) fn stage_type_pack_plan(

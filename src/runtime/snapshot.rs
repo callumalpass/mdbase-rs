@@ -424,6 +424,188 @@ fn resource_revision(resources: &[CollectionSnapshotResource]) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
+/// The snapshot a definition mutation produces without re-reading records.
+///
+/// `baseline`/`desired` are the exact bytes the mutation changes. Every changed
+/// path must be a definition resource (configuration, lock, type, contract or
+/// schema), so no record's bytes differ from `before`: records are only
+/// reinterpreted under the `staged` definitions, which can move them into or
+/// out of the saved-view namespace. Configured `.base` view sources and the
+/// record extensions depend on `mdbase.yaml` alone, so files newly qualifying
+/// as either are discovered (and only those read) when it changes.
+pub(crate) fn definition_change_snapshot(
+    authority: &Collection,
+    before: &CollectionSnapshot,
+    staged: &Collection,
+    baseline: &crate::transactions::FileBaseline,
+    desired: &crate::transactions::FileBaseline,
+    context: &super::OperationContext,
+) -> Result<CollectionSnapshot, ProviderError> {
+    let mut resources = before
+        .resources
+        .iter()
+        .filter(|resource| resource.kind != CollectionSnapshotResourceKind::View)
+        .map(|resource| (resource.path.clone(), resource.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let changed = baseline
+        .keys()
+        .chain(desired.keys())
+        .filter(|path| baseline.get(*path) != desired.get(*path))
+        .collect::<BTreeSet<_>>();
+    for path in &changed {
+        let kind = if path.as_str() == "mdbase.yaml" {
+            CollectionSnapshotResourceKind::Configuration
+        } else {
+            match staged.structural_resource_kind(path) {
+                Some(kind) if kind != CollectionSnapshotResourceKind::View => kind,
+                _ => {
+                    return Err(ProviderError::Transaction {
+                        code: "definition_mutation_invariant",
+                        message: format!(
+                            "a definition mutation changed non-definition file {path}"
+                        ),
+                    })
+                }
+            }
+        };
+        match desired.get(*path) {
+            Some(bytes) => {
+                let document = String::from_utf8(bytes.clone()).map_err(|error| {
+                    ProviderError::CollectionOpen(format!("{path} is not valid UTF-8: {error}"))
+                })?;
+                resources.insert(
+                    (*path).clone(),
+                    CollectionSnapshotResource {
+                        path: (*path).clone(),
+                        kind,
+                        revision: crate::v03::revision(bytes),
+                        document,
+                    },
+                );
+            }
+            None => {
+                resources.remove(*path);
+            }
+        }
+    }
+    let configuration = resources.remove("mdbase.yaml").ok_or_else(|| {
+        ProviderError::CollectionOpen("definition mutation removed mdbase.yaml".to_string())
+    })?;
+
+    let mut views = Vec::new();
+    let mut added_records = Vec::new();
+    if changed.iter().any(|path| path.as_str() == "mdbase.yaml") {
+        for path in authority.scan_collection_all_relative_paths_context(context)? {
+            if staged.validate_record_path_after_traversal(&path).is_ok()
+                && authority
+                    .validate_record_path_after_traversal(&path)
+                    .is_err()
+            {
+                let file = read_resource_held(
+                    authority.held_root(),
+                    path.clone(),
+                    CollectionSnapshotResourceKind::View,
+                    context,
+                )?;
+                let mut record = materialize_snapshot_record(staged, &path, file.document);
+                record.revision = file.revision;
+                added_records.push(record);
+            }
+        }
+        for path in authority
+            .held_root()
+            .files_recursive(std::path::Path::new(""))
+            .map_err(|error| {
+                ProviderError::CollectionOpen(format!("failed to inspect resources: {error}"))
+            })?
+        {
+            context.check()?;
+            let portable = path.to_string_lossy().replace('\\', "/");
+            if portable.ends_with(".base")
+                && staged.structural_resource_kind(&portable)
+                    == Some(CollectionSnapshotResourceKind::View)
+            {
+                let known = before
+                    .resources
+                    .iter()
+                    .find(|resource| resource.path == portable)
+                    .cloned();
+                views.push(match known {
+                    Some(resource) => resource,
+                    None => read_resource_held(
+                        authority.held_root(),
+                        portable,
+                        CollectionSnapshotResourceKind::View,
+                        context,
+                    )?,
+                });
+            }
+        }
+    } else {
+        views.extend(
+            before
+                .resources
+                .iter()
+                .filter(|resource| {
+                    resource.kind == CollectionSnapshotResourceKind::View
+                        && !resource.path.ends_with(".md")
+                })
+                .cloned(),
+        );
+    }
+
+    let saved_views = before.resources.iter().filter(|resource| {
+        resource.kind == CollectionSnapshotResourceKind::View && resource.path.ends_with(".md")
+    });
+    let mut records = Vec::with_capacity(before.records.len());
+    for record in before
+        .records
+        .iter()
+        .cloned()
+        .map(|mut record| {
+            // As `materialize_snapshot_record` does: malformed frontmatter is
+            // captured as an empty mapping.
+            record.types = staged.determine_types_for_path(
+                &Value::Object(record.frontmatter.clone()),
+                Some(&record.path),
+            );
+            record
+        })
+        .chain(saved_views.map(|view| {
+            let mut record = materialize_snapshot_record(staged, &view.path, view.document.clone());
+            record.revision = view.revision.clone();
+            record
+        }))
+        .chain(added_records)
+    {
+        context.check()?;
+        if record.path.ends_with(".md") && is_canonical_view(staged, &record) {
+            views.push(CollectionSnapshotResource {
+                path: record.path,
+                kind: CollectionSnapshotResourceKind::View,
+                revision: record.revision,
+                document: record.document,
+            });
+        } else {
+            records.push(record);
+        }
+    }
+    records.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut resources = std::iter::once(configuration)
+        .chain(resources.into_values())
+        .chain(views)
+        .collect::<Vec<_>>();
+    resources[1..].sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(CollectionSnapshot {
+        revision: snapshot_revision(&resources, &records),
+        resource_revision: resource_revision(&resources),
+        spec_version: before.spec_version.clone(),
+        resources,
+        records,
+    })
+}
+
 fn read_resource_held(
     root: &crate::collection_root::CollectionRoot,
     path: String,

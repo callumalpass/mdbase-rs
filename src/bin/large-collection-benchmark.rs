@@ -184,20 +184,9 @@ fn assess(
             )
             .into());
         }
-        if value["introduced_diagnostic_count"].as_u64() != Some(0) {
-            return Err(format!(
-                "setup introduced {} diagnostics",
-                value["introduced_diagnostic_count"]
-            )
-            .into());
-        }
         Ok(value)
     })?;
-    emit(
-        json!({"event": "assessment", "phase": phase, "status": value["status"],
-        "baseline_diagnostic_count": value["baseline_diagnostic_count"],
-        "introduced_diagnostic_count": value["introduced_diagnostic_count"]}),
-    );
+    emit(json!({"event": "assessment", "phase": phase, "status": value["status"]}));
     Ok(value)
 }
 

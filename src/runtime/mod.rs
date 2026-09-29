@@ -123,7 +123,7 @@ pub use record_structure::{
     RecordStructureParser, StructuralLinkKind, StructuralOccurrence, StructuralResolution,
     StructuralSourceKind, RECORD_STRUCTURE_SCHEMA_VERSION,
 };
-pub(crate) use snapshot::is_schema_resource_path;
+pub(crate) use snapshot::{definition_change_snapshot, is_schema_resource_path};
 pub use snapshot::{
     CollectionSnapshot, CollectionSnapshotRecord, CollectionSnapshotResource,
     CollectionSnapshotResourceKind,
