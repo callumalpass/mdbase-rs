@@ -1,0 +1,113 @@
+kind: mdbase.conformance
+status: verified
+implementation:
+  id: mdbase-rs
+  name: mdbase Rust implementation
+  version: 0.4.0-rc.6
+  language: Rust
+  target: crate
+  url: https://github.com/callumalpass/mdbase-rs
+spec_version: 0.3.0
+profiles:
+  - core_read
+  - collection_semantics
+  - data_contracts
+  - cel
+  - cel_match
+  - cel_query
+  - links
+  - core_write
+  - type_packs
+  - lifecycle
+  - watch
+optional_features: []
+json_schema:
+  dialect: https://json-schema.org/draft/2020-12/schema
+  keywords:
+    - type
+    - required
+    - properties
+    - additionalProperties
+    - items
+    - enum
+    - const
+    - oneOf
+    - anyOf
+    - allOf
+    - if
+    - then
+    - else
+    - minimum
+    - maximum
+    - exclusiveMinimum
+    - exclusiveMaximum
+    - multipleOf
+    - minLength
+    - maxLength
+    - pattern
+    - minItems
+    - maxItems
+    - uniqueItems
+    - $defs
+    - $ref
+    - title
+    - description
+    - default
+    - examples
+  formats:
+    - date
+    - date-time
+    - time
+  remote_refs: false
+compatibility:
+  v0_2_read: true
+  v0_2_migrate: false
+limits:
+  external_schema_refs: false
+  schema_ref_roots:
+    - collection_root
+    - ancestor_pack_schemas/v0.3
+  operation_surface: v03_operations
+  cel_source_bytes: 65536
+  cel_ast_depth: 128
+  cel_evaluation_depth: 128
+  cel_evaluation_steps: 1000000
+  cel_as_file_hops: 10
+  cel_clock_scope: operation
+  watch_debounce: host_configurable
+evidence:
+  - kind: testbed_transcript
+    command: mdbase-testbed run --adapter command:cargo --adapter-arg run --adapter-arg --quiet --adapter-arg -p --adapter-arg mdbase-testbed-adapter --adapter-arg -- --evidence conformance/testbed-v0.1.json
+    result: pass
+    verified_at: "2026-09-27T05:08:18Z"
+    artifact: conformance/testbed-v0.1.json
+    environment: Linux x86_64, Rust 1.94.0, Node.js 22.22.0
+    testbed_protocol_version: "0.1"
+    scenario_ids:
+      - core.shared-contract-consumers
+      - runtime.competing-workers
+      - runtime.crash-recovery
+    evidence_digest: sha256:d5e11866b988b2915205c71a54042bc3991f475fe81b6242d6005b9ddbdc9831
+  - kind: conformance_suite
+    command: MDBASE_SPEC_REPO_DIR=/path/to/mdbase-spec MDBASE_SPEC_TESTS_DIR=/path/to/mdbase-spec/tests cargo test --locked --workspace --all-features
+    result: pass
+    verified_at: "2026-09-27T05:08:18Z"
+    artifact: tests/v03_conformance.rs
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: test_suite
+    command: MDBASE_SPEC_REPO_DIR=/path/to/mdbase-spec MDBASE_SPEC_TESTS_DIR=/path/to/mdbase-spec/tests cargo test --locked --workspace --all-features
+    result: pass
+    verified_at: "2026-09-27T05:08:18Z"
+    artifact: tests/v03_*_profiles.rs and tests/v03_lifecycle.rs
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: test_suite
+    command: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+    result: pass
+    verified_at: "2026-09-27T05:08:18Z"
+    environment: Linux x86_64, Rust 1.94.0
+  - kind: package_smoke
+    command: cargo package --locked --allow-dirty -p mdbase -p mdbase-command
+    result: pass
+    verified_at: "2026-09-27T05:08:18Z"
+    artifact: target/package/mdbase-0.4.0-rc.3.crate
+    environment: Linux x86_64, Rust 1.94.0

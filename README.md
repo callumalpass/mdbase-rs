@@ -3,7 +3,7 @@
 Typed Rust implementation of the [mdbase specification](https://mdbase.dev).
 The `0.4` releases are deliberate breaking API releases: canonical v0.3
 collection semantics sit behind typed requests, results, paths, revisions,
-diagnostics, and errors. `0.4.0-rc.5` implements mdbase spec v0.3.0-rc.4.
+diagnostics, and errors. `0.4.0-rc.6` implements mdbase spec v0.3.0-rc.4.
 
 It includes:
 
