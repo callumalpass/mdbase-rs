@@ -400,10 +400,20 @@ fn execute_shadow(
             )])
         })?;
     // Facts are bound to the committed entry while the transaction lock is held.
-    let facts = commit
-        .file_facts
-        .get(planned_path.as_str())
-        .expect("a committed planned record always has locked file facts");
+    // A write that leaves the record's bytes unchanged commits no entry; the
+    // file it describes is the one already on disk.
+    let facts = match commit.file_facts.get(planned_path.as_str()) {
+        Some(facts) => facts.clone(),
+        None => crate::transactions::record_file_facts(collection, planned_path.as_str()).map_err(
+            |error| {
+                canonical_error(vec![CanonicalDiagnostic::error(
+                    error.code(),
+                    error.to_string(),
+                    Some(planned_path.to_string()),
+                )])
+            },
+        )?,
+    };
     facts.attach_record_file(&mut outcome.value.file);
     Ok(outcome)
 }

@@ -478,7 +478,8 @@ impl Collection {
         conn: &Connection,
         path: &str,
     ) -> Result<Vec<String>, CacheError> {
-        let mut statement = conn.prepare("SELECT type_name FROM file_types WHERE path = ?1")?;
+        let mut statement =
+            conn.prepare_cached("SELECT type_name FROM file_types WHERE path = ?1")?;
         let rows = statement.query_map([path], |row| row.get::<_, String>(0))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(CacheError::from)

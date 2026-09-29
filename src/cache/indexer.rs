@@ -1,7 +1,7 @@
 //! File -> cache indexing.
 
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::cache::CacheError;
 use crate::expressions::evaluator::{
@@ -236,6 +236,16 @@ pub(crate) fn maintenance_expectation_still_current(
     })
 }
 
+/// Execute one statement through the connection's prepared-statement cache.
+/// Indexing runs the same few statements for every record.
+fn execute_cached<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+) -> rusqlite::Result<usize> {
+    conn.prepare_cached(sql)?.execute(params)
+}
+
 fn index_record_outcome(
     conn: &Connection,
     collection: &Collection,
@@ -256,7 +266,7 @@ fn index_record_outcome(
             ..
         } => {
             let reason = state.reason();
-            conn.execute(
+            execute_cached(conn,
                 "INSERT INTO files (path, mtime_ns, ctime_ns, size, frontmatter_json, body, effective_json, parse_error, source_revision, failure_reason) \
                  VALUES (?1, ?2, ?3, ?4, '{}', '', NULL, 1, ?5, ?6)",
                 rusqlite::params![
@@ -269,7 +279,8 @@ fn index_record_outcome(
                 ],
             )?;
             for type_name in type_names {
-                conn.execute(
+                execute_cached(
+                    conn,
                     "INSERT OR IGNORE INTO file_types (path, type_name) VALUES (?1, ?2)",
                     rusqlite::params![rel_path, type_name],
                 )?;
@@ -287,7 +298,7 @@ fn index_record_outcome(
             let body = layout.body(&document);
             let fm_str = serde_json::to_string(&raw_frontmatter)?;
             let eff_str = serde_json::to_string(&effective_frontmatter)?;
-            conn.execute(
+            execute_cached(conn,
                 "INSERT INTO files (path, mtime_ns, ctime_ns, size, frontmatter_json, body, effective_json, parse_error, source_revision, failure_reason) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, NULL)",
                 rusqlite::params![
@@ -302,7 +313,8 @@ fn index_record_outcome(
                 ],
             )?;
             for type_name in &type_names {
-                conn.execute(
+                execute_cached(
+                    conn,
                     "INSERT OR IGNORE INTO file_types (path, type_name) VALUES (?1, ?2)",
                     rusqlite::params![rel_path, type_name],
                 )?;
@@ -321,11 +333,24 @@ fn index_record_outcome(
                 &effective_frontmatter,
                 &type_names,
             )?;
+            for (kind, key) in crate::links::resolver::record_resolution_keys(
+                rel_path,
+                &effective_frontmatter,
+                &collection.resolution_keys(),
+            )
+            .unwrap_or_default()
+            {
+                conn.prepare_cached(
+                    "INSERT OR IGNORE INTO resolution_keys (kind, key, path) VALUES (?1, ?2, ?3)",
+                )?
+                .execute(rusqlite::params![kind.as_str(), key, rel_path])?;
+            }
             if let Some(value) = effective_frontmatter
                 .get(&collection.settings.id_field)
                 .and_then(canonical_unique_value)
             {
-                conn.execute(
+                execute_cached(
+                    conn,
                     "INSERT OR REPLACE INTO identity_values (value, path) VALUES (?1, ?2)",
                     rusqlite::params![value, rel_path],
                 )?;
@@ -359,7 +384,7 @@ fn insert_links(
     // Body links
     let body_links = extract_links_from_body(body);
     for raw in &body_links {
-        conn.execute(
+        execute_cached(conn,
             "INSERT INTO links (source_path, target_path, source_revision, resolved, location, field, raw_target) \
              VALUES (?1, ?2, ?3, 0, ?4, NULL, ?5)",
             rusqlite::params![rel_path, raw, source_revision, "body", raw],
@@ -369,7 +394,7 @@ fn insert_links(
     // Body embeds
     let body_embeds = extract_embeds_from_body(body);
     for raw in &body_embeds {
-        conn.execute(
+        execute_cached(conn,
             "INSERT INTO links (source_path, target_path, source_revision, resolved, location, field, raw_target) \
              VALUES (?1, ?2, ?3, 0, ?4, NULL, ?5)",
             rusqlite::params![rel_path, raw, source_revision, "body", raw],
@@ -382,7 +407,7 @@ fn insert_links(
             let mut targets = Vec::new();
             extract_links_from_fm_value(val, &mut targets);
             for raw in &targets {
-                conn.execute(
+                execute_cached(conn,
                     "INSERT INTO links (source_path, target_path, source_revision, resolved, location, field, raw_target) \
                      VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
                     rusqlite::params![rel_path, raw, source_revision, "frontmatter", field_name, raw],
@@ -431,7 +456,7 @@ fn insert_unique_values(
                         _ => serde_json::to_string(val).unwrap_or_default(),
                     };
                     if !val_str.is_empty() {
-                        conn.execute(
+                        execute_cached(conn,
                             "INSERT OR REPLACE INTO unique_values (type_name, field_name, value, path) \
                              VALUES (?1, ?2, ?3, ?4)",
                             rusqlite::params![type_name, field_reference, val_str, rel_path],
@@ -447,23 +472,33 @@ fn insert_unique_values(
 /// Remove a file (by relative path) from all cache tables.
 #[allow(dead_code)]
 pub(crate) fn remove_file(conn: &Connection, rel_path: &str) -> Result<(), CacheError> {
-    conn.execute(
+    execute_cached(
+        conn,
         "DELETE FROM links WHERE source_path = ?1",
         rusqlite::params![rel_path],
     )?;
-    conn.execute(
+    execute_cached(
+        conn,
         "DELETE FROM file_types WHERE path = ?1",
         rusqlite::params![rel_path],
     )?;
-    conn.execute(
+    execute_cached(
+        conn,
         "DELETE FROM unique_values WHERE path = ?1",
         rusqlite::params![rel_path],
     )?;
-    conn.execute(
+    execute_cached(
+        conn,
         "DELETE FROM identity_values WHERE path = ?1",
         rusqlite::params![rel_path],
     )?;
-    conn.execute(
+    execute_cached(
+        conn,
+        "DELETE FROM resolution_keys WHERE path = ?1",
+        rusqlite::params![rel_path],
+    )?;
+    execute_cached(
+        conn,
         "DELETE FROM files WHERE path = ?1",
         rusqlite::params![rel_path],
     )?;
@@ -490,50 +525,47 @@ fn resolve_links(
     collection: &Collection,
     sources: Option<&HashSet<String>>,
 ) -> Result<(), CacheError> {
-    let mut files = conn.prepare(
-        "SELECT path, COALESCE(effective_json, frontmatter_json) FROM files WHERE parse_error = 0",
-    )?;
-    let rows = files.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut resolution_records = Vec::new();
-    for row in rows {
-        let (path, frontmatter) = row?;
-        resolution_records.push(crate::expressions::evaluator::ResolvedFileData {
-            path,
-            frontmatter: serde_json::from_str(&frontmatter)?,
-            body: String::new(),
-        });
-    }
-    drop(files);
-    let resolution_index = collection.build_link_resolution_index(&resolution_records);
-    let frontmatter_by_path = resolution_records
-        .iter()
-        .map(|record| (record.path.as_str(), &record.frontmatter))
-        .collect::<HashMap<_, _>>();
-
-    let mut links = conn.prepare("SELECT rowid, source_path, field, raw_target FROM links")?;
-    let rows = links.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    let mut updates = Vec::new();
-    for row in rows {
-        let (rowid, source, field, raw) = row?;
-        if sources.is_some_and(|sources| !sources.contains(&source)) {
-            continue;
+    let mut rows = Vec::new();
+    match sources {
+        Some(sources) => {
+            let mut links = conn.prepare_cached(
+                "SELECT rowid, source_path, field, raw_target FROM links WHERE source_path = ?1",
+            )?;
+            for source in sources {
+                let mapped = links.query_map([source], link_row)?;
+                for row in mapped {
+                    rows.push(row?);
+                }
+            }
         }
+        None => {
+            let mut links =
+                conn.prepare("SELECT rowid, source_path, field, raw_target FROM links")?;
+            let mapped = links.query_map([], link_row)?;
+            for row in mapped {
+                rows.push(row?);
+            }
+        }
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let resolution_index = match sources {
+        Some(_) => load_candidate_resolution_index(conn, &rows)?,
+        None => load_resolution_index(conn)?,
+    };
+    let mut update =
+        conn.prepare_cached("UPDATE links SET target_path = ?1, resolved = ?2 WHERE rowid = ?3")?;
+    for (rowid, source, field, raw) in rows {
         let target_types = field
             .as_deref()
             .filter(|field| !field.is_empty())
             .and_then(|field| {
-                frontmatter_by_path.get(source.as_str()).map(|frontmatter| {
-                    collection.get_field_target_types_from_frontmatter(&source, field, frontmatter)
-                })
+                resolution_index
+                    .types_by_path
+                    .get(&source)
+                    .map(|types| collection.field_target_types(types, field))
             })
             .unwrap_or_default();
         let resolved = collection
@@ -541,20 +573,129 @@ fn resolve_links(
             .map_err(|error| {
                 CacheError::Resolution(format!("{}: {}", error.code, error.message))
             })?;
-        updates.push((rowid, raw, resolved));
-    }
-    drop(links);
-    for (rowid, raw, resolved) in updates {
-        conn.execute(
-            "UPDATE links SET target_path = ?1, resolved = ?2 WHERE rowid = ?3",
-            rusqlite::params![
-                resolved.as_deref().unwrap_or(&raw),
-                i64::from(resolved.is_some()),
-                rowid
-            ],
-        )?;
+        update.execute(rusqlite::params![
+            resolved.as_deref().unwrap_or(&raw),
+            i64::from(resolved.is_some()),
+            rowid
+        ])?;
     }
     Ok(())
+}
+
+type LinkRow = (i64, String, Option<String>, String);
+
+fn link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LinkRow> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+}
+
+/// The part of the resolution index that resolving `rows` reads: each source's
+/// indexed types, and every indexed record a target could name, from the
+/// `resolution_keys` table and exact paths. Resolution against this index
+/// equals resolution against the full index, because a lookup never reads
+/// keys or paths other than its own.
+fn load_candidate_resolution_index(
+    conn: &Connection,
+    rows: &[LinkRow],
+) -> Result<crate::links::resolver::LinkResolutionIndex, CacheError> {
+    use crate::links::resolver::{LinkResolutionIndex, ResolutionKeyKind, ResolutionLookup};
+
+    let mut index = LinkResolutionIndex::default();
+    let mut simple = HashSet::new();
+    let mut paths = HashSet::new();
+    for (_, source, _, raw) in rows {
+        paths.insert(source.clone());
+        match ResolutionLookup::of(raw, source) {
+            Some(ResolutionLookup::Simple(key)) => {
+                simple.insert(key);
+            }
+            Some(ResolutionLookup::Path(candidates)) => paths.extend(candidates),
+            None => {}
+        }
+    }
+    let mut by_key =
+        conn.prepare_cached("SELECT kind, path FROM resolution_keys WHERE key = ?1")?;
+    for key in &simple {
+        let mapped = by_key.query_map([key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in mapped {
+            let (kind, path) = row?;
+            let kind = ResolutionKeyKind::parse(&kind).ok_or_else(|| {
+                CacheError::Resolution(format!("unknown resolution key kind '{kind}'"))
+            })?;
+            index.insert_key(kind, key.clone(), &path);
+            index.known_paths.insert(path);
+        }
+    }
+    // A path is a candidate when it is a valid record: it then has a basename key.
+    let mut is_record = conn.prepare_cached(
+        "SELECT 1 FROM resolution_keys WHERE path = ?1 AND kind = 'basename' LIMIT 1",
+    )?;
+    let mut known = Vec::new();
+    for path in &paths {
+        if is_record.exists([path])? {
+            known.push(path.clone());
+        }
+    }
+    index.known_paths.extend(known);
+    let mut types =
+        conn.prepare_cached("SELECT type_name FROM file_types WHERE path = ?1 ORDER BY type_name")?;
+    let lookups = index
+        .known_paths
+        .iter()
+        .chain(rows.iter().map(|(_, source, _, _)| source))
+        .cloned()
+        .collect::<HashSet<_>>();
+    for path in lookups {
+        let names = types
+            .query_map([&path], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !names.is_empty() {
+            index.types_by_path.insert(path, names);
+        }
+    }
+    Ok(index)
+}
+
+/// The complete link resolution index from the `resolution_keys` and
+/// `file_types` tables, without parsing frontmatter or re-matching types.
+fn load_resolution_index(
+    conn: &Connection,
+) -> Result<crate::links::resolver::LinkResolutionIndex, CacheError> {
+    use crate::links::resolver::{LinkResolutionIndex, ResolutionKeyKind};
+
+    let mut index = LinkResolutionIndex::default();
+    let mut keys = conn.prepare("SELECT kind, key, path FROM resolution_keys")?;
+    let mapped = keys.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in mapped {
+        let (kind, key, path) = row?;
+        let kind = ResolutionKeyKind::parse(&kind).ok_or_else(|| {
+            CacheError::Resolution(format!("unknown resolution key kind '{kind}'"))
+        })?;
+        if kind == ResolutionKeyKind::Basename {
+            index.known_paths.insert(path.clone());
+        }
+        index.insert_key(kind, key, &path);
+    }
+    drop(keys);
+    let mut types =
+        conn.prepare("SELECT path, type_name FROM file_types ORDER BY path, type_name")?;
+    let mapped = types.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in mapped {
+        let (path, type_name) = row?;
+        if index.known_paths.contains(&path) {
+            index.types_by_path.entry(path).or_default().push(type_name);
+        }
+    }
+    Ok(index)
 }
 
 /// Backlinks and each stored link's resolved target, from one read of the `links` table.
@@ -606,7 +747,7 @@ pub(crate) fn reindex_all(
     let files = collection.scan_collection_relative_paths_checked()?;
     let transaction = conn.transaction()?;
     transaction.execute_batch(
-        "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_values; DELETE FROM identity_values; DELETE FROM files; DELETE FROM meta;",
+        "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_values; DELETE FROM identity_values; DELETE FROM resolution_keys; DELETE FROM files; DELETE FROM meta;",
     )?;
 
     for rel_path in &files {
@@ -621,4 +762,95 @@ pub(crate) fn reindex_all(
     )?;
     transaction.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROJECT_TYPE: &str = "---\nkind: mdbase.type\nname: project\nversion: 1\nmatch:\n  path_glob: \"projects/*.md\"\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n---\n";
+    const TASK_TYPE: &str = "---\nkind: mdbase.type\nname: task\nversion: 1\nmatch:\n  path_glob: \"tasks/*.md\"\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    properties:\n      project: { type: string }\ncollection:\n  links:\n    project:\n      target_type: project\n---\n";
+
+    fn write(root: &std::path::Path, path: &str, contents: &str) {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn links(conn: &Connection) -> Vec<(String, String, String, i64)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT source_path, raw_target, target_path, resolved FROM links \
+                 ORDER BY source_path, raw_target, location",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn source_resolution_matches_full_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write(
+            root,
+            "mdbase.yaml",
+            "spec_version: 0.3.0\nsettings:\n  id_field: id\n",
+        );
+        write(root, "_types/project.md", PROJECT_TYPE);
+        write(root, "_types/task.md", TASK_TYPE);
+        write(root, "projects/alpha.md", "---\nid: p-alpha\n---\n");
+        write(root, "projects/beta.md", "---\nid: shared\n---\n");
+        write(root, "notes/beta.md", "---\nid: shared\n---\n");
+        write(root, "notes/Gamma.md", "---\ntitle: Gamma\n---\n");
+        write(
+            root,
+            "tasks/one.md",
+            "---\nproject: \"[[p-alpha]]\"\n---\n[[beta]] [[../projects/alpha]] [[notes/beta]] \
+             [[missing]] [[shared]] [[GAMMA]] [[/notes/gamma.md]] [x](../notes/Gamma.md)\n",
+        );
+        write(
+            root,
+            "tasks/two.md",
+            "---\nproject: \"[[shared]]\"\n---\n[[one]]\n",
+        );
+        let collection = Collection::open(root).unwrap();
+        crate::cache::runtime::rebuild(
+            &collection,
+            &crate::runtime::CollectionGeneration::initial(),
+        )
+        .unwrap();
+        let mut conn = crate::cache::sqlite::open_cache_db(
+            collection.held_root().cache_storage_path(),
+            &collection.settings.cache_folder,
+        )
+        .unwrap();
+        let full = links(&conn);
+        assert!(full
+            .iter()
+            .any(|(source, raw, target, resolved)| source == "tasks/two.md"
+                && raw.contains("shared")
+                && target == "projects/beta.md"
+                && *resolved == 1));
+        assert!(full.iter().any(|(_, _, _, resolved)| *resolved == 0));
+
+        let transaction = conn.transaction().unwrap();
+        transaction
+            .execute(
+                "UPDATE links SET target_path = raw_target, resolved = 0",
+                [],
+            )
+            .unwrap();
+        let sources = ["tasks/one.md", "tasks/two.md"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        resolve_links_for_sources(&transaction, &collection, &sources).unwrap();
+        assert_eq!(links(&transaction), full);
+    }
 }

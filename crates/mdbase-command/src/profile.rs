@@ -1279,7 +1279,7 @@ fn profile_runtime_update(
                 OperationKind::Update,
                 json!({
                     "path": task_paths[picks[i]],
-                    "fields": {
+                    "patch": {
                         "status": STATUS_CYCLE[i % STATUS_CYCLE.len()],
                         "points": ((i + 1) % 13) as i64,
                     },

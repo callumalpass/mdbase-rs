@@ -194,6 +194,16 @@ pub(crate) fn execute_model_profiled_cancellable(
             )]));
         }
     };
+    // Type matching reads the collection's timezone at the query's instant, so
+    // every record in one query sees the same `now()` and `today()`.
+    let match_clock = crate::expressions::evaluator::EvaluationClock::from_utc(
+        clock.instant(),
+        collection.settings.timezone.as_deref(),
+    )
+    .map_err(|message| cel::CelFailure {
+        code: "invalid_timezone".to_string(),
+        message,
+    });
     performance.clock_us = micros(phase.elapsed());
     cancellation.check()?;
 
@@ -258,6 +268,7 @@ pub(crate) fn execute_model_profiled_cancellable(
             let records = page.records.iter().collect::<Vec<_>>();
             let result = build_metadata_page_result(
                 collection,
+                &match_clock,
                 &compiled,
                 &records,
                 page.total,
@@ -387,6 +398,7 @@ pub(crate) fn execute_model_profiled_cancellable(
 
         let result = build_metadata_page_result(
             collection,
+            &match_clock,
             &compiled,
             &page,
             total_count,
@@ -432,8 +444,12 @@ pub(crate) fn execute_model_profiled_cancellable(
     let mut candidates = Vec::new();
     for record in &records {
         cancellation.check()?;
-        let (types, match_failures) = collection
-            .determine_types_for_path_checked(&record.raw_frontmatter, Some(&record.rel_path));
+        let (types, match_failures) = record_types(
+            collection,
+            &match_clock,
+            &record.raw_frontmatter,
+            &record.rel_path,
+        );
         query_diagnostics.extend(match_failures.into_iter().map(|(type_name, failure)| {
             diagnostics::evaluation(
                 &record.rel_path,
@@ -464,19 +480,22 @@ pub(crate) fn execute_model_profiled_cancellable(
             Some(&record.body),
         );
         let file = file_value(record, &effective, needs_file_body_metadata);
+        // One context per candidate; only the `projection` binding changes as
+        // projections are evaluated in dependency order.
         let mut projections = Map::new();
+        let mut expression_context = candidate_context(
+            record,
+            &types,
+            &effective,
+            &projections,
+            context.clone(),
+            all_files.clone(),
+            backlinks.clone(),
+            type_definitions.clone(),
+        );
         for (name, expression) in &compiled.projections {
-            let context = candidate_context(
-                record,
-                &types,
-                &effective,
-                &projections,
-                context.clone(),
-                all_files.clone(),
-                backlinks.clone(),
-                type_definitions.clone(),
-            );
-            match cel::evaluate_compiled(expression, &context, &clock) {
+            set_projection_binding(&mut expression_context, &projections);
+            match cel::evaluate_compiled(expression, &expression_context, &clock) {
                 Ok(value) => {
                     projections.insert(name.clone(), value);
                 }
@@ -493,16 +512,7 @@ pub(crate) fn execute_model_profiled_cancellable(
             }
         }
 
-        let expression_context = candidate_context(
-            record,
-            &types,
-            &effective,
-            &projections,
-            context.clone(),
-            all_files.clone(),
-            backlinks.clone(),
-            type_definitions.clone(),
-        );
+        set_projection_binding(&mut expression_context, &projections);
         if let Some(where_expression) = &compiled.where_expression {
             match cel::evaluate_compiled(where_expression, &expression_context, &clock) {
                 Ok(Value::Bool(true)) => {}
@@ -638,8 +648,37 @@ fn apply_load_performance(
     performance.link_graph_built = load.built_link_graph;
 }
 
+fn set_projection_binding(
+    context: &mut crate::expressions::evaluator::EvalContext,
+    projections: &Map<String, Value>,
+) {
+    if let Some(bindings) = context.frontmatter.as_object_mut() {
+        bindings.insert("projection".to_string(), Value::Object(projections.clone()));
+    }
+}
+
+type MatchClock = Result<crate::expressions::evaluator::EvaluationClock, cel::CelFailure>;
+
+/// A record's types and match-expression failures at the query's match clock.
+fn record_types(
+    collection: &Collection,
+    match_clock: &MatchClock,
+    raw_frontmatter: &serde_json::Value,
+    path: &str,
+) -> (Vec<String>, Vec<(String, cel::CelFailure)>) {
+    match match_clock {
+        Ok(clock) => collection.determine_types_for_path_checked_with_clock(
+            raw_frontmatter,
+            Some(path),
+            clock,
+        ),
+        Err(error) => (Vec::new(), vec![(String::new(), error.clone())]),
+    }
+}
+
 fn build_metadata_page_result(
     collection: &Collection,
+    match_clock: &MatchClock,
     compiled: &preflight::CompiledQuery,
     records: &[&LocalRecord],
     total_count: usize,
@@ -658,8 +697,12 @@ fn build_metadata_page_result(
                 query_diagnostics.push(diagnostics::invalid_record(&stub.rel_path, &stub.reason));
                 return serialize_invalid_stub(stub);
             };
-            let (types, failures) = collection
-                .determine_types_for_path_checked(&record.raw_frontmatter, Some(&record.rel_path));
+            let (types, failures) = record_types(
+                collection,
+                match_clock,
+                &record.raw_frontmatter,
+                &record.rel_path,
+            );
             query_diagnostics.extend(failures.into_iter().map(|(type_name, failure)| {
                 diagnostics::evaluation(
                     &record.rel_path,

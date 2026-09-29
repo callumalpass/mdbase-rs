@@ -1,6 +1,6 @@
 //! mdbase v0.3 schema loading and canonical diagnostics.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -655,24 +655,36 @@ fn read_yaml_document(path: &Path, relative_path: &str) -> Result<Value, Box<Dia
     Ok(value)
 }
 
+/// Compiled canonical schemas, keyed by their embedded source. Compiling one
+/// builds every keyword validator and format regex, so each is compiled once
+/// per process rather than for every configuration, type file, and query.
+type CompiledCanonicalSchema = Result<std::sync::Arc<JSONSchema>, String>;
+
+fn canonical_schema(schema_source: &'static str) -> CompiledCanonicalSchema {
+    static COMPILED: std::sync::LazyLock<
+        std::sync::Mutex<HashMap<&'static str, CompiledCanonicalSchema>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut compiled = COMPILED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    compiled
+        .entry(schema_source)
+        .or_insert_with(|| {
+            let schema: Value =
+                serde_json::from_str(schema_source).map_err(|error| error.to_string())?;
+            compile_canonical_schema(&schema).map(std::sync::Arc::new)
+        })
+        .clone()
+}
+
 fn validate_canonical_value(
-    schema_source: &str,
+    schema_source: &'static str,
     value: &Value,
     path: &str,
     schema_id: &str,
     type_name: Option<&str>,
 ) -> Vec<Diagnostic> {
-    let schema: Value = match serde_json::from_str(schema_source) {
-        Ok(schema) => schema,
-        Err(error) => {
-            return vec![Diagnostic::error(
-                "invalid_schema",
-                error.to_string(),
-                Some(path.to_string()),
-            )]
-        }
-    };
-    let compiled = match compile_canonical_schema(&schema) {
+    let compiled = match canonical_schema(schema_source) {
         Ok(compiled) => compiled,
         Err(error) => {
             return vec![Diagnostic::error(

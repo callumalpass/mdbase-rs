@@ -162,27 +162,35 @@ fn capture_committed_file_facts(
         .iter()
         .filter(|entry| entry.after_revision.is_some())
     {
-        let relative = CollectionPath::new(&entry.path)?.to_path_buf();
-        let file = collection
-            .held_root()
-            .open_file(&relative)
-            .map_err(|source| io_error(collection.root.join(&relative), source))?;
-        let metadata = file
-            .metadata()
-            .map_err(|source| io_error(collection.root.join(&relative), source))?;
-        let mtime = metadata.modified().ok().map(|time| {
-            let value: chrono::DateTime<chrono::Utc> = time.into();
-            value.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-        });
         facts.insert(
             entry.path.clone(),
-            CommittedFileFacts {
-                size: metadata.len(),
-                mtime,
-            },
+            record_file_facts(collection, &entry.path)?,
         );
     }
     Ok(facts)
+}
+
+/// Size and modification time of one record file as it is now.
+pub(crate) fn record_file_facts(
+    collection: &Collection,
+    path: &str,
+) -> Result<CommittedFileFacts, TransactionError> {
+    let relative = CollectionPath::new(path)?.to_path_buf();
+    let file = collection
+        .held_root()
+        .open_file(&relative)
+        .map_err(|source| io_error(collection.root.join(&relative), source))?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| io_error(collection.root.join(&relative), source))?;
+    let mtime = metadata.modified().ok().map(|time| {
+        let value: chrono::DateTime<chrono::Utc> = time.into();
+        value.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    });
+    Ok(CommittedFileFacts {
+        size: metadata.len(),
+        mtime,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,24 +425,9 @@ fn commit_shadow_controlled(
         )?;
         if journal.entries[index].after_revision.is_some() {
             let entry = &journal.entries[index];
-            let relative = CollectionPath::new(&entry.path)?.to_path_buf();
-            let file = collection
-                .held_root()
-                .open_file(&relative)
-                .map_err(|source| io_error(collection.root.join(&relative), source))?;
-            let metadata = file
-                .metadata()
-                .map_err(|source| io_error(collection.root.join(&relative), source))?;
-            let mtime = metadata.modified().ok().map(|time| {
-                let value: chrono::DateTime<chrono::Utc> = time.into();
-                value.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-            });
             file_facts.insert(
                 entry.path.clone(),
-                CommittedFileFacts {
-                    size: metadata.len(),
-                    mtime,
-                },
+                record_file_facts(collection, &entry.path)?,
             );
         }
         journal.applied = index + 1;

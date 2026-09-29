@@ -930,7 +930,13 @@ impl CanonicalOperationOutcome {
                         .cloned()
                         .map(wire_diagnostic)
                         .collect::<Vec<_>>();
-                    serde_json::json!({"results": query.records, "meta": meta, "diagnostics": diagnostics})
+                    // Records are already JSON: clone them rather than re-serialize.
+                    let results = query.records.iter().map(|record| Value::clone(record));
+                    Value::Object(serde_json::Map::from_iter([
+                        ("results".to_string(), Value::Array(results.collect())),
+                        ("meta".to_string(), meta),
+                        ("diagnostics".to_string(), encode(&diagnostics)),
+                    ]))
                 })
             }
             CanonicalOperationValue::Delete(value) => {
