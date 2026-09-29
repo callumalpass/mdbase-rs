@@ -3,12 +3,16 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use cel::context::VariableResolver;
 use cel::extractors::{Arguments, This};
 use cel::objects::{Key, KeyRef, OptionalValue, Value as CelValue};
-use cel::{Context, ExecutionError};
+use cel::{Context, Env, ExecutionError};
+
+/// The standard library is immutable; building it registers every overload, so
+/// share one instance instead of rebuilding it for each evaluation.
+static STDLIB: LazyLock<Arc<Env>> = LazyLock::new(|| Arc::new(Env::stdlib()));
 use chrono::{DateTime, Datelike, NaiveDate, SecondsFormat};
 use serde_json::{Map, Value};
 
@@ -56,25 +60,33 @@ pub(crate) fn evaluate(
         needs_facts,
         traversals: Arc::new(AtomicUsize::new(0)),
     };
-    let date_times = date_time_fields(context);
-    let bindings = context.frontmatter.as_object().cloned().unwrap_or_default();
+    let date_times = std::cell::OnceCell::new();
+    let date_times = || date_times.get_or_init(|| date_time_fields(context));
+    let empty = Map::new();
+    let bindings = context.frontmatter.as_object().unwrap_or(&empty);
     let record_context = bindings.contains_key("record");
+    let used = &program.facts().free_identifiers;
 
-    let mut cel_context = Context::default();
+    let mut cel_context = Context::with_env(STDLIB.clone());
     let mut bound = HashSet::new();
-    for (name, value) in &bindings {
+    for (name, value) in bindings {
+        // Unreferenced fields cannot affect the result; converting them is the
+        // dominant per-record cost of wide records.
+        if !used.contains(name) {
+            continue;
+        }
         let converted = match name.as_str() {
-            "record" | "raw" | "old" => typed_object(value, &date_times),
-            _ if date_times.contains(name) => typed_scalar(value),
+            "record" | "raw" | "old" => typed_object(value, date_times()),
+            _ if date_times().contains(name) => typed_scalar(value),
             _ => to_cel(value),
         };
         cel_context.add_variable_from_value(name.clone(), converted);
         bound.insert(name.clone());
     }
-    if let Some(path) = &context.file_path {
+    if let Some(path) = context.file_path.as_ref().filter(|_| used.contains("file")) {
         let file = host.file_value(
             path,
-            &bindings,
+            bindings,
             context.body.as_deref(),
             &declared_link_selectors(context),
             FileMetadata {
@@ -86,7 +98,7 @@ pub(crate) fn evaluate(
         cel_context.add_variable_from_value("file", file);
         bound.insert("file".to_string());
     }
-    if bindings.contains_key("projection") && !bound.contains("this") {
+    if bindings.contains_key("projection") && used.contains("this") && !bound.contains("this") {
         let this = context
             .this_context
             .as_deref()

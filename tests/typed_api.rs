@@ -785,3 +785,26 @@ fn typed_and_wire_create_update_outcomes_and_diagnostic_order_match() {
         diagnostic_values(wire_validation.diagnostics.as_slice())
     );
 }
+
+#[test]
+fn update_that_changes_nothing_reports_the_unchanged_file() {
+    let (_root, collection) = typed_collection();
+    let api = collection.typed().unwrap();
+    let path = CollectionPath::new("tasks/same.md").unwrap();
+    let created = api
+        .create(
+            CreateRequest::new(path.clone())
+                .with_type("task")
+                .with_frontmatter(json!({"title": "Same", "status": "open"})),
+        )
+        .unwrap();
+    assert!(created.diagnostics.is_empty(), "{created:#?}");
+
+    let unchanged = api
+        .update(UpdateRequest::new(path, json!({"status": "open"})))
+        .unwrap();
+    assert!(unchanged.diagnostics.is_empty(), "{unchanged:#?}");
+    assert_eq!(unchanged.value.revision, created.value.revision);
+    assert_eq!(unchanged.value.file.size, created.value.file.size);
+    assert_eq!(unchanged.value.file.mtime, created.value.file.mtime);
+}

@@ -190,13 +190,34 @@ impl CollectionRoot {
             })
     }
 
-    pub(crate) fn modified_nanos(&self, relative: &Path) -> std::io::Result<i64> {
-        let modified = self.metadata(relative)?.modified()?;
-        Ok(modified
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
-            .unwrap_or(0))
+    /// Modification times for many record files, opening each parent directory
+    /// once and reading each leaf with one no-follow stat. Applies the same
+    /// regular, single-link file requirement as `open_file`.
+    pub(crate) fn modified_nanos_many(&self, relatives: &[String]) -> std::io::Result<Vec<i64>> {
+        let mut dirs: HashMap<PathBuf, Dir> = HashMap::new();
+        let mut out = Vec::with_capacity(relatives.len());
+        for relative in relatives {
+            let (parent, leaf) = split_parent(Path::new(relative))?;
+            if !dirs.contains_key(parent) {
+                dirs.insert(parent.to_path_buf(), self.open_dir(parent)?);
+            }
+            let metadata = dirs[parent].symlink_metadata(leaf)?;
+            if !metadata.is_file() || cap_has_multiple_hard_links(&metadata) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "collection resource is not an unlinked regular file",
+                ));
+            }
+            let modified = metadata.modified()?.into_std();
+            out.push(
+                modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+                    .unwrap_or(0),
+            );
+        }
+        Ok(out)
     }
 
     pub(crate) fn atomic_create(&self, relative: &Path, bytes: &[u8]) -> std::io::Result<()> {

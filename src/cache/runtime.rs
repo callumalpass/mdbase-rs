@@ -12,7 +12,10 @@ use super::{indexer, sqlite, CacheError};
 use crate::runtime::{CanonicalChange, ChangeSet, CollectionGeneration};
 use crate::Collection;
 
-const GENERATION_KEY: &str = "runtime_generation";
+/// Versioned with the derived tables the runtime maintains incrementally: a
+/// cache written before `resolution_keys` existed does not match any
+/// generation, so the runtime rebuilds it once.
+const GENERATION_KEY: &str = "runtime_generation_v2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum UniqueConflictKind {
@@ -43,7 +46,7 @@ pub(crate) fn rebuild(
     let files = collection.scan_collection_relative_paths_checked()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
-        "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_values; DELETE FROM identity_values; DELETE FROM files; DELETE FROM meta;",
+        "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_values; DELETE FROM identity_values; DELETE FROM resolution_keys; DELETE FROM files; DELETE FROM meta;",
     )?;
     for relative in files {
         indexer::reindex_file(&transaction, collection, &relative)?;

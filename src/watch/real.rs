@@ -1243,7 +1243,7 @@ fn now() -> String {
 #[derive(Clone)]
 struct Snapshot {
     resources: BTreeMap<String, ResourceState>,
-    records: BTreeMap<String, RecordState>,
+    records: BTreeMap<String, Arc<RecordState>>,
     invalid_records: Arc<BTreeSet<String>>,
     types_folder: String,
     contracts_folder: String,
@@ -1305,13 +1305,13 @@ impl Snapshot {
             let effective = collection.coerce_types(&effective, &record.types);
             records.insert(
                 record.path,
-                RecordState {
+                Arc::new(RecordState {
                     revision: record.revision,
                     raw_frontmatter: record.frontmatter,
                     effective_frontmatter: effective,
                     types: json!(record.types),
                     body: record.body,
-                },
+                }),
             );
         }
         Ok(Self {
@@ -1491,7 +1491,7 @@ impl Snapshot {
             match outcome {
                 WatchRecordLoad::Parsed(record) => {
                     Arc::make_mut(&mut self.invalid_records).remove(&path);
-                    self.records.insert(path, record);
+                    self.records.insert(path, Arc::new(record));
                 }
                 WatchRecordLoad::Invalid => {
                     Arc::make_mut(&mut self.invalid_records).insert(path);
@@ -1556,8 +1556,8 @@ fn resource_event_type(kind: CollectionSnapshotResourceKind) -> &'static str {
 }
 
 fn record_events(
-    before: &BTreeMap<String, RecordState>,
-    after: &BTreeMap<String, RecordState>,
+    before: &BTreeMap<String, Arc<RecordState>>,
+    after: &BTreeMap<String, Arc<RecordState>>,
 ) -> Vec<PendingEvent> {
     let mut events = Vec::new();
     let mut deleted: BTreeSet<String> = before
@@ -1570,7 +1570,8 @@ fn record_events(
         .filter(|path| !before.contains_key(*path))
         .cloned()
         .collect();
-    let revision_counts = |paths: &BTreeSet<String>, states: &BTreeMap<String, RecordState>| {
+    let revision_counts = |paths: &BTreeSet<String>,
+                           states: &BTreeMap<String, Arc<RecordState>>| {
         let mut counts = BTreeMap::<String, usize>::new();
         for path in paths {
             *counts.entry(states[path].revision.clone()).or_default() += 1;
@@ -1918,7 +1919,7 @@ mod tests {
             if event.paths[0].ends_with("gone-with-records") {
                 snapshot.records.insert(
                     "gone-with-records/a.md".to_string(),
-                    record_state_for_test(),
+                    Arc::new(record_state_for_test()),
                 );
             }
             assert_eq!(snapshot.invalidation_paths(root, &event), None, "{event:?}");
@@ -2247,12 +2248,14 @@ mod tests {
 
     #[test]
     fn asymmetric_duplicate_revisions_never_invent_rename_identity() {
-        let state = || RecordState {
-            revision: "sha256:duplicate".to_string(),
-            raw_frontmatter: Map::new(),
-            effective_frontmatter: json!({}),
-            types: json!([]),
-            body: "same".to_string(),
+        let state = || {
+            Arc::new(RecordState {
+                revision: "sha256:duplicate".to_string(),
+                raw_frontmatter: Map::new(),
+                effective_frontmatter: json!({}),
+                types: json!([]),
+                body: "same".to_string(),
+            })
         };
         for (before, after) in [
             (

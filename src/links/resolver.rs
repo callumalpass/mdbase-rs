@@ -101,6 +101,9 @@ pub(crate) fn compute_relative_path(source_dir: &str, target_path: &str) -> Stri
 
 // --- impl Collection methods for link resolution ---
 
+pub(crate) use super::resolution_keys::{
+    record_resolution_keys, ResolutionKeyKind, ResolutionLookup,
+};
 use crate::errors::*;
 use crate::links::parser::{count_leading_dotdot, normalize_link_path};
 use crate::runtime::{
@@ -167,27 +170,27 @@ impl LinkResolutionIndex {
     ) -> Self {
         let mut index = Self::default();
         for file_data in all_files {
-            let path = &file_data.path;
-            if crate::api::CollectionPath::new(path).is_err() {
+            let Some(record_keys) =
+                record_resolution_keys(&file_data.path, &file_data.frontmatter, keys)
+            else {
                 continue;
-            }
-            index.known_paths.insert(path.clone());
-            if let Some(basename) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
-                insert_resolution_key(
-                    &mut index.basename_lower_to_paths,
-                    basename.to_lowercase(),
-                    path,
-                );
-            }
-            let text = |field: &str| file_data.frontmatter.get(field).and_then(|v| v.as_str());
-            if let Some(id) = keys.id_field.as_deref().and_then(text) {
-                insert_resolution_key(&mut index.id_lower_to_paths, id.to_lowercase(), path);
-            }
-            if let Some(title) = keys.titles.then(|| text("title")).flatten() {
-                insert_resolution_key(&mut index.title_lower_to_paths, title.to_lowercase(), path);
+            };
+            index.known_paths.insert(file_data.path.clone());
+            for (kind, key) in record_keys {
+                index.insert_key(kind, key, &file_data.path);
             }
         }
         index
+    }
+
+    /// Add one resolution key; paths under a key stay sorted and distinct.
+    pub(crate) fn insert_key(&mut self, kind: ResolutionKeyKind, key: String, path: &str) {
+        let map = match kind {
+            ResolutionKeyKind::Basename => &mut self.basename_lower_to_paths,
+            ResolutionKeyKind::Id => &mut self.id_lower_to_paths,
+            ResolutionKeyKind::Title => &mut self.title_lower_to_paths,
+        };
+        insert_resolution_key(map, key, path);
     }
 
     fn eligible_paths(&self, paths: &[String], target_types: &[String]) -> Vec<String> {
@@ -218,147 +221,51 @@ impl LinkResolutionIndex {
         target_types: &[String],
     ) -> Result<Option<String>, CatalogError> {
         let resolution_index = self;
-        // Spec Chapter 08: markdown links and bare paths resolve from the
-        // containing folder, as do wikilinks beginning with ./ or ../; other
-        // wikilinks containing / resolve from the collection root; a leading
-        // / is always root-relative.
-        let (target, from_source) = link_path(target);
-        let target = target.as_str();
-        if target.is_empty() {
-            return Ok(None);
-        }
-        let resolved_target = if let Some(rooted) = target.strip_prefix('/') {
-            crate::links::parser::normalize_segments(rooted)
-        } else if from_source {
-            let source_dir = source_path
-                .rsplit_once('/')
-                .map_or("", |(parent, _)| parent);
-            let joined = if source_dir.is_empty() {
-                target.to_string()
-            } else {
-                format!("{source_dir}/{target}")
-            };
-            crate::links::parser::normalize_segments(&joined)
-        } else {
-            // A simple wikilink may name the file with its record extension.
-            target
-                .strip_suffix(".md")
-                .filter(|name| !name.contains('/'))
-                .unwrap_or(target)
-                .to_string()
-        };
-        if resolved_target == ".." || resolved_target.starts_with("../") {
-            return Ok(None);
-        }
-
-        // Simple-name lookup follows the same priority and ranking as hosted
-        // resolution. A populated ambiguous ID class never falls through.
-        let simple_name =
-            !from_source && !target.starts_with('/') && !resolved_target.contains('/');
-        if simple_name {
-            let target_lower = resolved_target.to_lowercase();
-            if let Some(paths) = resolution_index.id_lower_to_paths.get(&target_lower) {
-                let eligible = resolution_index.eligible_paths(paths, target_types);
-                if !eligible.is_empty() {
-                    return select_local_resolution(
-                        source_path,
+        match ResolutionLookup::of(target, source_path) {
+            None => Ok(None),
+            // Simple-name lookup follows the same priority and ranking as hosted
+            // resolution. A populated ambiguous ID class never falls through.
+            Some(ResolutionLookup::Simple(target_lower)) => {
+                for (kind, map) in [
+                    (
                         RecordResolutionKeyKind::Id,
-                        eligible,
-                    )
-                    .map(|resolution| match resolution {
-                        LinkResolution::Resolved { path, .. } => Some(path),
-                        LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
-                    });
-                }
-            }
-            if let Some(paths) = resolution_index.basename_lower_to_paths.get(&target_lower) {
-                let eligible = resolution_index.eligible_paths(paths, target_types);
-                if !eligible.is_empty() {
-                    return select_local_resolution(
-                        source_path,
+                        &resolution_index.id_lower_to_paths,
+                    ),
+                    (
                         RecordResolutionKeyKind::Basename,
-                        eligible,
-                    )
-                    .map(|resolution| match resolution {
-                        LinkResolution::Resolved { path, .. } => Some(path),
-                        LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
-                    });
-                }
-            }
-            if let Some(paths) = resolution_index.title_lower_to_paths.get(&target_lower) {
-                let eligible = resolution_index.eligible_paths(paths, target_types);
-                if !eligible.is_empty() {
-                    return select_local_resolution(
-                        source_path,
+                        &resolution_index.basename_lower_to_paths,
+                    ),
+                    (
                         RecordResolutionKeyKind::Title,
-                        eligible,
-                    )
-                    .map(|resolution| match resolution {
-                        LinkResolution::Resolved { path, .. } => Some(path),
-                        LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
-                    });
+                        &resolution_index.title_lower_to_paths,
+                    ),
+                ] {
+                    if let Some(paths) = map.get(&target_lower) {
+                        let eligible = resolution_index.eligible_paths(paths, target_types);
+                        if !eligible.is_empty() {
+                            return select_local_resolution(source_path, kind, eligible).map(
+                                |resolution| match resolution {
+                                    LinkResolution::Resolved { path, .. } => Some(path),
+                                    LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
+                                },
+                            );
+                        }
+                    }
                 }
+                Ok(None)
             }
-            return Ok(None);
-        }
-
-        // Explicit path targets retain exact path and extension behavior.
-        if resolution_index.known_paths.contains(&resolved_target) {
-            return Ok(resolution_index
-                .eligible_paths(std::slice::from_ref(&resolved_target), target_types)
+            // Explicit path targets retain exact path and extension behavior.
+            Some(ResolutionLookup::Path(candidates)) => Ok(candidates
                 .into_iter()
-                .next());
+                .find(|candidate| resolution_index.known_paths.contains(candidate))
+                .and_then(|candidate| {
+                    resolution_index
+                        .eligible_paths(std::slice::from_ref(&candidate), target_types)
+                        .into_iter()
+                        .next()
+                })),
         }
-        if !resolved_target.ends_with(".md") && !resolved_target.ends_with(".mdx") {
-            let with_md = format!("{}.md", resolved_target);
-            if resolution_index.known_paths.contains(&with_md) {
-                return Ok(resolution_index
-                    .eligible_paths(std::slice::from_ref(&with_md), target_types)
-                    .into_iter()
-                    .next());
-            }
-        }
-
-        Ok(None)
     }
-}
-
-/// The path a link names, and whether it resolves from the containing folder.
-///
-/// Input is either a raw link value or a target produced by link extraction,
-/// which marks markdown and bare-path targets with `./` (spec Chapter 08).
-fn link_path(link: &str) -> (String, bool) {
-    let link = link.trim();
-    let target = if let Some(inner) = link
-        .strip_prefix("[[")
-        .and_then(|rest| rest.strip_suffix("]]"))
-    {
-        let target = inner.split('|').next().unwrap_or(inner);
-        target
-            .split('#')
-            .next()
-            .unwrap_or(target)
-            .trim()
-            .to_string()
-    } else if let Some(destination) = link
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(')'))
-        .and_then(|inner| inner.split_once("]("))
-        .map(|(_, destination)| destination.split('#').next().unwrap_or(destination).trim())
-    {
-        if destination.starts_with('/')
-            || destination.starts_with("./")
-            || destination.starts_with("../")
-        {
-            destination.to_string()
-        } else {
-            format!("./{destination}")
-        }
-    } else {
-        link.split('#').next().unwrap_or(link).trim().to_string()
-    };
-    let from_source = target.starts_with("./") || target.starts_with("../");
-    (target, from_source)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -664,7 +571,17 @@ impl Collection {
         frontmatter: &serde_json::Value,
     ) -> Vec<String> {
         let file_types = self.determine_types_for_path(frontmatter, Some(source_path));
-        for type_name in &file_types {
+        self.field_target_types(&file_types, field_name)
+    }
+
+    /// Target types a link field declares on the first of `file_types` that
+    /// defines the field.
+    pub(crate) fn field_target_types(
+        &self,
+        file_types: &[String],
+        field_name: &str,
+    ) -> Vec<String> {
+        for type_name in file_types {
             if let Some(type_def) = self.types.get(&type_name.to_lowercase()) {
                 if let Some(field_def) = type_def.fields.get(field_name) {
                     return allowed_target_types(field_def);

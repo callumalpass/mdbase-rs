@@ -40,6 +40,15 @@ CREATE TABLE IF NOT EXISTS identity_values (
     path TEXT NOT NULL
 );
 
+-- Lowercased basename, id and title keys of valid records, so resolving one
+-- record's links reads only its candidate targets.
+CREATE TABLE IF NOT EXISTS resolution_keys (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    path TEXT NOT NULL,
+    PRIMARY KEY (key, kind, path)
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -50,3 +59,4 @@ CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_path);
 CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_path);
 CREATE INDEX IF NOT EXISTS idx_unique_values_path ON unique_values(path);
 CREATE INDEX IF NOT EXISTS idx_identity_values_path ON identity_values(path);
+CREATE INDEX IF NOT EXISTS idx_resolution_keys_path ON resolution_keys(path);

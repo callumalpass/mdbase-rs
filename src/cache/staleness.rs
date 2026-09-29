@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::CacheError;
 use crate::Collection;
@@ -40,9 +40,9 @@ pub(crate) fn find_changes(
 
     let mut disk_paths = HashSet::with_capacity(files.len());
     let mut stale = Vec::new();
-    for rel_path in files {
+    let mtimes = collection.held_root().modified_nanos_many(files)?;
+    for (rel_path, filesystem_mtime) in files.iter().zip(mtimes) {
         disk_paths.insert(rel_path.clone());
-        let filesystem_mtime = collection.held_root().modified_nanos(Path::new(rel_path))?;
         if !matches!(cached.get(rel_path), Some((mtime, false)) if *mtime == filesystem_mtime) {
             stale.push(rel_path.clone());
         }

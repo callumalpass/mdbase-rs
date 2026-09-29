@@ -354,6 +354,8 @@ pub(crate) fn open_cache_db(root: &Path, cache_folder: &str) -> Result<Connectio
     let db_path = db_dir.join("cache.db");
     let conn = Connection::open(&db_path)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Indexing and link resolution cycle through about twenty statements.
+    conn.set_prepared_statement_cache_capacity(64);
     conn.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
     )?;

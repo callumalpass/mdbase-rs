@@ -1083,20 +1083,18 @@ impl FilesystemRuntime {
         }
 
         loop {
-            match receiver.try_recv() {
-                Ok(result) => return result,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return Ok(CommitAttempt::SettlementPending { commit_id })
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-            if context.check().is_err() {
-                return Ok(CommitAttempt::SettlementPending { commit_id });
-            }
+            // Wake as soon as the worker reports; the bounded wait only keeps
+            // cancellation and the deadline responsive.
             let Ok(wait) = context.next_wait() else {
                 return Ok(CommitAttempt::SettlementPending { commit_id });
             };
-            std::thread::sleep(wait);
+            match receiver.recv_timeout(wait) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(CommitAttempt::SettlementPending { commit_id })
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
         }
     }
 

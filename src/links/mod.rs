@@ -3,5 +3,6 @@
 pub mod extractor;
 pub mod linked_files;
 pub mod parser;
+mod resolution_keys;
 pub mod resolver;
 pub mod traversal;
