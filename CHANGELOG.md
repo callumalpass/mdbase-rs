@@ -22,6 +22,19 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Collection setup and type-pack mutations plan in a definitions-only
+  workspace (configuration, both locks, types, contracts, referenced schemas
+  and pack targets) and never copy or validate every record. Their runtime
+  `after` snapshot reinterprets the captured records under the staged
+  definitions instead of re-reading them, including records that become saved
+  views and files a new `record_extensions` value makes records. `create_type`,
+  `update_type` and `apply_type_pack` use the same path. A setup's
+  `collection_revision` now identifies its inputs, so record edits no longer
+  make a reviewed setup stale. The informational `baseline_diagnostic_count`,
+  `final_diagnostic_count`, `resolved_diagnostic_count`,
+  `introduced_diagnostic_count` and `baseline_diagnostic_digest` assessment
+  fields are removed. At 30,000 records a TaskNotes setup assessment falls
+  from 9 s to 30 ms and its apply from 17 s to 3.5 s.
 - Saved views are identified through the `mdbase.view` record contract rather
   than the `view` type name or `type: view` frontmatter. Listing, execution,
   hosted planning, snapshot classification, and view-source validation all

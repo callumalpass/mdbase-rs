@@ -18,7 +18,7 @@ python scripts/benchmark-large-collections.py \
   --notes 20 --noise-files 20 --page-size 7
 ```
 
-Always use the release binary. The binary emits whether debug assertions are enabled. The smoke matrix tests all five fixture variants, first/continuation pages, zero new schema diagnostics, managed upgrades, and byte-for-byte preservation of every original note/non-Markdown file.
+Always use the release binary. The binary emits whether debug assertions are enabled. The smoke matrix tests all five fixture variants, first/continuation pages, managed upgrades, and byte-for-byte preservation of every original note/non-Markdown file.
 
 The manifest is supplied rather than duplicated into this repository. It is the public bundled application declaration, **not** a credential/configuration file. Results retain its exact bytes and SHA-256. Only packs providing a required contract are selected, matching Connect's initial required-contract setup selection; optional scratchpad packs are not installed in this workload.
 

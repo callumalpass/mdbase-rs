@@ -27,10 +27,6 @@ impl<'a> Operations<'a> {
         Ok(Self { collection })
     }
 
-    pub(crate) fn collection(&self) -> &'a Collection {
-        self.collection
-    }
-
     pub fn read(&self, input: &Value) -> OperationResult {
         let request = match self.parse_read_request(input) {
             Ok(request) => request,
