@@ -25,7 +25,9 @@ use super::{
 /// key titles. Older projections stay deserializable for explicit stale-data
 /// handling but are never accepted by a v7 executor or mixed into a v7
 /// storage/digest binding.
-pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 7;
+/// Format v8 adds the record's uniqueness keys so a hosted write can find the
+/// records its unique values could conflict with without a collection scan.
+pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 8;
 pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v5";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,6 +43,8 @@ pub struct SemanticProjectionFacts {
     pub effective_frontmatter: Map<String, Value>,
     pub diagnostics: Vec<Diagnostic>,
     pub resolution_keys: Vec<RecordResolutionKey>,
+    #[serde(default)]
+    pub uniqueness_keys: Vec<UniquenessKey>,
     pub semantic_complete: bool,
 }
 
@@ -116,7 +120,46 @@ pub struct RecordResolutionKey {
     pub value: String,
 }
 
+/// One value a record contributes to the uniqueness set of a type it matches.
+/// Two records conflict when they share a key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct UniquenessKey {
+    pub type_name: String,
+    pub field_reference: String,
+    pub comparable_value: String,
+}
+
 impl CompiledCatalog {
+    /// Keys for every unique field declared by the record's matched types.
+    pub(crate) fn uniqueness_keys(
+        &self,
+        effective_frontmatter: &Value,
+        types: &[String],
+    ) -> Vec<UniquenessKey> {
+        let mut keys = BTreeSet::new();
+        for type_name in types {
+            let type_name = type_name.to_lowercase();
+            let Some(type_definition) = self.collection.types.get(&type_name) else {
+                continue;
+            };
+            for field_reference in
+                crate::validation::validator::unique_field_references(type_definition)
+            {
+                if let Some(comparable_value) =
+                    crate::field_references::get_value(effective_frontmatter, &field_reference)
+                        .and_then(crate::validation::validator::unique_comparable_value)
+                {
+                    keys.insert(UniquenessKey {
+                        type_name: type_name.clone(),
+                        field_reference,
+                        comparable_value,
+                    });
+                }
+            }
+        }
+        keys.into_iter().collect()
+    }
+
     /// Generate one full semantic projection from exact Markdown.
     ///
     /// This method performs no storage access and never serializes body prose or
@@ -219,6 +262,8 @@ impl CompiledCatalog {
         let file = file_facts(&record.path, exact_size, record.file_mtime.clone());
         let resolution_keys =
             resolution_keys(&file, &effective_frontmatter, &self.link_resolution_keys());
+        let uniqueness_keys =
+            self.uniqueness_keys(&Value::Object(effective_frontmatter.clone()), &types);
 
         Ok(PreparedSemanticProjection {
             facts: SemanticProjectionFacts {
@@ -233,6 +278,7 @@ impl CompiledCatalog {
                 effective_frontmatter,
                 diagnostics,
                 resolution_keys,
+                uniqueness_keys,
                 semantic_complete,
             },
             structure,

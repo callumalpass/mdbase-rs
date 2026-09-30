@@ -376,18 +376,9 @@ impl Collection {
             let unique_checks: Vec<(String, String)> = unique_field_references(type_def)
                 .into_iter()
                 .filter_map(|field_reference| {
-                    crate::field_references::get_value(frontmatter, &field_reference).and_then(
-                        |val| {
-                            if val.is_null() {
-                                return None;
-                            }
-                            let val_str = match val.as_str() {
-                                Some(s) => s.to_string(),
-                                None => val.to_string(),
-                            };
-                            Some((field_reference, val_str))
-                        },
-                    )
+                    crate::field_references::get_value(frontmatter, &field_reference)
+                        .and_then(unique_comparable_value)
+                        .map(|value| (field_reference, value))
                 })
                 .collect();
 
@@ -447,11 +438,7 @@ impl Collection {
                     if let Some(other_val) =
                         crate::field_references::get_value(other_fm, field_name)
                     {
-                        if !other_val.is_null() {
-                            let other_str = match other_val.as_str() {
-                                Some(s) => s.to_string(),
-                                None => other_val.to_string(),
-                            };
+                        if let Some(other_str) = unique_comparable_value(other_val) {
                             if &other_str == our_val {
                                 issues.push(Issue {
                                     code: "duplicate_value".to_string(),
@@ -932,6 +919,17 @@ pub(crate) fn unique_field_references(type_def: &TypeDef) -> Vec<String> {
     let mut references = references.into_iter().collect::<Vec<_>>();
     references.sort();
     references
+}
+
+/// The string two unique values are compared by. Null values are exempt.
+pub(crate) fn unique_comparable_value(value: &serde_json::Value) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    Some(match value.as_str() {
+        Some(value) => value.to_string(),
+        None => value.to_string(),
+    })
 }
 
 #[cfg(test)]

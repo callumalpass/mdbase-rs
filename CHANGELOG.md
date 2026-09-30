@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- Hosted writes can enforce `collection.unique`. Semantic projections (format
+  8) carry each record's uniqueness keys, and a typed hosted mutation plan
+  reports the keys its written records were validated against, so a host can
+  stage every other record sharing one before the plan is accepted. Hosted
+  validation planning derives its unique-field requirements from the same keys.
+
 ## 0.4.0-rc.6 - 2026-09-30
 
 ### Fixed

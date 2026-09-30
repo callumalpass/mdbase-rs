@@ -105,7 +105,7 @@ pub use outcome::{
 };
 pub use projection::{
     PreparedSemanticProjection, RecordResolutionKey, RecordResolutionKeyKind, SemanticFileFacts,
-    SemanticProjection, SemanticProjectionFacts, SEMANTIC_PROJECTION_FORMAT_VERSION,
+    SemanticProjection, SemanticProjectionFacts, UniquenessKey, SEMANTIC_PROJECTION_FORMAT_VERSION,
     SEMANTIC_PROJECTION_SCHEMA_VERSION,
 };
 pub use provider::{CollectionProvider, FilesystemProvider};

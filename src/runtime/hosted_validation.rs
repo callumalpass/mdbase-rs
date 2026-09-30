@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::v03::OperationResult;
+use crate::validation::validator::unique_comparable_value;
 use crate::{Collection, SpecProfile};
 
 use super::{
@@ -56,7 +57,7 @@ impl HostedValidationPlan {
                 &Value::Object(facts.effective_frontmatter.clone()),
                 &requirement.field_reference,
             )
-            .and_then(comparable_value)
+            .and_then(unique_comparable_value)
             .as_deref()
                 == Some(requirement.comparable_value.as_str())
         })
@@ -64,6 +65,28 @@ impl HostedValidationPlan {
 }
 
 impl CompiledCatalog {
+    /// Uniqueness keys of the records a hosted mutation wrote, when canonical
+    /// write validation compares them with the rest of the collection. The
+    /// host must stage every other record sharing a key for the plan to hold.
+    pub(crate) fn hosted_mutation_uniqueness_requirements(
+        &self,
+        operation: &str,
+        changes: &[super::HostedRecordChange],
+    ) -> Vec<super::UniquenessKey> {
+        if self.collection.settings.default_validation != "error"
+            || !matches!(operation, "create" | "update" | "batch")
+        {
+            return Vec::new();
+        }
+        changes
+            .iter()
+            .filter_map(|change| change.after.as_ref())
+            .flat_map(|after| self.uniqueness_keys(&after.effective_frontmatter, &after.types))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// Compile cross-record uniqueness requirements for one exact validation
     /// target. The host may stream current projections through the returned
     /// plan and fetch exact records only for possible conflicts.
@@ -100,7 +123,7 @@ impl CompiledCatalog {
         for type_name in &types {
             if let Some(value) =
                 crate::field_references::get_value(&effective, &self.collection.settings().id_field)
-                    .and_then(comparable_value)
+                    .and_then(unique_comparable_value)
             {
                 requirements.insert(HostedValidationRequirement {
                     kind: HostedValidationRequirementKind::Identity,
@@ -109,24 +132,14 @@ impl CompiledCatalog {
                     comparable_value: value,
                 });
             }
-            let Some(type_definition) = self.collection.types.get(type_name) else {
-                continue;
-            };
-            for field_reference in
-                crate::validation::validator::unique_field_references(type_definition)
-            {
-                if let Some(value) =
-                    crate::field_references::get_value(&effective, &field_reference)
-                        .and_then(comparable_value)
-                {
-                    requirements.insert(HostedValidationRequirement {
-                        kind: HostedValidationRequirementKind::UniqueField,
-                        type_name: type_name.clone(),
-                        field_reference,
-                        comparable_value: value,
-                    });
-                }
-            }
+        }
+        for key in self.uniqueness_keys(&effective, &types) {
+            requirements.insert(HostedValidationRequirement {
+                kind: HostedValidationRequirementKind::UniqueField,
+                type_name: key.type_name,
+                field_reference: key.field_reference,
+                comparable_value: key.comparable_value,
+            });
         }
         let mut resolution_lookups = self
             .collection
@@ -245,19 +258,6 @@ impl CompiledCatalog {
         Ok(self
             .execute_hosted_validation_typed(plan, records)?
             .to_v03())
-    }
-}
-
-fn comparable_value(value: &Value) -> Option<String> {
-    if value.is_null() {
-        None
-    } else {
-        Some(
-            value
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| value.to_string()),
-        )
     }
 }
 
@@ -390,5 +390,112 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "duplicate_value"));
+    }
+
+    fn unique_slug_catalog(validation: &str) -> CompiledCatalog {
+        CompiledCatalog::compile(CatalogInput {
+            resource_revision: "catalog-unique".to_string(),
+            configuration_document: format!(
+                "spec_version: 0.3.0\nsettings:\n  validation: {validation}\n"
+            ),
+            types: vec![ResolvedTypeResource {
+                path: "_types/note.md".to_string(),
+                revision: "type-1".to_string(),
+                definition: json!({
+                    "kind": "mdbase.type",
+                    "name": "note",
+                    "version": 1,
+                    "match": {"path_glob": "notes/*.md"},
+                    "schema": {"dialect": "json-schema-2020-12", "value": {
+                        "type": "object",
+                        "properties": {"slug": {"type": "string"}}
+                    }},
+                    "collection": {"unique": [{"field": "slug"}]}
+                }),
+                schema: json!({"type": "object"}),
+            }],
+            contracts: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn create_note(
+        path: &str,
+        slug: &str,
+        records: Vec<CanonicalRecordInput>,
+    ) -> crate::runtime::HostedMutationRequest {
+        crate::runtime::HostedMutationRequest {
+            operation: "create".to_string(),
+            primary_stable_id: format!("id-{path}"),
+            input: json!({"path": path, "type": "note", "frontmatter": {"slug": slug}}),
+            records,
+        }
+    }
+
+    fn slug_key(value: &str) -> crate::runtime::UniquenessKey {
+        crate::runtime::UniquenessKey {
+            type_name: "note".to_string(),
+            field_reference: "slug".to_string(),
+            comparable_value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn plans_report_the_uniqueness_keys_their_writes_were_validated_against() {
+        let catalog = unique_slug_catalog("error");
+        let existing = record(
+            "existing",
+            "notes/a.md",
+            "---\ntype: note\nslug: same\n---\n",
+        );
+
+        let without_context = catalog
+            .plan_hosted_mutation_typed(&create_note("notes/b.md", "same", Vec::new()))
+            .unwrap();
+        assert!(without_context.operation.valid);
+        assert_eq!(
+            without_context.uniqueness_requirements,
+            vec![slug_key("same")]
+        );
+
+        let with_conflict = catalog
+            .plan_hosted_mutation_typed(&create_note("notes/b.md", "same", vec![existing.clone()]))
+            .unwrap();
+        assert!(!with_conflict.operation.valid);
+        assert!(with_conflict.changes.is_empty());
+        assert!(with_conflict.uniqueness_requirements.is_empty());
+
+        let update = catalog
+            .plan_hosted_mutation_typed(&crate::runtime::HostedMutationRequest {
+                operation: "update".to_string(),
+                primary_stable_id: "existing".to_string(),
+                input: json!({"patch": {"slug": "renamed"}}),
+                records: vec![existing.clone()],
+            })
+            .unwrap();
+        assert!(update.operation.valid);
+        assert_eq!(update.uniqueness_requirements, vec![slug_key("renamed")]);
+
+        let projection = catalog.project_record(&existing).unwrap();
+        assert_eq!(projection.facts.uniqueness_keys, vec![slug_key("same")]);
+
+        let delete = catalog
+            .plan_hosted_mutation_typed(&crate::runtime::HostedMutationRequest {
+                operation: "delete".to_string(),
+                primary_stable_id: "existing".to_string(),
+                input: json!({}),
+                records: vec![existing],
+            })
+            .unwrap();
+        assert!(delete.uniqueness_requirements.is_empty());
+    }
+
+    #[test]
+    fn plans_without_error_validation_report_no_uniqueness_requirements() {
+        let plan = unique_slug_catalog("warn")
+            .plan_hosted_mutation_typed(&create_note("notes/b.md", "same", Vec::new()))
+            .unwrap();
+        assert!(plan.operation.valid);
+        assert!(plan.uniqueness_requirements.is_empty());
     }
 }

@@ -64,6 +64,10 @@ pub struct TypedHostedMutationPlan {
     pub primary_stable_id: String,
     pub changes: Vec<HostedRecordChange>,
     pub change_set: ChangeSet,
+    /// Uniqueness keys of the written records that canonical write validation
+    /// compared against the supplied context. The plan is authoritative only
+    /// when the context held every other record sharing one of these keys.
+    pub uniqueness_requirements: Vec<super::UniquenessKey>,
 }
 
 impl CompiledCatalog {
@@ -243,6 +247,7 @@ impl CompiledCatalog {
                 primary_stable_id: request.primary_stable_id.clone(),
                 changes: Vec::new(),
                 change_set: ChangeSet::None,
+                uniqueness_requirements: Vec::new(),
             });
         }
         let is_dry_run = request
@@ -423,11 +428,14 @@ impl CompiledCatalog {
             )
             .map_err(provider_change_error)?,
         );
+        let uniqueness_requirements =
+            self.hosted_mutation_uniqueness_requirements(&request.operation, &changes);
         Ok(TypedHostedMutationPlan {
             operation,
             primary_stable_id: request.primary_stable_id.clone(),
             changes,
             change_set,
+            uniqueness_requirements,
         })
     }
 
