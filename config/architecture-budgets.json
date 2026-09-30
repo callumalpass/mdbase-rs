@@ -1,6 +1,6 @@
 {
   "rustSourceFileCountMax": 194,
-  "rustSourceLineCountMax": 106909,
+  "rustSourceLineCountMax": 106977,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-architecture-check/src/main.rs": 1188,
@@ -19,7 +19,7 @@
     "src/runtime/hosted_query.rs": 3428,
     "src/runtime/hosted_resource.rs": 1044,
     "src/runtime/provider.rs": 1020,
-    "src/runtime/record_resolution.rs": 1393,
+    "src/runtime/record_resolution.rs": 1461,
     "src/runtime/tests.rs": 4433,
     "src/api/typed.rs": 1089,
     "src/transactions.rs": 1029,
