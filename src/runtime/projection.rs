@@ -25,8 +25,9 @@ use super::{
 /// key titles. Older projections stay deserializable for explicit stale-data
 /// handling but are never accepted by a v7 executor or mixed into a v7
 /// storage/digest binding.
-/// Format v8 adds the record's uniqueness keys so a hosted write can find the
-/// records its unique values could conflict with without a collection scan.
+/// Format v8 adds the uniqueness comparison sets a record belongs to, so a
+/// hosted write can find the records its unique values could conflict with
+/// without a collection scan.
 pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 8;
 pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v5";
 
@@ -120,44 +121,52 @@ pub struct RecordResolutionKey {
     pub value: String,
 }
 
-/// One value a record contributes to the uniqueness set of a type it matches.
-/// Two records conflict when they share a key.
+/// One value in one uniqueness comparison set (`type:<name>`, `collection`, or
+/// `path_glob:<glob>`). Two records conflict when one must hold a key alone
+/// and the other belongs to it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct UniquenessKey {
-    pub type_name: String,
+    pub set: String,
     pub field_reference: String,
     pub comparable_value: String,
 }
 
+impl From<crate::validation::cross_record::UniqueSetKey> for UniquenessKey {
+    fn from(key: crate::validation::cross_record::UniqueSetKey) -> Self {
+        Self {
+            set: key.set,
+            field_reference: key.field,
+            comparable_value: key.value,
+        }
+    }
+}
+
 impl CompiledCatalog {
-    /// Keys for every unique field declared by the record's matched types.
-    pub(crate) fn uniqueness_keys(
+    /// Keys a record belongs to in every uniqueness comparison set.
+    pub(crate) fn uniqueness_memberships(
+        &self,
+        effective_frontmatter: &Value,
+        types: &[String],
+        path: &str,
+    ) -> Vec<UniquenessKey> {
+        self.collection
+            .unique_memberships(effective_frontmatter, types, path)
+            .into_iter()
+            .map(UniquenessKey::from)
+            .collect()
+    }
+
+    /// Keys a record must hold alone under its own types' unique rules.
+    pub(crate) fn uniqueness_requirements(
         &self,
         effective_frontmatter: &Value,
         types: &[String],
     ) -> Vec<UniquenessKey> {
-        let mut keys = BTreeSet::new();
-        for type_name in types {
-            let type_name = type_name.to_lowercase();
-            let Some(type_definition) = self.collection.types.get(&type_name) else {
-                continue;
-            };
-            for field_reference in
-                crate::validation::validator::unique_field_references(type_definition)
-            {
-                if let Some(comparable_value) =
-                    crate::field_references::get_value(effective_frontmatter, &field_reference)
-                        .and_then(crate::validation::validator::unique_comparable_value)
-                {
-                    keys.insert(UniquenessKey {
-                        type_name: type_name.clone(),
-                        field_reference,
-                        comparable_value,
-                    });
-                }
-            }
-        }
-        keys.into_iter().collect()
+        self.collection
+            .unique_requirements(effective_frontmatter, types)
+            .into_iter()
+            .map(|(key, _)| UniquenessKey::from(key))
+            .collect()
     }
 
     /// Generate one full semantic projection from exact Markdown.
@@ -262,8 +271,11 @@ impl CompiledCatalog {
         let file = file_facts(&record.path, exact_size, record.file_mtime.clone());
         let resolution_keys =
             resolution_keys(&file, &effective_frontmatter, &self.link_resolution_keys());
-        let uniqueness_keys =
-            self.uniqueness_keys(&Value::Object(effective_frontmatter.clone()), &types);
+        let uniqueness_keys = self.uniqueness_memberships(
+            &Value::Object(effective_frontmatter.clone()),
+            &types,
+            &record.path,
+        );
 
         Ok(PreparedSemanticProjection {
             facts: SemanticProjectionFacts {

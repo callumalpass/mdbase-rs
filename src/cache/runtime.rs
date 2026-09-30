@@ -15,7 +15,7 @@ use crate::Collection;
 /// Versioned with the derived tables the runtime maintains incrementally: a
 /// cache written before `resolution_keys` existed does not match any
 /// generation, so the runtime rebuilds it once.
-const GENERATION_KEY: &str = "runtime_generation_v2";
+const GENERATION_KEY: &str = "runtime_generation_v3";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum UniqueConflictKind {
@@ -46,7 +46,7 @@ pub(crate) fn rebuild(
     let files = collection.scan_collection_relative_paths_checked()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
-        "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_values; DELETE FROM identity_values; DELETE FROM resolution_keys; DELETE FROM files; DELETE FROM meta;",
+        "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_keys; DELETE FROM identity_values; DELETE FROM resolution_keys; DELETE FROM files; DELETE FROM meta;",
     )?;
     for relative in files {
         indexer::reindex_file(&transaction, collection, &relative)?;
@@ -538,6 +538,24 @@ pub(crate) fn matches_generation(
     Ok(stored.as_deref() == Some(generation_value(generation)?.as_str()))
 }
 
+/// The part of the cached resolution index that resolving `links` from
+/// `source_path` reads.
+pub(crate) fn link_candidate_index(
+    collection: &Collection,
+    source_path: &str,
+    links: &[String],
+) -> Result<crate::links::resolver::LinkResolutionIndex, CacheError> {
+    let connection = sqlite::open_cache_db(
+        collection.held_root().cache_storage_path(),
+        &collection.settings.cache_folder,
+    )?;
+    let rows = links
+        .iter()
+        .map(|link| (0, source_path.to_string(), None, link.clone()))
+        .collect::<Vec<indexer::LinkRow>>();
+    indexer::load_candidate_resolution_index(&connection, &rows)
+}
+
 pub(crate) fn uniqueness_conflicts(
     collection: &Collection,
     frontmatter: &serde_json::Value,
@@ -572,51 +590,25 @@ pub(crate) fn uniqueness_conflicts(
         }
     }
 
-    for type_name in type_names {
-        let Some(type_definition) = collection.types.get(type_name) else {
-            continue;
-        };
-        let mut fields = type_definition
-            .fields
-            .iter()
-            .filter(|(_, field)| field.unique)
-            .map(|(name, _)| name.clone())
-            .collect::<BTreeSet<_>>();
-        fields.extend(
-            type_definition
-                .v03_frontmatter
-                .as_ref()
-                .and_then(|value| value.pointer("/collection/unique"))
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|rule| rule.get("field"))
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_string),
-        );
-        for field_name in fields {
-            let Some(value) = crate::field_references::get_value(frontmatter, &field_name)
-                .and_then(indexer::canonical_unique_value)
-            else {
-                continue;
-            };
-            let path = connection
-                .query_row(
-                    "SELECT path FROM unique_values WHERE type_name = ?1 AND field_name = ?2 AND value = ?3",
-                    rusqlite::params![type_name, field_name, value],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            if let Some(path) = path.filter(|path| path != exclude_path) {
-                conflicts.push(UniqueConflict {
-                    kind: UniqueConflictKind::Field {
-                        type_name: type_name.clone(),
-                        field_name,
-                    },
-                    value,
-                    path,
-                });
-            }
+    for (key, type_name) in collection.unique_requirements(frontmatter, type_names) {
+        let path = connection
+            .query_row(
+                "SELECT path FROM unique_keys \
+                 WHERE set_name = ?1 AND field_name = ?2 AND value = ?3 AND path <> ?4 \
+                 ORDER BY path LIMIT 1",
+                rusqlite::params![key.set, key.field, key.value, exclude_path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(path) = path {
+            conflicts.push(UniqueConflict {
+                kind: UniqueConflictKind::Field {
+                    type_name,
+                    field_name: key.field,
+                },
+                value: key.value,
+                path,
+            });
         }
     }
     Ok(conflicts)

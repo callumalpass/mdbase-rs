@@ -182,7 +182,7 @@ pub(crate) fn maintenance_cache_expectation_is_exact(
 
     for (table, column) in [
         ("links", "source_path"),
-        ("unique_values", "path"),
+        ("unique_keys", "path"),
         ("identity_values", "path"),
     ] {
         let count: i64 = conn.query_row(
@@ -418,7 +418,7 @@ fn insert_links(
     Ok(())
 }
 
-/// Insert unique field values into the `unique_values` table.
+/// Record every uniqueness comparison set the file belongs to.
 fn insert_unique_values(
     conn: &Connection,
     collection: &Collection,
@@ -426,45 +426,13 @@ fn insert_unique_values(
     effective: &serde_json::Value,
     type_names: &[String],
 ) -> Result<(), CacheError> {
-    for type_name in type_names {
-        if let Some(type_def) = collection.types.get(type_name) {
-            let mut field_references = type_def
-                .fields
-                .iter()
-                .filter(|(_, field)| field.unique)
-                .map(|(name, _)| name.clone())
-                .collect::<HashSet<_>>();
-            field_references.extend(
-                type_def
-                    .v03_frontmatter
-                    .as_ref()
-                    .and_then(|value| value.pointer("/collection/unique"))
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|rule| rule.get("field"))
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_string),
-            );
-            for field_reference in field_references {
-                if let Some(val) = crate::field_references::get_value(effective, &field_reference) {
-                    let val_str = match val {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Number(n) => n.to_string(),
-                        serde_json::Value::Bool(b) => b.to_string(),
-                        serde_json::Value::Null => continue,
-                        _ => serde_json::to_string(val).unwrap_or_default(),
-                    };
-                    if !val_str.is_empty() {
-                        execute_cached(conn,
-                            "INSERT OR REPLACE INTO unique_values (type_name, field_name, value, path) \
-                             VALUES (?1, ?2, ?3, ?4)",
-                            rusqlite::params![type_name, field_reference, val_str, rel_path],
-                        )?;
-                    }
-                }
-            }
-        }
+    for key in collection.unique_memberships(effective, type_names, rel_path) {
+        execute_cached(
+            conn,
+            "INSERT OR IGNORE INTO unique_keys (set_name, field_name, value, path) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![key.set, key.field, key.value, rel_path],
+        )?;
     }
     Ok(())
 }
@@ -484,7 +452,7 @@ pub(crate) fn remove_file(conn: &Connection, rel_path: &str) -> Result<(), Cache
     )?;
     execute_cached(
         conn,
-        "DELETE FROM unique_values WHERE path = ?1",
+        "DELETE FROM unique_keys WHERE path = ?1",
         rusqlite::params![rel_path],
     )?;
     execute_cached(
@@ -582,7 +550,7 @@ fn resolve_links(
     Ok(())
 }
 
-type LinkRow = (i64, String, Option<String>, String);
+pub(crate) type LinkRow = (i64, String, Option<String>, String);
 
 fn link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LinkRow> {
     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -593,7 +561,7 @@ fn link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LinkRow> {
 /// `resolution_keys` table and exact paths. Resolution against this index
 /// equals resolution against the full index, because a lookup never reads
 /// keys or paths other than its own.
-fn load_candidate_resolution_index(
+pub(crate) fn load_candidate_resolution_index(
     conn: &Connection,
     rows: &[LinkRow],
 ) -> Result<crate::links::resolver::LinkResolutionIndex, CacheError> {
@@ -747,7 +715,7 @@ pub(crate) fn reindex_all(
     let files = collection.scan_collection_relative_paths_checked()?;
     let transaction = conn.transaction()?;
     transaction.execute_batch(
-        "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_values; DELETE FROM identity_values; DELETE FROM resolution_keys; DELETE FROM files; DELETE FROM meta;",
+        "DELETE FROM links; DELETE FROM file_types; DELETE FROM unique_keys; DELETE FROM identity_values; DELETE FROM resolution_keys; DELETE FROM files; DELETE FROM meta;",
     )?;
 
     for rel_path in &files {

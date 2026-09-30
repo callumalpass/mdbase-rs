@@ -27,12 +27,14 @@ CREATE TABLE IF NOT EXISTS links (
     raw_target TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS unique_values (
-    type_name TEXT NOT NULL,
+-- Each row places a record in one uniqueness comparison set
+-- (`type:<name>`, `collection` or `path_glob:<glob>`) with its value.
+CREATE TABLE IF NOT EXISTS unique_keys (
+    set_name TEXT NOT NULL,
     field_name TEXT NOT NULL,
     value TEXT NOT NULL,
     path TEXT NOT NULL,
-    PRIMARY KEY (type_name, field_name, value)
+    PRIMARY KEY (set_name, field_name, value, path)
 );
 
 CREATE TABLE IF NOT EXISTS identity_values (
@@ -57,6 +59,6 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE INDEX IF NOT EXISTS idx_file_types_type ON file_types(type_name);
 CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_path);
 CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_path);
-CREATE INDEX IF NOT EXISTS idx_unique_values_path ON unique_values(path);
+CREATE INDEX IF NOT EXISTS idx_unique_keys_path ON unique_keys(path);
 CREATE INDEX IF NOT EXISTS idx_identity_values_path ON identity_values(path);
 CREATE INDEX IF NOT EXISTS idx_resolution_keys_path ON resolution_keys(path);

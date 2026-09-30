@@ -319,17 +319,12 @@ fn prepare_sparse_runtime(
     if matches!(kind, OperationKind::Create | OperationKind::Update)
         && collection.settings.default_validation == "error"
     {
-        let frontmatter = outcome
-            .record()
-            .map(|record| &record.frontmatter)
-            .ok_or_else(|| {
-                ProviderError::CollectionOpen(
-                    "record mutation outcome omitted frontmatter".to_string(),
-                )
-            })?;
-        let type_names = collection.determine_types_for_path(frontmatter, Some(&path));
+        let record = outcome.record().ok_or_else(|| {
+            ProviderError::CollectionOpen("record mutation outcome omitted frontmatter".to_string())
+        })?;
+        let type_names = collection.determine_types_for_path(&record.frontmatter, Some(&path));
         let issues = collection
-            .check_uniqueness_indexed(frontmatter, &type_names, &path)
+            .write_cross_record_issues_indexed(&record.effective_frontmatter, &type_names, &path)
             .map_err(|error| ProviderError::Transaction {
                 code: "cache_maintenance_failed",
                 message: error.to_string(),

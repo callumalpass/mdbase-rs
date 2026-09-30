@@ -3637,7 +3637,7 @@ fn invalid_maintenance_rejects_ambiguous_hints_and_repairs_exact_cache_shape() {
         .unwrap();
     connection
         .execute(
-            "INSERT INTO unique_values VALUES ('bogus', 'id', 'value', 'invalid.md')",
+            "INSERT INTO unique_keys VALUES ('bogus', 'id', 'value', 'invalid.md')",
             [],
         )
         .unwrap();
@@ -3670,7 +3670,7 @@ fn invalid_maintenance_rejects_ambiguous_hints_and_repairs_exact_cache_shape() {
     assert_eq!(canonical.2, None);
     assert_eq!(canonical.3, 1);
     assert_eq!(canonical.4, "invalid_utf8");
-    for table in ["file_types", "links", "unique_values", "identity_values"] {
+    for table in ["file_types", "links", "unique_keys", "identity_values"] {
         let count: i64 = connection
             .query_row(
                 &format!(

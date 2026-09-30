@@ -64,10 +64,9 @@ pub struct TypedHostedMutationPlan {
     pub primary_stable_id: String,
     pub changes: Vec<HostedRecordChange>,
     pub change_set: ChangeSet,
-    /// Uniqueness keys of the written records that canonical write validation
-    /// compared against the supplied context. The plan is authoritative only
-    /// when the context held every other record sharing one of these keys.
-    pub uniqueness_requirements: Vec<super::UniquenessKey>,
+    /// What validation compared the written records against; see
+    /// [`super::HostedWriteContext`].
+    pub context_requirements: super::HostedWriteContext,
 }
 
 impl CompiledCatalog {
@@ -243,11 +242,11 @@ impl CompiledCatalog {
             );
         if !result.valid && !partial_batch_applied {
             return Ok(TypedHostedMutationPlan {
+                context_requirements: self.rejected_write_context(&request.operation, &operation),
                 operation,
                 primary_stable_id: request.primary_stable_id.clone(),
                 changes: Vec::new(),
                 change_set: ChangeSet::None,
-                uniqueness_requirements: Vec::new(),
             });
         }
         let is_dry_run = request
@@ -428,14 +427,15 @@ impl CompiledCatalog {
             )
             .map_err(provider_change_error)?,
         );
-        let uniqueness_requirements =
-            self.hosted_mutation_uniqueness_requirements(&request.operation, &changes);
+        let (context_requirements, rejection) =
+            self.hosted_write_verdict(&collection, &request.operation, &changes)?;
+        let applied = rejection.is_none();
         Ok(TypedHostedMutationPlan {
-            operation,
+            operation: rejection.unwrap_or(operation),
             primary_stable_id: request.primary_stable_id.clone(),
-            changes,
-            change_set,
-            uniqueness_requirements,
+            changes: if applied { changes } else { Vec::new() },
+            change_set: if applied { change_set } else { ChangeSet::None },
+            context_requirements,
         })
     }
 

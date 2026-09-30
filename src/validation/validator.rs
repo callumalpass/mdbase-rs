@@ -182,7 +182,7 @@ pub fn validate_frontmatter_full_multi(
 use crate::generated::derive_path;
 use crate::validation::merge::detect_type_conflicts;
 use crate::Collection;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 fn invalid_record_issue(path: &str, reason: &str) -> Issue {
     Issue {
@@ -305,16 +305,12 @@ impl Collection {
         exclude_path: &str,
         snapshot: &crate::snapshot::AuthoritativeCollectionSnapshot,
     ) -> Vec<Issue> {
-        let corpus = snapshot
-            .entries()
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .effective_frontmatter()
-                    .map(|frontmatter| (entry.relative_path().to_string(), frontmatter.clone()))
-            })
-            .collect::<Vec<_>>();
-        self.check_uniqueness_in_corpus(frontmatter, type_names, exclude_path, &corpus)
+        self.check_uniqueness_in_corpus(
+            frontmatter,
+            type_names,
+            exclude_path,
+            &snapshot.unique_corpus(),
+        )
     }
 
     /// Uniqueness issues for a record being written. The check compares against
@@ -332,11 +328,7 @@ impl Collection {
             .identity_field()
             .and_then(|field| frontmatter.get(field))
             .is_some_and(|value| !value.is_null());
-        let applies = type_names
-            .iter()
-            .filter_map(|type_name| self.types.get(type_name))
-            .any(|type_def| has_id || !unique_field_references(type_def).is_empty());
-        if !applies {
+        if !has_id && self.unique_requirements(frontmatter, type_names).is_empty() {
             return Ok(Vec::new());
         }
         let captured;
@@ -362,25 +354,15 @@ impl Collection {
         frontmatter: &serde_json::Value,
         type_names: &[String],
         exclude_path: &str,
-        corpus: &[(String, serde_json::Value)],
+        corpus: &[crate::validation::cross_record::UniqueCorpusEntry],
     ) -> Vec<Issue> {
-        let mut issues = Vec::new();
+        let mut issues = self.unique_value_issues(frontmatter, type_names, exclude_path, corpus);
         let exclude_normalized = exclude_path.replace('\\', "/");
 
         for type_name in type_names {
-            let type_def = match self.types.get(type_name) {
-                Some(td) => td,
-                None => continue,
-            };
-
-            let unique_checks: Vec<(String, String)> = unique_field_references(type_def)
-                .into_iter()
-                .filter_map(|field_reference| {
-                    crate::field_references::get_value(frontmatter, &field_reference)
-                        .and_then(unique_comparable_value)
-                        .map(|value| (field_reference, value))
-                })
-                .collect();
+            if !self.types.contains_key(type_name) {
+                continue;
+            }
 
             // Check id_field
             let id_field = &self.settings.id_field;
@@ -399,7 +381,7 @@ impl Collection {
                 });
 
             // Check against all other files using the preloaded frontmatter snapshot.
-            for (rel_path, other_fm) in corpus {
+            for (rel_path, other_fm, _) in corpus {
                 if rel_path == &exclude_normalized {
                     continue;
                 }
@@ -421,33 +403,6 @@ impl Collection {
                                     ),
                                     path: Some(exclude_path.to_string()),
                                     field: Some(id_field.clone()),
-                                    severity: Severity::Error,
-                                    expected: None,
-                                    actual: None,
-                                    type_name: Some(type_name.clone()),
-                                    line: None,
-                                    column: None,
-                                });
-                            }
-                        }
-                    }
-                }
-
-                // Check unique fields
-                for (field_name, our_val) in &unique_checks {
-                    if let Some(other_val) =
-                        crate::field_references::get_value(other_fm, field_name)
-                    {
-                        if let Some(other_str) = unique_comparable_value(other_val) {
-                            if &other_str == our_val {
-                                issues.push(Issue {
-                                    code: "duplicate_value".to_string(),
-                                    message: format!(
-                                        "Duplicate unique value '{}' for field '{}' (also in {})",
-                                        our_val, field_name, rel_path
-                                    ),
-                                    path: Some(exclude_path.to_string()),
-                                    field: Some(field_name.clone()),
                                     severity: Severity::Error,
                                     expected: None,
                                     actual: None,
@@ -737,8 +692,7 @@ impl Collection {
         let mut all_issues = Vec::new();
 
         // Track unique values per (type, field) and id values per type
-        let mut unique_values: HashMap<(String, String), HashMap<String, Vec<String>>> =
-            HashMap::new();
+        let mut unique_corpus = Vec::new();
         let mut id_values: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
 
         for entry in collection_snapshot.entries() {
@@ -754,6 +708,8 @@ impl Collection {
                     continue;
                 }
             };
+
+            unique_corpus.push((rel_path.clone(), effective.clone(), type_names.clone()));
 
             // Detect multi-type conflicts
             if type_names.len() > 1 {
@@ -794,28 +750,6 @@ impl Collection {
                     );
                     all_issues.extend(result.issues);
 
-                    // Track unique fields.
-                    for field_reference in unique_field_references(type_def) {
-                        if let Some(val) =
-                            crate::field_references::get_value(&effective, &field_reference)
-                        {
-                            if val.is_null() {
-                                continue;
-                            }
-                            let key = (tn.clone(), field_reference);
-                            let val_str = match val.as_str() {
-                                Some(s) => s.to_string(),
-                                None => val.to_string(),
-                            };
-                            unique_values
-                                .entry(key)
-                                .or_default()
-                                .entry(val_str)
-                                .or_default()
-                                .push(rel_path.clone());
-                        }
-                    }
-
                     // Track id_field
                     if let Some(val) = self.identity_field().and_then(|field| effective.get(field))
                     {
@@ -837,30 +771,7 @@ impl Collection {
             all_issues.extend(self.data_contract_issues(&type_names, &effective, &rel_path));
         }
 
-        // Check for duplicate unique values
-        for ((type_name, field_name), values) in &unique_values {
-            for (val, paths) in values {
-                if paths.len() > 1 {
-                    for p in paths {
-                        all_issues.push(Issue {
-                            code: DUPLICATE_VALUE.to_string(),
-                            message: format!(
-                                "Duplicate value '{}' for unique field '{}' in type '{}'",
-                                val, field_name, type_name
-                            ),
-                            path: Some(p.clone()),
-                            field: Some(field_name.clone()),
-                            severity: Severity::Error,
-                            expected: None,
-                            actual: Some(serde_json::json!(val)),
-                            type_name: Some(type_name.clone()),
-                            line: None,
-                            column: None,
-                        });
-                    }
-                }
-            }
-        }
+        all_issues.extend(self.corpus_unique_value_issues(&unique_corpus));
 
         // Check for duplicate id values
         for (type_name, values) in &id_values {
@@ -895,41 +806,6 @@ impl Collection {
             "issues": issues_json,
         })
     }
-}
-
-pub(crate) fn unique_field_references(type_def: &TypeDef) -> Vec<String> {
-    let mut references = type_def
-        .fields
-        .iter()
-        .filter(|(_, field)| field.unique)
-        .map(|(name, _)| name.clone())
-        .collect::<HashSet<_>>();
-    references.extend(
-        type_def
-            .v03_frontmatter
-            .as_ref()
-            .and_then(|value| value.pointer("/collection/unique"))
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|rule| rule.get("field"))
-            .filter_map(serde_json::Value::as_str)
-            .map(str::to_string),
-    );
-    let mut references = references.into_iter().collect::<Vec<_>>();
-    references.sort();
-    references
-}
-
-/// The string two unique values are compared by. Null values are exempt.
-pub(crate) fn unique_comparable_value(value: &serde_json::Value) -> Option<String> {
-    if value.is_null() {
-        return None;
-    }
-    Some(match value.as_str() {
-        Some(value) => value.to_string(),
-        None => value.to_string(),
-    })
 }
 
 #[cfg(test)]

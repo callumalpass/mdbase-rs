@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::v03::OperationResult;
-use crate::validation::validator::unique_comparable_value;
+use crate::validation::cross_record::unique_comparable_value;
 use crate::{Collection, SpecProfile};
 
 use super::{
@@ -44,6 +44,15 @@ pub struct HostedValidationPlan {
     pub resolution_lookups: Vec<ResolutionLookupKey>,
 }
 
+/// Records a hosted write's canonical validation compared its written records
+/// against. A plan holds only when its context held every other record that
+/// shares one of these uniqueness keys or answers one of these link lookups.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedWriteContext {
+    pub uniqueness_keys: Vec<super::UniquenessKey>,
+    pub resolution_lookups: Vec<ResolutionLookupKey>,
+}
+
 impl HostedValidationPlan {
     /// Return true only when a current semantic projection can conflict with
     /// at least one canonical uniqueness requirement. False is a pruning proof.
@@ -65,26 +74,103 @@ impl HostedValidationPlan {
 }
 
 impl CompiledCatalog {
-    /// Uniqueness keys of the records a hosted mutation wrote, when canonical
-    /// write validation compares them with the rest of the collection. The
-    /// host must stage every other record sharing a key for the plan to hold.
-    pub(crate) fn hosted_mutation_uniqueness_requirements(
+    /// What canonical write validation compared a hosted write's records
+    /// against. Empty unless the write is validated (`validation: error`).
+    pub(crate) fn hosted_write_context<'a>(
         &self,
         operation: &str,
-        changes: &[super::HostedRecordChange],
-    ) -> Vec<super::UniquenessKey> {
+        written: impl IntoIterator<Item = &'a crate::api::RecordDocument>,
+    ) -> HostedWriteContext {
+        let mut context = HostedWriteContext::default();
         if self.collection.settings.default_validation != "error"
             || !matches!(operation, "create" | "update" | "batch")
         {
-            return Vec::new();
+            return context;
         }
-        changes
+        for record in written {
+            let types = record
+                .types
+                .iter()
+                .map(|name| name.to_lowercase())
+                .collect::<Vec<_>>();
+            context
+                .uniqueness_keys
+                .extend(self.uniqueness_requirements(&record.effective_frontmatter, &types));
+            context.resolution_lookups.extend(
+                self.collection
+                    .validation_resolution_targets(
+                        &record.effective_frontmatter,
+                        &types,
+                        record.path.as_str(),
+                    )
+                    .iter()
+                    .flat_map(|target| self.resolution_lookup_alternatives(target)),
+            );
+        }
+        context.uniqueness_keys.sort();
+        context.uniqueness_keys.dedup();
+        context.resolution_lookups.sort();
+        context.resolution_lookups.dedup();
+        context
+    }
+
+    /// The context of a rejected hosted write: a batch rejected for its links
+    /// still reports each item's resulting record.
+    pub(crate) fn rejected_write_context(
+        &self,
+        operation: &str,
+        outcome: &super::CanonicalOperationOutcome,
+    ) -> HostedWriteContext {
+        let super::CanonicalOperationValue::Batch(Some(batch)) = &outcome.value else {
+            return HostedWriteContext::default();
+        };
+        self.hosted_write_context(
+            operation,
+            batch
+                .operations
+                .iter()
+                .filter_map(|item| match &item.result {
+                    crate::api::BatchOperationResult::Record(record) => Some(record),
+                    _ => None,
+                }),
+        )
+    }
+
+    /// The staged write's context, and its rejection when a written record's
+    /// required links do not resolve among the staged records. Staged create
+    /// and update check uniqueness but not links, which only the complete
+    /// context can answer.
+    pub(crate) fn hosted_write_verdict(
+        &self,
+        staged: &Collection,
+        operation: &str,
+        changes: &[super::HostedRecordChange],
+    ) -> Result<(HostedWriteContext, Option<super::CanonicalOperationOutcome>), CatalogError> {
+        let written = changes
             .iter()
             .filter_map(|change| change.after.as_ref())
-            .flat_map(|after| self.uniqueness_keys(&after.effective_frontmatter, &after.types))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
+            .collect::<Vec<_>>();
+        let context = self.hosted_write_context(operation, written.iter().copied());
+        if context.resolution_lookups.is_empty() {
+            return Ok((context, None));
+        }
+        let issues = staged
+            .written_link_issues(&written)
+            .map_err(|error| validation_error("hosted_mutation_stage_failed", error.to_string()))?;
+        if issues.is_empty() {
+            return Ok((context, None));
+        }
+        let kind = operation
+            .parse::<super::OperationKind>()
+            .map_err(|error| validation_error("unsupported_hosted_mutation", error.to_string()))?;
+        let diagnostics = issues
+            .iter()
+            .map(|issue| crate::mutation::diagnostic_from_issue(issue).into())
+            .collect();
+        Ok((
+            context,
+            Some(super::CanonicalOperationOutcome::invalid(kind, diagnostics)),
+        ))
     }
 
     /// Compile cross-record uniqueness requirements for one exact validation
@@ -133,12 +219,12 @@ impl CompiledCatalog {
                 });
             }
         }
-        for key in self.uniqueness_keys(&effective, &types) {
+        for (key, type_name) in self.collection.unique_requirements(&effective, &types) {
             requirements.insert(HostedValidationRequirement {
                 kind: HostedValidationRequirementKind::UniqueField,
-                type_name: key.type_name,
-                field_reference: key.field_reference,
-                comparable_value: key.comparable_value,
+                type_name,
+                field_reference: key.field,
+                comparable_value: key.value,
             });
         }
         let mut resolution_lookups = self
@@ -410,7 +496,10 @@ mod tests {
                         "type": "object",
                         "properties": {"slug": {"type": "string"}}
                     }},
-                    "collection": {"unique": [{"field": "slug"}]}
+                    "collection": {
+                        "unique": [{"field": "slug"}],
+                        "links": {"related": {"validate_exists": true}}
+                    }
                 }),
                 schema: json!({"type": "object"}),
             }],
@@ -434,7 +523,7 @@ mod tests {
 
     fn slug_key(value: &str) -> crate::runtime::UniquenessKey {
         crate::runtime::UniquenessKey {
-            type_name: "note".to_string(),
+            set: "type:note".to_string(),
             field_reference: "slug".to_string(),
             comparable_value: value.to_string(),
         }
@@ -454,7 +543,7 @@ mod tests {
             .unwrap();
         assert!(without_context.operation.valid);
         assert_eq!(
-            without_context.uniqueness_requirements,
+            without_context.context_requirements.uniqueness_keys,
             vec![slug_key("same")]
         );
 
@@ -463,7 +552,10 @@ mod tests {
             .unwrap();
         assert!(!with_conflict.operation.valid);
         assert!(with_conflict.changes.is_empty());
-        assert!(with_conflict.uniqueness_requirements.is_empty());
+        assert!(with_conflict
+            .context_requirements
+            .uniqueness_keys
+            .is_empty());
 
         let update = catalog
             .plan_hosted_mutation_typed(&crate::runtime::HostedMutationRequest {
@@ -474,7 +566,10 @@ mod tests {
             })
             .unwrap();
         assert!(update.operation.valid);
-        assert_eq!(update.uniqueness_requirements, vec![slug_key("renamed")]);
+        assert_eq!(
+            update.context_requirements.uniqueness_keys,
+            vec![slug_key("renamed")]
+        );
 
         let projection = catalog.project_record(&existing).unwrap();
         assert_eq!(projection.facts.uniqueness_keys, vec![slug_key("same")]);
@@ -487,7 +582,7 @@ mod tests {
                 records: vec![existing],
             })
             .unwrap();
-        assert!(delete.uniqueness_requirements.is_empty());
+        assert!(delete.context_requirements.uniqueness_keys.is_empty());
     }
 
     #[test]
@@ -496,6 +591,49 @@ mod tests {
             .plan_hosted_mutation_typed(&create_note("notes/b.md", "same", Vec::new()))
             .unwrap();
         assert!(plan.operation.valid);
-        assert!(plan.uniqueness_requirements.is_empty());
+        assert!(plan.context_requirements.uniqueness_keys.is_empty());
+    }
+
+    #[test]
+    fn plans_report_link_lookups_and_resolve_them_against_staged_targets() {
+        let catalog = unique_slug_catalog("error");
+        let target = record("target", "notes/target.md", "---\ntype: note\n---\n");
+        let linking = |records| crate::runtime::HostedMutationRequest {
+            operation: "create".to_string(),
+            primary_stable_id: "source".to_string(),
+            input: json!({
+                "path": "notes/source.md",
+                "type": "note",
+                "frontmatter": {"related": "[[notes/target]]"}
+            }),
+            records,
+        };
+
+        let unstaged = catalog
+            .plan_hosted_mutation_typed(&linking(Vec::new()))
+            .unwrap();
+        assert!(!unstaged.operation.valid);
+        assert!(unstaged.changes.is_empty());
+        assert!(!unstaged.context_requirements.resolution_lookups.is_empty());
+
+        let staged = catalog
+            .plan_hosted_mutation_typed(&linking(vec![target.clone()]))
+            .unwrap();
+        assert!(staged.operation.valid, "{:?}", staged.operation);
+        assert_eq!(staged.changes.len(), 1);
+        assert_eq!(
+            staged.context_requirements.resolution_lookups,
+            unstaged.context_requirements.resolution_lookups
+        );
+
+        let mut dangling = linking(vec![target]);
+        dangling.input["frontmatter"]["related"] = json!("[[notes/missing]]");
+        let dangling = catalog.plan_hosted_mutation_typed(&dangling).unwrap();
+        assert!(!dangling.operation.valid);
+        assert!(dangling
+            .operation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "link_not_found"));
     }
 }

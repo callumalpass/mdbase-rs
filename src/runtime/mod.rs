@@ -82,6 +82,7 @@ pub use hosted_resource::{
 };
 pub use hosted_validation::{
     HostedValidationPlan, HostedValidationRequirement, HostedValidationRequirementKind,
+    HostedWriteContext,
 };
 pub use hosted_view::{
     HostedCanonicalViewPlan, HostedCanonicalViewPlanning, HostedCanonicalViewPlanningTyped,
