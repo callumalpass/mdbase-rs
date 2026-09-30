@@ -750,7 +750,28 @@ impl CompiledCatalog {
                                     path: path.clone(),
                                 }),
                         )
-                        .map(|resolution| (selected_lookup, resolution))
+                        .map(|resolution| {
+                            // Every alternative at one priority has the same kind, but an
+                            // extensionless path has one alternative per record extension.
+                            // The evidence names the alternative that matched the winner.
+                            let selected_lookup = match &resolution {
+                                RankedResolution::Resolved { path, .. } => plan
+                                    .lookups
+                                    .iter()
+                                    .find(|lookup| lookup.occurrence_ordinal == occurrence.ordinal)
+                                    .and_then(|lookup| {
+                                        lookup.alternatives.iter().find(|alternative| {
+                                            alternative.priority == *priority
+                                                && alternative.kind == RecordResolutionKeyKind::Path
+                                                && alternative.value == *path
+                                        })
+                                    })
+                                    .cloned()
+                                    .unwrap_or(selected_lookup),
+                                _ => selected_lookup,
+                            };
+                            (selected_lookup, resolution)
+                        })
                     })
                     .transpose()?;
                 let (selected_lookup, selected) = selected
@@ -916,6 +937,53 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    #[test]
+    fn extensionless_path_evidence_names_the_extension_that_matched() {
+        // `base` sorts before `md`, so the first planned alternative at this
+        // priority is not the one that matched.
+        let catalog = CompiledCatalog::compile(CatalogInput {
+            resource_revision: "resources-1".to_string(),
+            configuration_document:
+                "spec_version: 0.3.0\nsettings:\n  record_extensions: [md, base]\n".to_string(),
+            types: Vec::new(),
+            contracts: Vec::new(),
+        })
+        .unwrap();
+        let structure = catalog
+            .parse_record_structure(&CanonicalRecordInput {
+                stable_id: None,
+                path: "tasks/open.md".to_string(),
+                document: "---\nprojects: ['[[projects/alpha]]']\n---\n".to_string(),
+                file_size: 0,
+                file_mtime: None,
+            })
+            .unwrap();
+        let plan = catalog.plan_record_resolution(&structure).unwrap();
+        let lookup = &plan.lookups[0];
+        let matched = lookup
+            .alternatives
+            .iter()
+            .position(|alternative| alternative.value == "projects/alpha.md")
+            .unwrap();
+        let resolved = catalog
+            .resolve_record_structure(
+                &structure,
+                &plan,
+                &[candidate(lookup, matched, "alpha", "projects/alpha.md")],
+            )
+            .unwrap();
+        let occurrence = &resolved.occurrences[0];
+        assert_eq!(occurrence.target_path.as_deref(), Some("projects/alpha.md"));
+        assert_eq!(
+            occurrence
+                .selected_lookup
+                .as_ref()
+                .map(|lookup| lookup.value.as_str()),
+            Some("projects/alpha.md")
+        );
+        assert!(resolved.resolution_evidence_is_valid());
     }
 
     fn rebind_fabricated_evidence(occurrence: &mut ResolvedStructuralOccurrence) {

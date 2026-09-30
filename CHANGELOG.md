@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## 0.4.0-rc.6 - 2026-09-30
+
+### Fixed
+
+- An extensionless path link resolves through one lookup per record
+  extension at the same priority; the resolution evidence now names the lookup
+  that matched rather than the first planned one. With `record_extensions:
+  [md, base]`, a link to `projects/a.md` recorded `projects/a.base`, the
+  evidence failed validation, and hosted Obsidian Base evaluation rejected any
+  view reaching such a record. The semantic engine version changes so hosted
+  projections are rebuilt with valid evidence.
+
 ### Added
 
 - YAML document records (spec `b3883f9`): a record's format is fixed by its
