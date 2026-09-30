@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- Writes under `validation: error` now reject a `validate_exists` link whose
+  target does not exist (`link_not_found`, `ambiguous_link`,
+  `link_wrong_type`), as §04 requires; only `validate` checked links before.
+  The runtime resolves a single write's links through the cache's candidate
+  resolution index, and a batch resolves them against its final state, so an
+  item may link to a record another item creates.
+- `collection.unique` honours `scope`. `type` (the default when omitted)
+  compares with records matching the declaring type, `collection` with every
+  record, and `path_glob` with records under the glob. The corpus check,
+  collection-wide `validate`, the runtime cache index and hosted projections
+  share one derivation, so they no longer disagree (the corpus check compared
+  every record; the cache compared only the declaring type). An empty string
+  is now a comparable value everywhere, as only missing and null values are
+  exempt. The cache's `unique_values` table becomes `unique_keys`, keyed by
+  record path as well, so a pre-existing duplicate can no longer mask another;
+  the runtime generation moves to v3 and existing caches rebuild once.
+- Hosted writes can enforce both rules. Semantic projections (format 8) carry
+  the uniqueness comparison sets a record belongs to, and a typed hosted
+  mutation plan reports a `HostedWriteContext` of the uniqueness keys and link
+  lookups its written records were validated against, even when it rejects
+  them, so a host stages every record that could answer and plans again.
+
 ## 0.4.0-rc.6 - 2026-09-30
 
 ### Fixed

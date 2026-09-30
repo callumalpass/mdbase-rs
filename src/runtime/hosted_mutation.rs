@@ -64,6 +64,9 @@ pub struct TypedHostedMutationPlan {
     pub primary_stable_id: String,
     pub changes: Vec<HostedRecordChange>,
     pub change_set: ChangeSet,
+    /// What validation compared the written records against; see
+    /// [`super::HostedWriteContext`].
+    pub context_requirements: super::HostedWriteContext,
 }
 
 impl CompiledCatalog {
@@ -239,6 +242,7 @@ impl CompiledCatalog {
             );
         if !result.valid && !partial_batch_applied {
             return Ok(TypedHostedMutationPlan {
+                context_requirements: self.rejected_write_context(&request.operation, &operation),
                 operation,
                 primary_stable_id: request.primary_stable_id.clone(),
                 changes: Vec::new(),
@@ -423,11 +427,15 @@ impl CompiledCatalog {
             )
             .map_err(provider_change_error)?,
         );
+        let (context_requirements, rejection) =
+            self.hosted_write_verdict(&collection, &request.operation, &changes)?;
+        let applied = rejection.is_none();
         Ok(TypedHostedMutationPlan {
-            operation,
+            operation: rejection.unwrap_or(operation),
             primary_stable_id: request.primary_stable_id.clone(),
-            changes,
-            change_set,
+            changes: if applied { changes } else { Vec::new() },
+            change_set: if applied { change_set } else { ChangeSet::None },
+            context_requirements,
         })
     }
 

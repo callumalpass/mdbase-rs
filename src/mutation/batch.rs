@@ -207,7 +207,13 @@ pub(crate) fn prepare_runtime_batch(
         request.dry_run,
         context,
     );
-    if request.dry_run || execution.result.failed != 0 {
+    if request.dry_run
+        || execution.result.failed != 0
+        || (shadow
+            .collection
+            .reject_unresolved_links(&mut execution.result))
+        .map_err(|error| ProviderError::CollectionOpen(error.to_string()))?
+    {
         execution.result.preflight = true;
         return Ok(RuntimeBatchPreparation::NoMutation(execution));
     }
@@ -245,7 +251,19 @@ fn execute_atomic(
         Some(context) => execute_items(&shadow.collection, operations, options, dry_run, context),
         None => execute_items_direct_context(&shadow.collection, operations, options, dry_run),
     };
-    if dry_run || execution.result.failed != 0 {
+    if dry_run
+        || execution.result.failed != 0
+        || (shadow
+            .collection
+            .reject_unresolved_links(&mut execution.result))
+        .map_err(|error| {
+            operation_error(vec![CanonicalDiagnostic::error(
+                "collection_snapshot_failed",
+                error.to_string(),
+                None,
+            )])
+        })?
+    {
         execution.result.preflight = true;
         return Ok(execution);
     }

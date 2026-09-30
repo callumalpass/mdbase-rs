@@ -660,7 +660,7 @@ impl Collection {
         targets
     }
 
-    fn validation_link_checks(
+    pub(crate) fn validation_link_checks(
         &self,
         frontmatter: &serde_json::Value,
         type_names: &[String],

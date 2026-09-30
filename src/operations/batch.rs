@@ -162,15 +162,7 @@ impl Collection {
         let mut generated = crate::generated::GeneratedValueContext::from_snapshot(self, &snapshot);
         let mut proposals = Vec::new();
         let mut prepared_updates = std::collections::HashMap::new();
-        let mut corpus = snapshot
-            .entries()
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .effective_frontmatter()
-                    .map(|frontmatter| (entry.relative_path().to_string(), frontmatter.clone()))
-            })
-            .collect::<Vec<_>>();
+        let mut corpus = snapshot.unique_corpus();
         for path in &matching_paths {
             if ineligible_paths.contains(path) {
                 continue;
@@ -211,10 +203,12 @@ impl Collection {
                 }
             }
             generated = candidate_generated;
-            if let Some((_, frontmatter)) =
-                corpus.iter_mut().find(|(candidate, _)| candidate == path)
+            if let Some((_, frontmatter, types)) = corpus
+                .iter_mut()
+                .find(|(candidate, _, _)| candidate == path)
             {
                 *frontmatter = effective.clone();
+                types.clone_from(&type_names);
             }
             proposals.push((path.clone(), effective, type_names));
             prepared_updates.insert(
@@ -407,13 +401,9 @@ impl Collection {
             })
             .collect::<std::collections::HashMap<_, _>>();
         let mut effective_corpus = snapshot
-            .entries()
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .effective_frontmatter()
-                    .map(|frontmatter| (entry.relative_path().to_string(), frontmatter.clone()))
-            })
+            .unique_corpus()
+            .into_iter()
+            .map(|(path, effective, types)| (path, (effective, types)))
             .collect::<std::collections::HashMap<_, _>>();
         let mut final_proposals = std::collections::HashMap::new();
         let mut prepared_updates = Vec::with_capacity(updates.len());
@@ -469,7 +459,7 @@ impl Collection {
             }
             generated = candidate_generated;
             working_raw.insert(path.to_string(), raw_value);
-            effective_corpus.insert(path.to_string(), effective.clone());
+            effective_corpus.insert(path.to_string(), (effective.clone(), type_names.clone()));
             final_proposals.insert(path.to_string(), (effective, type_names));
             prepared_updates.push(Some(crate::operations::update::PrevalidatedUpdate {
                 expected_revision: entry.facts().revision.clone(),
@@ -477,7 +467,10 @@ impl Collection {
             }));
         }
         if self.settings.default_validation == "error" {
-            let corpus = effective_corpus.into_iter().collect::<Vec<_>>();
+            let corpus = effective_corpus
+                .into_iter()
+                .map(|(path, (effective, types))| (path, effective, types))
+                .collect::<Vec<_>>();
             for (path, (effective, type_names)) in final_proposals {
                 let issues =
                     self.check_uniqueness_in_corpus(&effective, &type_names, &path, &corpus);

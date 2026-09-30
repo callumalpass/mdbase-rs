@@ -82,6 +82,7 @@ pub use hosted_resource::{
 };
 pub use hosted_validation::{
     HostedValidationPlan, HostedValidationRequirement, HostedValidationRequirementKind,
+    HostedWriteContext,
 };
 pub use hosted_view::{
     HostedCanonicalViewPlan, HostedCanonicalViewPlanning, HostedCanonicalViewPlanningTyped,
@@ -105,7 +106,7 @@ pub use outcome::{
 };
 pub use projection::{
     PreparedSemanticProjection, RecordResolutionKey, RecordResolutionKeyKind, SemanticFileFacts,
-    SemanticProjection, SemanticProjectionFacts, SEMANTIC_PROJECTION_FORMAT_VERSION,
+    SemanticProjection, SemanticProjectionFacts, UniquenessKey, SEMANTIC_PROJECTION_FORMAT_VERSION,
     SEMANTIC_PROJECTION_SCHEMA_VERSION,
 };
 pub use provider::{CollectionProvider, FilesystemProvider};

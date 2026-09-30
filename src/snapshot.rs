@@ -133,6 +133,22 @@ impl AuthoritativeCollectionSnapshot {
         &self.entries
     }
 
+    /// Every parsed record as a uniqueness comparison entry.
+    pub(crate) fn unique_corpus(&self) -> Vec<crate::validation::cross_record::UniqueCorpusEntry> {
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                entry.effective_frontmatter().map(|frontmatter| {
+                    (
+                        entry.relative_path().to_string(),
+                        frontmatter.clone(),
+                        entry.type_names().to_vec(),
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn entry(&self, path: &str) -> Option<&AuthoritativeCollectionSnapshotEntry> {
         #[cfg(all(test, feature = "legacy-collection-mutation"))]
         SNAPSHOT_ENTRY_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));

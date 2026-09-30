@@ -365,18 +365,20 @@ impl Collection {
         // Validate the complete final effective corpus before the first write.
         if self.settings.default_validation == "error" {
             let mut corpus = snapshot
-                .entries()
-                .iter()
-                .filter_map(|entry| {
-                    entry
-                        .effective_frontmatter()
-                        .map(|frontmatter| (entry.relative_path().to_string(), frontmatter.clone()))
-                })
+                .unique_corpus()
+                .into_iter()
+                .map(|(path, effective, types)| (path, (effective, types)))
                 .collect::<HashMap<_, _>>();
             for plan in &plans {
-                corpus.insert(plan.path.clone(), plan.effective.clone());
+                corpus.insert(
+                    plan.path.clone(),
+                    (plan.effective.clone(), plan.type_names.clone()),
+                );
             }
-            let corpus = corpus.into_iter().collect::<Vec<_>>();
+            let corpus = corpus
+                .into_iter()
+                .map(|(path, (effective, types))| (path, effective, types))
+                .collect::<Vec<_>>();
             let mut resolved_files = snapshot.resolved_files_data();
             for plan in &plans {
                 if let Some(file) = resolved_files

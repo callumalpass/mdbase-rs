@@ -430,6 +430,9 @@ pub(crate) fn open_cache_db_memory() -> Result<Connection> {
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
+    // unique_values kept one path per type value; unique_keys replaced it
+    // and the runtime generation bump rebuilds its rows.
+    conn.execute_batch("DROP TABLE IF EXISTS unique_values;")?;
     conn.execute_batch(include_str!("schema.sql"))?;
     if !table_has_column(conn, "files", "ctime_ns")? {
         conn.execute_batch("ALTER TABLE files ADD COLUMN ctime_ns INTEGER;")?;
@@ -491,7 +494,7 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_unique_values_path'",
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_unique_keys_path'",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
