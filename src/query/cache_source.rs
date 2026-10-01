@@ -14,6 +14,12 @@ use crate::record_load::RecordLoadOutcome;
 use crate::snapshot::{CollectionSnapshot, SnapshotError};
 use crate::{Collection, OperationCancellation};
 
+pub(crate) struct MetadataPageWindow {
+    pub offset: u64,
+    pub limit: Option<u64>,
+    pub known_total: Option<usize>,
+}
+
 pub(crate) struct MetadataPage {
     pub records: Vec<LocalRecord>,
     pub total: usize,
@@ -303,6 +309,56 @@ impl Collection {
         cancellation: &OperationCancellation,
         refresh_from_filesystem: bool,
     ) -> Option<MetadataPage> {
+        let started = Instant::now();
+        let mut conn = sqlite::open_cache_db(
+            self.held_root().cache_storage_path(),
+            &self.settings.cache_folder,
+        )
+        .ok()?;
+        let open_ms = elapsed_ms(started);
+        let refresh_started = Instant::now();
+        if refresh_from_filesystem {
+            self.refresh_cache(&mut conn, cancellation).ok()?;
+            if cancellation.is_cancelled() {
+                return None;
+            }
+        }
+        let refresh_ms = if refresh_from_filesystem {
+            elapsed_ms(refresh_started)
+        } else {
+            0.0
+        };
+        let mut page = self.load_query_metadata_page_connection(
+            &conn,
+            types,
+            order_by,
+            MetadataPageWindow {
+                offset,
+                limit,
+                known_total: None,
+            },
+            cancellation,
+        )?;
+        page.performance.try_open_cache_ms = open_ms;
+        page.performance.refresh_cache_ms = refresh_ms;
+        page.performance.total_ms = elapsed_ms(started);
+        Some(page)
+    }
+
+    /// Read one bounded page from an already-pinned SQLite snapshot.
+    pub(crate) fn load_query_metadata_page_connection(
+        &self,
+        conn: &Connection,
+        types: &[String],
+        order_by: &[(&str, bool)],
+        window: MetadataPageWindow,
+        cancellation: &OperationCancellation,
+    ) -> Option<MetadataPage> {
+        let MetadataPageWindow {
+            offset,
+            limit,
+            known_total,
+        } = window;
         let mut clauses = Vec::new();
         for (field, descending) in order_by {
             let direction = if *descending { "DESC" } else { "ASC" };
@@ -324,25 +380,10 @@ impl Collection {
         clauses.push("f.path ASC".to_string());
 
         let total_started = Instant::now();
-        let mut perf = LoadQueryPerf::default();
-        let open_started = Instant::now();
-        let mut conn = sqlite::open_cache_db(
-            self.held_root().cache_storage_path(),
-            &self.settings.cache_folder,
-        )
-        .ok()?;
-        perf.try_open_cache_ms = elapsed_ms(open_started);
-        perf.cache_used = true;
-
-        if refresh_from_filesystem {
-            let refresh_started = Instant::now();
-            self.refresh_cache(&mut conn, cancellation).ok()?;
-            if cancellation.is_cancelled() {
-                return None;
-            }
-            perf.refresh_cache_ms = elapsed_ms(refresh_started);
-        }
-
+        let mut perf = LoadQueryPerf {
+            cache_used: true,
+            ..LoadQueryPerf::default()
+        };
         let load_started = Instant::now();
         let normalized_types = types
             .iter()
@@ -358,13 +399,15 @@ impl Collection {
             )
         };
         let count_sql = format!("SELECT COUNT(*) FROM files f WHERE 1 = 1{type_filter}");
-        let total = match conn.query_row(
-            &count_sql,
-            params_from_iter(normalized_types.iter()),
-            |row| row.get::<_, usize>(0),
-        ) {
-            Ok(total) => total,
-            Err(_) => return None,
+        let total = match known_total {
+            Some(total) => total,
+            None => conn
+                .query_row(
+                    &count_sql,
+                    params_from_iter(normalized_types.iter()),
+                    |row| row.get::<_, usize>(0),
+                )
+                .ok()?,
         };
         let sql = format!(
             "SELECT f.path, f.frontmatter_json, f.body, f.size, f.mtime_ns, f.ctime_ns, f.source_revision, f.failure_reason \
@@ -419,7 +462,7 @@ impl Collection {
                 Ok(row) => row,
                 Err(_) => return None,
             };
-            let type_names = self.load_types_for_path(&conn, &path).ok()?;
+            let type_names = self.load_types_for_path(conn, &path).ok()?;
             let common_mtime = (mtime_ns != 0).then(|| ns_to_iso(mtime_ns));
             let common_ctime = ctime_ns.map(ns_to_iso);
             if let Some(reason) = invalid_reason {

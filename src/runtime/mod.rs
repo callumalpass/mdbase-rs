@@ -214,4 +214,8 @@ impl ProviderError {
 }
 
 #[cfg(test)]
+mod startup_benchmark_tests;
+#[cfg(test)]
+mod startup_tests;
+#[cfg(test)]
 mod tests;

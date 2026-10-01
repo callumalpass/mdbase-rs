@@ -1,4 +1,5 @@
 mod readiness;
+mod reads;
 
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
@@ -19,7 +20,7 @@ use super::{
     ChangeWatermark, CollectionGeneration, CommitAttempt, CommitId, CommitRejection,
     DurableCommitState, ExecutionOutcome, FilesystemProvider, HostClaimId, ObserverOptions,
     OperationContext, OperationRequest, PreparationOutcome, PreparedMutation, ProviderError,
-    ReadCursor, ReadPage, RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeObserver,
+    RuntimeChangeEvent, RuntimeChangeEventPage, RuntimeObserver,
 };
 use crate::transactions::{
     self, RuntimeCommitAttempt, RuntimePrepareOutcome, RuntimeResolution, RuntimeSettlement,
@@ -285,52 +286,6 @@ impl FilesystemRuntime {
         ))
     }
 
-    /// Open a bounded generation-pinned read page.
-    pub fn open_read(
-        &self,
-        request: &OperationRequest,
-        context: &OperationContext,
-    ) -> Result<ReadPage, ProviderError> {
-        if request.operation.is_mutation() {
-            return Err(ProviderError::UnsupportedOperation(
-                "open_read requires a non-mutation operation".to_string(),
-            ));
-        }
-        let mut expanded = request.clone();
-        let page_items = expanded
-            .input
-            .get("limit")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok());
-        if let Some(input) = expanded.input.as_object_mut() {
-            input.remove("limit");
-        }
-        let outcome = self.read_with_result_charge(&expanded, context, false)?;
-        self.cursor_lock(context)?
-            .open(outcome, page_items, context)
-    }
-
-    /// Read or deterministically replay one page from a pinned generation.
-    pub fn read_page(
-        &self,
-        cursor: &ReadCursor,
-        context: &OperationContext,
-    ) -> Result<ReadPage, ProviderError> {
-        self.cursor_lock(context)?.page(cursor, context)
-    }
-
-    /// Explicitly release a pinned read and its bounded retained state.
-    pub fn release_read(
-        &self,
-        cursor: ReadCursor,
-        context: &OperationContext,
-    ) -> Result<super::CursorReleaseOutcome, ProviderError> {
-        context.check()?;
-        let released = self.cursor_lock(context)?.release(cursor)?;
-        context.check()?;
-        Ok(super::CursorReleaseOutcome { released })
-    }
-
     /// Validate and durably stage one exact mutation under an opaque host claim.
     pub fn prepare(
         &self,
@@ -347,6 +302,7 @@ impl FilesystemRuntime {
         claim: &HostClaimId,
         context: &OperationContext,
     ) -> Result<PreparationOutcome, ProviderError> {
+        self.reap_idle_read_snapshots();
         if !request.operation.is_mutation() {
             return Err(ProviderError::UnsupportedOperation(
                 "prepare requires a mutation operation".to_string(),
@@ -856,6 +812,7 @@ impl FilesystemRuntime {
         paths: Option<&[&str]>,
         context: &OperationContext,
     ) -> Result<(), ProviderError> {
+        self.reap_idle_read_snapshots();
         const MAX_STALE_RETRIES: usize = 3;
         let mut maintenance_seal = None;
         for _ in 0..MAX_STALE_RETRIES {
@@ -970,7 +927,22 @@ impl FilesystemRuntime {
             .map_err(|_| ProviderError::LockPoisoned)
     }
 
+    fn reap_idle_read_snapshots(&self) {
+        // Abandoned WAL readers must not prevent checkpointing while the
+        // connector continues writing or observing changes. Never delay a
+        // writer behind a busy cursor: that reader already reaps its leases.
+        if let Ok(mut cursors) = self.cursors.try_lock() {
+            let _ = cursors.measurements();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_read_leases_for_test(&self) {
+        self.cursors.lock().unwrap().expire_all_for_test();
+    }
+
     fn wait_for_settlement(&self, context: &OperationContext) -> Result<(), ProviderError> {
+        self.reap_idle_read_snapshots();
         let mut active = self.settlement_lock(context)?;
         while active.is_some() {
             let wait = context.next_wait()?;

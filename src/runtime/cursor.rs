@@ -11,7 +11,9 @@ use super::{
 const MAX_ACTIVE_CURSORS: usize = 32;
 const MAX_CURSOR_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_PAGE_ITEMS: usize = 100;
-const MAX_PAGE_ITEMS: usize = 256;
+const MAX_PAGE_ITEMS: usize = 1_000;
+// Conservative HashMap allocation allowance, including spare bucket capacity.
+const PAGE_CHOICE_BYTES: usize = 128;
 const IDLE_LEASE: Duration = Duration::from_secs(30);
 const HARD_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
@@ -26,7 +28,10 @@ struct PinnedRead {
     generation: CollectionGeneration,
     template: CanonicalOperationOutcome,
     results: Vec<crate::api::ProjectedValue>,
+    metadata: Option<Box<crate::query::canonical::pinned::PinnedMetadataQuery>>,
     page_items: usize,
+    // Bind the first requested size at each offset so retries are deterministic.
+    page_sizes: HashMap<usize, usize>,
     retained_bytes: usize,
     created: Instant,
     last_access: Instant,
@@ -108,7 +113,9 @@ impl CursorStore {
                 generation: generation.clone(),
                 template,
                 results,
+                metadata: None,
                 page_items,
+                page_sizes: HashMap::new(),
                 retained_bytes,
                 created: now,
                 last_access: now,
@@ -117,9 +124,86 @@ impl CursorStore {
         self.page(&self.issue(&id, 0), context)
     }
 
+    pub(crate) fn open_metadata(
+        &mut self,
+        mut source: crate::query::canonical::pinned::PinnedMetadataQuery,
+        generation: CollectionGeneration,
+        page_items: Option<usize>,
+        retained_bytes: usize,
+        context: &OperationContext,
+    ) -> Result<ReadPage, ProviderError> {
+        context.check()?;
+        self.remove_expired();
+        let page_items = page_items
+            .unwrap_or(DEFAULT_PAGE_ITEMS)
+            .clamp(1, MAX_PAGE_ITEMS);
+        let operation = context.scope(|| source.page(0, page_items, context))?;
+        let mut template = operation.clone();
+        let query = template
+            .query_value_mut()
+            .ok_or(ProviderError::InvalidReadCursor)?;
+        let first_bytes =
+            measured_json_bytes(&query.records, context.capture_limits().max_retained_bytes)?;
+        context.charge_retained(first_bytes)?;
+        query.records.clear();
+        let outcome =
+            ExecutionOutcome::new(operation, generation.clone(), ChangeSet::None, None, None);
+        if !query.has_more {
+            return Ok(ReadPage {
+                outcome,
+                next: None,
+            });
+        }
+        let retained_bytes = retained_bytes
+            .checked_add(PAGE_CHOICE_BYTES)
+            .ok_or(ProviderError::CursorCapacityExhausted)?;
+        let store_bytes = self
+            .retained_bytes
+            .checked_add(retained_bytes)
+            .filter(|bytes| *bytes <= MAX_CURSOR_BYTES)
+            .ok_or(ProviderError::CursorCapacityExhausted)?;
+        if self.entries.len() >= MAX_ACTIVE_CURSORS {
+            return Err(ProviderError::CursorCapacityExhausted);
+        }
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| ProviderError::CursorCapacityExhausted)?;
+        context.charge_retained(retained_bytes as u64)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Instant::now();
+        self.entries.insert(
+            id.clone(),
+            PinnedRead {
+                generation,
+                template,
+                results: Vec::new(),
+                metadata: Some(Box::new(source)),
+                page_items,
+                page_sizes: HashMap::new(),
+                retained_bytes,
+                created: now,
+                last_access: now,
+            },
+        );
+        self.retained_bytes = store_bytes;
+        Ok(ReadPage {
+            outcome,
+            next: Some(self.issue(&id, page_items)),
+        })
+    }
+
     pub(crate) fn page(
         &mut self,
         cursor: &ReadCursor,
+        context: &OperationContext,
+    ) -> Result<ReadPage, ProviderError> {
+        self.page_with_limit(cursor, None, context)
+    }
+
+    pub(crate) fn page_with_limit(
+        &mut self,
+        cursor: &ReadCursor,
+        limit: Option<usize>,
         context: &OperationContext,
     ) -> Result<ReadPage, ProviderError> {
         context.check()?;
@@ -128,25 +212,65 @@ impl CursorStore {
         let Some(pinned) = self.entries.get_mut(&id) else {
             return Err(ProviderError::GenerationExpired);
         };
-        if next_index > pinned.results.len() {
+        let total = pinned
+            .metadata
+            .as_ref()
+            .map_or(pinned.results.len(), |source| source.remaining());
+        if next_index > total {
             return Err(ProviderError::InvalidReadCursor);
         }
-        let end = next_index
-            .saturating_add(pinned.page_items)
-            .min(pinned.results.len());
-        let mut operation = pinned.template.clone();
+        let requested = limit.unwrap_or(pinned.page_items).clamp(1, MAX_PAGE_ITEMS);
+        let page_items = pinned
+            .page_sizes
+            .get(&next_index)
+            .copied()
+            .unwrap_or(requested);
+        if limit.is_some() && requested != page_items {
+            return Err(ProviderError::InvalidReadCursor);
+        }
+        if !pinned.page_sizes.contains_key(&next_index) {
+            let retained_bytes = pinned
+                .retained_bytes
+                .checked_add(PAGE_CHOICE_BYTES)
+                .ok_or(ProviderError::CursorCapacityExhausted)?;
+            let store_bytes = self
+                .retained_bytes
+                .checked_add(PAGE_CHOICE_BYTES)
+                .filter(|bytes| *bytes <= MAX_CURSOR_BYTES)
+                .ok_or(ProviderError::CursorCapacityExhausted)?;
+            pinned
+                .page_sizes
+                .try_reserve(1)
+                .map_err(|_| ProviderError::CursorCapacityExhausted)?;
+            context.charge_retained(PAGE_CHOICE_BYTES as u64)?;
+            pinned.page_sizes.insert(next_index, page_items);
+            pinned.retained_bytes = retained_bytes;
+            self.retained_bytes = store_bytes;
+        }
+        let end = next_index.saturating_add(page_items).min(total);
+        let mut operation = match pinned.metadata.as_mut() {
+            Some(source) => context.scope(|| source.page(next_index, page_items, context))?,
+            None => pinned.template.clone(),
+        };
         let Some(query) = operation.query_value_mut() else {
             return Err(ProviderError::Transaction {
                 code: "cursor_state_invalid",
                 message: "pinned read no longer contains a typed query".to_string(),
             });
         };
-        query.records = pinned.results[next_index..end].to_vec();
-        query.has_more = end < pinned.results.len();
+        if pinned.metadata.is_none() {
+            query.records = pinned.results[next_index..end].to_vec();
+        } else {
+            context.charge_retained(measured_json_bytes(
+                &query.records,
+                context.capture_limits().max_retained_bytes,
+            )?)?;
+        }
+        query.has_more = end < total;
         set_has_more(&mut query.meta, query.has_more);
         pinned.last_access = Instant::now();
         let generation = pinned.generation.clone();
-        let next = (end < pinned.results.len()).then(|| self.issue(&id, end));
+        let next = (end < total).then(|| self.issue(&id, end));
         context.check()?;
         Ok(ReadPage {
             outcome: ExecutionOutcome::new(operation, generation, ChangeSet::None, None, None),
@@ -201,6 +325,13 @@ impl CursorStore {
             return Err(ProviderError::InvalidReadCursor);
         }
         Ok((id, next_index))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_all_for_test(&mut self) {
+        for pinned in self.entries.values_mut() {
+            pinned.last_access = Instant::now() - IDLE_LEASE - Duration::from_secs(1);
+        }
     }
 
     fn remove_expired(&mut self) {

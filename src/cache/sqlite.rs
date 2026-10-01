@@ -1,8 +1,6 @@
 //! SQLite setup and helpers.
 
-#[cfg(test)]
-use rusqlite::OpenFlags;
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, OpenFlags, Result};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -363,10 +361,8 @@ pub(crate) fn open_cache_db(root: &Path, cache_folder: &str) -> Result<Connectio
     Ok(conn)
 }
 
-/// Test the behavior of opening an existing cache read-only without schema
-/// initialization, DDL, or logical cache writes. Production seal validation
-/// deliberately reuses its committing connection instead of taking this path.
-#[cfg(test)]
+/// Open an existing cache without schema initialization or logical writes.
+/// A held read transaction can pin its WAL snapshot for bounded query pages.
 pub(crate) fn open_cache_db_read_only_existing(
     root: &Path,
     cache_folder: &str,
