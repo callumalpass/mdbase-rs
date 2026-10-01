@@ -7,6 +7,7 @@ pub(crate) mod canonical {
     pub(crate) mod diagnostics;
     pub(crate) mod execute;
     pub(crate) mod model;
+    pub(crate) mod pinned;
     pub(crate) mod preflight;
     pub(crate) mod result;
 

@@ -676,7 +676,7 @@ fn record_types(
     }
 }
 
-fn build_metadata_page_result(
+pub(super) fn build_metadata_page_result(
     collection: &Collection,
     match_clock: &MatchClock,
     compiled: &preflight::CompiledQuery,

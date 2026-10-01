@@ -131,10 +131,7 @@ impl FilesystemProvider {
     }
 
     pub(crate) fn loaded_type_definitions(&self) -> Result<usize, ProviderError> {
-        self.collection_cache
-            .read()
-            .map(|cached| cached.collection.types.len())
-            .map_err(|_| ProviderError::LockPoisoned)
+        Ok(self.current_collection()?.types.len())
     }
 
     /// Capture collection resources and canonical records at one read boundary.
@@ -247,11 +244,22 @@ impl FilesystemProvider {
     where
         E: From<ProviderError>,
     {
+        self.with_collection_arc_read_context(context, |collection| operation(collection.as_ref()))
+    }
+
+    pub(crate) fn with_collection_arc_read_context<T, E>(
+        &self,
+        context: &OperationContext,
+        operation: impl FnOnce(Arc<Collection>) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<ProviderError>,
+    {
         let _guard = self.read_lock(context).map_err(E::from)?;
         context.check().map_err(E::from)?;
         let collection = self.current_collection().map_err(E::from)?;
         context.check().map_err(E::from)?;
-        let result = context.scope(|| operation(collection.as_ref()))?;
+        let result = context.scope(|| operation(collection))?;
         context.check().map_err(E::from)?;
         Ok(result)
     }
