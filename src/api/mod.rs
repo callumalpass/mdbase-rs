@@ -5,6 +5,11 @@ mod collection_path;
 mod dynamic;
 pub(crate) mod operations;
 mod query;
+mod read_many;
+pub use read_many::{
+    BatchReadDocument, ReadManyError, ReadManyItem, ReadManyRequest, ReadManyResult,
+    READ_MANY_MAX_BYTES, READ_MANY_MAX_PATHS,
+};
 pub(crate) mod typed;
 
 pub use collection_path::{CollectionPath, CollectionPathError};

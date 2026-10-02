@@ -167,6 +167,26 @@ impl From<CanonicalDiagnostic> for Diagnostic {
     }
 }
 
+impl From<Diagnostic> for CanonicalDiagnostic {
+    fn from(value: Diagnostic) -> Self {
+        Self {
+            severity: match value.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+                Severity::Info => "info",
+            }
+            .to_string(),
+            code: value.code.to_string(),
+            message: value.message,
+            path: value.path,
+            field: value.field,
+            type_name: value.type_name,
+            schema_location: value.schema_location,
+            details: value.details,
+        }
+    }
+}
+
 /// Opaque content revision used for optimistic concurrency.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]

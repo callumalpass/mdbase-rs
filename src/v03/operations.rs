@@ -28,6 +28,21 @@ impl<'a> Operations<'a> {
     }
 
     pub fn read(&self, input: &Value) -> OperationResult {
+        if input.get("paths").is_some() {
+            let request = match crate::api::ReadManyRequest::parse(input) {
+                Ok(request) => request,
+                Err(message) => {
+                    return failed_result(vec![Diagnostic::error("invalid_request", message, None)])
+                }
+            };
+            return crate::operations::read::evaluate_read_many(&request, |request| {
+                Ok(crate::operations::read::evaluate_typed_read(
+                    self.collection,
+                    request,
+                    crate::operations::read::TypedReadSource::Filesystem,
+                ))
+            });
+        }
         let request = match self.parse_read_request(input) {
             Ok(request) => request,
             Err(result) => return result,
@@ -78,6 +93,13 @@ impl<'a> Operations<'a> {
         &self,
         input: &Value,
     ) -> Result<crate::api::ReadRequest, OperationResult> {
+        if input.get("paths").is_some() {
+            return Err(failed_result(vec![Diagnostic::error(
+                "invalid_request",
+                "Point reads require path, not paths.",
+                None,
+            )]));
+        }
         let parsed = crate::api::operations::ReadInput::parse(input)
             .map_err(|error| legacy_read_error(input, error))?;
         crate::operations::ensure_safe_relative_path(&parsed.path, self.collection.spec_profile)
@@ -630,25 +652,7 @@ fn typed_read_result(evaluation: crate::operations::read::TypedReadEvaluation) -
             .value
             .map(|value| serde_json::to_value(value).expect("record documents serialize"))
             .unwrap_or_else(|| serde_json::json!({})),
-        diagnostics: evaluation
-            .diagnostics
-            .into_iter()
-            .map(|diagnostic| Diagnostic {
-                severity: match diagnostic.severity {
-                    crate::api::Severity::Error => "error",
-                    crate::api::Severity::Warning => "warning",
-                    crate::api::Severity::Info => "info",
-                }
-                .to_string(),
-                code: diagnostic.code.to_string(),
-                message: diagnostic.message,
-                path: diagnostic.path,
-                field: diagnostic.field,
-                type_name: diagnostic.type_name,
-                schema_location: diagnostic.schema_location,
-                details: diagnostic.details,
-            })
-            .collect(),
+        diagnostics: evaluation.diagnostics.into_iter().map(Into::into).collect(),
     }
 }
 

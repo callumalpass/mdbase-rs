@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Canonical query rows (including malformed-record stubs and hosted Base rows)
+  carry exact-source `revision` tokens. Hosted projection format 9 retains that
+  token; format 8 projections must be rebuilt before projection-only execution.
+- `read` accepts ordered `paths` document batches (1–100 occurrences), sharing
+  physical work for duplicates. `include_body` defaults true and
+  `include_document` defaults false. Missing and expected semantic failures are
+  per-item outcomes; cancellation, storage and binding failures remain operation
+  failures. Responses over 8 MiB fail explicitly and require splitting. Hosted
+  providers use `ReadManyRequest` and `CompiledCatalog::read_records_typed` with
+  exact source inputs. Contract batches await the contract-query surface.
+
 ### Fixed
 
 - Writes under `validation: error` now reject a `validate_exists` link whose

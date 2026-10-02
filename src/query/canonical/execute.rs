@@ -561,6 +561,7 @@ pub(crate) fn execute_model_profiled_cancellable(
 
         candidates.push(Candidate {
             path: record.rel_path.clone(),
+            revision: record.source_revision.clone(),
             types,
             raw: record.raw_frontmatter.clone(),
             effective,
@@ -722,6 +723,7 @@ pub(super) fn build_metadata_page_result(
             );
             let candidate = Candidate {
                 path: record.rel_path.clone(),
+                revision: record.source_revision.clone(),
                 types,
                 raw: record.raw_frontmatter.clone(),
                 effective: effective.clone(),
@@ -758,6 +760,7 @@ fn millis_to_micros(milliseconds: f64) -> u64 {
 fn serialize_invalid_stub(stub: &InvalidRecordStub) -> Value {
     json!({
         "path": stub.rel_path,
+        "revision": stub.source_revision,
         "types": stub.type_names,
         "file": {
             "path": stub.rel_path,

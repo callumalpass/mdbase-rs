@@ -96,6 +96,7 @@ pub struct HostedBaseRecordContext {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostedBaseRow {
     pub path: String,
+    pub revision: String,
     pub file: Value,
     pub effective_frontmatter: Map<String, Value>,
     pub types: Vec<String>,
@@ -105,6 +106,17 @@ pub struct HostedBaseRow {
     pub sort_values: Map<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_value: Option<Value>,
+}
+
+impl HostedBaseRow {
+    /// Portable query row; reducer-only facts never cross the response boundary.
+    pub fn to_query_record(&self) -> Value {
+        json!({
+            "path": self.path, "revision": self.revision, "file": self.file,
+            "effective_frontmatter": self.effective_frontmatter,
+            "types": self.types, "values": self.values,
+        })
+    }
 }
 
 pub struct HostedBaseGroupAccumulator {
@@ -564,6 +576,7 @@ impl HostedBasePlan {
         Ok(HostedBaseEvaluation::Included {
             row: Box::new(HostedBaseRow {
                 path: input.projection.facts.path.clone(),
+                revision: input.projection.facts.revision.clone(),
                 file: file_value,
                 effective_frontmatter: input.projection.facts.effective_frontmatter.clone(),
                 types: input.projection.facts.types.clone(),
@@ -1628,6 +1641,7 @@ views:
             grouping
                 .push(&HostedBaseRow {
                     path: format!("tasks/{index}.md"),
+                    revision: "sha256:test".into(),
                     file: Value::Null,
                     effective_frontmatter: Map::new(),
                     types: Vec::new(),
@@ -1650,6 +1664,7 @@ views:
         for value in ["open", "done"] {
             let result = over_budget.push(&HostedBaseRow {
                 path: format!("tasks/{value}.md"),
+                revision: "sha256:test".into(),
                 file: Value::Null,
                 effective_frontmatter: Map::new(),
                 types: Vec::new(),

@@ -27,7 +27,7 @@ use ::cel::common::ast::{Expr, IdedExpr, LiteralValue};
 use super::hosted_links::{hosted_link_graph, HostedRelationshipNeighborhood};
 use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 12;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 13;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -913,6 +913,7 @@ impl CompiledCatalog {
         );
         let file_record = FileRecord {
             rel_path: record.path.clone(),
+            source_revision: crate::v03::revision(record.document.as_bytes()),
             raw_frontmatter: raw,
             effective_frontmatter: effective.clone(),
             body: classified.body,
@@ -1038,6 +1039,7 @@ impl CompiledCatalog {
             }
             Some(Candidate {
                 path: record.path.clone(),
+                revision: file_record.source_revision,
                 types,
                 raw: file_record.raw_frontmatter,
                 effective,
@@ -1223,6 +1225,7 @@ impl CompiledCatalog {
             .map_err(|error| query_error(&error.code, error.message))?;
         let file_record = FileRecord {
             rel_path: projection.facts.path.clone(),
+            source_revision: projection.facts.revision.clone(),
             raw_frontmatter: Value::Object(projection.facts.persisted_frontmatter.clone()),
             effective_frontmatter: Value::Object(projection.facts.effective_frontmatter.clone()),
             body: String::new(),
@@ -1265,6 +1268,7 @@ impl CompiledCatalog {
         complete_file_value_from_projection(&mut file, &effective, projection);
         let candidate = matched.then(|| Candidate {
             path: projection.facts.path.clone(),
+            revision: file_record.source_revision,
             types: projection.facts.types.clone(),
             raw: file_record.raw_frontmatter,
             effective,

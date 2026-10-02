@@ -245,6 +245,7 @@ impl Query {
 
 pub(crate) struct Candidate {
     pub path: String,
+    pub revision: String,
     pub types: Vec<String>,
     pub raw: Value,
     pub effective: Value,

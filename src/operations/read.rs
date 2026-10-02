@@ -85,8 +85,8 @@ pub(crate) fn evaluate_typed_read(
                 }
                 Err(_) => {
                     return read_error(
-                        INVALID_FRONTMATTER,
-                        "File contains invalid UTF-8",
+                        "record_read_failed",
+                        "Record storage could not be read.",
                         Some(requested),
                     )
                 }
@@ -147,6 +147,127 @@ pub(crate) fn evaluate_typed_read(
         facts,
         request.include_document,
     )
+}
+
+/// Shared bounded batch evaluator. Only source selection belongs to providers.
+pub(crate) fn evaluate_read_many(
+    request: &crate::api::ReadManyRequest,
+    mut load: impl FnMut(&ReadRequest) -> Result<TypedReadEvaluation, crate::diagnostic::Diagnostic>,
+) -> crate::v03::OperationResult {
+    use crate::api::{
+        BatchReadDocument, ReadManyError, ReadManyItem, ReadManyResult, READ_MANY_MAX_BYTES,
+    };
+    let fail = |diagnostic| crate::v03::OperationResult {
+        valid: false,
+        result: serde_json::json!({}),
+        diagnostics: vec![diagnostic],
+    };
+    let budget_error = || {
+        crate::diagnostic::Diagnostic::error(
+            "read_many_byte_budget_exceeded",
+            "Document batch exceeds 8 MiB; split the read.",
+            None,
+        )
+    };
+    let mut cached = std::collections::BTreeMap::new();
+    let mut items = Vec::with_capacity(request.paths.len());
+    let mut diagnostics = Vec::new();
+    let mut bytes = 0;
+    for path in &request.paths {
+        if let Some(context) = crate::runtime::OperationContext::current() {
+            if let Err(error) = context.check() {
+                return fail(crate::diagnostic::Diagnostic::error(
+                    error.code(),
+                    error.to_string(),
+                    None,
+                ));
+            }
+        }
+        let item = if let Some(item) = cached.get(path.as_str()) {
+            item
+        } else {
+            let evaluation = match load(&ReadRequest {
+                path: path.clone(),
+                include_document: request.include_document,
+            }) {
+                Ok(evaluation) => evaluation,
+                Err(error) => return fail(error),
+            };
+            if let Some(error) = crate::runtime::OperationContext::current()
+                .and_then(|context| context.capture_limit_error())
+            {
+                return fail(crate::diagnostic::Diagnostic::error(
+                    error.code(),
+                    error.to_string(),
+                    None,
+                ));
+            }
+            let item = if evaluation.valid {
+                let Some(record) = evaluation.value else {
+                    return fail(crate::diagnostic::Diagnostic::error(
+                        "invalid_result",
+                        "Successful read has no document.",
+                        None,
+                    ));
+                };
+                diagnostics.extend(evaluation.diagnostics.into_iter().map(Into::into));
+                ReadManyItem::Found {
+                    path: path.clone(),
+                    record: BatchReadDocument::from_record(record, request.include_body),
+                }
+            } else {
+                let Some(error) = evaluation
+                    .diagnostics
+                    .iter()
+                    .find(|d| d.severity == Severity::Error)
+                else {
+                    return fail(crate::diagnostic::Diagnostic::error(
+                        "invalid_result",
+                        "Failed read has no error diagnostic.",
+                        None,
+                    ));
+                };
+                if error.code.as_str() == FILE_NOT_FOUND {
+                    ReadManyItem::Missing { path: path.clone() }
+                } else if matches!(
+                    error.code.as_str(),
+                    "record_identity_mismatch" | "record_read_failed"
+                ) {
+                    return fail(error.clone().into());
+                } else {
+                    ReadManyItem::Error {
+                        path: path.clone(),
+                        error: ReadManyError {
+                            code: error.code.to_string(),
+                            message: error.message.clone(),
+                        },
+                    }
+                }
+            };
+            cached.entry(path.as_str().to_string()).or_insert(item)
+        };
+        bytes += serde_json::to_vec(item)
+            .expect("batch items serialize")
+            .len()
+            + 1;
+        if bytes > READ_MANY_MAX_BYTES {
+            return fail(budget_error());
+        }
+        items.push(item.clone());
+    }
+    let result = crate::v03::OperationResult {
+        valid: true,
+        result: serde_json::to_value(ReadManyResult { items }).expect("batch result serializes"),
+        diagnostics,
+    };
+    if serde_json::to_vec(&result)
+        .expect("batch envelope serializes")
+        .len()
+        > READ_MANY_MAX_BYTES
+    {
+        return fail(budget_error());
+    }
+    result
 }
 
 fn evaluate_document(

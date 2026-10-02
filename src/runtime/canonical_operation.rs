@@ -149,6 +149,7 @@ impl<'de> Deserialize<'de> for LegacyRecoveredV03Value {
 #[serde(tag = "operation", content = "value", rename_all = "snake_case")]
 pub enum CanonicalOperationValue {
     Read(Option<RecordDocument>),
+    ReadMany(Option<crate::api::ReadManyResult>),
     Query(Option<CanonicalQueryValue>),
     Create(Option<RecordDocument>),
     Update(Option<RecordDocument>),
@@ -246,7 +247,7 @@ impl<'de> Deserialize<'de> for CanonicalOperationOutcome {
 impl CanonicalOperationValue {
     pub(crate) fn kind(&self) -> Option<OperationKind> {
         match self {
-            Self::Read(_) => Some(OperationKind::Read),
+            Self::Read(_) | Self::ReadMany(_) => Some(OperationKind::Read),
             Self::Query(_) => Some(OperationKind::Query),
             Self::Create(_) => Some(OperationKind::Create),
             Self::Update(_) => Some(OperationKind::Update),
@@ -285,6 +286,7 @@ impl CanonicalOperationOutcome {
         let missing_semantic_value = matches!(
             value,
             CanonicalOperationValue::Read(None)
+                | CanonicalOperationValue::ReadMany(None)
                 | CanonicalOperationValue::Query(None)
                 | CanonicalOperationValue::Create(None)
                 | CanonicalOperationValue::Update(None)
@@ -753,7 +755,13 @@ impl CanonicalOperationOutcome {
         let empty = result.as_object().is_some_and(serde_json::Map::is_empty);
         let value = match operation {
             OperationKind::Read => {
-                CanonicalOperationValue::Read((!empty).then(|| decode_value(result)).transpose()?)
+                if result.get("items").is_some() {
+                    CanonicalOperationValue::ReadMany(Some(decode_value(result)?))
+                } else {
+                    CanonicalOperationValue::Read(
+                        (!empty).then(|| decode_value(result)).transpose()?,
+                    )
+                }
             }
             OperationKind::Query => {
                 let query = if empty {
@@ -912,6 +920,7 @@ impl CanonicalOperationOutcome {
             CanonicalOperationValue::Read(value)
             | CanonicalOperationValue::Create(value)
             | CanonicalOperationValue::Update(value) => encode_optional(value),
+            CanonicalOperationValue::ReadMany(value) => encode_optional(value),
             CanonicalOperationValue::Query(value) => {
                 value.as_ref().map_or_else(empty_object, |query| {
                     let mut meta = query.meta.clone().into_inner();
@@ -1061,21 +1070,7 @@ fn encode_optional<T: Serialize>(value: &Option<T>) -> Value {
 }
 
 fn wire_diagnostic(value: Diagnostic) -> WireDiagnostic {
-    WireDiagnostic {
-        severity: match value.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-            Severity::Info => "info",
-        }
-        .to_string(),
-        code: value.code.as_str().to_string(),
-        message: value.message,
-        path: value.path,
-        field: value.field,
-        type_name: value.type_name,
-        schema_location: value.schema_location,
-        details: value.details,
-    }
+    value.into()
 }
 
 #[cfg(test)]

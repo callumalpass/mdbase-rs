@@ -97,6 +97,10 @@ pub(crate) fn serialize_candidate(candidate: &Candidate, query: &Query) -> Value
     complete_file_value(&mut file, &candidate.effective, &candidate.body);
     let mut result = Map::from_iter([
         ("path".to_string(), Value::String(candidate.path.clone())),
+        (
+            "revision".to_string(),
+            Value::String(candidate.revision.clone()),
+        ),
         ("file".to_string(), file),
         (
             "types".to_string(),

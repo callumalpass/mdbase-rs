@@ -28,7 +28,8 @@ use super::{
 /// Format v8 adds the uniqueness comparison sets a record belongs to, so a
 /// hosted write can find the records its unique values could conflict with
 /// without a collection scan.
-pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 8;
+// Format v9 carries the exact-source revision through every query renderer.
+pub const SEMANTIC_PROJECTION_FORMAT_VERSION: u32 = 9;
 pub const SEMANTIC_PROJECTION_SCHEMA_VERSION: &str = "mdbase-semantic-projection-v5";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,6 +39,8 @@ pub struct SemanticProjectionFacts {
     pub semantic_engine_version: String,
     pub catalog_revision: String,
     pub path: String,
+    #[serde(default)]
+    pub revision: String,
     pub types: Vec<String>,
     pub file: SemanticFileFacts,
     pub persisted_frontmatter: Map<String, Value>,
@@ -79,6 +82,7 @@ impl SemanticProjection {
             && self.facts.format_version == SEMANTIC_PROJECTION_FORMAT_VERSION
             && self.facts.semantic_engine_version == semantic_engine_version
             && self.facts.catalog_revision == catalog_revision
+            && !self.facts.revision.is_empty()
             && self.facts.path == self.facts.file.path
             && self.structure.schema_version == RECORD_STRUCTURE_SCHEMA_VERSION
             && self.structure.path == self.facts.path
@@ -284,6 +288,7 @@ impl CompiledCatalog {
                 semantic_engine_version: env!("CARGO_PKG_VERSION").to_string(),
                 catalog_revision: self.resource_revision().to_string(),
                 path: record.path.clone(),
+                revision: crate::v03::revision(record.document.as_bytes()),
                 types,
                 file,
                 persisted_frontmatter: classified.frontmatter,
