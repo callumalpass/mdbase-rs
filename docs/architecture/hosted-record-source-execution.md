@@ -212,9 +212,10 @@ canonical existence/type validation. Missing files still fail; paths alone make
 no claim about attachment revisions or content. The host owns existence evidence,
 encryption, snapshot consistency and commit fencing.
 
-Reviewed production-source growth is 97 lines, with no new production module.
+Reviewed source growth is 106 lines (including shadow regression assertions), with no new production module.
 The mutation module's existing concentration allowance increases by 15 lines for
-the source-compatible file-aware entry point; the validation owner adds one
+the source-compatible file-aware entry point; batch's allowance gains two lines
+for the byte-ownership regression assertions. The validation owner adds one
 `create_dir_all` and one `OpenOptions::create_new` staging capability. These
 operate only in the engine-owned disposable directory, not authority storage.
 
