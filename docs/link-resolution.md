@@ -133,6 +133,19 @@ then run against hosted policy evaluation too. No endpoint or wire change is
 implemented here. Existing resolution evidence is described in
 [`relationship-resolution.md`](relationship-resolution.md).
 
+## Architecture budget review
+
+The checker measures 200 Rust source files / 108,922 lines (previous ceilings
+199 / 108,486). The one new source file is the private indexed-policy budget/
+benchmark test module; integration fixtures live under `tests`/`conformance`.
+The 436-line ceiling increase pays for explicit overload/provenance handling,
+strict policy parsing, eligible candidate constraints, and hosted fail-closed
+tests—not a second client resolver or additional filesystem discovery path.
+The existing resolver ceiling increases from 1,175 to its measured 1,244 lines
+for the policy/index metadata it owns. All other concentration, ambient-I/O,
+legacy-call, and transitional-reference budgets remain unchanged. These exact
+ceilings are review signals, not unused headroom.
+
 ## Consumers and producer evidence
 
 The corpus records Writer's installed **JavaScript** producer probe separately:
