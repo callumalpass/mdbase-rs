@@ -1,0 +1,33 @@
+{
+  "scenario":"wb-links/indexed-policy-lookup",
+  "baseline_revision":"f60adfe",
+  "implementation_commit":"1c58cd1",
+  "after_features":"all",
+  "before_features":"default",
+  "profile":"debug",
+  "repetitions":3,
+  "lookups_per_repetition":10000,
+  "dataset":"distinct source basenames; one stored target; source type index",
+  "scope":"LinkedFiles/index lookups only; excludes collection capture, real type classification, cached-query index construction, CEL and network",
+  "sdk_bench_boundary":"sdk-review/bench does not implement authority query semantics; this engine-only scenario lives in the assigned Rust worktree",
+  "samples_ms":{
+    "500":{
+      "before_default_stored":[16.126,18.341,18.281],
+      "after_default_stored":[16.645,17.778,18.802],
+      "after_explicit_native":[185.600,187.395,191.102],
+      "after_unique_source":[194.188,191.404,197.013]
+    },
+    "50000":{
+      "before_default_stored":[17.773,17.093,17.167],
+      "after_default_stored":[16.924,16.797,16.154],
+      "after_explicit_native":[184.359,184.191,186.634],
+      "after_unique_source":[188.218,190.596,199.597]
+    }
+  },
+  "notes":[
+    "Non-gating microbenchmark on a shared machine; no speedup claim.",
+    "Policy re-resolution pays the shared bounded selector/evidence cost, unlike the default stored-winner shortcut.",
+    "Nearly flat per-link cost from 500 to 50k records; full query snapshot/index costs are not measured.",
+    "Before run used a git archive of the baseline inside this worktree's ignored target directory and an equivalent default-only private test. Package artifacts were cleaned before measuring current code to avoid shared-target binary collisions."
+  ]
+}

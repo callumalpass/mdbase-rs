@@ -25,6 +25,15 @@ All notable changes to this project are documented in this file.
   version 13; old plans/cursors must restart, not be relabeled. Rust query result
   and runtime value constructors gain an optional `output` field (use `None`
   for ordinary rows). Source tokens do not replace catalog cache invalidation.
+- Filesystem-native CEL `asFile()` accepts an options map with
+  `ambiguity: "native" | "unique"` and optional nonempty registered `types`.
+  Explicit policy traversal re-resolves stored links, intersects declared target
+  types, and retains record/list provenance. Existing no-option overloads keep
+  their behavior. See `docs/link-resolution.md` for fixtures and strict-parser
+  differences. Hosted winner-only neighborhoods explicitly reject options;
+  Connect must not advertise `link-resolution-options-v1` until hosted policy
+  candidate evidence is implemented. Existing consumers need no migration;
+  option users require an explicit authority capability gate.
 
 ### Fixed
 

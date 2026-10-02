@@ -39,6 +39,11 @@ impl CompiledQuery {
             .any(|program| program.facts().needs_link_graph)
     }
 
+    pub fn requires_link_resolution_options(&self) -> bool {
+        self.record_expressions()
+            .any(|program| program.facts().needs_link_resolution_options)
+    }
+
     /// Invocation context is metadata-only unless an expression actually
     /// reads the `this` binding.
     pub fn requires_this_context(&self) -> bool {

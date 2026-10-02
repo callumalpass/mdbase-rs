@@ -53,8 +53,9 @@ paths before an operation starts. Mutations accept opaque `Revision`
 preconditions. `allow_partial: false` batches stage and journal all changes,
 then recover deterministically after interruption.
 
-See [the Rust API guide](docs/rust-api.md) and
-[the v0.2 migration guide](docs/migration-v02-to-v03.md).
+See [the Rust API guide](docs/rust-api.md),
+[the v0.2 migration guide](docs/migration-v02-to-v03.md), and
+[the native link-resolution contract and option support matrix](docs/link-resolution.md).
 
 ## Unified CLI integration
 

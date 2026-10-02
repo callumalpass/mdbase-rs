@@ -281,27 +281,56 @@ impl Host {
                 format!("expected a string, got {}", other.type_of()),
             )),
         });
-        let host = self.clone();
-        context.add_function(
-            "asFile",
-            move |This(link): This<Arc<String>>, Arguments(args): Arguments| {
-                let source = match args.as_slice() {
-                    [] => host.source.clone(),
-                    [CelValue::String(source)] => source.to_string(),
-                    _ => {
-                        return Err(ExecutionError::function_error(
-                            "asFile",
-                            "expected no argument or a source path",
-                        ))
-                    }
-                };
-                host.as_file(&link, &source)
-            },
-        );
+        for function in ["asFile", "__mdbase_asFile"] {
+            let host = self.clone();
+            context.add_function(
+                function,
+                move |This(link): This<Arc<String>>, Arguments(args): Arguments| {
+                    let declaration_source = match (function, args.first()) {
+                        ("__mdbase_asFile", Some(CelValue::String(origin))) => origin.as_str(),
+                        _ => host.source.as_str(),
+                    };
+                    let (source, options) = match args.as_slice() {
+                        [] => (host.source.as_str(), None),
+                        [CelValue::String(source)] => (source.as_str(), None),
+                        // Provenance may prepend an inferred source; an explicit
+                        // caller source still takes precedence.
+                        [CelValue::String(_), CelValue::String(source)]
+                            if function == "__mdbase_asFile" =>
+                        {
+                            (source.as_str(), None)
+                        }
+                        [options @ CelValue::Map(_)] => (host.source.as_str(), Some(options)),
+                        [CelValue::String(source), options @ CelValue::Map(_)] => {
+                            (source.as_str(), Some(options))
+                        }
+                        [CelValue::String(_), CelValue::String(source), options @ CelValue::Map(_)]
+                            if function == "__mdbase_asFile" =>
+                        {
+                            (source.as_str(), Some(options))
+                        }
+                        _ => {
+                            return Err(ExecutionError::function_error(
+                                "asFile",
+                                "expected an optional source path and an options map",
+                            ))
+                        }
+                    };
+                    let options = options.map(link_resolution_options).transpose()?;
+                    host.as_file(&link, source, declaration_source, options.as_ref())
+                },
+            );
+        }
     }
 
     /// The record a link resolves to, in query-candidate shape, or null.
-    fn as_file(&self, link: &str, source: &str) -> Result<CelValue, ExecutionError> {
+    fn as_file(
+        &self,
+        link: &str,
+        source: &str,
+        declaration_source: &str,
+        options: Option<&crate::links::resolver::LinkResolutionOptions>,
+    ) -> Result<CelValue, ExecutionError> {
         if self.traversals.fetch_add(1, Ordering::Relaxed) >= MAX_LINK_TRAVERSALS {
             return Err(ExecutionError::function_error(
                 "asFile",
@@ -312,8 +341,17 @@ impl Host {
             return Ok(CelValue::Null);
         };
         let resolved = links
-            .resolve(link, Some(source))
-            .map_err(|error| ExecutionError::function_error("asFile", error.message))?;
+            .resolve_with_options_from(link, Some(source), Some(declaration_source), options)
+            .map_err(|error| {
+                ExecutionError::function_error(
+                    "asFile",
+                    if options.is_some() {
+                        format!("{}: {}", error.code, error.message)
+                    } else {
+                        error.message
+                    },
+                )
+            })?;
         Ok(resolved.map_or(CelValue::Null, |target| {
             let frontmatter = target.frontmatter.as_object().cloned().unwrap_or_default();
             let file = self.file_value(
@@ -527,6 +565,41 @@ fn push_link_values(value: &Value, links: &mut Vec<String>, declared: bool) {
         }
         _ => {}
     }
+}
+
+fn link_resolution_options(
+    value: &CelValue,
+) -> Result<crate::links::resolver::LinkResolutionOptions, ExecutionError> {
+    let invalid = |message| ExecutionError::function_error("asFile", message);
+    let value = to_json(value).map_err(invalid)?;
+    let mut options = crate::links::resolver::LinkResolutionOptions::default();
+    for (key, value) in value.as_object().expect("options is a CEL map") {
+        match key.as_str() {
+            "ambiguity" => {
+                options.unique = match value.as_str() {
+                    Some("native") => false,
+                    Some("unique") => true,
+                    _ => return Err(invalid("ambiguity must be 'native' or 'unique'".into())),
+                }
+            }
+            "types" => {
+                let Some(types) = value.as_array().filter(|types| !types.is_empty()) else {
+                    return Err(invalid(
+                        "types must be a nonempty list of type names".into(),
+                    ));
+                };
+                for name in types {
+                    let Some(name) = name.as_str() else {
+                        return Err(invalid("types must contain strings".into()));
+                    };
+                    crate::types::loader::validate_type_name(name).map_err(invalid)?;
+                    options.types.push(name.to_lowercase());
+                }
+            }
+            _ => return Err(invalid(format!("Unknown asFile option '{key}'"))),
+        }
+    }
+    Ok(options)
 }
 
 fn is_wikilink(text: &str) -> bool {

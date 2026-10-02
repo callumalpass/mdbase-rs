@@ -3055,7 +3055,7 @@ pub fn link_value(target: &str) -> String {
 /// folder (spec Chapter 08). The explicit `./` keeps it distinct from a
 /// wikilink path such as `people/alice`, which resolves from the collection
 /// root.
-fn source_relative(target: String) -> String {
+pub(crate) fn source_relative(target: String) -> String {
     if target.starts_with('/') || target.starts_with("./") || target.starts_with("../") {
         target
     } else {
@@ -3064,7 +3064,7 @@ fn source_relative(target: String) -> String {
 }
 
 /// The destination of a whole-value markdown link, `[text](path)`.
-fn markdown_link_destination(value: &str) -> Option<String> {
+pub(crate) fn markdown_link_destination(value: &str) -> Option<String> {
     let inner = value.strip_prefix('[')?.strip_suffix(')')?;
     let (_, destination) = inner.split_once("](")?;
     markdown_destination_target(destination)

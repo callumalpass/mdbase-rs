@@ -69,6 +69,9 @@ pub(crate) struct ProgramFacts {
     pub needs_body_facts: bool,
     /// Whether the expression traverses links or reads backlinks.
     pub needs_link_graph: bool,
+    /// Whether traversal may use an explicit policy (dynamic single arguments
+    /// are conservative: they can evaluate to either a source string or map).
+    pub needs_link_resolution_options: bool,
     /// Whether the expression reads the record body or body-derived facts.
     pub needs_file_body: bool,
 }
@@ -179,6 +182,10 @@ fn collect(expression: &IdedExpr, bound: &mut Vec<String>, facts: &mut ProgramFa
             }
             if matches!(call.func_name.as_str(), "asFile" | "hasLink") {
                 facts.needs_link_graph = true;
+            }
+            if call.func_name == "asFile" && !call.args.is_empty() {
+                facts.needs_link_resolution_options |= call.args.len() > 1
+                    || !matches!(&call.args[0].expr, Expr::Literal(LiteralValue::String(_)));
             }
             if call.func_name == "_[_]"
                 && call.args.len() == 2

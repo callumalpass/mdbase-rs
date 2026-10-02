@@ -1,5 +1,8 @@
 # Relationship resolution evidence
 
+See [Native link resolution V1](link-resolution.md) for the CEL policy contract,
+compatibility gaps, executable fixtures, and `asFile()` option support matrix.
+
 Local filesystem resolution and hosted authority resolution retain separate candidate enumeration. Both pass eligible candidates to the same bounded selector.
 
 A resolved occurrence carries a typed `reason`:
