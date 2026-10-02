@@ -97,6 +97,8 @@ fn option_queries_re_resolve_stored_links_intersect_types_and_keep_provenance() 
             {"name":"default", "expr":"source.asFile().file.path"},
             {"name":"unique", "expr":"source.asFile({'ambiguity':'unique'}).file.path"},
             {"name":"intersection", "expr":"source.asFile({'types':['note']})"},
+            {"name":"explicit_intersection", "expr":"source.asFile('notes/book.md', {'types':['note']})"},
+            {"name":"explicit_list_intersection", "expr":"related.exists(l, l.asFile('notes/book.md', {'types':['note']}) != null)"},
             {"name":"blocked", "expr":"blocked.asFile({'types':['source']})"},
             {"name":"list", "expr":"related.exists(l, l.asFile({'ambiguity':'unique','types':['source']}).file.path == 'sources/book.md')"},
             {"name":"traversed", "expr":"source.asFile({'types':['source']}).lead.asFile({'ambiguity':'unique'}).file.path"},
@@ -114,11 +116,38 @@ fn option_queries_re_resolve_stored_links_intersect_types_and_keep_provenance() 
             result.result["results"][0]["values"],
             json!({
                 "default":"sources/book.md", "unique":"sources/book.md", "intersection":null,
+                "explicit_intersection":null, "explicit_list_intersection":false,
                 "blocked":null, "list":true, "traversed":"sources/companion.md", "context":true,
                 "explicit":"sources/book.md"
             })
         );
     }
+}
+
+#[test]
+fn untyped_copies_and_source_overrides_cannot_erase_declared_policy_constraints() {
+    let (root, collection, _) = fixture();
+    write(
+        &root,
+        "annotations/copied.md",
+        "---\ntype: annotation\ncopy: '[[book]]'\nsource: '[[book]]'\n---\n",
+    );
+    let result = collection.v03_operations().unwrap().query(&json!({
+        "where":"file.path == 'annotations/copied.md'",
+        "select":[
+            // Keep the baseline's frontmatter-first stored winner unchanged.
+            {"name":"default", "expr":"source.asFile().file.path"},
+            {"name":"unique", "expr":"source.asFile({'ambiguity':'unique'}).file.path"},
+            {"name":"intersection", "expr":"source.asFile('notes/book.md', {'types':['note']})"},
+        ]
+    }));
+    assert!(result.valid && result.diagnostics.is_empty(), "{result:#?}");
+    assert_eq!(
+        result.result["results"][0]["values"],
+        json!({
+            "default":"notes/book.md", "unique":"sources/book.md", "intersection":null
+        })
+    );
 }
 
 #[test]

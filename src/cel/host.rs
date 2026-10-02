@@ -286,6 +286,10 @@ impl Host {
             context.add_function(
                 function,
                 move |This(link): This<Arc<String>>, Arguments(args): Arguments| {
+                    let declaration_source = match (function, args.first()) {
+                        ("__mdbase_asFile", Some(CelValue::String(origin))) => origin.as_str(),
+                        _ => host.source.as_str(),
+                    };
                     let (source, options) = match args.as_slice() {
                         [] => (host.source.as_str(), None),
                         [CelValue::String(source)] => (source.as_str(), None),
@@ -300,6 +304,11 @@ impl Host {
                         [CelValue::String(source), options @ CelValue::Map(_)] => {
                             (source.as_str(), Some(options))
                         }
+                        [CelValue::String(_), CelValue::String(source), options @ CelValue::Map(_)]
+                            if function == "__mdbase_asFile" =>
+                        {
+                            (source.as_str(), Some(options))
+                        }
                         _ => {
                             return Err(ExecutionError::function_error(
                                 "asFile",
@@ -308,7 +317,7 @@ impl Host {
                         }
                     };
                     let options = options.map(link_resolution_options).transpose()?;
-                    host.as_file(&link, source, options.as_ref())
+                    host.as_file(&link, source, declaration_source, options.as_ref())
                 },
             );
         }
@@ -319,6 +328,7 @@ impl Host {
         &self,
         link: &str,
         source: &str,
+        declaration_source: &str,
         options: Option<&crate::links::resolver::LinkResolutionOptions>,
     ) -> Result<CelValue, ExecutionError> {
         if self.traversals.fetch_add(1, Ordering::Relaxed) >= MAX_LINK_TRAVERSALS {
@@ -331,7 +341,7 @@ impl Host {
             return Ok(CelValue::Null);
         };
         let resolved = links
-            .resolve_with_options(link, Some(source), options)
+            .resolve_with_options_from(link, Some(source), Some(declaration_source), options)
             .map_err(|error| {
                 ExecutionError::function_error(
                     "asFile",

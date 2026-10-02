@@ -53,7 +53,7 @@ struct Rewriter {
 impl Rewriter {
     fn rewrite(&mut self, node: &IdedExpr, scope: &Scope) -> IdedExpr {
         match &node.expr {
-            Expr::Call(call) if call.func_name == "asFile" && call.args.len() <= 1 => {
+            Expr::Call(call) if call.func_name == "asFile" && call.args.len() <= 2 => {
                 if let Some(receiver) = &call.target {
                     match source_of(receiver, scope) {
                         Some(Source::AsFile(target)) => return self.bind(target, node, scope),

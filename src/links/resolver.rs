@@ -428,6 +428,13 @@ impl Collection {
                             .entry(file_data.path.clone())
                             .or_default()
                             .entry(target)
+                            .and_modify(|current| {
+                                // An untyped copy of a value cannot erase a
+                                // declared constraint on that same stored target.
+                                if current.is_empty() {
+                                    *current = types.clone();
+                                }
+                            })
                             .or_insert_with(|| types.clone());
                     }
                 }

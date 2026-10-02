@@ -101,11 +101,12 @@ Unknown keys, invalid values/names, and unknown types produce CEL diagnostics.
 There is no folder scope, target alias, extension override, or fuzzy matching
 option in V1. Scope is expressed through eligible record types.
 
-Requested types intersect declared target types; they cannot widen schema
-constraints. Explicit policies always re-resolve against the typed snapshot
+Requested types intersect declared target types; they cannot widen the snapshot's
+stored-target constraints. An explicit lexical source-path override retains the
+originating record's constraints, and untyped copies cannot erase them. Explicit policies always re-resolve against the typed snapshot
 index, including stored links with an existing graph winner and unresolved
-stored links. Constraints retain the baseline frontmatter-first target-key
-association described above. There is no per-link scan of the full collection.
+stored links. Constraints use the first declared frontmatter target-key association described
+above, independently of the lexical source override. There is no per-link scan of the full collection.
 
 `unique` rejects more than one eligible candidate in the winning class **before
 ranking**, including a same-directory winner. Filtering happens before counting.
@@ -135,13 +136,13 @@ implemented here. Existing resolution evidence is described in
 
 ## Architecture budget review
 
-The checker measures 200 Rust source files / 108,922 lines (previous ceilings
+The checker measures 200 Rust source files / 108,951 lines (previous ceilings
 199 / 108,486). The one new source file is the private indexed-policy budget/
 benchmark test module; integration fixtures live under `tests`/`conformance`.
-The 436-line ceiling increase pays for explicit overload/provenance handling,
+The 465-line ceiling increase pays for explicit overload/provenance handling,
 strict policy parsing, eligible candidate constraints, and hosted fail-closed
 tests—not a second client resolver or additional filesystem discovery path.
-The existing resolver ceiling increases from 1,175 to its measured 1,244 lines
+The existing resolver ceiling increases from 1,175 to its measured 1,251 lines
 for the policy/index metadata it owns. All other concentration, ambient-I/O,
 legacy-call, and transitional-reference budgets remain unchanged. These exact
 ceilings are review signals, not unused headroom.

@@ -82,6 +82,18 @@ impl LinkedFiles {
         source_path: Option<&str>,
         options: Option<&LinkResolutionOptions>,
     ) -> Result<Option<&ResolvedFileData>, CatalogError> {
+        self.resolve_with_options_from(link, source_path, source_path, options)
+    }
+
+    /// An explicit lexical source override must not discard the originating
+    /// record's declared target constraints.
+    pub(crate) fn resolve_with_options_from(
+        &self,
+        link: &str,
+        source_path: Option<&str>,
+        declaration_source: Option<&str>,
+        options: Option<&LinkResolutionOptions>,
+    ) -> Result<Option<&ResolvedFileData>, CatalogError> {
         if let Some(options) = options {
             // Hosted neighborhoods contain winners, not the complete candidate
             // universe. This remains false even after a default traversal lazily
@@ -158,7 +170,7 @@ impl LinkedFiles {
         let path = if let Some(options) = options {
             let declared = index
                 .declared_types
-                .get(source)
+                .get(declaration_source.unwrap_or(source))
                 .and_then(|targets| targets.get(target))
                 .map_or(&[][..], Vec::as_slice);
             index.resolve_with_options(target, source, declared, options)?
