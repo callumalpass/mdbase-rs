@@ -37,6 +37,12 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A seed type upgrade (`upgrade_from`) over an unedited seed, whose live bytes
+  equal the baseline document, now writes the desired pack document
+  byte-for-byte. It previously wrote a re-serialised merge result, reformatting
+  the file and leaving its digest different from the pack resource digest, so
+  later assessments treated it as user-modified. Edited seeds still merge.
+
 - `update` of a path with no record reports `file_not_found`, as `delete` and
   `validate` already did, rather than `file_read_failed` ("Record could not be
   read."). Callers can now tell a missing record from an unreadable one.

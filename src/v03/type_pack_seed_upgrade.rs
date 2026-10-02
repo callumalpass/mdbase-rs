@@ -29,14 +29,14 @@ impl Base {
     }
 }
 
-fn merge(base: &str, current: &str, desired: &str) -> Result<String, String> {
+fn merge(base_document: &str, current: &str, desired_document: &str) -> Result<String, String> {
     fn parse(document: &str) -> Result<Value, String> {
         let (start, end) = frontmatter_bounds(document).map_err(|d| d.message.clone())?;
         serde_yaml::from_str(&document[start..end]).map_err(|e| e.to_string())
     }
-    let base = parse(base)?;
+    let base = parse(base_document)?;
     let current_value = parse(current)?;
-    let desired = parse(desired)?;
+    let desired = parse(desired_document)?;
     for key in ["kind", "name"] {
         if base.get(key).is_none()
             || base.get(key) != desired.get(key)
@@ -44,6 +44,11 @@ fn merge(base: &str, current: &str, desired: &str) -> Result<String, String> {
         {
             return Err(format!("Seed upgrade requires the same type {key}."));
         }
+    }
+    // An unedited seed is an ordinary update: install the publisher's exact
+    // bytes so the file keeps the pack resource digest.
+    if current == base_document {
+        return Ok(desired_document.to_string());
     }
     let merged = merge_value(Some(&base), Some(&current_value), Some(&desired), "")?
         .ok_or("Seed upgrade cannot delete a type.")?;

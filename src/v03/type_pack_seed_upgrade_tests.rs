@@ -1,5 +1,8 @@
 //! Seed-type upgrade tests, kept beside the type-pack test helpers they use.
-use super::tests::{apply_pack, collection, manifest, provision, resource, task_resources, write};
+use super::tests::{
+    apply_pack, assessment_options, collection, manifest, provision, resource, task_resources,
+    write,
+};
 use super::*;
 
 #[test]
@@ -56,6 +59,60 @@ fn seed_upgrade_atomically_changes_exact_contract_and_preserves_customizations()
         assert!(repeated.valid, "{:?}", repeated.diagnostics);
         assert_eq!(fs::read_to_string(&type_path).unwrap(), result);
     }
+}
+
+#[test]
+fn unedited_seed_upgrade_writes_the_exact_desired_document() {
+    let (root, collection) = collection();
+    let definitions = task_resources();
+    let mut old_manifest = manifest(&definitions);
+    old_manifest["resources"][2]["mode"] = json!("seed");
+    let old = provision(
+        old_manifest,
+        definitions
+            .iter()
+            .map(|(_, s, _, d)| resource(s, d))
+            .collect(),
+    );
+    assert!(apply_pack(&collection, &old).valid);
+    let upgraded = seed_upgrade_provision(&definitions);
+    let desired = upgraded.resources[2].document.clone().into_bytes();
+    let desired_digest = revision(&desired);
+    let collection = Collection::open(root.path()).unwrap();
+    let assessment = collection.assess_type_pack(&upgraded, &assessment_options());
+    assert!(assessment.valid, "{:?}", assessment.diagnostics);
+    let planned = &assessment.result["resources"][2];
+    assert_eq!(planned["action"], "update");
+    assert_eq!(planned["digest"], desired_digest.as_str());
+    assert_eq!(
+        planned["current_digest"],
+        revision(definitions[2].3.as_bytes())
+    );
+
+    assert!(apply_pack(&collection, &upgraded).valid);
+    assert_eq!(
+        fs::read(root.path().join("_types/task.md")).unwrap(),
+        desired
+    );
+    let lock: Value =
+        serde_yaml::from_slice(&fs::read(root.path().join("mdbase.lock.yaml")).unwrap()).unwrap();
+    let recorded = lock["packs"][0]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["target"] == "_types/task.md")
+        .unwrap();
+    assert_eq!(recorded["digest"], desired_digest.as_str());
+
+    let reopened = Collection::open(root.path()).unwrap();
+    let repeated = reopened.assess_type_pack(&upgraded, &assessment_options());
+    assert!(repeated.valid, "{:?}", repeated.diagnostics);
+    assert_eq!(repeated.result["status"], "current");
+    assert_eq!(repeated.result["resources"][2]["action"], "preserve");
+    assert_eq!(
+        repeated.result["resources"][2]["digest"],
+        desired_digest.as_str()
+    );
 }
 
 fn seed_upgrade_provision(definitions: &[(&str, &str, &str, &str)]) -> TypePackProvision {
