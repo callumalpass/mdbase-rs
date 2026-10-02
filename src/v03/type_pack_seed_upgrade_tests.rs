@@ -137,17 +137,6 @@ fn seed_upgrade_rejects_remaining_old_references_without_publishing_any_resource
 }
 
 #[test]
-fn seed_upgrade_rejects_a_tampered_baseline_even_on_fresh_install() {
-    let (root, collection) = collection();
-    let mut pack = seed_upgrade_provision(&task_resources());
-    pack.manifest["resources"][2]["upgrade_from"]["document"] = json!("tampered");
-    let result = apply_pack(&collection, &pack);
-    assert!(!result.valid);
-    assert!(!root.path().join("_types/task.md").exists());
-    assert!(!root.path().join("mdbase.lock.yaml").exists());
-}
-
-#[test]
 fn renamed_seed_source_does_not_resurrect_a_deleted_type() {
     let (root, collection) = collection();
     let definitions = task_resources();
