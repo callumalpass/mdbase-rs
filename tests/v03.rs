@@ -220,6 +220,25 @@ fn targeted_validation_distinguishes_non_regular_from_missing_records() {
 }
 
 #[test]
+fn update_of_a_missing_record_reports_file_not_found() {
+    let directory = v03_collection();
+    let collection = Collection::open(directory.path()).unwrap();
+    let operations = collection.v03_operations().expect("v0.3 operations");
+
+    let missing = operations.update(&serde_json::json!({
+        "path": "missing.md",
+        "patch": {"title": "Updated"},
+    }));
+    assert!(!missing.valid);
+    let codes: Vec<_> = missing
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code.as_str())
+        .collect();
+    assert_eq!(codes, ["file_not_found"]);
+}
+
+#[test]
 fn v03_allows_disabling_explicit_type_keys() {
     let directory = tempfile::tempdir().expect("temp collection");
     write(

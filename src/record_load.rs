@@ -271,6 +271,19 @@ impl RecordLoadOutcome {
     }
 }
 
+/// The portable code and message for a record that could not be loaded:
+/// `file_not_found` when nothing is at the path, `file_read_failed` otherwise.
+pub(crate) fn load_failure(error: &std::io::Error, rel_path: &str) -> (&'static str, String) {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        (
+            crate::errors::FILE_NOT_FOUND,
+            format!("File not found: {rel_path}"),
+        )
+    } else {
+        ("file_read_failed", "Record could not be read.".to_string())
+    }
+}
+
 pub(crate) fn load_record(
     collection: &Collection,
     rel_path: &str,

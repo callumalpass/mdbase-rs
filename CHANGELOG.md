@@ -37,6 +37,10 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `update` of a path with no record reports `file_not_found`, as `delete` and
+  `validate` already did, rather than `file_read_failed` ("Record could not be
+  read."). Callers can now tell a missing record from an unreadable one.
+
 - Writes under `validation: error` now reject a `validate_exists` link whose
   target does not exist (`link_not_found`, `ambiguous_link`,
   `link_wrong_type`), as §04 requires; only `validate` checked links before.
