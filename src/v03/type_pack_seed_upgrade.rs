@@ -45,8 +45,7 @@ fn merge(base_document: &str, current: &str, desired_document: &str) -> Result<S
             return Err(format!("Seed upgrade requires the same type {key}."));
         }
     }
-    // An unedited seed is an ordinary update: install the publisher's exact
-    // bytes so the file keeps the pack resource digest.
+    // An unedited seed is an ordinary update to the publisher's exact bytes.
     if current == base_document {
         return Ok(desired_document.to_string());
     }
