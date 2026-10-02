@@ -153,6 +153,14 @@ impl Collection {
     }
 }
 
+/// Explicit query policy. An empty map is native policy, but still re-resolves
+/// stored links so declared constraints and candidate evidence cannot be bypassed.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LinkResolutionOptions {
+    pub unique: bool,
+    pub types: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LinkResolutionIndex {
     pub known_paths: HashSet<String>,
@@ -160,6 +168,8 @@ pub(crate) struct LinkResolutionIndex {
     pub id_lower_to_paths: HashMap<String, Vec<String>>,
     pub title_lower_to_paths: HashMap<String, Vec<String>>,
     pub types_by_path: HashMap<String, Vec<String>>,
+    pub known_types: HashSet<String>,
+    pub declared_types: HashMap<String, HashMap<String, Vec<String>>>,
 }
 
 impl LinkResolutionIndex {
@@ -220,7 +230,25 @@ impl LinkResolutionIndex {
         source_path: &str,
         target_types: &[String],
     ) -> Result<Option<String>, CatalogError> {
+        self.resolve_with_options(
+            target,
+            source_path,
+            target_types,
+            &LinkResolutionOptions::default(),
+        )
+    }
+
+    pub(crate) fn resolve_with_options(
+        &self,
+        target: &str,
+        source_path: &str,
+        target_types: &[String],
+        options: &LinkResolutionOptions,
+    ) -> Result<Option<String>, CatalogError> {
         let resolution_index = self;
+        let eligible = |paths: &[String]| {
+            self.eligible_paths(&self.eligible_paths(paths, target_types), &options.types)
+        };
         match ResolutionLookup::of(target, source_path) {
             None => Ok(None),
             // Simple-name lookup follows the same priority and ranking as hosted
@@ -241,11 +269,17 @@ impl LinkResolutionIndex {
                     ),
                 ] {
                     if let Some(paths) = map.get(&target_lower) {
-                        let eligible = resolution_index.eligible_paths(paths, target_types);
+                        let eligible = eligible(paths);
                         if !eligible.is_empty() {
+                            let count = eligible.len();
                             return select_local_resolution(source_path, kind, eligible).map(
                                 |resolution| match resolution {
-                                    LinkResolution::Resolved { path, .. } => Some(path),
+                                    LinkResolution::Resolved { path, .. }
+                                        if !options.unique || count == 1 =>
+                                    {
+                                        Some(path)
+                                    }
+                                    LinkResolution::Resolved { .. } => None,
                                     LinkResolution::Missing | LinkResolution::Ambiguous(_) => None,
                                 },
                             );
@@ -259,8 +293,7 @@ impl LinkResolutionIndex {
                 .into_iter()
                 .find(|candidate| resolution_index.known_paths.contains(candidate))
                 .and_then(|candidate| {
-                    resolution_index
-                        .eligible_paths(std::slice::from_ref(&candidate), target_types)
+                    eligible(std::slice::from_ref(&candidate))
                         .into_iter()
                         .next()
                 })),
@@ -356,13 +389,49 @@ fn select_local_resolution(
     )
 }
 
+fn collect_policy_targets(value: &serde_json::Value, targets: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(link) => {
+            if let Ok(Some(target)) = crate::links::linked_files::traversal_target(link) {
+                targets.push(target);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_policy_targets(value, targets);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Collection {
     pub(crate) fn build_link_resolution_index(
         &self,
         all_files: &[crate::expressions::evaluator::ResolvedFileData],
     ) -> LinkResolutionIndex {
         let mut index = LinkResolutionIndex::untyped(all_files, &self.resolution_keys());
+        index.known_types.extend(self.types.keys().cloned());
         for file_data in all_files {
+            if let Some(fields) = file_data.frontmatter.as_object() {
+                for (field, value) in fields {
+                    let mut targets = Vec::new();
+                    collect_policy_targets(value, &mut targets);
+                    let types = self.get_field_target_types_from_frontmatter(
+                        &file_data.path,
+                        field,
+                        &file_data.frontmatter,
+                    );
+                    for target in targets {
+                        index
+                            .declared_types
+                            .entry(file_data.path.clone())
+                            .or_default()
+                            .entry(target)
+                            .or_insert_with(|| types.clone());
+                    }
+                }
+            }
             if index.known_paths.contains(&file_data.path) {
                 index.types_by_path.insert(
                     file_data.path.clone(),

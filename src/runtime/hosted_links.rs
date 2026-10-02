@@ -251,6 +251,38 @@ mod tests {
     }
 
     #[test]
+    fn options_never_infer_uniqueness_or_type_scope_from_winner_only_neighbors() {
+        let (catalog, task, alpha) = fixture();
+        let neighborhood = HostedRelationshipNeighborhood {
+            projection: Some(projection(&catalog, &task, "projects/alpha.md")),
+            related: vec![projection(&catalog, &alpha, "")],
+            complete: true,
+        };
+        for expression in [
+            "project.asFile({'ambiguity':'unique'}) != null",
+            "project.asFile({'types':['project']}) != null",
+            // A prior default lookup must not turn an incomplete policy index
+            // into a complete one through lazy initialization.
+            "'[[absent]]'.asFile() == null && project.asFile({'ambiguity':'unique'}) != null",
+        ] {
+            let plan = catalog
+                .compile_hosted_query(&json!({"where":expression}))
+                .unwrap();
+            let evaluation = catalog
+                .evaluate_hosted_residual_with_neighborhood(&plan, &task, None, Some(&neighborhood))
+                .unwrap();
+            assert!(!evaluation.matched);
+            assert!(
+                evaluation.diagnostics.iter().any(|diagnostic| diagnostic
+                    .message
+                    .contains("link_resolution_options_context_required")),
+                "{:?}",
+                evaluation.diagnostics
+            );
+        }
+    }
+
+    #[test]
     fn reads_backlinks_from_neighbors() {
         let (catalog, task, alpha) = fixture();
         let plan = catalog

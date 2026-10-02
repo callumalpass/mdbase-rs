@@ -796,7 +796,12 @@ impl Collection {
             // then also serves `asFile()` for links that are not stored.
             let (backlinks_index, stored_links, resolution_index, backlinks_perf) =
                 match cached_graph {
-                    Some(Ok((backlinks, stored))) => (backlinks, stored, None, None),
+                    Some(Ok((backlinks, stored))) => {
+                        // Option queries must retain eligible candidate evidence,
+                        // including declared constraints on unresolved stored links.
+                        let index = self.build_link_resolution_index(&all_files_data);
+                        (backlinks, stored, Some(index), None)
+                    }
                     _ => {
                         let index = self.build_link_resolution_index(&all_files_data);
                         let (backlinks, stored, perf) = self
