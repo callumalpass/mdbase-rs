@@ -265,11 +265,13 @@ mod tests {
                 let shadow = crate::mutation::shadow::shadow_collection(&collection).unwrap();
                 assert!(shadow.collection.types.contains_key("task"));
                 assert_eq!(shadow.directory.path().join("detour").is_dir(), exists);
-                assert!(!shadow
-                    .directory
-                    .path()
-                    .join("detour/unrelated.json")
-                    .exists());
+                let witness = shadow.directory.path().join("detour/unrelated.json");
+                if exists {
+                    assert_eq!(fs::metadata(&witness).unwrap().len(), 0);
+                    assert!(!shadow.baseline.contains_key("detour/unrelated.json"));
+                } else {
+                    assert!(!witness.exists());
+                }
             }
         }
     }

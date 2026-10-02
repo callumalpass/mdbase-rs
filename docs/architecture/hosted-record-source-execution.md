@@ -191,6 +191,34 @@ Authorities prepare against a read snapshot and atomically revalidate the plan a
 their own commit boundary. A changed precondition causes bounded reprepare or a
 typed conflict; mdbase-rs does not own provider transaction retries.
 
+### Ordinary-file existence in hosted validation
+
+`hosted_file_context_paths` selects exact-path alternatives in the catalog's
+ordinary-file namespace. Hosts attest only committed current files from the same
+snapshot as the exact records, then pass their authenticated original paths to
+`plan_hosted_mutation_with_files_typed` or
+`execute_hosted_validation_with_files_typed`. The record-only entry points retain
+their source-compatible behavior for callers without ordinary-file evidence.
+
+The engine stages bounded, empty existence witnesses (at most 2,000 paths of
+1,024 bytes each). These are not fake Markdown records: record extensions,
+control resources, noncanonical/duplicate paths and traversal are rejected.
+Attachments acquire no record types, and witnesses never enter a record write
+set. Batch shadows likewise preserve ordinary-file existence without copying
+attachment bytes or adding those files to transaction baselines.
+
+This fixes required links such as Reader's `document.file` without disabling
+canonical existence/type validation. Missing files still fail; paths alone make
+no claim about attachment revisions or content. The host owns existence evidence,
+encryption, snapshot consistency and commit fencing.
+
+Reviewed source growth is 106 lines (including shadow regression assertions), with no new production module.
+The mutation module's existing concentration allowance increases by 15 lines for
+the source-compatible file-aware entry point; batch's allowance gains two lines
+for the byte-ownership regression assertions. The validation owner adds one
+`create_dir_all` and one `OpenOptions::create_new` staging capability. These
+operate only in the engine-owned disposable directory, not authority storage.
+
 ## Conformance
 
 Every seam is delivered with a filesystem consumer and a provider-neutral fixture
