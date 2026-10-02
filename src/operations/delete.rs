@@ -83,18 +83,8 @@ impl Collection {
         let path = request.path;
         let display_path = path.to_string();
         let loaded = crate::record_load::load_record(self, &display_path).map_err(|error| {
-            crate::mutation::MutationFailure::operation(
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    FILE_NOT_FOUND
-                } else {
-                    "file_read_failed"
-                },
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    format!("File not found: {display_path}")
-                } else {
-                    "Record could not be read.".to_string()
-                },
-            )
+            let (code, message) = crate::record_load::load_failure(&error, &display_path);
+            crate::mutation::MutationFailure::operation(code, message)
         })?;
         if loaded.facts().revision != before_revision
             || request

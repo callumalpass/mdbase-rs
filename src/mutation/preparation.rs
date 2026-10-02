@@ -66,12 +66,9 @@ pub(crate) fn prepare_update(
             vec![error]
         },
     )?;
-    let loaded = crate::record_load::load_record(collection, &path).map_err(|_| {
-        vec![Diagnostic::error(
-            "file_read_failed",
-            "Record could not be read.",
-            Some(path.clone()),
-        )]
+    let loaded = crate::record_load::load_record(collection, &path).map_err(|error| {
+        let (code, message) = crate::record_load::load_failure(&error, &path);
+        vec![Diagnostic::error(code, message, Some(path.clone()))]
     })?;
     let candidate = request
         .document
@@ -236,19 +233,8 @@ pub(crate) fn prepare_delete(
             )
         } else {
             let loaded = crate::record_load::load_record(collection, &path).map_err(|error| {
-                vec![Diagnostic::error(
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        crate::errors::FILE_NOT_FOUND
-                    } else {
-                        "file_read_failed"
-                    },
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        format!("File not found: {path}")
-                    } else {
-                        "Record could not be read.".to_string()
-                    },
-                    Some(path.clone()),
-                )]
+                let (code, message) = crate::record_load::load_failure(&error, &path);
+                vec![Diagnostic::error(code, message, Some(path.clone()))]
             })?;
             let (frontmatter, body) = delete_record_projection(&loaded);
             (
