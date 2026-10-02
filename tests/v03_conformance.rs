@@ -5,9 +5,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mdbase::{v03::TypePackProvision, Collection};
+use mdbase::v03::{OperationResult, TypePackAssessmentOptions, TypePackProvision};
+use mdbase::Collection;
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 #[derive(Debug, Deserialize)]
@@ -148,8 +150,8 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
         | "data_contract_registry_validate" => {
             execute_standalone_data_contract_case(&case.operation, &input)
         }
-        "apply_type_pack" => execute_type_pack_case(collection, &input),
-        "assess_type_pack" => execute_type_pack_assessment(collection, &input),
+        "apply_type_pack" => execute_type_pack_case(collection, &input, expected),
+        "assess_type_pack" => execute_type_pack_assessment(collection, &input, expected),
         "validate" => {
             let envelope = operations.validate(&input);
             let mut result = flatten_envelope(envelope);
@@ -342,16 +344,12 @@ fn execute(collection: &Collection, setup: &Setup, case: &Case, expected: &Value
     }
 }
 
-fn execute_type_pack_case(collection: &Collection, input: &Value) -> Value {
-    let manifest_path = spec_root().join(
-        input
-            .get("pack")
-            .and_then(Value::as_str)
-            .expect("apply_type_pack requires input.pack"),
-    );
-    let manifest_yaml = fs::read_to_string(&manifest_path).expect("read shared type pack manifest");
-    let manifest_yaml: serde_yaml::Value =
-        serde_yaml::from_str(&manifest_yaml).expect("parse shared type pack manifest");
+fn load_type_pack(relative_path: &str) -> TypePackProvision {
+    let manifest_path = spec_root().join(relative_path);
+    let manifest_yaml: serde_yaml::Value = serde_yaml::from_str(
+        &fs::read_to_string(&manifest_path).expect("read shared type pack manifest"),
+    )
+    .expect("parse shared type pack manifest");
     let mut manifest = yaml_to_json(&manifest_yaml);
     for resource in manifest["resources"]
         .as_array_mut()
@@ -379,25 +377,260 @@ fn execute_type_pack_case(collection: &Collection, input: &Value) -> Value {
             .expect("read shared type pack resource");
             mdbase::v03::TypePackResource { source, document }
         })
-        .collect::<Vec<_>>();
+        .collect();
+    TypePackProvision {
+        manifest,
+        resources,
+    }
+}
+
+fn type_pack_options() -> TypePackAssessmentOptions {
+    TypePackAssessmentOptions {
+        installed_by: "dev.mdbase.conformance".to_string(),
+        adopt_resources: BTreeMap::new(),
+        preserve_seed_targets: Default::default(),
+        target_overrides: BTreeMap::new(),
+        contract_setups: Vec::new(),
+    }
+}
+
+fn apply_reviewed(
+    collection: &Collection,
+    provision: &TypePackProvision,
+    options: TypePackAssessmentOptions,
+    assessment: &OperationResult,
+) -> OperationResult {
+    collection.apply_type_pack(
+        provision,
+        &mdbase::v03::TypePackApplyOptions {
+            installed_by: options.installed_by,
+            expected_assessment_digest: assessment.result["assessment_digest"]
+                .as_str()
+                .expect("assessment digest")
+                .to_string(),
+            allow_downgrade: false,
+            adopt_resources: options.adopt_resources,
+            preserve_seed_targets: options.preserve_seed_targets,
+            target_overrides: options.target_overrides,
+            contract_setups: options.contract_setups,
+        },
+    )
+}
+
+/// Prepares the collection with `input.history` (tests/v0.3/README.md).
+fn apply_type_pack_history(collection: &Collection, input: &Value) {
+    let root = collection.root();
+    for step in input["history"].as_array().into_iter().flatten() {
+        if let Some(pack) = step.get("apply").and_then(Value::as_str) {
+            let provision = load_type_pack(pack);
+            let assessment = collection.assess_type_pack(&provision, &type_pack_options());
+            assert!(
+                assessment.valid && assessment.result["applicable"] == true,
+                "history apply {pack} is not applicable: {:#}",
+                serde_json::json!({"result": assessment.result, "diagnostics": assessment.diagnostics})
+            );
+            let applied = apply_reviewed(collection, &provision, type_pack_options(), &assessment);
+            assert!(
+                applied.valid,
+                "history apply {pack} failed: {:?}",
+                applied.diagnostics
+            );
+        } else if let Some(write) = step.get("write") {
+            let path = write["path"].as_str().expect("history write path");
+            let content = write["content"].as_str().expect("history write content");
+            self::write(root, path, content);
+        } else if let Some(replace) = step.get("replace") {
+            let path = replace["path"].as_str().expect("history replace path");
+            let old = replace["old"].as_str().expect("history replace old");
+            let new = replace["new"].as_str().expect("history replace new");
+            let current = fs::read_to_string(root.join(path)).expect("read history target");
+            assert_eq!(
+                current.matches(old).count(),
+                1,
+                "history replace in {path} requires exactly one {old:?}"
+            );
+            self::write(root, path, &current.replacen(old, new, 1));
+        } else {
+            panic!("unsupported type-pack history step: {step}");
+        }
+    }
+}
+
+/// The bytes of every target an expectation requires to stay unchanged.
+fn type_pack_snapshot(root: &Path, expected: &Value) -> BTreeMap<String, Option<Vec<u8>>> {
+    expected["target_unchanged"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|target| {
+            let target = target.as_str().expect("target_unchanged entry").to_string();
+            let bytes = fs::read(root.join(&target)).ok();
+            (target, bytes)
+        })
+        .collect()
+}
+
+fn split_frontmatter(document: &str) -> (Value, &str) {
+    let yaml = document
+        .strip_prefix("---\n")
+        .expect("type-pack target has frontmatter");
+    let end = yaml
+        .find("\n---\n")
+        .expect("type-pack frontmatter is closed");
+    let frontmatter: serde_yaml::Value =
+        serde_yaml::from_str(&yaml[..=end]).expect("parse type-pack target frontmatter");
+    (yaml_to_json(&frontmatter), &yaml[end + 5..])
+}
+
+/// Observes the seed-upgrade expectations on the collection, echoing each
+/// expected value that holds so the ordinary subset comparison reports the rest.
+fn observe_type_pack_targets(
+    root: &Path,
+    expected: &Value,
+    before: &BTreeMap<String, Option<Vec<u8>>>,
+    resources: &Value,
+) -> Map<String, Value> {
+    let entries = |key: &str| {
+        expected
+            .get(key)
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+    };
+    let read = |target: &str| fs::read_to_string(root.join(target)).unwrap_or_default();
+    let source_digest = |source: &str| {
+        let bytes = fs::read(spec_root().join(source)).expect("read expected source");
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    };
+    let mut observed = Map::new();
+    observed.insert(
+        "resources".to_string(),
+        resources
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|resource| {
+                let mut entry = serde_json::json!({
+                    "target": resource["target"],
+                    "action": resource["action"],
+                    "reason": resource.get("reason").is_some(),
+                });
+                if let Some(version) = resource.pointer("/upgrade_baseline/version") {
+                    entry["upgrade_baseline_version"] = version.clone();
+                }
+                entry
+            })
+            .collect(),
+    );
+    let matches_source = entries("target_matches_source")
+        .map(|(target, source)| {
+            let source = source.as_str().expect("target_matches_source value");
+            let expected_bytes = fs::read(spec_root().join(source)).expect("read source");
+            let holds = fs::read(root.join(target)).ok() == Some(expected_bytes);
+            let value = if holds { source.into() } else { read(target) };
+            (target.clone(), Value::String(value))
+        })
+        .collect();
+    observed.insert(
+        "target_matches_source".into(),
+        Value::Object(matches_source),
+    );
+    let unchanged = before
+        .iter()
+        .filter(|(target, bytes)| fs::read(root.join(target)).ok() == **bytes)
+        .map(|(target, _)| Value::String(target.clone()))
+        .collect();
+    observed.insert("target_unchanged".into(), Value::Array(unchanged));
+    let frontmatter = entries("target_frontmatter")
+        .map(|(target, pointers)| {
+            let (frontmatter, _) = split_frontmatter(&read(target));
+            let values = pointers
+                .as_object()
+                .expect("target_frontmatter pointers")
+                .iter()
+                .map(|(pointer, value)| {
+                    let actual = frontmatter.pointer(pointer).cloned();
+                    let holds = actual.as_ref() == Some(value);
+                    let value = if holds {
+                        value.clone()
+                    } else {
+                        serde_json::json!({ "observed": actual })
+                    };
+                    (pointer.clone(), value)
+                })
+                .collect();
+            (target.clone(), Value::Object(values))
+        })
+        .collect();
+    observed.insert("target_frontmatter".into(), Value::Object(frontmatter));
+    let body = entries("target_body_contains")
+        .map(|(target, texts)| {
+            let document = read(target);
+            let (_, body) = split_frontmatter(&document);
+            let found = texts
+                .as_array()
+                .expect("target_body_contains texts")
+                .iter()
+                .filter(|text| body.contains(text.as_str().expect("body text")))
+                .cloned()
+                .collect();
+            (target.clone(), Value::Array(found))
+        })
+        .collect();
+    observed.insert("target_body_contains".into(), Value::Object(body));
+    let lock: Value = serde_yaml::from_str::<serde_yaml::Value>(&read("mdbase.lock.yaml"))
+        .map(|lock| yaml_to_json(&lock))
+        .unwrap_or(Value::Null);
+    let origins = entries("lock_origin")
+        .map(|(target, source)| {
+            let origin = lock["packs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|pack| pack["resources"].as_array().into_iter().flatten())
+                .find(|resource| resource["target"] == *target)
+                .and_then(|resource| resource.get("origin_digest"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let source = source.as_str().expect("lock_origin value");
+            let value = match origin {
+                None => "absent".to_string(),
+                Some(origin) if source != "absent" && origin == source_digest(source) => {
+                    source.to_string()
+                }
+                Some(origin) => origin,
+            };
+            (target.clone(), Value::String(value))
+        })
+        .collect();
+    observed.insert("lock_origin".into(), Value::Object(origins));
+    observed
+}
+
+fn execute_type_pack_case(collection: &Collection, input: &Value, expected: &Value) -> Value {
+    let pack = input
+        .get("pack")
+        .and_then(Value::as_str)
+        .expect("apply_type_pack requires input.pack");
+    apply_type_pack_history(collection, input);
+    let before = type_pack_snapshot(collection.root(), expected);
+    let TypePackProvision {
+        mut manifest,
+        resources,
+    } = load_type_pack(pack);
     if input.get("corrupt_digest").and_then(Value::as_bool) == Some(true) {
         manifest["resources"][0]["digest"] = Value::String(format!("sha256:{}", "0".repeat(64)));
     }
 
     let repeat = input.get("repeat").and_then(Value::as_u64).unwrap_or(1);
     let mut runs = Vec::new();
+    let mut first_resources = None;
     for _ in 0..repeat {
         let provision = TypePackProvision {
             manifest: manifest.clone(),
             resources: resources.clone(),
         };
-        let mut assessment_options = mdbase::v03::TypePackAssessmentOptions {
-            installed_by: "dev.mdbase.conformance".to_string(),
-            adopt_resources: BTreeMap::new(),
-            preserve_seed_targets: Default::default(),
-            target_overrides: BTreeMap::new(),
-            contract_setups: Vec::new(),
-        };
+        let mut assessment_options = type_pack_options();
         let mut assessment = collection.assess_type_pack(&provision, &assessment_options);
         if input.get("adopt_conflicts").and_then(Value::as_bool) == Some(true) && assessment.valid {
             assessment_options.adopt_resources = assessment.result["resources"]
@@ -418,6 +651,7 @@ fn execute_type_pack_case(collection: &Collection, input: &Value) -> Value {
                 .collect();
             assessment = collection.assess_type_pack(&provision, &assessment_options);
         }
+        first_resources.get_or_insert_with(|| assessment.result["resources"].clone());
         if let Some(target) = input.get("mutate_after_assess").and_then(Value::as_str) {
             let target = collection.root().join(target);
             fs::create_dir_all(target.parent().expect("mutation target parent"))
@@ -425,21 +659,7 @@ fn execute_type_pack_case(collection: &Collection, input: &Value) -> Value {
             fs::write(target, "Changed after assessment.\n").expect("mutate assessed target");
         }
         let result = if assessment.valid {
-            collection.apply_type_pack(
-                &provision,
-                &mdbase::v03::TypePackApplyOptions {
-                    installed_by: assessment_options.installed_by,
-                    expected_assessment_digest: assessment.result["assessment_digest"]
-                        .as_str()
-                        .expect("assessment digest")
-                        .to_string(),
-                    allow_downgrade: false,
-                    adopt_resources: assessment_options.adopt_resources,
-                    preserve_seed_targets: assessment_options.preserve_seed_targets,
-                    target_overrides: assessment_options.target_overrides,
-                    contract_setups: assessment_options.contract_setups,
-                },
-            )
+            apply_reviewed(collection, &provision, assessment_options, &assessment)
         } else {
             assessment.clone()
         };
@@ -496,62 +716,51 @@ fn execute_type_pack_case(collection: &Collection, input: &Value) -> Value {
     if !last["error"].is_null() {
         output["error"] = last["error"].clone();
     }
+    let observed = observe_type_pack_targets(
+        collection.root(),
+        expected,
+        &before,
+        &first_resources.unwrap_or_default(),
+    );
+    output.as_object_mut().unwrap().extend(observed);
     output
 }
 
-fn execute_type_pack_assessment(collection: &Collection, input: &Value) -> Value {
-    let mut apply_input = input.clone();
-    apply_input["repeat"] = Value::from(1);
-    let installed = execute_type_pack_case(collection, &apply_input);
-    if !installed["valid"].as_bool().unwrap_or(false) {
-        return installed;
-    }
+fn execute_type_pack_assessment(collection: &Collection, input: &Value, expected: &Value) -> Value {
+    apply_type_pack_history(collection, input);
     if let Some(target) = input.get("install_then_modify").and_then(Value::as_str) {
+        let install = serde_json::json!({ "pack": input["pack"] });
+        let installed = execute_type_pack_case(collection, &install, &Value::Null);
+        if !installed["valid"].as_bool().unwrap_or(false) {
+            return installed;
+        }
         fs::write(collection.root().join(target), "User-authored change.\n")
             .expect("modify installed target");
     }
-    let manifest_path = spec_root().join(input["pack"].as_str().expect("assessment pack"));
-    let manifest_yaml: serde_yaml::Value = serde_yaml::from_str(
-        &fs::read_to_string(&manifest_path).expect("read assessment manifest"),
-    )
-    .expect("parse assessment manifest");
-    let mut manifest = yaml_to_json(&manifest_yaml);
-    for resource in manifest["resources"].as_array_mut().unwrap() {
-        if resource.get("mode").is_none() {
-            resource["mode"] = Value::String("managed".to_string());
-        }
-    }
-    let resources = manifest["resources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|resource| {
-            let source = resource["source"].as_str().unwrap().to_string();
-            let document = fs::read_to_string(manifest_path.parent().unwrap().join(&source))
-                .expect("read assessment resource");
-            mdbase::v03::TypePackResource { source, document }
-        })
-        .collect();
-    let assessed = collection.assess_type_pack(
-        &TypePackProvision {
-            manifest,
-            resources,
-        },
-        &mdbase::v03::TypePackAssessmentOptions {
-            installed_by: "dev.mdbase.conformance".to_string(),
-            adopt_resources: BTreeMap::new(),
-            preserve_seed_targets: Default::default(),
-            target_overrides: BTreeMap::new(),
-            contract_setups: Vec::new(),
-        },
-    );
-    serde_json::json!({
+    let before = type_pack_snapshot(collection.root(), expected);
+    let pack = input["pack"].as_str().expect("assessment pack");
+    let assessed = collection.assess_type_pack(&load_type_pack(pack), &type_pack_options());
+    let mut output = serde_json::json!({
         "valid": assessed.valid,
         "status": assessed.result["status"],
         "applicable": assessed.result["applicable"],
         "actions": assessed.result["resources"].as_array().into_iter().flatten()
             .map(|resource| resource["action"].clone()).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(diagnostic) = assessed.diagnostics.first() {
+        output["error"] = serde_json::json!({
+            "code": diagnostic.code,
+            "message": diagnostic.message,
+        });
+    }
+    let observed = observe_type_pack_targets(
+        collection.root(),
+        expected,
+        &before,
+        &assessed.result["resources"],
+    );
+    output.as_object_mut().unwrap().extend(observed);
+    output
 }
 
 fn execute_standalone_data_contract_case(operation: &str, input: &Value) -> Value {
@@ -890,7 +1099,7 @@ fn shared_v03_data_contract_fixture_passes() {
 
 #[test]
 fn shared_v03_type_pack_fixture_passes() {
-    run_suite("type-packs/type-packs.yaml", "type_packs", 6);
+    run_suite("type-packs/type-packs.yaml", "type_packs", 19);
 }
 
 fn run_suite(relative_path: &str, fixture_set: &str, expected_cases: usize) {

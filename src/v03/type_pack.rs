@@ -85,8 +85,8 @@ pub struct ContractSetupChoice {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ManifestResource {
-    #[serde(default)]
-    upgrade_from: Option<seed_upgrade::Base>,
+    #[serde(default, deserialize_with = "seed_upgrade::baselines")]
+    upgrade_from: Vec<seed_upgrade::Base>,
     kind: String,
     mode: String,
     source: String,
@@ -108,6 +108,9 @@ struct TypePackReceiptResource {
     source: String,
     target: String,
     digest: String,
+    /// The publisher document a seed's target descends from, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -137,6 +140,7 @@ pub(crate) struct PlannedPackResource {
     current_digest: Option<String>,
     installed_digest: Option<String>,
     adopted_from_digest: Option<String>,
+    upgrade_baseline: Option<Value>,
     pub(crate) reason: Option<String>,
     bytes: Option<Vec<u8>>,
 }
@@ -288,7 +292,7 @@ pub(crate) fn plan_type_pack(
     let sources = provision
         .resources
         .iter()
-        .map(|resource| (resource.source.as_str(), resource.document.as_bytes()))
+        .map(|resource| (resource.source.as_str(), resource.document.as_str()))
         .collect::<BTreeMap<_, _>>();
     if sources.len() != provision.resources.len() || sources.len() != manifest_resources.len() {
         return Err(pack_plan_error(
@@ -330,6 +334,7 @@ pub(crate) fn plan_type_pack(
                 source: resource.source.clone(),
                 target: resource.target.clone(),
                 digest: resource.digest.clone(),
+                origin_digest: None,
             })
             .collect(),
     };
@@ -368,18 +373,19 @@ pub(crate) fn plan_type_pack(
 
     let mut targets = BTreeSet::new();
     let mut planned = Vec::new();
-    for resource in &resolved_resources {
+    for (index, resource) in resolved_resources.iter().enumerate() {
         if !targets.insert(resource.target.clone()) {
             return Err(pack_plan_error("A type-pack target may appear only once."));
         }
         CollectionPath::new(&resource.source)
             .map_err(|error| pack_plan_error(format!("Unsafe type-pack source: {error}")))?;
-        let bytes = sources.get(resource.source.as_str()).ok_or_else(|| {
+        let document = sources.get(resource.source.as_str()).ok_or_else(|| {
             pack_plan_error(format!(
                 "Type-pack source '{}' is missing.",
                 resource.source
             ))
         })?;
+        let bytes = document.as_bytes();
         let actual = revision(bytes);
         if actual != resource.digest {
             return Err(pack_plan_error(format!(
@@ -387,10 +393,7 @@ pub(crate) fn plan_type_pack(
                 resource.source, actual, resource.digest
             )));
         }
-        if let Some(base) = &resource.upgrade_from {
-            base.verify(&resource.kind, &resource.mode)
-                .map_err(pack_plan_error)?;
-        }
+        seed_upgrade::verify(resource, document).map_err(pack_plan_error)?;
         let target = validate_resource_target(collection, &resource.kind, &resource.target, bytes)
             .map_err(pack_plan_error)?;
         collection
@@ -421,7 +424,8 @@ pub(crate) fn plan_type_pack(
             });
         let owner = other_owners.get(resource.target.as_str()).copied();
         let mut adopted_from_digest = None;
-        let mut planned_bytes = (*bytes).to_vec();
+        let mut upgrade_baseline = None;
+        let mut planned_bytes = bytes.to_vec();
         let (action, reason) = if let Some((owner, owned_digest)) = owner {
             // Once deferred (recorded as a seed), keep deferring as the owner
             // moves the file forward, as seeds do.
@@ -446,22 +450,20 @@ pub(crate) fn plan_type_pack(
                     )),
                 )
             }
-        } else if let Some(merged) = resource
-            .upgrade_from
-            .as_ref()
-            .filter(|_| resource.mode == "seed")
-            .filter(|_| !options.preserve_seed_targets.contains(&resource.target))
-            .zip(before.as_deref())
-            .map(|(base, current)| base.plan(current, bytes))
-        {
-            match merged {
-                Ok(document) => {
-                    let unchanged = before.as_deref() == Some(document.as_slice());
-                    planned_bytes = document;
-                    (if unchanged { "preserve" } else { "update" }, None)
-                }
-                Err(reason) => ("conflict", Some(format!("{}: {reason}", resource.target))),
+        } else if let Some(live) = before.as_deref().filter(|_| {
+            !resource.upgrade_from.is_empty()
+                && !options.preserve_seed_targets.contains(&resource.target)
+        }) {
+            let origin = installed.and_then(|installed| installed.origin_digest.as_deref());
+            let (action, reason, update) = seed_upgrade::plan(resource, live, document, origin);
+            if let Some((document, base)) = update {
+                planned_bytes = document;
+                upgrade_baseline = Some(json!(base));
             }
+            (
+                action,
+                reason.map(|reason| format!("{}: {reason}", resource.target)),
+            )
         } else if resource.mode == "seed" {
             (
                 if before.is_none()
@@ -530,6 +532,17 @@ pub(crate) fn plan_type_pack(
         } else {
             ("update", None)
         };
+        // A seed's origin is the desired document once the apply writes it or
+        // finds it byte-for-byte; otherwise the recorded origin carries forward.
+        if resource.mode == "seed" {
+            desired.resources[index].origin_digest = if matches!(action, "create" | "update")
+                || current_digest.as_deref() == Some(resource.digest.as_str())
+            {
+                Some(resource.digest.clone())
+            } else {
+                installed.and_then(|installed| installed.origin_digest.clone())
+            };
+        }
         planned.push(PlannedPackResource {
             kind: resource.kind.clone(),
             mode: resource.mode.clone(),
@@ -540,6 +553,7 @@ pub(crate) fn plan_type_pack(
             current_digest,
             installed_digest: installed.map(|installed| installed.digest.clone()),
             adopted_from_digest,
+            upgrade_baseline,
             reason,
             bytes: Some(planned_bytes),
         });
@@ -604,6 +618,7 @@ pub(crate) fn plan_type_pack(
                 current_digest,
                 installed_digest: Some(resource.digest.clone()),
                 adopted_from_digest: None,
+                upgrade_baseline: None,
                 reason,
                 bytes: None,
             });
@@ -617,12 +632,21 @@ pub(crate) fn plan_type_pack(
     } else if current.as_ref().is_some_and(|receipt| {
         receipt.version == desired.version && receipt.digest == desired.digest
     }) {
-        if current
-            .as_ref()
-            .is_some_and(|receipt| receipt.resources != desired.resources)
-            || planned.iter().any(|resource| {
-                !matches!(resource.action.as_str(), "unchanged" | "preserve" | "adopt")
-            })
+        // Recording only seed origins is not a reconfiguration.
+        let without_origins = |resources: &[TypePackReceiptResource]| {
+            let resources = resources.iter().cloned();
+            resources
+                .map(|resource| TypePackReceiptResource {
+                    origin_digest: None,
+                    ..resource
+                })
+                .collect::<Vec<_>>()
+        };
+        if current.as_ref().is_some_and(|receipt| {
+            without_origins(&receipt.resources) != without_origins(&desired.resources)
+        }) || planned
+            .iter()
+            .any(|resource| !matches!(resource.action.as_str(), "unchanged" | "preserve" | "adopt"))
         {
             "reconfigure"
         } else {
@@ -696,7 +720,6 @@ pub(crate) fn plan_type_pack(
     let contract_setup_resources = contract_setup
         .as_ref()
         .map(prepared_contract_setup_resources)
-        .transpose()?
         .unwrap_or_default();
     if status == "current" && !contract_setup_resources.is_empty() {
         status = "reconfigure";
@@ -892,6 +915,9 @@ fn planned_resource_value(resource: &PlannedPackResource) -> Value {
     if let Some(digest) = &resource.adopted_from_digest {
         value["adopted_from_digest"] = Value::String(digest.clone());
     }
+    if let Some(baseline) = &resource.upgrade_baseline {
+        value["upgrade_baseline"] = baseline.clone();
+    }
     if let Some(reason) = &resource.reason {
         value["reason"] = Value::String(reason.clone());
     }
@@ -925,40 +951,26 @@ fn pack_diagnostic(code: impl Into<String>, message: impl Into<String>) -> Opera
 
 #[derive(Debug)]
 struct PreparedContractSetupPack {
-    manifest: Value,
-    resources: Vec<TypePackResource>,
+    /// Each changed type's target and its reviewed document.
+    resources: Vec<(String, TypePackResource)>,
     expected_revisions: BTreeMap<String, String>,
 }
 
-fn prepared_contract_setup_resources(
-    prepared: &PreparedContractSetupPack,
-) -> Result<Vec<Value>, Box<Diagnostic>> {
-    let manifest_resources = serde_json::from_value::<Vec<ManifestResource>>(
-        prepared
-            .manifest
-            .get("resources")
-            .cloned()
-            .unwrap_or(Value::Null),
-    )
-    .map_err(|error| {
-        contract_setup_diagnostic(format!(
-            "Could not inspect prepared contract setup resources: {error}"
-        ))
-    })?;
-    Ok(manifest_resources
-        .into_iter()
-        .map(|resource| {
-            let current_digest = prepared.expected_revisions.get(&resource.target).cloned();
+fn prepared_contract_setup_resources(prepared: &PreparedContractSetupPack) -> Vec<Value> {
+    prepared
+        .resources
+        .iter()
+        .map(|(target, resource)| {
             json!({
-                "kind": resource.kind,
+                "kind": "type",
                 "source": resource.source,
-                "target": resource.target,
+                "target": target,
                 "action": "update",
-                "digest": resource.digest,
-                "current_digest": current_digest,
+                "digest": revision(resource.document.as_bytes()),
+                "current_digest": prepared.expected_revisions.get(target),
             })
         })
-        .collect())
+        .collect()
 }
 
 fn stage_prepared_contract_setup(
@@ -966,35 +978,12 @@ fn stage_prepared_contract_setup(
     prepared: &PreparedContractSetupPack,
     pack_resources: &[PlannedPackResource],
 ) -> Result<(), Box<Diagnostic>> {
-    let manifest_resources = serde_json::from_value::<Vec<ManifestResource>>(
-        prepared
-            .manifest
-            .get("resources")
-            .cloned()
-            .unwrap_or(Value::Null),
-    )
-    .map_err(|error| {
-        contract_setup_diagnostic(format!(
-            "Could not stage prepared contract setup resources: {error}"
-        ))
-    })?;
-    let sources = prepared
-        .resources
-        .iter()
-        .map(|resource| (resource.source.as_str(), resource.document.as_bytes()))
-        .collect::<BTreeMap<_, _>>();
-    for resource in manifest_resources {
-        let bytes = sources.get(resource.source.as_str()).ok_or_else(|| {
-            contract_setup_diagnostic(format!(
-                "Prepared contract setup source '{}' is missing.",
-                resource.source
-            ))
-        })?;
-        let target =
-            validate_resource_target(&shadow.collection, &resource.kind, &resource.target, bytes)
-                .map_err(contract_setup_diagnostic)?;
+    for (target, resource) in &prepared.resources {
+        let bytes = resource.document.as_bytes();
+        let target = validate_resource_target(&shadow.collection, "type", target, bytes)
+            .map_err(contract_setup_diagnostic)?;
         if pack_resources.iter().any(|pack_resource| {
-            pack_resource.target == resource.target
+            pack_resource.target == target.as_str()
                 && matches!(
                     pack_resource.action.as_str(),
                     "create" | "update" | "delete"
@@ -1002,7 +991,7 @@ fn stage_prepared_contract_setup(
         }) {
             return Err(contract_setup_diagnostic(format!(
                 "Contract setup target '{}' is also changed by the managed type pack.",
-                resource.target
+                target.as_str()
             )));
         }
         let expected = prepared
@@ -1131,20 +1120,6 @@ fn prepare_existing_contract_setups(
         .into_iter()
         .filter(|(target, _)| expected_revisions.contains_key(target))
         .collect::<BTreeMap<_, _>>();
-    if changed.is_empty() {
-        return Ok(PreparedContractSetupPack {
-            manifest: json!({
-                "kind": "mdbase.type-pack",
-                "id": "dev.mdbase.existing-contract-setup",
-                "version": "1.0.0",
-                "resources": [],
-            }),
-            resources: Vec::new(),
-            expected_revisions,
-        });
-    }
-
-    let mut manifest_resources = Vec::with_capacity(changed.len());
     let mut resources = Vec::with_capacity(changed.len());
     for (index, (target, (_, document))) in changed.into_iter().enumerate() {
         let extension = Path::new(&target)
@@ -1152,22 +1127,9 @@ fn prepare_existing_contract_setups(
             .and_then(|value| value.to_str())
             .unwrap_or("md");
         let source = format!("contract-setup/resource-{index}.{extension}");
-        manifest_resources.push(json!({
-            "kind": "type",
-            "mode": "managed",
-            "source": source,
-            "target": target,
-            "digest": revision(document.as_bytes()),
-        }));
-        resources.push(TypePackResource { source, document });
+        resources.push((target, TypePackResource { source, document }));
     }
     Ok(PreparedContractSetupPack {
-        manifest: json!({
-            "kind": "mdbase.type-pack",
-            "id": "dev.mdbase.existing-contract-setup",
-            "version": "1.0.0",
-            "resources": manifest_resources,
-        }),
         resources,
         expected_revisions,
     })
@@ -1617,25 +1579,7 @@ mod tests {
         collection: &Collection,
         provision: &TypePackProvision,
     ) -> OperationResult {
-        let assessment = collection.assess_type_pack(provision, &assessment_options());
-        if !assessment.valid {
-            return assessment;
-        }
-        collection.apply_type_pack(
-            provision,
-            &TypePackApplyOptions {
-                installed_by: "dev.mdbase.tests".to_string(),
-                expected_assessment_digest: assessment.result["assessment_digest"]
-                    .as_str()
-                    .expect("assessment digest")
-                    .to_string(),
-                allow_downgrade: false,
-                adopt_resources: BTreeMap::new(),
-                preserve_seed_targets: BTreeSet::new(),
-                target_overrides: BTreeMap::new(),
-                contract_setups: Vec::new(),
-            },
-        )
+        apply_pack_with_setups(collection, provision, Vec::new())
     }
 
     fn apply_pack_with_setups(
@@ -1673,10 +1617,7 @@ mod tests {
     pub(super) fn assessment_options() -> TypePackAssessmentOptions {
         TypePackAssessmentOptions {
             installed_by: "dev.mdbase.tests".to_string(),
-            adopt_resources: BTreeMap::new(),
-            preserve_seed_targets: BTreeSet::new(),
-            target_overrides: BTreeMap::new(),
-            contract_setups: Vec::new(),
+            ..Default::default()
         }
     }
 

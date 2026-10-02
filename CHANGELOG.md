@@ -35,6 +35,24 @@ All notable changes to this project are documented in this file.
   candidate evidence is implemented. Existing consumers need no migration;
   option users require an explicit authority capability gate.
 
+### Changed
+
+- Seed type upgrades follow the seed's recorded origin (spec 05A). A seed
+  type's `upgrade_from` is one baseline or a non-empty list of
+  `{ digest, document, version? }`, validated as `invalid_type_pack` unless it is
+  on a seed type and each baseline matches its digest, is distinct, is not the
+  desired document, has the same type kind and name, and declares any stated
+  `version`. Seed lock entries record `origin_digest`: the desired digest on
+  create, on any upgrade, and whenever live bytes equal the desired document;
+  otherwise the previous origin carries forward. For an existing target, the
+  engine preserves it when it equals the desired document, replaces it exactly
+  when it equals any baseline, preserves it when its origin is the desired
+  document, merges against the baseline its origin names, and otherwise
+  preserves it with a `reason` instead of merging against an unrelated
+  baseline. Each seed `update` reports `upgrade_baseline: { digest, version? }`.
+  Locks written before this change have no origins, so their edited seeds are
+  preserved rather than merged; recording only origins keeps a pack `current`.
+
 ### Fixed
 
 - A seed type upgrade (`upgrade_from`) over an unedited seed, whose live bytes
