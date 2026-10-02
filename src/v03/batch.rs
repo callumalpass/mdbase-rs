@@ -1381,9 +1381,16 @@ mod tests {
         assert!(root.join("schema.json").is_file());
         assert!(root.join("_types/nested.json").is_file());
         assert!(!root.join("_types/unrelated.json").exists());
-        assert!(!root.join("unrelated.json").exists());
+        // Ordinary files preserve existence only, never their source bytes or
+        // record transaction membership. Required schema/base bytes stay exact.
+        assert_eq!(fs::metadata(root.join("unrelated.json")).unwrap().len(), 0);
+        assert!(!shadow.baseline.contains_key("unrelated.json"));
         assert!(root.join("views/configured.base").is_file());
-        assert!(!root.join("unconfigured.base").exists());
+        assert_eq!(
+            fs::metadata(root.join("unconfigured.base")).unwrap().len(),
+            0
+        );
+        assert!(!shadow.baseline.contains_key("unconfigured.base"));
         assert!(!root.join("private/excluded.base").exists());
         assert!(!root.join(".git").exists());
         assert!(!root.join("nested").exists());
