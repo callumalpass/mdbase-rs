@@ -1,6 +1,6 @@
 {
   "rustSourceFileCountMax": 201,
-  "rustSourceLineCountMax": 109603,
+  "rustSourceLineCountMax": 109700,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-architecture-check/src/main.rs": 1188,
@@ -15,7 +15,7 @@
     "src/runtime/filesystem.rs": 1462,
     "src/runtime/canonical_operation.rs": 1510,
     "src/runtime/hosted_base.rs": 1969,
-    "src/runtime/hosted_mutation.rs": 1200,
+    "src/runtime/hosted_mutation.rs": 1215,
     "src/runtime/hosted_query.rs": 3428,
     "src/runtime/hosted_resource.rs": 1044,
     "src/runtime/provider.rs": 1020,
@@ -66,7 +66,7 @@
     "src/runtime/catalog.rs": {"tempfile": 1},
     "src/runtime/hosted_mutation.rs": {"std::fs": 11, "tempfile": 1},
     "src/runtime/hosted_resource.rs": {"std::fs": 6, "tempfile": 3, "walkdir": 1},
-    "src/runtime/hosted_validation.rs": {"std::fs": 3, "tempfile": 1},
+    "src/runtime/hosted_validation.rs": {"std::fs": 4, "std::fs::OpenOptions": 1, "tempfile": 1},
     "src/transactions.rs": {"std::fs::File": 3},
     "src/types/loader.rs": {"std::fs": 3},
     "src/v03/batch.rs": {"std::fs": 5, "tempfile": 1},

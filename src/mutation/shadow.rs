@@ -95,7 +95,11 @@ fn copy_collection(
         })?;
     for relative in files {
         context.check().map_err(RuntimeBatchError::Provider)?;
-        if !should_copy_file(collection, &relative, &schemas.files)
+        let record_or_resource = should_copy_file(collection, &relative, &schemas.files);
+        if (!record_or_resource
+            && collection
+                .validate_file_path(portable_path(&relative))
+                .is_err())
             || below_nested_collection(collection, &relative)
         {
             continue;
@@ -116,11 +120,20 @@ fn copy_collection(
                 RuntimeBatchError::Diagnostic(Box::new(copy_error(&relative, error)))
             })?;
         }
-        let bytes = read_capture_file(collection, &relative, context)?;
+        // Ordinary files contribute existence, not record contents. Preserve
+        // them through batch preflight without downloading/copying their bytes
+        // or including them in the record transaction's baseline/write set.
+        let bytes = if record_or_resource {
+            read_capture_file(collection, &relative, context)?
+        } else {
+            Vec::new()
+        };
         fs::write(&target, &bytes).map_err(|error| {
             RuntimeBatchError::Diagnostic(Box::new(copy_error(&relative, error)))
         })?;
-        baseline.insert(portable_path(&relative), bytes);
+        if record_or_resource {
+            baseline.insert(portable_path(&relative), bytes);
+        }
     }
     Ok(baseline)
 }

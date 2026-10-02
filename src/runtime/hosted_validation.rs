@@ -17,6 +17,8 @@ use super::{
 
 const MAX_HOSTED_VALIDATION_RECORDS: usize = 2_001;
 const MAX_HOSTED_VALIDATION_EXACT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HOSTED_FILE_CONTEXT_PATHS: usize = 2_000;
+const MAX_HOSTED_FILE_CONTEXT_PATH_BYTES: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +76,24 @@ impl HostedValidationPlan {
 }
 
 impl CompiledCatalog {
+    /// Exact-path link alternatives that may refer to ordinary collection files.
+    /// IDs, titles, basenames, records and control namespaces are not file evidence.
+    pub fn hosted_file_context_paths(&self, lookups: &[ResolutionLookupKey]) -> Vec<String> {
+        lookups
+            .iter()
+            .filter(|lookup| {
+                lookup.kind == super::RecordResolutionKeyKind::Path
+                    && self
+                        .collection
+                        .validate_file_path(&lookup.value)
+                        .is_ok_and(|path| path.as_str() == lookup.value)
+            })
+            .map(|lookup| lookup.value.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// What canonical write validation compared a hosted write's records
     /// against. Empty unless the write is validated (`validation: error`).
     pub(crate) fn hosted_write_context<'a>(
@@ -253,6 +273,17 @@ impl CompiledCatalog {
         plan: &HostedValidationPlan,
         records: &[CanonicalRecordInput],
     ) -> Result<super::CanonicalOperationOutcome, CatalogError> {
+        self.execute_hosted_validation_with_files_typed(plan, records, &[])
+    }
+
+    /// Validate with ordinary-file existence evidence from the same authority
+    /// snapshot as `records`. No attachment bytes are required or parsed.
+    pub fn execute_hosted_validation_with_files_typed(
+        &self,
+        plan: &HostedValidationPlan,
+        records: &[CanonicalRecordInput],
+        existing_file_paths: &[String],
+    ) -> Result<super::CanonicalOperationOutcome, CatalogError> {
         if plan.catalog_revision != self.resource_revision() {
             return Err(validation_error(
                 "hosted_validation_catalog_mismatch",
@@ -306,6 +337,7 @@ impl CompiledCatalog {
                 "Hosted validation context omitted its exact target record.",
             ));
         }
+        materialize_file_context(self, directory.path(), existing_file_paths)?;
         let data_contracts = crate::data_contracts::DataContractRegistry::load_resolved(
             self.contracts.clone(),
             &self.collection.types,
@@ -345,6 +377,48 @@ impl CompiledCatalog {
             .execute_hosted_validation_typed(plan, records)?
             .to_v03())
     }
+}
+
+/// Existence-only witnesses for the canonical filesystem validator. Reject
+/// records/control resources rather than inventing record contents or types.
+/// The caller must attest these paths exist in its consistent authority snapshot.
+pub(super) fn materialize_file_context(
+    catalog: &CompiledCatalog,
+    root: &std::path::Path,
+    paths: &[String],
+) -> Result<(), CatalogError> {
+    if paths.len() > MAX_HOSTED_FILE_CONTEXT_PATHS {
+        return Err(validation_error(
+            "hosted_file_context_budget_exceeded",
+            "Hosted ordinary-file context exceeds its path budget.",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for value in paths {
+        let path = catalog
+            .collection
+            .validate_file_path(value)
+            .map_err(|error| validation_error("invalid_file_path", error.to_string()))?;
+        if path.as_str() != value
+            || value.len() > MAX_HOSTED_FILE_CONTEXT_PATH_BYTES
+            || !seen.insert(value)
+        {
+            return Err(validation_error(
+                "invalid_file_path",
+                "Hosted file context requires unique, canonical, bounded paths.",
+            ));
+        }
+        let destination = path.under(root);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(validation_stage_error)?;
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(validation_stage_error)?;
+    }
+    Ok(())
 }
 
 fn validation_error(code: impl Into<String>, message: impl Into<String>) -> CatalogError {

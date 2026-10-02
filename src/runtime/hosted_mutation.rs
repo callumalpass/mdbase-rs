@@ -95,6 +95,17 @@ impl CompiledCatalog {
         &self,
         request: &HostedMutationRequest,
     ) -> Result<TypedHostedMutationPlan, CatalogError> {
+        self.plan_hosted_mutation_with_files_typed(request, &[])
+    }
+
+    /// Plan with ordinary-file existence evidence from the same authority
+    /// snapshot as `request.records`. File contents are not needed for links.
+    /// Paths are staged only as non-record files and never enter the write set.
+    pub fn plan_hosted_mutation_with_files_typed(
+        &self,
+        request: &HostedMutationRequest,
+        existing_file_paths: &[String],
+    ) -> Result<TypedHostedMutationPlan, CatalogError> {
         if request.records.len() > MAX_HOSTED_MUTATION_RECORDS {
             return Err(mutation_error(
                 "hosted_mutation_context_budget_exceeded",
@@ -163,6 +174,11 @@ impl CompiledCatalog {
             fs::write(destination, &record.document).map_err(stage_io_error)?;
         }
 
+        super::hosted_validation::materialize_file_context(
+            self,
+            directory.path(),
+            existing_file_paths,
+        )?;
         let data_contracts = crate::data_contracts::DataContractRegistry::load_resolved(
             self.contracts.clone(),
             &self.collection.types,
@@ -256,6 +272,11 @@ impl CompiledCatalog {
             .unwrap_or(false);
         let mutation_result = if is_dry_run {
             reset_mutation_stage(directory.path(), &request.records, self)?;
+            super::hosted_validation::materialize_file_context(
+                self,
+                directory.path(),
+                existing_file_paths,
+            )?;
             let mut committed_input = request
                 .input
                 .as_object()
