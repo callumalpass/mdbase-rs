@@ -151,6 +151,37 @@ fn untyped_copies_and_source_overrides_cannot_erase_declared_policy_constraints(
 }
 
 #[test]
+fn conflicting_typed_fields_fail_closed_instead_of_widening_either_declaration() {
+    let (root, _collection, _) = fixture();
+    write(&root, "_types/conflicted.md", "---\nkind: mdbase.type\nname: conflicted\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    properties:\n      type: { const: conflicted }\n      source: { type: string }\n      note: { type: string }\ncollection:\n  links:\n    source: { target_type: source }\n    note: { target_type: note }\n---\n");
+    write(
+        &root,
+        "annotations/conflict.md",
+        "---\ntype: conflicted\nsource: '[[book]]'\nnote: '[[book]]'\n---\n",
+    );
+    let collection = Collection::open(root.path()).unwrap();
+    let operations = collection.v03_operations().unwrap();
+    let default = operations.evaluate_cel(
+        &json!({"path":"annotations/conflict.md", "expression":"source.asFile().file.path"}),
+    );
+    assert!(default.diagnostics.is_empty());
+    assert_eq!(default.result["value"], "notes/book.md");
+    for expression in [
+        "source.asFile({'types':['note']})",
+        "note.asFile({'types':['source']})",
+    ] {
+        let result = operations
+            .evaluate_cel(&json!({"path":"annotations/conflict.md", "expression":expression}));
+        assert!(
+            result.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("link_resolution_field_context_required")),
+            "{result:#?}"
+        );
+    }
+}
+
+#[test]
 fn invalid_options_and_invalid_links_are_diagnostics_not_missing_targets() {
     let (_root, collection, _) = fixture();
     let operations = collection.v03_operations().unwrap();

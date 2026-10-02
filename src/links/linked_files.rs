@@ -56,6 +56,15 @@ impl LinkedFiles {
         }
     }
 
+    /// Prepare policy evidence only for a plan that can request it. Cached
+    /// default traversals retain their stored-winner/untyped-index fast paths.
+    pub(crate) fn prepare_policy_index(&mut self, collection: &crate::Collection) {
+        if !self.policy_complete {
+            self.index = OnceLock::from(collection.build_link_resolution_index(&self.files));
+            self.policy_complete = true;
+        }
+    }
+
     /// Every record, in snapshot order.
     pub fn files(&self) -> &[ResolvedFileData] {
         &self.files
@@ -168,9 +177,22 @@ impl LinkedFiles {
             .get_or_init(|| LinkResolutionIndex::untyped(&self.files, &self.keys));
         let source = source_path.unwrap_or_default();
         let path = if let Some(options) = options {
+            let origin = declaration_source.unwrap_or(source);
+            if index
+                .declared_type_conflicts
+                .get(origin)
+                .is_some_and(|targets| targets.contains(target))
+            {
+                return Err(CatalogError {
+                    code: "link_resolution_field_context_required".into(),
+                    message:
+                        "Conflicting stored-target declarations require field-specific provenance"
+                            .into(),
+                });
+            }
             let declared = index
                 .declared_types
-                .get(declaration_source.unwrap_or(source))
+                .get(origin)
                 .and_then(|targets| targets.get(target))
                 .map_or(&[][..], Vec::as_slice);
             index.resolve_with_options(target, source, declared, options)?

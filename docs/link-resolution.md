@@ -107,6 +107,16 @@ originating record's constraints, and untyped copies cannot erase them. Explicit
 index, including stored links with an existing graph winner and unresolved
 stored links. Constraints use the first declared frontmatter target-key association described
 above, independently of the lexical source override. There is no per-link scan of the full collection.
+Compiled CEL facts identify explicit/dynamic option calls; cached canonical queries
+prepare the typed policy index once only when needed. No-option cached queries
+retain their existing stored-winner and lazy untyped-index paths.
+
+Different typed fields sharing one extracted target expose a further baseline
+limitation: the native graph associates values by source/target, not field
+identity. Explicit policies reject conflicting declarations with
+`link_resolution_field_context_required` rather than apply one field's scope to
+another. Field-specific declaration provenance is required to support those
+collections; no-option graph selection remains unchanged.
 
 `unique` rejects more than one eligible candidate in the winning class **before
 ranking**, including a same-directory winner. Filtering happens before counting.
@@ -129,20 +139,21 @@ index. Default hosted traversal remains supported and unchanged.
 
 **Do not advertise `link-resolution-options-v1` yet.** Hosted provider/plan work
 must supply complete eligible candidate evidence and target records from the
-same snapshot before this capability can be advertised. The native corpus must
+same snapshot, and declaration provenance must handle conflicting typed fields,
+before this capability can be advertised. The native corpus must
 then run against hosted policy evaluation too. No endpoint or wire change is
 implemented here. Existing resolution evidence is described in
 [`relationship-resolution.md`](relationship-resolution.md).
 
 ## Architecture budget review
 
-The checker measures 200 Rust source files / 108,951 lines (previous ceilings
+The checker measures 200 Rust source files / 109,002 lines (previous ceilings
 199 / 108,486). The one new source file is the private indexed-policy budget/
 benchmark test module; integration fixtures live under `tests`/`conformance`.
-The 465-line ceiling increase pays for explicit overload/provenance handling,
+The 516-line ceiling increase pays for explicit overload/provenance handling,
 strict policy parsing, eligible candidate constraints, and hosted fail-closed
 tests—not a second client resolver or additional filesystem discovery path.
-The existing resolver ceiling increases from 1,175 to its measured 1,251 lines
+The existing resolver ceiling increases from 1,175 to its measured 1,265 lines
 for the policy/index metadata it owns. All other concentration, ambient-I/O,
 legacy-call, and transitional-reference budgets remain unchanged. These exact
 ceilings are review signals, not unused headroom.

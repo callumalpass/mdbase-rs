@@ -312,7 +312,7 @@ pub(crate) fn execute_model_profiled_cancellable(
             cancellation,
         )
     };
-    let (snapshot, load_profile) = match loaded {
+    let (mut snapshot, load_profile) = match loaded {
         Ok(loaded) => loaded,
         Err(error) => {
             cancellation.check()?;
@@ -329,6 +329,14 @@ pub(crate) fn execute_model_profiled_cancellable(
             )]));
         }
     };
+    if compiled.requires_link_resolution_options() {
+        if let Some(files) = &mut snapshot.all_files {
+            // The operation-scoped graph is owned until contexts are constructed.
+            Arc::get_mut(files)
+                .expect("new snapshot link graph is not shared")
+                .prepare_policy_index(collection);
+        }
+    }
     let local_records = snapshot
         .records
         .into_iter()

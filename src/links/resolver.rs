@@ -170,6 +170,7 @@ pub(crate) struct LinkResolutionIndex {
     pub types_by_path: HashMap<String, Vec<String>>,
     pub known_types: HashSet<String>,
     pub declared_types: HashMap<String, HashMap<String, Vec<String>>>,
+    pub declared_type_conflicts: HashMap<String, HashSet<String>>,
 }
 
 impl LinkResolutionIndex {
@@ -417,18 +418,31 @@ impl Collection {
                 for (field, value) in fields {
                     let mut targets = Vec::new();
                     collect_policy_targets(value, &mut targets);
-                    let types = self.get_field_target_types_from_frontmatter(
-                        &file_data.path,
-                        field,
-                        &file_data.frontmatter,
-                    );
+                    let mut types = self
+                        .get_field_target_types_from_frontmatter(
+                            &file_data.path,
+                            field,
+                            &file_data.frontmatter,
+                        )
+                        .into_iter()
+                        .map(|name| name.to_lowercase())
+                        .collect::<Vec<_>>();
+                    types.sort();
+                    types.dedup();
                     for target in targets {
                         index
                             .declared_types
                             .entry(file_data.path.clone())
                             .or_default()
-                            .entry(target)
+                            .entry(target.clone())
                             .and_modify(|current| {
+                                if !current.is_empty() && !types.is_empty() && current != &types {
+                                    index
+                                        .declared_type_conflicts
+                                        .entry(file_data.path.clone())
+                                        .or_default()
+                                        .insert(target.clone());
+                                }
                                 // An untyped copy of a value cannot erase a
                                 // declared constraint on that same stored target.
                                 if current.is_empty() {
