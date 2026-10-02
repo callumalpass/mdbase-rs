@@ -399,3 +399,27 @@ fn byte_equality_sets_the_origin_of_predating_and_intentionally_preserved_target
         assert_eq!(origin(root), Some(digest(&note(1))));
     }
 }
+
+#[test]
+fn managed_resources_never_carry_an_origin_and_a_lock_claiming_one_is_rejected() {
+    let directory = collection();
+    let root = directory.path();
+    let mut managed = pack(1, None);
+    managed.manifest["resources"][0]["mode"] = json!("managed");
+    apply(root, &managed);
+    let mut forged = lock(root);
+    let entry = &mut forged["packs"][0]["resources"][0];
+    assert!(entry.get("origin_digest").is_none());
+    entry["origin_digest"] = json!(digest(&note(1)));
+    fs::write(
+        root.join("mdbase.lock.yaml"),
+        serde_json::to_vec_pretty(&forged).unwrap(),
+    )
+    .unwrap();
+    let result = assess(root, &managed);
+    assert!(!result.valid, "{:#}", result.result);
+    assert_eq!(
+        result.diagnostics[0].path.as_deref(),
+        Some("mdbase.lock.yaml")
+    );
+}
