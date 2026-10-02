@@ -193,18 +193,23 @@ impl Collection {
         if let Err(diagnostic) = self.validate_type_path(path) {
             return Err(vec![*diagnostic]);
         }
-        // `parse_type_file` may resolve a local schema.ref. Materialize a private snapshot
-        // from the held authority so its pathname-based resolver cannot adopt a replacement root.
+        // Only schema.ref dependencies belong to this candidate's snapshot.
+        // Copying the whole collection races unrelated atomic publications:
+        // temporary names disappear, and create-only targets briefly have two
+        // hard links (which authority reads correctly reject).
         let staging = tempfile::tempdir().map_err(|error| vec![io_diagnostic(path, error)])?;
-        for relative in self
-            .held_root()
-            .files_recursive(Path::new(""))
-            .map_err(|error| vec![io_diagnostic(path, error)])?
-        {
-            let bytes = self
-                .held_root()
-                .read(&relative)
-                .map_err(|error| vec![io_diagnostic(path, error)])?;
+        let dependencies =
+            crate::definition_stage::schema_dependencies(Path::new(path), document.as_bytes());
+        dependencies
+            .stage_directories(self.held_root(), staging.path())
+            .map_err(|error| vec![io_diagnostic(path, error)])?;
+        for relative in dependencies.files {
+            let bytes = match self.held_root().read(&relative) {
+                Ok(bytes) => bytes,
+                // Leave missing-reference diagnostics to the canonical parser.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(vec![io_diagnostic(path, error)]),
+            };
             let destination = staging.path().join(&relative);
             if let Some(parent) = destination.parent() {
                 std::fs::create_dir_all(parent)
@@ -445,6 +450,48 @@ mod tests {
     }
 
     #[test]
+    fn type_candidate_does_not_read_an_unrelated_in_flight_publication() {
+        let directory = collection();
+        let collection = Collection::open(directory.path()).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let publisher_barrier = barrier.clone();
+        // Hold the exact two-link window of atomic_create open until the
+        // candidate operation finishes. No scheduler timing or sleeps.
+        let temporary = directory.path().join(".mdbase-publish-in-flight");
+        fs::write(&temporary, b"unrelated payload").unwrap();
+        fs::hard_link(&temporary, directory.path().join("unrelated.bin")).unwrap();
+        let publisher = thread::spawn(move || {
+            publisher_barrier.wait();
+            publisher_barrier.wait();
+            fs::remove_file(temporary).unwrap();
+        });
+        barrier.wait();
+        let created = collection.create_type_file(&json!({
+            "document": type_document("project", "Project")
+        }));
+        barrier.wait();
+        publisher.join().unwrap();
+        assert!(created.valid, "{:?}", created.diagnostics);
+    }
+
+    #[test]
+    fn type_candidate_stages_only_its_explicit_schema_reference() {
+        let directory = collection();
+        fs::create_dir(directory.path().join("schemas")).unwrap();
+        fs::write(
+            directory.path().join("schemas/project.json"),
+            r#"{"type":"object"}"#,
+        )
+        .unwrap();
+        let collection = Collection::open(directory.path()).unwrap();
+        let document = "---\nkind: mdbase.type\nname: project\nversion: 1\nschema:\n  dialect: json-schema-2020-12\n  ref: ../schemas/project.json\n---\n";
+        let created = collection.create_type_file(&json!({
+            "path": "_types/project.md", "document": document
+        }));
+        assert!(created.valid, "{:?}", created.diagnostics);
+    }
+
+    #[test]
     fn concurrent_type_creates_never_replace_the_winner() {
         let directory = collection();
         let collection = Arc::new(Collection::open(directory.path()).unwrap());
@@ -468,7 +515,11 @@ mod tests {
             .map(|handle| handle.join().unwrap())
             .collect::<Vec<_>>();
 
-        assert_eq!(results.iter().filter(|result| result.valid).count(), 1);
+        assert_eq!(
+            results.iter().filter(|result| result.valid).count(),
+            1,
+            "unexpected create outcomes: {results:#?}"
+        );
         assert!(
             results.iter().filter(|result| !result.valid).all(|result| {
                 result

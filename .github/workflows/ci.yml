@@ -38,10 +38,21 @@ jobs:
       - run: ./scripts/check-legacy-feature-boundary.sh
       - name: Reject legacy mutation feature in canonical resolved graphs
         run: ./scripts/check-no-legacy-feature.sh
-      - run: cargo test --locked -p mdbase --no-default-features backfill
-      - run: cargo test --locked -p mdbase-command --no-default-features
-      - run: cargo test --locked -p mdbase-runtime --no-default-features
-      - run: cargo test --locked -p mdbase-runtime --no-default-features --features sqlite
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - run: node --test scripts/ci/*.test.mjs
+      - run: node scripts/ci/cargo-test.mjs --locked -p mdbase --no-default-features --filter backfill
+      - run: node scripts/ci/cargo-test.mjs --locked -p mdbase-command --no-default-features
+      - run: node scripts/ci/cargo-test.mjs --locked -p mdbase-runtime --no-default-features
+      - run: node scripts/ci/cargo-test.mjs --locked -p mdbase-runtime --no-default-features --features sqlite
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: flake-evidence-features-${{ github.run_attempt }}
+          path: .ci-flakes/
+          include-hidden-files: true
+          retention-days: 14
       - run: cargo check --locked -p mdbase-runtime --no-default-features --features postgres
       - run: cargo doc --locked --workspace --all-features --no-deps
         env:
@@ -64,17 +75,26 @@ jobs:
           path: mdbase-spec
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.94.0
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: 24
       - uses: Swatinem/rust-cache@v2
       - name: Compile every Windows target, including capability publication
         if: runner.os == 'Windows'
         run: cargo check --locked --workspace --all-targets --all-features
-      - run: cargo test --locked --workspace --all-features
+      - run: node scripts/ci/cargo-test.mjs --locked --workspace --all-features
         env:
           MDBASE_SPEC_REPO_DIR: ${{ github.workspace }}/mdbase-spec
           MDBASE_SPEC_TESTS_DIR: ${{ github.workspace }}/mdbase-spec/tests
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: flake-evidence-${{ matrix.os }}-${{ github.run_attempt }}
+          path: .ci-flakes/
+          include-hidden-files: true
+          retention-days: 14
+      # Compilation is setup, not part of the adapter's response deadline.
+      - run: cargo build --locked -p mdbase-testbed-adapter
       - name: Install portable testbed runner
         working-directory: mdbase-spec/packages/testbed
         run: npm ci
@@ -109,11 +129,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
       - name: Run mandatory PostgreSQL contracts
-        run: cargo test --locked -p mdbase-runtime --all-features --test postgres --test store_contract
+        run: node scripts/ci/cargo-test.mjs --locked -p mdbase-runtime --all-features --test postgres --test store_contract
         env:
           MDBASE_RUNTIME_REQUIRE_POSTGRES: "1"
           MDBASE_RUNTIME_TEST_DATABASE_URL: postgres://postgres:mdbase-test@127.0.0.1:5432/mdbase_runtime_test
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: flake-evidence-postgres-${{ github.run_attempt }}
+          path: .ci-flakes/
+          include-hidden-files: true
+          retention-days: 14
 
   package:
     name: Package publishable crates

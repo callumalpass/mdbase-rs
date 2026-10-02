@@ -166,6 +166,9 @@ and `RuntimeStore` boundaries and emits canonical transcripts, so the Rust core
 and durable runtime can be compared directly with implementations in other
 languages.
 
+See the [CI flake policy](docs/ci-flakes.md) for bounded, recorded per-test
+retries and the retry-free nightly stress workflow.
+
 ## Performance Profiling
 
 Run the profiler against a synthetic, deterministic dataset:
