@@ -77,6 +77,9 @@ pub struct QueryRequest {
     /// Frontmatter representation to return.
     #[serde(default)]
     pub frontmatter_mode: FrontmatterMode,
+    /// Opt-in narrow response envelope, not an evaluation mode.
+    #[serde(default)]
+    pub output: Option<super::QueryOutput>,
 }
 
 impl QueryRequest {
@@ -199,6 +202,9 @@ impl QueryRequest {
                 Value::String(mode.to_string()),
             );
         }
+        if let Some(output) = self.output {
+            value.insert("output".into(), json!(output));
+        }
         Value::Object(value)
     }
 }
@@ -228,6 +234,9 @@ fn insert_order(target: &mut Map<String, Value>, name: &str, order: &[QueryOrder
 /// Paginated canonical query result.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct QueryResult {
+    /// Requested output envelope; absent for ordinary query rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<super::QueryOutput>,
     /// Returned records.
     #[serde(rename = "results")]
     pub records: Vec<ProjectedValue>,

@@ -22,6 +22,11 @@ pub(crate) fn query(
     collection: &Collection,
     request: QueryRequest,
 ) -> MdbaseResult<OperationOutcome<QueryResult>> {
+    if request.output.is_some() {
+        return Err(MdbaseError::InvalidRequest {
+            message: "Metadata output requires a v0.3 authority.".into(),
+        });
+    }
     let result = collection.query(&request.to_wire());
     let diagnostics = legacy_diagnostics(&result, None);
     if result.get("error").is_some() {
@@ -48,6 +53,7 @@ pub(crate) fn query(
         .unwrap_or(false);
     Ok(OperationOutcome {
         value: QueryResult {
+            output: None,
             records: records.into_iter().map(Into::into).collect(),
             total_count,
             has_more,

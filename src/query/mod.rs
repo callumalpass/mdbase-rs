@@ -10,6 +10,7 @@ pub(crate) mod canonical {
     pub(crate) mod pinned;
     pub(crate) mod preflight;
     pub(crate) mod result;
+    pub(crate) mod values;
 
     pub use execute::QueryPerformance;
     pub(crate) use execute::{execute_model_profiled_cancellable, execute_typed, QueryEvaluation};

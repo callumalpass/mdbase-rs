@@ -911,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn digest_changes_with_structure_but_not_unrelated_body_prose() {
+    fn projection_digest_binds_source_revision_even_when_structure_is_unchanged() {
         let first = projection("alpha [[two]]\n");
         let second = projection("gamma [[two]]\n");
         let changed = projection("gamma [[six]]\n");
@@ -923,7 +923,8 @@ mod tests {
             second.structure.structural_digest,
             changed.structure.structural_digest
         );
-        assert_eq!(
+        assert_ne!(first.facts.revision, second.facts.revision);
+        assert_ne!(
             first.canonical_digest().unwrap(),
             second.canonical_digest().unwrap()
         );

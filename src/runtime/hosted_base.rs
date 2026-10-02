@@ -111,11 +111,18 @@ pub struct HostedBaseRow {
 impl HostedBaseRow {
     /// Portable query row; reducer-only facts never cross the response boundary.
     pub fn to_query_record(&self) -> Value {
-        json!({
-            "path": self.path, "revision": self.revision, "file": self.file,
-            "effective_frontmatter": self.effective_frontmatter,
-            "types": self.types, "values": self.values,
-        })
+        let effective = Value::Object(self.effective_frontmatter.clone());
+        crate::api::QueryRecordMaterial {
+            path: &self.path,
+            revision: &self.revision,
+            types: &self.types,
+            frontmatter: None,
+            effective_frontmatter: Some(&effective),
+            file: &self.file,
+            body: None,
+            values: Some(&self.values),
+        }
+        .render(None)
     }
 }
 

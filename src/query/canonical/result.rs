@@ -94,47 +94,28 @@ pub(super) fn build_groups(
 
 pub(crate) fn serialize_candidate(candidate: &Candidate, query: &Query) -> Value {
     let mut file = candidate.file.clone();
-    complete_file_value(&mut file, &candidate.effective, &candidate.body);
-    let mut result = Map::from_iter([
-        ("path".to_string(), Value::String(candidate.path.clone())),
-        (
-            "revision".to_string(),
-            Value::String(candidate.revision.clone()),
-        ),
-        ("file".to_string(), file),
-        (
-            "types".to_string(),
-            Value::Array(candidate.types.iter().cloned().map(Value::String).collect()),
-        ),
-    ]);
-    match query.frontmatter_mode {
-        FrontmatterMode::Effective => {
-            result.insert(
-                "effective_frontmatter".to_string(),
-                candidate.effective.clone(),
-            );
-        }
-        FrontmatterMode::Persisted => {
-            result.insert("frontmatter".to_string(), candidate.raw.clone());
-        }
-        FrontmatterMode::Both => {
-            result.insert("frontmatter".to_string(), candidate.raw.clone());
-            result.insert(
-                "effective_frontmatter".to_string(),
-                candidate.effective.clone(),
-            );
-        }
+    if query.output.is_none() {
+        complete_file_value(&mut file, &candidate.effective, &candidate.body);
     }
-    if query.select.is_some() {
-        result.insert(
-            "values".to_string(),
-            Value::Object(candidate.values.clone()),
-        );
+    crate::api::QueryRecordMaterial {
+        path: &candidate.path,
+        revision: &candidate.revision,
+        types: &candidate.types,
+        frontmatter: matches!(
+            query.frontmatter_mode,
+            FrontmatterMode::Persisted | FrontmatterMode::Both
+        )
+        .then_some(&candidate.raw),
+        effective_frontmatter: matches!(
+            query.frontmatter_mode,
+            FrontmatterMode::Effective | FrontmatterMode::Both
+        )
+        .then_some(&candidate.effective),
+        file: &file,
+        body: query.include_body.then_some(candidate.body.as_str()),
+        values: query.select.as_ref().map(|_| &candidate.values),
     }
-    if query.include_body {
-        result.insert("body".to_string(), Value::String(candidate.body.clone()));
-    }
-    Value::Object(result)
+    .render(query.output)
 }
 
 fn candidate_value(candidate: &Candidate, field: &str) -> Value {

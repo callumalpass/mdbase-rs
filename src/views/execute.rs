@@ -902,13 +902,18 @@ struct BaseRow<'a> {
 }
 
 fn serialize_base_row(row: &BaseRow<'_>) -> Value {
-    json!({
-        "path": row.record.rel_path,
-        "file": serialize_bases_file(&row.file),
-        "effective_frontmatter": row.record.effective_frontmatter,
-        "types": row.record.type_names,
-        "values": row.values,
-    })
+    let file = serialize_bases_file(&row.file);
+    crate::api::QueryRecordMaterial {
+        path: &row.record.rel_path,
+        revision: &row.record.source_revision,
+        types: &row.record.type_names,
+        frontmatter: None,
+        effective_frontmatter: Some(&row.record.effective_frontmatter),
+        file: &file,
+        body: None,
+        values: Some(&row.values),
+    }
+    .render(None)
 }
 
 fn sort_rows(rows: &mut [BaseRow<'_>], view: &ObsidianBaseView) {

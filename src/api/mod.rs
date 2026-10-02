@@ -5,6 +5,8 @@ mod collection_path;
 mod dynamic;
 pub(crate) mod operations;
 mod query;
+mod query_output;
+pub use query_output::{MetadataQueryRecord, QueryOutput, QueryRecordMaterial};
 mod read_many;
 pub use read_many::{
     BatchReadDocument, ReadManyError, ReadManyItem, ReadManyRequest, ReadManyResult,

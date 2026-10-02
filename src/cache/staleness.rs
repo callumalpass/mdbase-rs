@@ -22,20 +22,24 @@ pub(crate) fn find_changes(
     files: &[String],
 ) -> Result<CacheChanges, CacheError> {
     let mut cached = HashMap::<String, (i64, bool)>::new();
-    let mut statement =
-        conn.prepare("SELECT path, mtime_ns, parse_error, failure_reason FROM files")?;
+    let mut statement = conn.prepare(
+        "SELECT path, mtime_ns, parse_error, failure_reason, source_revision FROM files",
+    )?;
     let rows = statement.query_map([], |row| {
         let parse_error = row.get::<_, i64>(2)? != 0;
         let failure_reason = row.get::<_, Option<String>>(3)?;
+        // Cache migrations created empty tokens in pre-revision stores. Reindex
+        // those rows once; remove this migration test when those caches expire.
+        let missing_revision = row.get::<_, String>(4)?.is_empty();
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
-            parse_error && failure_reason.is_none(),
+            (parse_error && failure_reason.is_none()) || missing_revision,
         ))
     })?;
     for row in rows {
-        let (path, mtime, legacy_unclassified) = row?;
-        cached.insert(path, (mtime, legacy_unclassified));
+        let (path, mtime, needs_refresh) = row?;
+        cached.insert(path, (mtime, needs_refresh));
     }
 
     let mut disk_paths = HashSet::with_capacity(files.len());
@@ -52,6 +56,44 @@ pub(crate) fn find_changes(
         .filter(|path| !disk_paths.contains(path))
         .collect();
     Ok(CacheChanges { stale, deleted })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn missing_cache_revision_is_reindexed_before_required_output() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("mdbase.yaml"),
+            "spec_version: 0.3.0\nsettings:\n  default_validation: off\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("one.md"),
+            "---\ntitle: cached\n---\nbody\n",
+        )
+        .unwrap();
+        let collection = crate::Collection::open(root.path()).unwrap();
+        assert_eq!(collection.cache_rebuild()["success"], true);
+        let db = rusqlite::Connection::open(
+            collection
+                .held_root()
+                .cache_storage_path()
+                .join(".mdbase/cache.db"),
+        )
+        .unwrap();
+        db.execute("UPDATE files SET source_revision = ''", [])
+            .unwrap();
+        drop(db);
+        let ops = collection.v03_operations().unwrap();
+        let query = ops.query(&serde_json::json!({"output":"metadata"}));
+        let read = ops.read(&serde_json::json!({"path":"one.md"}));
+        assert!(query.valid);
+        assert_eq!(
+            query.result["results"][0]["revision"],
+            read.result["revision"]
+        );
+    }
 }
 
 /// Compatibility helpers retained for cache tests and older internal callers.

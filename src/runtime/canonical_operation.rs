@@ -14,6 +14,8 @@ use super::{CursorReleaseOutcome, OperationKind, ProviderError};
 /// Typed canonical query value retained by the runtime and read cursors.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalQueryValue {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<crate::api::QueryOutput>,
     pub records: Vec<ProjectedValue>,
     /// Exact total when computed; `None` when the provider explicitly deferred it.
     pub total_count: Option<usize>,
@@ -441,6 +443,7 @@ impl CanonicalOperationOutcome {
         Self {
             valid: true,
             value: CanonicalOperationValue::Query(Some(CanonicalQueryValue {
+                output: outcome.value.output,
                 records: outcome.value.records,
                 total_count: Some(outcome.value.total_count),
                 has_more: outcome.value.has_more,
@@ -799,6 +802,11 @@ impl CanonicalOperationOutcome {
                         .map(Into::into)
                         .collect();
                     Some(CanonicalQueryValue {
+                        output: result
+                            .get("output")
+                            .cloned()
+                            .map(decode_value)
+                            .transpose()?,
                         records: records.into_iter().map(Into::into).collect(),
                         total_count,
                         has_more,
@@ -941,11 +949,15 @@ impl CanonicalOperationOutcome {
                         .collect::<Vec<_>>();
                     // Records are already JSON: clone them rather than re-serialize.
                     let results = query.records.iter().map(|record| Value::clone(record));
-                    Value::Object(serde_json::Map::from_iter([
+                    let mut result = serde_json::Map::from_iter([
                         ("results".to_string(), Value::Array(results.collect())),
                         ("meta".to_string(), meta),
                         ("diagnostics".to_string(), encode(&diagnostics)),
-                    ]))
+                    ]);
+                    if let Some(output) = query.output {
+                        result.insert("output".into(), encode(&output));
+                    }
+                    Value::Object(result)
                 })
             }
             CanonicalOperationValue::Delete(value) => {
@@ -1299,6 +1311,7 @@ mod tests {
         let deferred = CanonicalOperationOutcome {
             valid: true,
             value: CanonicalOperationValue::Query(Some(CanonicalQueryValue {
+                output: None,
                 records: Vec::new(),
                 total_count: None,
                 has_more: true,
@@ -1324,6 +1337,7 @@ mod tests {
 
         let exact = CanonicalOperationOutcome {
             value: CanonicalOperationValue::Query(Some(CanonicalQueryValue {
+                output: None,
                 records: Vec::new(),
                 total_count: Some(7),
                 has_more: false,

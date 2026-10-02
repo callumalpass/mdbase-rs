@@ -193,6 +193,11 @@ impl From<Diagnostic> for CanonicalDiagnostic {
 pub struct Revision(String);
 
 impl Revision {
+    /// Compute the canonical token from exact source bytes, never semantic JSON.
+    pub fn from_document(bytes: &[u8]) -> Self {
+        Self(crate::v03::revision(bytes))
+    }
+
     /// Validate and construct an opaque revision.
     pub fn parse(value: impl Into<String>) -> MdbaseResult<Self> {
         let value = value.into();
@@ -1022,6 +1027,7 @@ impl<'a> TypedCollection<'a> {
         match crate::query::canonical::execute_typed(self.collection, query) {
             Ok(execution) => Ok(OperationOutcome {
                 value: QueryResult {
+                    output: execution.output,
                     records: execution.records.into_iter().map(Into::into).collect(),
                     total_count: execution.total_count,
                     has_more: execution.has_more,
@@ -1068,6 +1074,7 @@ impl<'a> TypedCollection<'a> {
         match evaluation {
             Ok(execution) => Ok(OperationOutcome {
                 value: QueryResult {
+                    output: execution.output,
                     records: execution.records.into_iter().map(Into::into).collect(),
                     total_count: execution.total_count,
                     has_more: execution.has_more,

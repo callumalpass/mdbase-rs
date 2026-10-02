@@ -106,13 +106,16 @@ fn evaluation_into_wire(evaluation: canonical::QueryEvaluation) -> OperationResu
         Ok(execution) => {
             let inner_diagnostics =
                 serde_json::to_value(&execution.diagnostics).unwrap_or_else(|_| json!([]));
+            let mut result = json!({
+                "results": execution.records, "meta": execution.meta,
+                "diagnostics": inner_diagnostics,
+            });
+            if let Some(output) = execution.output {
+                result["output"] = json!(output);
+            }
             OperationResult {
                 valid: true,
-                result: json!({
-                    "results": execution.records,
-                    "meta": execution.meta,
-                    "diagnostics": inner_diagnostics,
-                }),
+                result,
                 diagnostics: execution.diagnostics,
             }
         }

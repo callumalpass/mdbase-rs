@@ -134,6 +134,7 @@ impl PinnedMetadataQuery {
         context.check()?;
         Ok(CanonicalOperationOutcome::query(OperationOutcome {
             value: QueryResult {
+                output: evaluated.output,
                 records: evaluated.records.into_iter().map(Into::into).collect(),
                 total_count: evaluated.total_count,
                 has_more: evaluated.has_more,

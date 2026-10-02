@@ -873,6 +873,25 @@ collection:
     }
 
     #[test]
+    fn batches_load_duplicate_paths_once_and_keep_output_slots() {
+        let (root, collection) = collection("off");
+        std::fs::write(
+            root.path().join("tasks/one.md"),
+            "---\ntitle: One\n---\nBody\n",
+        )
+        .unwrap();
+        let operations = crate::v03::Operations::new(&collection).unwrap();
+        crate::record_load::reset_snapshot_record_loads_for_test();
+        let result = operations.read(
+            &json!({"paths":["tasks/one.md","tasks/missing.md","tasks/one.md","tasks/missing.md"]}),
+        );
+        assert!(result.valid);
+        assert_eq!(crate::record_load::snapshot_record_loads_for_test(), 2);
+        assert_eq!(result.result["items"].as_array().unwrap().len(), 4);
+        assert_eq!(result.result["items"][0], result.result["items"][2]);
+    }
+
+    #[test]
     fn wire_traversal_stays_path_traversal_while_typed_path_fails_locally() {
         let (_root, collection) = collection("off");
         assert!(matches!(
