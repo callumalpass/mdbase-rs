@@ -81,6 +81,18 @@ fn normal_narrow_membership_order_counts_groups_values_and_diagnostics_match() {
         let narrow = ops.query(&metadata);
         assert!(normal.valid && narrow.valid, "{normal:?}\n{narrow:?}");
         assert_eq!(narrow.result["output"], "metadata");
+        assert!(mdbase::v03::validate_query_result(&normal.result).is_empty());
+        assert!(mdbase::v03::validate_query_result(&narrow.result).is_empty());
+        if !narrow.result["results"].as_array().unwrap().is_empty() {
+            for key in ["revision", "values"] {
+                let mut malformed = narrow.result.clone();
+                malformed["results"][0].as_object_mut().unwrap().remove(key);
+                assert!(!mdbase::v03::validate_query_result(&malformed).is_empty());
+            }
+            let mut leaked = narrow.result.clone();
+            leaked["results"][0]["body"] = json!("not metadata");
+            assert!(!mdbase::v03::validate_query_result(&leaked).is_empty());
+        }
         assert!(normal.result.get("output").is_none());
         assert_eq!(normal.result["meta"], narrow.result["meta"]);
         assert_eq!(normal.diagnostics, narrow.diagnostics);

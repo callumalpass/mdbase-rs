@@ -5,11 +5,11 @@
   "type": "object",
   "required": ["results", "meta", "diagnostics"],
   "properties": {
+    "output": {"const": "metadata"},
     "results": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["file"],
         "properties": {
           "file": {
             "type": "object",
@@ -92,7 +92,23 @@
     }
   },
   "additionalProperties": false,
+  "allOf": [{
+    "if": {"required": ["output"]},
+    "then": {"properties": {"results": {"items": {"$ref": "#/$defs/metadataRecord"}}}},
+    "else": {"properties": {"results": {"items": {"required": ["file"]}}}}
+  }],
   "$defs": {
+    "metadataRecord": {
+      "type": "object",
+      "required": ["path", "revision", "types", "values"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "revision": {"type": "string", "minLength": 1},
+        "types": {"type": "array", "items": {"type": "string"}},
+        "values": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
     "group": {
       "type": "object",
       "required": ["values", "count", "summaries"],
