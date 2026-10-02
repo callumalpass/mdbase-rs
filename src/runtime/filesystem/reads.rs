@@ -72,6 +72,18 @@ impl FilesystemRuntime {
         self.cursor_lock(context)?.page(cursor, context)
     }
 
+    /// Validate an explicitly repeated output mode before consuming or releasing
+    /// a continuation. Omitting the mode always retains the pinned shape.
+    pub fn validate_read_output(
+        &self,
+        cursor: &ReadCursor,
+        output: crate::api::QueryOutput,
+        context: &OperationContext,
+    ) -> Result<(), ProviderError> {
+        context.check()?;
+        self.cursor_lock(context)?.validate_output(cursor, output)
+    }
+
     /// Choose a bounded continuation size without changing the pinned data.
     /// Replaying an issued cursor with a different explicit size is rejected.
     pub fn read_page_with_limit(

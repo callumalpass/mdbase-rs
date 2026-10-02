@@ -1260,6 +1260,12 @@ fn execute_typed_read_operation(
         Err(error) => return Ok(CanonicalOperationOutcome::failure(request.operation, error)),
     };
     let operation = match request.operation {
+        super::OperationKind::Read if request.input.get("paths").is_some() => {
+            CanonicalOperationOutcome::hosted_wire_edge(
+                super::OperationKind::Read,
+                crate::operations::read::read_many_filesystem(collection, &request.input),
+            )?
+        }
         super::OperationKind::Read => {
             match serde_json::from_value::<crate::api::ReadRequest>(request.input.clone()) {
                 Ok(request) => typed

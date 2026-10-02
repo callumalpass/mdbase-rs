@@ -95,6 +95,13 @@ pub(crate) enum CompiledSelection {
 
 pub(crate) fn compile(query: Query) -> Result<CompiledQuery, Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
+    if query.output == Some(crate::api::QueryOutput::Metadata) && query.include_body {
+        diagnostics.push(invalid_query(
+            "include_body",
+            "Metadata output cannot include_body; select explicit values instead.",
+            None,
+        ));
+    }
     let mut parsed_projections = BTreeMap::new();
     for (name, projection) in &query.projections {
         match cel::compile(&projection.expr) {

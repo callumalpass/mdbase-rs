@@ -238,6 +238,57 @@ impl CompiledCatalog {
             .map_err(catalog_provider_error)
     }
 
+    /// Evaluate a document batch from an exact provider snapshot. Missing keys
+    /// mean absent records; extraneous and inconsistent bindings fail explicitly.
+    pub fn read_records_typed(
+        &self,
+        request: &crate::api::ReadManyRequest,
+        records: &std::collections::BTreeMap<String, CanonicalRecordInput>,
+    ) -> Result<super::CanonicalOperationOutcome, CatalogError> {
+        let validated = crate::api::ReadManyRequest::parse(
+            &serde_json::to_value(request).expect("read request serializes"),
+        )
+        .map_err(|message| CatalogError {
+            code: "invalid_request".into(),
+            message,
+        })?;
+        if records.iter().any(|(path, record)| {
+            path != &record.path
+                || !validated
+                    .paths
+                    .iter()
+                    .any(|requested| requested.as_str() == path)
+        }) {
+            return Err(CatalogError {
+                code: "record_identity_mismatch".into(),
+                message: "Batch source bindings disagree with requested identities.".into(),
+            });
+        }
+        let result = crate::operations::read::evaluate_read_many(&validated, |request| {
+            let source = match records.get(request.path.as_str()) {
+                Some(record) => {
+                    let facts = RecordFileFacts {
+                        size: record.file_size,
+                        mtime: record.file_mtime.clone(),
+                    };
+                    return crate::operations::read::evaluate_typed_read(
+                        &self.collection,
+                        request,
+                        crate::operations::read::TypedReadSource::Exact {
+                            canonical_path: &record.path,
+                            document: &record.document,
+                            file_facts: &facts,
+                        },
+                    );
+                }
+                None => crate::operations::read::TypedReadSource::Missing,
+            };
+            crate::operations::read::evaluate_typed_read(&self.collection, request, source)
+        });
+        super::CanonicalOperationOutcome::hosted_wire_edge(super::OperationKind::Read, result)
+            .map_err(catalog_provider_error)
+    }
+
     /// Compatibility projection for current Connect callers.
     #[deprecated(note = "use read_record_typed")]
     pub fn read_record(&self, input: &Value, record: &CanonicalRecordInput) -> OperationResult {

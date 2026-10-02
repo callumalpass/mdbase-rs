@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 use super::{
-    CollectionPath, CollectionPathError, ProjectedValue, QueryMetadata, QueryRequest, QueryResult,
+    CollectionPath, CollectionPathError, ProjectedValue, QueryRequest, QueryResult,
     ReferenceEvidence,
 };
 use crate::diagnostic::Diagnostic as CanonicalDiagnostic;
@@ -167,12 +167,37 @@ impl From<CanonicalDiagnostic> for Diagnostic {
     }
 }
 
+impl From<Diagnostic> for CanonicalDiagnostic {
+    fn from(value: Diagnostic) -> Self {
+        Self {
+            severity: match value.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+                Severity::Info => "info",
+            }
+            .to_string(),
+            code: value.code.to_string(),
+            message: value.message,
+            path: value.path,
+            field: value.field,
+            type_name: value.type_name,
+            schema_location: value.schema_location,
+            details: value.details,
+        }
+    }
+}
+
 /// Opaque content revision used for optimistic concurrency.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Revision(String);
 
 impl Revision {
+    /// Compute the canonical token from exact source bytes, never semantic JSON.
+    pub fn from_document(bytes: &[u8]) -> Self {
+        Self(crate::v03::revision(bytes))
+    }
+
     /// Validate and construct an opaque revision.
     pub fn parse(value: impl Into<String>) -> MdbaseResult<Self> {
         let value = value.into();
@@ -999,24 +1024,10 @@ impl<'a> TypedCollection<'a> {
             });
         }
         let query = crate::query::canonical::model::Query::from_typed(&request);
-        match crate::query::canonical::execute_typed(self.collection, query) {
-            Ok(execution) => Ok(OperationOutcome {
-                value: QueryResult {
-                    records: execution.records.into_iter().map(Into::into).collect(),
-                    total_count: execution.total_count,
-                    has_more: execution.has_more,
-                    meta: QueryMetadata::new(execution.meta),
-                },
-                diagnostics: execution
-                    .diagnostics
-                    .into_iter()
-                    .map(Diagnostic::from)
-                    .collect(),
-            }),
-            Err(diagnostics) => Err(MdbaseError::Operation {
-                diagnostics: diagnostics.into_iter().map(Diagnostic::from).collect(),
-            }),
-        }
+        super::query::typed_query_result(crate::query::canonical::execute_typed(
+            self.collection,
+            query,
+        ))
     }
 
     pub(crate) fn query_runtime(
@@ -1045,24 +1056,7 @@ impl<'a> TypedCollection<'a> {
         .map_err(|_| MdbaseError::InvalidRequest {
             message: "operation cancelled".to_string(),
         })?;
-        match evaluation {
-            Ok(execution) => Ok(OperationOutcome {
-                value: QueryResult {
-                    records: execution.records.into_iter().map(Into::into).collect(),
-                    total_count: execution.total_count,
-                    has_more: execution.has_more,
-                    meta: QueryMetadata::new(execution.meta),
-                },
-                diagnostics: execution
-                    .diagnostics
-                    .into_iter()
-                    .map(Diagnostic::from)
-                    .collect(),
-            }),
-            Err(diagnostics) => Err(MdbaseError::Operation {
-                diagnostics: diagnostics.into_iter().map(Diagnostic::from).collect(),
-            }),
-        }
+        super::query::typed_query_result(evaluation)
     }
 
     /// Plan or atomically apply the explicit v0.2-to-v0.3 migration.

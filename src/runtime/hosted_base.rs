@@ -96,6 +96,7 @@ pub struct HostedBaseRecordContext {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostedBaseRow {
     pub path: String,
+    pub revision: String,
     pub file: Value,
     pub effective_frontmatter: Map<String, Value>,
     pub types: Vec<String>,
@@ -564,6 +565,7 @@ impl HostedBasePlan {
         Ok(HostedBaseEvaluation::Included {
             row: Box::new(HostedBaseRow {
                 path: input.projection.facts.path.clone(),
+                revision: input.projection.facts.revision.clone(),
                 file: file_value,
                 effective_frontmatter: input.projection.facts.effective_frontmatter.clone(),
                 types: input.projection.facts.types.clone(),
@@ -1628,6 +1630,7 @@ views:
             grouping
                 .push(&HostedBaseRow {
                     path: format!("tasks/{index}.md"),
+                    revision: "sha256:test".into(),
                     file: Value::Null,
                     effective_frontmatter: Map::new(),
                     types: Vec::new(),
@@ -1650,6 +1653,7 @@ views:
         for value in ["open", "done"] {
             let result = over_budget.push(&HostedBaseRow {
                 path: format!("tasks/{value}.md"),
+                revision: "sha256:test".into(),
                 file: Value::Null,
                 effective_frontmatter: Map::new(),
                 types: Vec::new(),

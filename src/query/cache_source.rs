@@ -29,6 +29,7 @@ pub(crate) struct MetadataPage {
 /// Parsed record data used by the ordinary query engine.
 pub(crate) struct FileRecord {
     pub rel_path: String,
+    pub source_revision: String,
     pub raw_frontmatter: serde_json::Value,
     pub effective_frontmatter: serde_json::Value, // defaults + coercion, NO computed fields
     pub body: String,
@@ -261,6 +262,7 @@ impl Collection {
                 }
                 records.push(LocalRecord::Parsed(FileRecord {
                     rel_path: path,
+                    source_revision,
                     raw_frontmatter,
                     effective_frontmatter,
                     body,
@@ -479,6 +481,7 @@ impl Collection {
                 let raw_frontmatter: serde_json::Value = serde_json::from_str(&frontmatter).ok()?;
                 records.push(LocalRecord::Parsed(FileRecord {
                     rel_path: path,
+                    source_revision,
                     effective_frontmatter: raw_frontmatter.clone(),
                     raw_frontmatter,
                     body,
@@ -571,6 +574,7 @@ impl Collection {
                     ..
                 } => LocalRecord::Parsed(FileRecord {
                     rel_path,
+                    source_revision,
                     raw_frontmatter,
                     effective_frontmatter,
                     body: if include_bodies {

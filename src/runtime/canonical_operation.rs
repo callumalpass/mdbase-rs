@@ -14,6 +14,8 @@ use super::{CursorReleaseOutcome, OperationKind, ProviderError};
 /// Typed canonical query value retained by the runtime and read cursors.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalQueryValue {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<crate::api::QueryOutput>,
     pub records: Vec<ProjectedValue>,
     /// Exact total when computed; `None` when the provider explicitly deferred it.
     pub total_count: Option<usize>,
@@ -149,6 +151,7 @@ impl<'de> Deserialize<'de> for LegacyRecoveredV03Value {
 #[serde(tag = "operation", content = "value", rename_all = "snake_case")]
 pub enum CanonicalOperationValue {
     Read(Option<RecordDocument>),
+    ReadMany(Option<crate::api::ReadManyResult>),
     Query(Option<CanonicalQueryValue>),
     Create(Option<RecordDocument>),
     Update(Option<RecordDocument>),
@@ -246,7 +249,7 @@ impl<'de> Deserialize<'de> for CanonicalOperationOutcome {
 impl CanonicalOperationValue {
     pub(crate) fn kind(&self) -> Option<OperationKind> {
         match self {
-            Self::Read(_) => Some(OperationKind::Read),
+            Self::Read(_) | Self::ReadMany(_) => Some(OperationKind::Read),
             Self::Query(_) => Some(OperationKind::Query),
             Self::Create(_) => Some(OperationKind::Create),
             Self::Update(_) => Some(OperationKind::Update),
@@ -285,6 +288,7 @@ impl CanonicalOperationOutcome {
         let missing_semantic_value = matches!(
             value,
             CanonicalOperationValue::Read(None)
+                | CanonicalOperationValue::ReadMany(None)
                 | CanonicalOperationValue::Query(None)
                 | CanonicalOperationValue::Create(None)
                 | CanonicalOperationValue::Update(None)
@@ -439,6 +443,7 @@ impl CanonicalOperationOutcome {
         Self {
             valid: true,
             value: CanonicalOperationValue::Query(Some(CanonicalQueryValue {
+                output: outcome.value.output,
                 records: outcome.value.records,
                 total_count: Some(outcome.value.total_count),
                 has_more: outcome.value.has_more,
@@ -753,7 +758,13 @@ impl CanonicalOperationOutcome {
         let empty = result.as_object().is_some_and(serde_json::Map::is_empty);
         let value = match operation {
             OperationKind::Read => {
-                CanonicalOperationValue::Read((!empty).then(|| decode_value(result)).transpose()?)
+                if result.get("items").is_some() {
+                    CanonicalOperationValue::ReadMany(Some(decode_value(result)?))
+                } else {
+                    CanonicalOperationValue::Read(
+                        (!empty).then(|| decode_value(result)).transpose()?,
+                    )
+                }
             }
             OperationKind::Query => {
                 let query = if empty {
@@ -791,6 +802,11 @@ impl CanonicalOperationOutcome {
                         .map(Into::into)
                         .collect();
                     Some(CanonicalQueryValue {
+                        output: result
+                            .get("output")
+                            .cloned()
+                            .map(decode_value)
+                            .transpose()?,
                         records: records.into_iter().map(Into::into).collect(),
                         total_count,
                         has_more,
@@ -856,23 +872,16 @@ impl CanonicalOperationOutcome {
                     result,
                 })
             }
-            OperationKind::AssessTypePack | OperationKind::ApplyTypePack => {
+            OperationKind::AssessTypePack
+            | OperationKind::ApplyTypePack
+            | OperationKind::AssessCollectionSetup
+            | OperationKind::ApplyCollectionSetup => {
                 return Self::definition(
                     operation,
                     OperationResult {
                         valid,
                         result,
-                        diagnostics: diagnostics.into_iter().map(wire_diagnostic).collect(),
-                    },
-                );
-            }
-            OperationKind::AssessCollectionSetup | OperationKind::ApplyCollectionSetup => {
-                return Self::definition(
-                    operation,
-                    OperationResult {
-                        valid,
-                        result,
-                        diagnostics: diagnostics.into_iter().map(wire_diagnostic).collect(),
+                        diagnostics: diagnostics.into_iter().map(WireDiagnostic::from).collect(),
                     },
                 );
             }
@@ -912,6 +921,7 @@ impl CanonicalOperationOutcome {
             CanonicalOperationValue::Read(value)
             | CanonicalOperationValue::Create(value)
             | CanonicalOperationValue::Update(value) => encode_optional(value),
+            CanonicalOperationValue::ReadMany(value) => encode_optional(value),
             CanonicalOperationValue::Query(value) => {
                 value.as_ref().map_or_else(empty_object, |query| {
                     let mut meta = query.meta.clone().into_inner();
@@ -928,15 +938,19 @@ impl CanonicalOperationOutcome {
                         .embedded_diagnostics
                         .iter()
                         .cloned()
-                        .map(wire_diagnostic)
+                        .map(WireDiagnostic::from)
                         .collect::<Vec<_>>();
                     // Records are already JSON: clone them rather than re-serialize.
                     let results = query.records.iter().map(|record| Value::clone(record));
-                    Value::Object(serde_json::Map::from_iter([
+                    let mut result = serde_json::Map::from_iter([
                         ("results".to_string(), Value::Array(results.collect())),
                         ("meta".to_string(), meta),
                         ("diagnostics".to_string(), encode(&diagnostics)),
-                    ]))
+                    ]);
+                    if let Some(output) = query.output {
+                        result.insert("output".into(), encode(&output));
+                    }
+                    Value::Object(result)
                 })
             }
             CanonicalOperationValue::Delete(value) => {
@@ -981,7 +995,7 @@ impl CanonicalOperationOutcome {
                 .diagnostics
                 .iter()
                 .cloned()
-                .map(wire_diagnostic)
+                .map(WireDiagnostic::from)
                 .collect(),
         }
     }
@@ -1058,24 +1072,6 @@ fn encode<T: Serialize>(value: &T) -> Value {
 }
 fn encode_optional<T: Serialize>(value: &Option<T>) -> Value {
     value.as_ref().map_or_else(empty_object, encode)
-}
-
-fn wire_diagnostic(value: Diagnostic) -> WireDiagnostic {
-    WireDiagnostic {
-        severity: match value.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-            Severity::Info => "info",
-        }
-        .to_string(),
-        code: value.code.as_str().to_string(),
-        message: value.message,
-        path: value.path,
-        field: value.field,
-        type_name: value.type_name,
-        schema_location: value.schema_location,
-        details: value.details,
-    }
 }
 
 #[cfg(test)]
@@ -1304,6 +1300,7 @@ mod tests {
         let deferred = CanonicalOperationOutcome {
             valid: true,
             value: CanonicalOperationValue::Query(Some(CanonicalQueryValue {
+                output: None,
                 records: Vec::new(),
                 total_count: None,
                 has_more: true,
@@ -1329,6 +1326,7 @@ mod tests {
 
         let exact = CanonicalOperationOutcome {
             value: CanonicalOperationValue::Query(Some(CanonicalQueryValue {
+                output: None,
                 records: Vec::new(),
                 total_count: Some(7),
                 has_more: false,

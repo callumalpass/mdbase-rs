@@ -29,6 +29,8 @@ pub(crate) struct Query {
     pub include_body: bool,
     #[serde(default)]
     pub frontmatter_mode: FrontmatterMode,
+    #[serde(default)]
+    pub output: Option<crate::api::QueryOutput>,
     #[serde(flatten)]
     pub _extensions: BTreeMap<String, Value>,
 }
@@ -233,6 +235,7 @@ impl Query {
             limit: request.limit,
             offset: request.offset,
             include_body: request.include_body,
+            output: request.output,
             frontmatter_mode: match request.frontmatter_mode {
                 crate::api::FrontmatterMode::Effective => FrontmatterMode::Effective,
                 crate::api::FrontmatterMode::Persisted => FrontmatterMode::Persisted,
@@ -245,6 +248,7 @@ impl Query {
 
 pub(crate) struct Candidate {
     pub path: String,
+    pub revision: String,
     pub types: Vec<String>,
     pub raw: Value,
     pub effective: Value,

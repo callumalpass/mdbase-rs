@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Canonical query rows (including malformed-record stubs and hosted Base rows)
+  carry exact-source `revision` tokens. Hosted projection format 9 retains that
+  token; format 8 projections must be rebuilt before projection-only execution.
+- `read` accepts ordered `paths` document batches (1–100 occurrences), sharing
+  physical work for duplicates. `include_body` defaults true and
+  `include_document` defaults false. Missing and expected semantic failures are
+  per-item outcomes; cancellation, storage and binding failures remain operation
+  failures. Responses over 8 MiB fail explicitly and require splitting. Hosted
+  providers use `ReadManyRequest` and `CompiledCatalog::read_records_typed` with
+  exact source inputs. Contract batches await the contract-query surface.
+- Native queries accept `output: "metadata"`: revision-required typed rows with
+  only path, types and selected values, plus an output discriminator. Selection,
+  projection, null/missing, grouping and paging semantics remain unchanged;
+  `include_body: true` is rejected. Normal and narrow rows (including Base rows)
+  share one renderer. Simple hosted selections/projections now evaluate from
+  current projections without exact-document hydration. Hosted query plans are
+  version 13; old plans/cursors must restart, not be relabeled. Rust query result
+  and runtime value constructors gain an optional `output` field (use `None`
+  for ordinary rows). Source tokens do not replace catalog cache invalidation.
+
 ### Fixed
 
 - Writes under `validation: error` now reject a `validate_exists` link whose

@@ -5,12 +5,20 @@ mod collection_path;
 mod dynamic;
 pub(crate) mod operations;
 mod query;
+mod read_many;
+pub use read_many::{
+    BatchReadDocument, ReadManyError, ReadManyItem, ReadManyRequest, ReadManyResult,
+    READ_MANY_MAX_BYTES, READ_MANY_MAX_PATHS,
+};
 pub(crate) mod typed;
 
 pub use collection_path::{CollectionPath, CollectionPathError};
 pub(crate) use dynamic::reference_evidence;
 pub use dynamic::{ProjectedValue, QueryMetadata, ReferenceEvidence};
-pub use query::{FrontmatterMode, QueryDirection, QueryOrder, QueryRequest, QueryResult};
+pub use query::{
+    FrontmatterMode, MetadataQueryRecord, QueryDirection, QueryOrder, QueryOutput,
+    QueryRecordMaterial, QueryRequest, QueryResult,
+};
 pub use typed::{
     BackfillBatchResult, BackfillDetail, BackfillRequest, BackfillResult,
     BatchDeletePreflightResult, BatchItemResult, BatchOperation, BatchOperationResult,

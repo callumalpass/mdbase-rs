@@ -4,10 +4,10 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use super::context::{candidate_context, file_value, load_context, namespace_value};
+use super::context::{candidate_context, file_value, load_context};
 use super::diagnostics;
 use super::model::{Candidate, Query};
-use super::preflight::{self, CompiledSelection};
+use super::preflight;
 use super::result::{build_groups, compare_values, serialize_candidate, sort_candidates};
 use crate::cel;
 use crate::diagnostic::Diagnostic;
@@ -117,6 +117,7 @@ pub(crate) fn record_wire_query_decode() {
 
 /// Dynamic rows and metadata produced by the already-parsed query core.
 pub(crate) struct QueryExecution {
+    pub output: Option<crate::api::QueryOutput>,
     pub records: Vec<Value>,
     pub total_count: usize,
     pub has_more: bool,
@@ -493,26 +494,13 @@ pub(crate) fn execute_model_profiled_cancellable(
             backlinks.clone(),
             type_definitions.clone(),
         );
-        for (name, expression) in &compiled.projections {
-            set_projection_binding(&mut expression_context, &projections);
-            match cel::evaluate_compiled(expression, &expression_context, &clock) {
-                Ok(value) => {
-                    projections.insert(name.clone(), value);
-                }
-                Err(error) => {
-                    query_diagnostics.push(diagnostics::evaluation(
-                        &record.rel_path,
-                        &format!("projections.{name}"),
-                        "query_projection",
-                        error,
-                        None,
-                    ));
-                    projections.insert(name.clone(), Value::Null);
-                }
-            }
-        }
-
-        set_projection_binding(&mut expression_context, &projections);
+        projections = super::context::projections(
+            &compiled,
+            &mut expression_context,
+            &clock,
+            &record.rel_path,
+            &mut query_diagnostics,
+        );
         if let Some(where_expression) = &compiled.where_expression {
             match cel::evaluate_compiled(where_expression, &expression_context, &clock) {
                 Ok(Value::Bool(true)) => {}
@@ -530,37 +518,20 @@ pub(crate) fn execute_model_profiled_cancellable(
             }
         }
 
-        let mut values = Map::new();
-        for selection in &compiled.selections {
-            match selection {
-                CompiledSelection::Field { source, name } => {
-                    values.insert(
-                        name.clone(),
-                        namespace_value(source, &effective, &projections, &values, &file),
-                    );
-                }
-                CompiledSelection::Expression { expression, name } => {
-                    let value =
-                        match cel::evaluate_compiled(expression, &expression_context, &clock) {
-                            Ok(value) => value,
-                            Err(error) => {
-                                query_diagnostics.push(diagnostics::evaluation(
-                                    &record.rel_path,
-                                    &format!("select.{name}"),
-                                    "query_selection",
-                                    error,
-                                    None,
-                                ));
-                                Value::Null
-                            }
-                        };
-                    values.insert(name.clone(), value);
-                }
-            }
-        }
+        let values = super::context::selections(
+            &compiled,
+            &expression_context,
+            &clock,
+            &record.rel_path,
+            &effective,
+            &file,
+            &projections,
+            &mut query_diagnostics,
+        );
 
         candidates.push(Candidate {
             path: record.rel_path.clone(),
+            revision: record.source_revision.clone(),
             types,
             raw: record.raw_frontmatter.clone(),
             effective,
@@ -615,6 +586,7 @@ pub(crate) fn execute_model_profiled_cancellable(
         meta["groups"] = Value::Array(groups);
     }
     let result = Ok(QueryExecution {
+        output: compiled.query.output,
         records: results,
         total_count,
         has_more,
@@ -646,15 +618,6 @@ fn apply_load_performance(
     performance.cache_used = load.cache_used;
     performance.cache_fallback = load.cache_fallback;
     performance.link_graph_built = load.built_link_graph;
-}
-
-fn set_projection_binding(
-    context: &mut crate::expressions::evaluator::EvalContext,
-    projections: &Map<String, Value>,
-) {
-    if let Some(bindings) = context.frontmatter.as_object_mut() {
-        bindings.insert("projection".to_string(), Value::Object(projections.clone()));
-    }
 }
 
 type MatchClock = Result<crate::expressions::evaluator::EvaluationClock, cel::CelFailure>;
@@ -695,7 +658,7 @@ pub(super) fn build_metadata_page_result(
                     unreachable!()
                 };
                 query_diagnostics.push(diagnostics::invalid_record(&stub.rel_path, &stub.reason));
-                return serialize_invalid_stub(stub);
+                return serialize_invalid_stub(stub, &compiled.query);
             };
             let (types, failures) = record_types(
                 collection,
@@ -722,6 +685,7 @@ pub(super) fn build_metadata_page_result(
             );
             let candidate = Candidate {
                 path: record.rel_path.clone(),
+                revision: record.source_revision.clone(),
                 types,
                 raw: record.raw_frontmatter.clone(),
                 effective: effective.clone(),
@@ -740,6 +704,7 @@ pub(super) fn build_metadata_page_result(
         "has_more": has_more,
     });
     Ok(QueryExecution {
+        output: compiled.query.output,
         records: results,
         total_count,
         has_more,
@@ -755,20 +720,25 @@ fn millis_to_micros(milliseconds: f64) -> u64 {
     (milliseconds * 1_000.0).min(u64::MAX as f64) as u64
 }
 
-fn serialize_invalid_stub(stub: &InvalidRecordStub) -> Value {
-    json!({
+fn serialize_invalid_stub(stub: &InvalidRecordStub, query: &Query) -> Value {
+    let file = json!({
         "path": stub.rel_path,
-        "types": stub.type_names,
-        "file": {
-            "path": stub.rel_path,
-            "name": std::path::Path::new(&stub.rel_path).file_name().and_then(|value| value.to_str()).unwrap_or(""),
-            "folder": std::path::Path::new(&stub.rel_path).parent().and_then(|value| value.to_str()).unwrap_or(""),
-            "size": stub.file_size,
-            "mtime": stub.file_mtime_iso,
-            "ctime": stub.file_ctime_iso,
-            "revision": stub.source_revision,
-        }
-    })
+        "name": std::path::Path::new(&stub.rel_path).file_name().and_then(|value| value.to_str()).unwrap_or(""),
+        "folder": std::path::Path::new(&stub.rel_path).parent().and_then(|value| value.to_str()).unwrap_or(""),
+        "size": stub.file_size, "mtime": stub.file_mtime_iso, "ctime": stub.file_ctime_iso,
+        "revision": stub.source_revision,
+    });
+    crate::api::QueryRecordMaterial {
+        path: &stub.rel_path,
+        revision: &stub.source_revision,
+        types: &stub.type_names,
+        frontmatter: None,
+        effective_frontmatter: None,
+        file: &file,
+        body: None,
+        values: None,
+    }
+    .render(query.output)
 }
 
 fn record_metadata_value(record: &LocalRecord, field: &str) -> Value {

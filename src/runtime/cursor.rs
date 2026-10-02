@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use super::{
-    CanonicalOperationOutcome, ChangeSet, CollectionGeneration, ExecutionOutcome, OperationContext,
-    ProviderError, ReadCursor, ReadPage,
+    CanonicalOperationOutcome, CanonicalOperationValue, ChangeSet, CollectionGeneration,
+    ExecutionOutcome, OperationContext, ProviderError, ReadCursor, ReadPage,
 };
 
 const MAX_ACTIVE_CURSORS: usize = 32;
@@ -190,6 +190,22 @@ impl CursorStore {
             outcome,
             next: Some(self.issue(&id, page_items)),
         })
+    }
+
+    pub(crate) fn validate_output(
+        &self,
+        cursor: &ReadCursor,
+        output: crate::api::QueryOutput,
+    ) -> Result<(), ProviderError> {
+        let (id, _) = self.authenticate(cursor)?;
+        let pinned = self
+            .entries
+            .get(&id)
+            .ok_or(ProviderError::GenerationExpired)?;
+        match pinned.template.value() {
+            CanonicalOperationValue::Query(Some(query)) if query.output == Some(output) => Ok(()),
+            _ => Err(ProviderError::InvalidReadCursor),
+        }
     }
 
     pub(crate) fn page(
@@ -458,6 +474,7 @@ mod tests {
         let operation = CanonicalOperationOutcome {
             valid: true,
             value: CanonicalOperationValue::Query(Some(CanonicalQueryValue {
+                output: None,
                 records: vec![
                     ProjectedValue::new(json!({"id": 1})),
                     ProjectedValue::new(json!({"id": 2})),

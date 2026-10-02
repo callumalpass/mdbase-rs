@@ -16,10 +16,11 @@ use crate::expressions::evaluator::{
     path_is_in_folder, resolve_execution_timezone, ResolvedFileData,
 };
 use crate::query::cache_source::FileRecord;
-use crate::query::canonical::context::{candidate_context, file_value, namespace_value};
+use crate::query::canonical::context as query_values;
+use crate::query::canonical::context::{candidate_context, file_value};
 use crate::query::canonical::diagnostics;
 use crate::query::canonical::model::{Candidate, Query};
-use crate::query::canonical::preflight::{self, CompiledSelection};
+use crate::query::canonical::preflight;
 use crate::query::canonical::result::serialize_candidate;
 use crate::{cel, diagnostic::Diagnostic, v03::validate_query};
 use ::cel::common::ast::{Expr, IdedExpr, LiteralValue};
@@ -27,7 +28,7 @@ use ::cel::common::ast::{Expr, IdedExpr, LiteralValue};
 use super::hosted_links::{hosted_link_graph, HostedRelationshipNeighborhood};
 use super::{CanonicalRecordInput, CatalogError, CompiledCatalog, SemanticProjection};
 
-pub const HOSTED_QUERY_PLAN_VERSION: u32 = 12;
+pub const HOSTED_QUERY_PLAN_VERSION: u32 = 13;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_ORDER_TERMS: usize = 16;
 const MAX_GROUP_TERMS: usize = 8;
@@ -636,8 +637,7 @@ impl CompiledCatalog {
             && !requirements.relationships
             && !requirements.diagnostic_type_matchers;
         requirements.exact_document |= requirements.query_context
-            || !query.projections.is_empty()
-            || query.select.is_some()
+            || requirements.relationships
             || requirements.structural_body_facts
             || requirements.diagnostic_type_matchers;
         requirements.diagnostics = true;
@@ -743,6 +743,14 @@ impl CompiledCatalog {
                 .iter()
                 .any(|item| item.severity == crate::api::Severity::Error),
             value: super::CanonicalOperationValue::Query(Some(super::CanonicalQueryValue {
+                output: plan
+                    .residual
+                    .query
+                    .get("output")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|_| query_error("invalid_query", "Invalid query output."))?,
                 records: values,
                 total_count,
                 has_more,
@@ -913,6 +921,7 @@ impl CompiledCatalog {
         );
         let file_record = FileRecord {
             rel_path: record.path.clone(),
+            source_revision: crate::v03::revision(record.document.as_bytes()),
             raw_frontmatter: raw,
             effective_frontmatter: effective.clone(),
             body: classified.body,
@@ -947,44 +956,22 @@ impl CompiledCatalog {
         .map_err(|message| query_error("invalid_timezone", message))?;
         let clock = cel::operation_clock(timezone)
             .map_err(|error| query_error(&error.code, error.message))?;
-        let type_definitions = Arc::new(collection.types.clone());
-        let mut projections = serde_json::Map::new();
-        for (name, expression) in &compiled.projections {
-            let context = candidate_context(
-                &file_record,
-                &types,
-                &effective,
-                &projections,
-                this_context.clone(),
-                all_files.clone(),
-                backlinks.clone(),
-                type_definitions.clone(),
-            );
-            match cel::evaluate_compiled(expression, &context, &clock) {
-                Ok(value) => {
-                    projections.insert(name.clone(), value);
-                }
-                Err(error) => {
-                    diagnostics.push(diagnostics::evaluation(
-                        &record.path,
-                        &format!("projections.{name}"),
-                        "query_projection",
-                        error,
-                        None,
-                    ));
-                    projections.insert(name.clone(), Value::Null);
-                }
-            }
-        }
-        let context = candidate_context(
+        let mut context = candidate_context(
             &file_record,
             &types,
             &effective,
-            &projections,
+            &serde_json::Map::new(),
             this_context,
             all_files,
             backlinks,
-            type_definitions,
+            Arc::new(collection.types.clone()),
+        );
+        let projections = query_values::projections(
+            &compiled,
+            &mut context,
+            &clock,
+            &record.path,
+            &mut diagnostics,
         );
         let matched = match compiled.where_expression.as_ref() {
             None => true,
@@ -1009,35 +996,19 @@ impl CompiledCatalog {
             compiled.requires_file_body_metadata(),
         );
         let candidate = if matched {
-            let mut values = serde_json::Map::new();
-            for selection in &compiled.selections {
-                match selection {
-                    CompiledSelection::Field { source, name } => {
-                        values.insert(
-                            name.clone(),
-                            namespace_value(source, &effective, &projections, &values, &file),
-                        );
-                    }
-                    CompiledSelection::Expression { expression, name } => {
-                        let value = match cel::evaluate_compiled(expression, &context, &clock) {
-                            Ok(value) => value,
-                            Err(error) => {
-                                diagnostics.push(diagnostics::evaluation(
-                                    &record.path,
-                                    &format!("select.{name}"),
-                                    "query_selection",
-                                    error,
-                                    None,
-                                ));
-                                Value::Null
-                            }
-                        };
-                        values.insert(name.clone(), value);
-                    }
-                }
-            }
+            let values = query_values::selections(
+                &compiled,
+                &context,
+                &clock,
+                &record.path,
+                &effective,
+                &file,
+                &projections,
+                &mut diagnostics,
+            );
             Some(Candidate {
                 path: record.path.clone(),
+                revision: file_record.source_revision,
                 types,
                 raw: file_record.raw_frontmatter,
                 effective,
@@ -1183,12 +1154,10 @@ impl CompiledCatalog {
                     .join("; "),
             )
         })?;
-        if (!match_only
-            && (!compiled.projections.is_empty()
-                || !compiled.selections.is_empty()
-                || compiled.query.include_body))
+        if (!match_only && compiled.query.include_body)
             || compiled.requires_this_context()
             || compiled.requires_link_graph()
+            || compiled.requires_file_body_metadata()
         {
             return Err(query_error(
                 "hosted_exact_residual_required",
@@ -1223,6 +1192,7 @@ impl CompiledCatalog {
             .map_err(|error| query_error(&error.code, error.message))?;
         let file_record = FileRecord {
             rel_path: projection.facts.path.clone(),
+            source_revision: projection.facts.revision.clone(),
             raw_frontmatter: Value::Object(projection.facts.persisted_frontmatter.clone()),
             effective_frontmatter: Value::Object(projection.facts.effective_frontmatter.clone()),
             body: String::new(),
@@ -1232,18 +1202,24 @@ impl CompiledCatalog {
             file_ctime_iso: None,
         };
         let effective = Value::Object(projection.facts.effective_frontmatter.clone());
-        let projections = serde_json::Map::new();
-        let context = candidate_context(
+        let mut context = candidate_context(
             &file_record,
             &projection.facts.types,
             &effective,
-            &projections,
+            &serde_json::Map::new(),
             None,
             None,
             None,
             Arc::new(collection.types.clone()),
         );
         let mut diagnostics = Vec::new();
+        let projections = query_values::projections(
+            &compiled,
+            &mut context,
+            &clock,
+            &projection.facts.path,
+            &mut diagnostics,
+        );
         let matched = match compiled.where_expression.as_ref() {
             None => true,
             Some(expression) => match cel::evaluate_compiled(expression, &context, &clock) {
@@ -1263,15 +1239,30 @@ impl CompiledCatalog {
         };
         let mut file = file_value(&file_record, &effective, false);
         complete_file_value_from_projection(&mut file, &effective, projection);
+        let values = if matched && !match_only {
+            query_values::selections(
+                &compiled,
+                &context,
+                &clock,
+                &projection.facts.path,
+                &effective,
+                &file,
+                &projections,
+                &mut diagnostics,
+            )
+        } else {
+            serde_json::Map::new()
+        };
         let candidate = matched.then(|| Candidate {
             path: projection.facts.path.clone(),
+            revision: file_record.source_revision,
             types: projection.facts.types.clone(),
             raw: file_record.raw_frontmatter,
             effective,
             body: String::new(),
             file,
             projections,
-            values: serde_json::Map::new(),
+            values,
         });
         let (order_values, group_values, aggregate_values) = candidate
             .as_ref()
@@ -3187,10 +3178,12 @@ mod tests {
         let second = catalog().compile_hosted_query(&query).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version, HOSTED_QUERY_PLAN_VERSION);
-        assert_eq!(first.version, 12);
         assert!(first.canonical_query_digest.starts_with("sha256:"));
         assert!(first.plan_digest.starts_with("sha256:"));
-        assert_eq!(serde_json::to_value(first).unwrap()["version"], 12);
+        assert_eq!(
+            serde_json::to_value(first).unwrap()["version"],
+            HOSTED_QUERY_PLAN_VERSION
+        );
     }
 
     #[test]
