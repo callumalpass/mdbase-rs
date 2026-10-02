@@ -30,6 +30,15 @@ fn seed_upgrade_atomically_changes_exact_contract_and_preserves_customizations()
         write(&root.path().join("task.md"), task);
         let upgraded = seed_upgrade_provision(&definitions);
         let collection = Collection::open(root.path()).unwrap();
+        // An unedited seed receives the exact desired bytes and digest.
+        let desired = &upgraded.resources[2].document;
+        let options = super::tests::assessment_options();
+        let planned = &collection.assess_type_pack(&upgraded, &options).result["resources"][2];
+        assert_eq!(planned["action"], "update");
+        assert_eq!(
+            planned["digest"] == revision(desired.as_bytes()),
+            !customized
+        );
         let applied = apply_pack(&collection, &upgraded);
         assert!(applied.valid, "{:?}", applied.diagnostics);
         let reopened = Collection::open(root.path()).unwrap();
@@ -44,6 +53,11 @@ fn seed_upgrade_atomically_changes_exact_contract_and_preserves_customizations()
             .is_empty());
         let result = fs::read_to_string(&type_path).unwrap();
         assert!(result.contains("assignees"));
+        assert_eq!(result == *desired, !customized);
+        let lock = fs::read_to_string(root.path().join("mdbase.lock.yaml")).unwrap();
+        assert!(lock.contains(&revision(desired.as_bytes())));
+        let repeat = reopened.assess_type_pack(&upgraded, &options).result;
+        assert_eq!(repeat["status"], "current");
         if customized {
             assert!(result.contains("title: label"));
             assert!(result.ends_with("My custom documentation.\n"));

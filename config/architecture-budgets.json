@@ -1,6 +1,6 @@
 {
   "rustSourceFileCountMax": 201,
-  "rustSourceLineCountMax": 109709,
+  "rustSourceLineCountMax": 109727,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-architecture-check/src/main.rs": 1188,
