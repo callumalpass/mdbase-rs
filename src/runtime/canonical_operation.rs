@@ -872,23 +872,16 @@ impl CanonicalOperationOutcome {
                     result,
                 })
             }
-            OperationKind::AssessTypePack | OperationKind::ApplyTypePack => {
+            OperationKind::AssessTypePack
+            | OperationKind::ApplyTypePack
+            | OperationKind::AssessCollectionSetup
+            | OperationKind::ApplyCollectionSetup => {
                 return Self::definition(
                     operation,
                     OperationResult {
                         valid,
                         result,
-                        diagnostics: diagnostics.into_iter().map(wire_diagnostic).collect(),
-                    },
-                );
-            }
-            OperationKind::AssessCollectionSetup | OperationKind::ApplyCollectionSetup => {
-                return Self::definition(
-                    operation,
-                    OperationResult {
-                        valid,
-                        result,
-                        diagnostics: diagnostics.into_iter().map(wire_diagnostic).collect(),
+                        diagnostics: diagnostics.into_iter().map(WireDiagnostic::from).collect(),
                     },
                 );
             }
@@ -945,7 +938,7 @@ impl CanonicalOperationOutcome {
                         .embedded_diagnostics
                         .iter()
                         .cloned()
-                        .map(wire_diagnostic)
+                        .map(WireDiagnostic::from)
                         .collect::<Vec<_>>();
                     // Records are already JSON: clone them rather than re-serialize.
                     let results = query.records.iter().map(|record| Value::clone(record));
@@ -1002,7 +995,7 @@ impl CanonicalOperationOutcome {
                 .diagnostics
                 .iter()
                 .cloned()
-                .map(wire_diagnostic)
+                .map(WireDiagnostic::from)
                 .collect(),
         }
     }
@@ -1079,10 +1072,6 @@ fn encode<T: Serialize>(value: &T) -> Value {
 }
 fn encode_optional<T: Serialize>(value: &Option<T>) -> Value {
     value.as_ref().map_or_else(empty_object, encode)
-}
-
-fn wire_diagnostic(value: Diagnostic) -> WireDiagnostic {
-    value.into()
 }
 
 #[cfg(test)]

@@ -29,19 +29,7 @@ impl<'a> Operations<'a> {
 
     pub fn read(&self, input: &Value) -> OperationResult {
         if input.get("paths").is_some() {
-            let request = match crate::api::ReadManyRequest::parse(input) {
-                Ok(request) => request,
-                Err(message) => {
-                    return failed_result(vec![Diagnostic::error("invalid_request", message, None)])
-                }
-            };
-            return crate::operations::read::evaluate_read_many(&request, |request| {
-                Ok(crate::operations::read::evaluate_typed_read(
-                    self.collection,
-                    request,
-                    crate::operations::read::TypedReadSource::Filesystem,
-                ))
-            });
+            return crate::operations::read::read_many_filesystem(self.collection, input);
         }
         let request = match self.parse_read_request(input) {
             Ok(request) => request,

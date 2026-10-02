@@ -98,7 +98,7 @@ pub enum ReadManyItem {
         /// Requested canonical identity.
         path: CollectionPath,
         /// Coherent document and exact-source token.
-        record: BatchReadDocument,
+        record: Box<BatchReadDocument>,
     },
     /// No record exists at the requested path.
     Missing {

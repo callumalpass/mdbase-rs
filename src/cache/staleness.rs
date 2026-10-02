@@ -58,6 +58,29 @@ pub(crate) fn find_changes(
     Ok(CacheChanges { stale, deleted })
 }
 
+/// Compatibility helpers retained for cache tests and older internal callers.
+#[allow(dead_code)]
+pub(crate) fn find_stale(
+    conn: &Connection,
+    collection: &Collection,
+    files: &[String],
+) -> Vec<PathBuf> {
+    find_changes(conn, collection, files)
+        .map(|changes| changes.stale.into_iter().map(PathBuf::from).collect())
+        .unwrap_or_default()
+}
+
+#[allow(dead_code)]
+pub(crate) fn find_deleted(
+    conn: &Connection,
+    collection: &Collection,
+    files: &[String],
+) -> Vec<String> {
+    find_changes(conn, collection, files)
+        .map(|changes| changes.deleted)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -85,36 +108,19 @@ mod tests {
         db.execute("UPDATE files SET source_revision = ''", [])
             .unwrap();
         drop(db);
-        let ops = collection.v03_operations().unwrap();
-        let query = ops.query(&serde_json::json!({"output":"metadata"}));
-        let read = ops.read(&serde_json::json!({"path":"one.md"}));
-        assert!(query.valid);
+        let typed = collection.typed().unwrap();
+        let query = typed
+            .query(crate::api::QueryRequest {
+                output: Some(crate::api::QueryOutput::Metadata),
+                ..Default::default()
+            })
+            .unwrap();
+        let read = typed
+            .read(crate::api::ReadRequest::new("one.md").unwrap())
+            .unwrap();
         assert_eq!(
-            query.result["results"][0]["revision"],
-            read.result["revision"]
+            query.value.records[0]["revision"],
+            read.value.revision.as_str()
         );
     }
-}
-
-/// Compatibility helpers retained for cache tests and older internal callers.
-#[allow(dead_code)]
-pub(crate) fn find_stale(
-    conn: &Connection,
-    collection: &Collection,
-    files: &[String],
-) -> Vec<PathBuf> {
-    find_changes(conn, collection, files)
-        .map(|changes| changes.stale.into_iter().map(PathBuf::from).collect())
-        .unwrap_or_default()
-}
-
-#[allow(dead_code)]
-pub(crate) fn find_deleted(
-    conn: &Connection,
-    collection: &Collection,
-    files: &[String],
-) -> Vec<String> {
-    find_changes(conn, collection, files)
-        .map(|changes| changes.deleted)
-        .unwrap_or_default()
 }

@@ -149,10 +149,31 @@ pub(crate) fn evaluate_typed_read(
     )
 }
 
+/// Filesystem batch entrypoint shared by typed runtime and v0.3 wire reads.
+pub(crate) fn read_many_filesystem(
+    collection: &Collection,
+    input: &serde_json::Value,
+) -> crate::v03::OperationResult {
+    match crate::api::ReadManyRequest::parse(input) {
+        Ok(request) => evaluate_read_many(&request, |request| {
+            evaluate_typed_read(collection, request, TypedReadSource::Filesystem)
+        }),
+        Err(message) => crate::v03::OperationResult {
+            valid: false,
+            result: serde_json::json!({}),
+            diagnostics: vec![crate::diagnostic::Diagnostic::error(
+                "invalid_request",
+                message,
+                None,
+            )],
+        },
+    }
+}
+
 /// Shared bounded batch evaluator. Only source selection belongs to providers.
 pub(crate) fn evaluate_read_many(
     request: &crate::api::ReadManyRequest,
-    mut load: impl FnMut(&ReadRequest) -> Result<TypedReadEvaluation, crate::diagnostic::Diagnostic>,
+    mut load: impl FnMut(&ReadRequest) -> TypedReadEvaluation,
 ) -> crate::v03::OperationResult {
     use crate::api::{
         BatchReadDocument, ReadManyError, ReadManyItem, ReadManyResult, READ_MANY_MAX_BYTES,
@@ -186,13 +207,10 @@ pub(crate) fn evaluate_read_many(
         let item = if let Some(item) = cached.get(path.as_str()) {
             item
         } else {
-            let evaluation = match load(&ReadRequest {
+            let evaluation = load(&ReadRequest {
                 path: path.clone(),
                 include_document: request.include_document,
-            }) {
-                Ok(evaluation) => evaluation,
-                Err(error) => return fail(error),
-            };
+            });
             if let Some(error) = crate::runtime::OperationContext::current()
                 .and_then(|context| context.capture_limit_error())
             {
@@ -213,7 +231,7 @@ pub(crate) fn evaluate_read_many(
                 diagnostics.extend(evaluation.diagnostics.into_iter().map(Into::into));
                 ReadManyItem::Found {
                     path: path.clone(),
-                    record: BatchReadDocument::from_record(record, request.include_body),
+                    record: Box::new(BatchReadDocument::from_record(record, request.include_body)),
                 }
             } else {
                 let Some(error) = evaluation

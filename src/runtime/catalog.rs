@@ -271,7 +271,7 @@ impl CompiledCatalog {
                         size: record.file_size,
                         mtime: record.file_mtime.clone(),
                     };
-                    return Ok(crate::operations::read::evaluate_typed_read(
+                    return crate::operations::read::evaluate_typed_read(
                         &self.collection,
                         request,
                         crate::operations::read::TypedReadSource::Exact {
@@ -279,15 +279,11 @@ impl CompiledCatalog {
                             document: &record.document,
                             file_facts: &facts,
                         },
-                    ));
+                    );
                 }
                 None => crate::operations::read::TypedReadSource::Missing,
             };
-            Ok(crate::operations::read::evaluate_typed_read(
-                &self.collection,
-                request,
-                source,
-            ))
+            crate::operations::read::evaluate_typed_read(&self.collection, request, source)
         });
         super::CanonicalOperationOutcome::hosted_wire_edge(super::OperationKind::Read, result)
             .map_err(catalog_provider_error)

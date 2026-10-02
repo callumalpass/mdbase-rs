@@ -494,7 +494,7 @@ pub(crate) fn execute_model_profiled_cancellable(
             backlinks.clone(),
             type_definitions.clone(),
         );
-        projections = super::values::projections(
+        projections = super::context::projections(
             &compiled,
             &mut expression_context,
             &clock,
@@ -518,7 +518,7 @@ pub(crate) fn execute_model_profiled_cancellable(
             }
         }
 
-        let values = super::values::selections(
+        let values = super::context::selections(
             &compiled,
             &expression_context,
             &clock,

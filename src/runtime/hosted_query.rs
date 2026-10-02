@@ -16,12 +16,12 @@ use crate::expressions::evaluator::{
     path_is_in_folder, resolve_execution_timezone, ResolvedFileData,
 };
 use crate::query::cache_source::FileRecord;
+use crate::query::canonical::context as query_values;
 use crate::query::canonical::context::{candidate_context, file_value};
 use crate::query::canonical::diagnostics;
 use crate::query::canonical::model::{Candidate, Query};
 use crate::query::canonical::preflight;
 use crate::query::canonical::result::serialize_candidate;
-use crate::query::canonical::values as query_values;
 use crate::{cel, diagnostic::Diagnostic, v03::validate_query};
 use ::cel::common::ast::{Expr, IdedExpr, LiteralValue};
 

@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 use super::{
-    CollectionPath, CollectionPathError, ProjectedValue, QueryMetadata, QueryRequest, QueryResult,
+    CollectionPath, CollectionPathError, ProjectedValue, QueryRequest, QueryResult,
     ReferenceEvidence,
 };
 use crate::diagnostic::Diagnostic as CanonicalDiagnostic;
@@ -1024,25 +1024,10 @@ impl<'a> TypedCollection<'a> {
             });
         }
         let query = crate::query::canonical::model::Query::from_typed(&request);
-        match crate::query::canonical::execute_typed(self.collection, query) {
-            Ok(execution) => Ok(OperationOutcome {
-                value: QueryResult {
-                    output: execution.output,
-                    records: execution.records.into_iter().map(Into::into).collect(),
-                    total_count: execution.total_count,
-                    has_more: execution.has_more,
-                    meta: QueryMetadata::new(execution.meta),
-                },
-                diagnostics: execution
-                    .diagnostics
-                    .into_iter()
-                    .map(Diagnostic::from)
-                    .collect(),
-            }),
-            Err(diagnostics) => Err(MdbaseError::Operation {
-                diagnostics: diagnostics.into_iter().map(Diagnostic::from).collect(),
-            }),
-        }
+        super::query::typed_query_result(crate::query::canonical::execute_typed(
+            self.collection,
+            query,
+        ))
     }
 
     pub(crate) fn query_runtime(
@@ -1071,25 +1056,7 @@ impl<'a> TypedCollection<'a> {
         .map_err(|_| MdbaseError::InvalidRequest {
             message: "operation cancelled".to_string(),
         })?;
-        match evaluation {
-            Ok(execution) => Ok(OperationOutcome {
-                value: QueryResult {
-                    output: execution.output,
-                    records: execution.records.into_iter().map(Into::into).collect(),
-                    total_count: execution.total_count,
-                    has_more: execution.has_more,
-                    meta: QueryMetadata::new(execution.meta),
-                },
-                diagnostics: execution
-                    .diagnostics
-                    .into_iter()
-                    .map(Diagnostic::from)
-                    .collect(),
-            }),
-            Err(diagnostics) => Err(MdbaseError::Operation {
-                diagnostics: diagnostics.into_iter().map(Diagnostic::from).collect(),
-            }),
-        }
+        super::query::typed_query_result(evaluation)
     }
 
     /// Plan or atomically apply the explicit v0.2-to-v0.3 migration.

@@ -1263,10 +1263,7 @@ fn execute_typed_read_operation(
         super::OperationKind::Read if request.input.get("paths").is_some() => {
             CanonicalOperationOutcome::hosted_wire_edge(
                 super::OperationKind::Read,
-                collection
-                    .v03_operations()
-                    .expect("typed reads require v0.3")
-                    .read(&request.input),
+                crate::operations::read::read_many_filesystem(collection, &request.input),
             )?
         }
         super::OperationKind::Read => {
