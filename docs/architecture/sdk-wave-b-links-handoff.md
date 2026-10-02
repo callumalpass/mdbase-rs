@@ -1,7 +1,11 @@
 # B6 handoff — wb-links
 
-Branch: `sdk-upgrade/links`. Implementation commits: `aef9783`, `2a01a29`,
-`5dfd920`, `1c58cd1`. No push, PR, merge, tag, or release performed.
+Branch: `sdk-upgrade/links`, rebased onto `origin/main` at `af73732`
+(authority PR #102). Rebased implementation commits: `2ac251b`, `33f7e48`,
+`d60f17e`, `812d4e4`; original benchmark provenance labels `aef9783`, `2a01a29`,
+`5dfd920`, `1c58cd1` describe the pre-rebase runs. The coordinator authorised
+only this branch's force-with-lease push; PR creation, merge, tags and release
+remain coordinator-owned.
 
 ## Delivered
 
@@ -41,9 +45,26 @@ Primary engine files: `src/cel/{host,provenance,program}.rs`,
 `src/query/canonical/{preflight,execute}.rs`, `src/runtime/hosted_links.rs`.
 `src/expressions/evaluator.rs` only exposes existing shared parser helpers within
 this crate. No wire definitions or client API files changed. Canonical query
-preflight/execution may overlap wb-authority's B2/B3 work during integration.
+preflight/execution merged with wb-authority's B2/B3 changes during rebase;
+changelog and budget conflicts were resolved by preserving both features.
 
-## Verification (final implementation, CARGO_BUILD_JOBS=4)
+## Post-rebase verification (CARGO_BUILD_JOBS=4)
+
+On `af73732`, format, architecture, workspace/all-target/all-feature Clippy and
+all four CI strict Clippy variants passed with `-D warnings`. The architecture
+check measures **201 files / 109,603 lines**, combining authority's +1/+601 and
+B6's +1/+516 deltas and retaining both per-file justifications in
+[`docs/link-resolution.md`](../link-resolution.md).
+
+`cargo test --locked -p mdbase --all-features --lib` plus the nine selected
+integration suites passed **549 tests, 0 failed, 3 ignored**: 492 engine unit
+tests and 57 integration tests. This includes all link-policy/traversal/security/
+provenance/person-link suites, and authority's `query_document_revisions` and
+`query_metadata` producer tests. The eight B6 integration tests pass unchanged.
+Log: `/tmp/wb-links-rebase-verification.log`. The full workspace/testbed evidence
+below is pre-rebase; it was not relabeled as a post-rebase full CI run.
+
+## Pre-rebase verification (CARGO_BUILD_JOBS=4)
 
 All requested final checks passed:
 

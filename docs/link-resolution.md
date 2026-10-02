@@ -147,15 +147,26 @@ implemented here. Existing resolution evidence is described in
 
 ## Architecture budget review
 
-The checker measures 200 Rust source files / 109,002 lines (previous ceilings
-199 / 108,486). The one new source file is the private indexed-policy budget/
-benchmark test module; integration fixtures live under `tests`/`conformance`.
-The 516-line ceiling increase pays for explicit overload/provenance handling,
-strict policy parsing, eligible candidate constraints, and hosted fail-closed
-tests—not a second client resolver or additional filesystem discovery path.
-The existing resolver ceiling increases from 1,175 to its measured 1,265 lines
-for the policy/index metadata it owns. All other concentration, ambient-I/O,
-legacy-call, and transitional-reference budgets remain unchanged. These exact
+Rebased onto `af73732` (authority PR #102), the checker measures **201 Rust
+source files / 109,603 lines**. Both independently reviewed deltas are retained:
+
+- Authority's `718f4c1`: 199 / 108,486 → 200 / 109,087 (+1 file, +601 lines).
+  The remaining bounded-document-batch DTO owner, exact-source revisions,
+  ordered batch reads and metadata output justify this growth, net of shared
+  rendering/evaluation and deleted incidental modules.
+- B6: 200 / 109,087 → 201 / 109,603 (+1 file, +516 lines). The new source file
+  is the private indexed-policy budget/benchmark test module; integration
+  fixtures live under `tests`/`conformance`. The line increase pays for explicit
+  overload/provenance handling, strict policy parsing, eligible candidate
+  constraints and hosted fail-closed tests—not another client resolver or
+  filesystem discovery path. The resolver ceiling remains 1,175 → 1,265 (+90)
+  for its policy/index metadata ownership.
+- Authority's per-file ceilings remain `hosted_base.rs` 1,966 → 1,969 (+3) for
+  the source revision and canonical candidate assignments, and `views/execute.rs`
+  1,391 → 1,396 (+5) for delegation to the shared revision-bearing renderer.
+
+All other concentration, ambient-I/O, legacy-call and transitional-reference
+budgets remain unchanged (including 26 v0.3 facade references). These exact
 ceilings are review signals, not unused headroom.
 
 ## Consumers and producer evidence
