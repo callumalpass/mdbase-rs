@@ -221,7 +221,8 @@ pub(crate) fn plan_type_pack(
         )));
     }
     let diagnostics = validate_type_pack(&provision.manifest, "mdbase-pack.yaml");
-    if let Some(diagnostic) = diagnostics.into_iter().next() {
+    if let Some(mut diagnostic) = diagnostics.into_iter().next() {
+        diagnostic.code = "invalid_type_pack".into();
         return Err(Box::new(diagnostic));
     }
     let manifest_resources = serde_json::from_value::<Vec<ManifestResource>>(

@@ -1099,7 +1099,7 @@ fn shared_v03_data_contract_fixture_passes() {
 
 #[test]
 fn shared_v03_type_pack_fixture_passes() {
-    run_suite("type-packs/type-packs.yaml", "type_packs", 19);
+    run_suite("type-packs/type-packs.yaml", "type_packs", 21);
 }
 
 fn run_suite(relative_path: &str, fixture_set: &str, expected_cases: usize) {
