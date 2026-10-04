@@ -635,6 +635,33 @@ mod tests {
             assert!(update.unwrap().contains(&"link_not_found".to_string()));
         }
 
+        /// An outside edit can leave two records sharing a value; the index
+        /// counts every holder, so removing either must not hide the other.
+        #[test]
+        fn index_keeps_every_holder_of_an_externally_duplicated_value() {
+            for removed in ["notes/first.md", "notes/second.md"] {
+                let (directory, runtime) = runtime();
+                let ingest = || {
+                    runtime.synchronize().unwrap();
+                    let context = OperationContext::internal();
+                    while runtime
+                        .ingest_external_timeout(Duration::from_millis(200), &context)
+                        .unwrap()
+                        .is_some()
+                    {}
+                };
+                for path in ["notes/first.md", "notes/second.md"] {
+                    fs::write(directory.path().join(path), "---\nslug: shared\n---\n").unwrap();
+                }
+                ingest();
+                fs::remove_file(directory.path().join(removed)).unwrap();
+                ingest();
+                let create = note("notes/third.md", json!({"slug": "shared"}));
+                let codes = rejection(&runtime, OperationKind::Create, create);
+                assert!(codes.unwrap().contains(&"duplicate_value".to_string()));
+            }
+        }
+
         #[test]
         fn batch_links_resolve_against_the_batch_final_state() {
             let (_directory, runtime) = runtime();
