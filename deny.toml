@@ -2,7 +2,10 @@
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+  # unmaintained notice only; serde_yaml/unsafe-libyaml retained in legacy reader for migration parse fidelity; legacy crate retires after migration
+  "RUSTSEC-2024-0449",
+]
 
 [licenses]
 allow = [
