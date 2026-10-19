@@ -17,7 +17,12 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 pub(crate) struct CollectionRoot {
     directory: Arc<Dir>,
     display_path: Arc<PathBuf>,
-    cache_storage: Arc<tempfile::TempDir>,
+    cache_storage: Arc<CacheStorage>,
+}
+
+struct CacheStorage {
+    identity: Arc<same_file::Handle>,
+    directory: tempfile::TempDir,
 }
 
 impl std::fmt::Debug for CollectionRoot {
@@ -56,7 +61,7 @@ impl CollectionRoot {
     }
 
     pub(crate) fn cache_storage_path(&self) -> &Path {
-        self.cache_storage.path()
+        self.cache_storage.directory.path()
     }
 
     pub(crate) fn open_dir(&self, relative: &Path) -> std::io::Result<Dir> {
@@ -558,19 +563,27 @@ fn sync_directory(dir: &Dir) -> std::io::Result<()> {
     Ok(())
 }
 
-static CACHE_STORAGE: LazyLock<Mutex<HashMap<Arc<same_file::Handle>, Weak<tempfile::TempDir>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+// The registry must not own a directory handle: Windows capability handles
+// deliberately deny delete sharing. Keep identity and derived storage together
+// under the live authorities, so both release without another acquisition.
+static CACHE_STORAGE: LazyLock<Mutex<Vec<Weak<CacheStorage>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
-fn cache_storage_for(identity: &Arc<same_file::Handle>) -> std::io::Result<Arc<tempfile::TempDir>> {
+fn cache_storage_for(identity: &Arc<same_file::Handle>) -> std::io::Result<Arc<CacheStorage>> {
     let mut registry = CACHE_STORAGE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    registry.retain(|_, storage| storage.strong_count() != 0);
-    if let Some(storage) = registry.get(identity).and_then(Weak::upgrade) {
-        return Ok(storage);
+    registry.retain(|storage| storage.strong_count() != 0);
+    for storage in registry.iter().filter_map(Weak::upgrade) {
+        if storage.identity.as_ref() == identity.as_ref() {
+            return Ok(storage);
+        }
     }
-    let storage = Arc::new(tempfile::tempdir()?);
-    registry.insert(Arc::clone(identity), Arc::downgrade(&storage));
+    let storage = Arc::new(CacheStorage {
+        identity: Arc::clone(identity),
+        directory: tempfile::tempdir()?,
+    });
+    registry.push(Arc::downgrade(&storage));
     Ok(storage)
 }
 
@@ -634,6 +647,49 @@ fn cap_has_multiple_hard_links(metadata: &cap_std::fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn cap_has_multiple_hard_links(_metadata: &cap_std::fs::Metadata) -> bool {
     false
+}
+
+#[cfg(test)]
+mod cache_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn last_cache_owner_releases_directory_identity_without_another_acquire() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = Dir::open_ambient_dir(root.path(), cap_std::ambient_authority()).unwrap();
+        let identity = Arc::new(same_file::Handle::from_file(directory.into_std_file()).unwrap());
+        let released = Arc::downgrade(&identity);
+        let storage = cache_storage_for(&identity).unwrap();
+        let other_owner = Arc::clone(&storage);
+        drop(identity);
+        drop(storage);
+        assert_eq!(released.strong_count(), 1);
+        // No unrelated acquisition may prune a dead entry and mask retention.
+        let _registry = CACHE_STORAGE.lock().unwrap();
+        drop(other_owner);
+        assert_eq!(
+            released.strong_count(),
+            0,
+            "cache registry retained a directory handle"
+        );
+    }
+
+    #[test]
+    fn live_authorities_share_cache_but_reacquisition_after_release_is_fresh() {
+        let root = tempfile::tempdir().unwrap();
+        let first = CollectionRoot::acquire(root.path()).unwrap();
+        let second = CollectionRoot::acquire(&root.path().join(".")).unwrap();
+        assert!(Arc::ptr_eq(&first.cache_storage, &second.cache_storage));
+        let marker = "lifetime-fixture";
+        std::fs::write(first.cache_storage_path().join(marker), b"derived").unwrap();
+        drop(first);
+        assert!(second.cache_storage_path().join(marker).exists());
+        let released = Arc::downgrade(&second.cache_storage);
+        drop(second);
+        assert!(released.upgrade().is_none());
+        let reopened = CollectionRoot::acquire(root.path()).unwrap();
+        assert!(!reopened.cache_storage_path().join(marker).exists());
+    }
 }
 
 #[cfg(all(test, windows))]
