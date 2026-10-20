@@ -55,6 +55,10 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Collection-directory capability handles now close with the last authority.
+  The derived-cache registry no longer retains a stale identity handle that
+  blocks Windows deletion after runtime shutdown.
+
 - A seed type upgrade (`upgrade_from`) over an unedited seed, whose live bytes
   equal the baseline document, now writes the desired pack document
   byte-for-byte. It previously wrote a re-serialised merge result, reformatting

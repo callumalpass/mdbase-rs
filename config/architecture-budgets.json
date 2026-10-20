@@ -1,6 +1,6 @@
 {
   "rustSourceFileCountMax": 201,
-  "rustSourceLineCountMax": 109806,
+  "rustSourceLineCountMax": 109862,
   "rustSourceFileMaxLines": 1000,
   "legacyFileLineBudgets": {
     "crates/mdbase-architecture-check/src/main.rs": 1188,
@@ -53,7 +53,7 @@
     "src/bin/link-traversal-benchmark.rs": {"std::fs": 4, "tempfile": 1},
     "src/cache/mod.rs": {"std::fs": 2},
     "src/cache/sqlite.rs": {"std::fs": 3, "std::fs::File": 2, "std::fs::OpenOptions": 2},
-    "src/collection_root.rs": {"cap_std::ambient-acquisition": 2, "std::fs": 3, "std::fs::File": 2, "tempfile": 4},
+    "src/collection_root.rs": {"cap_std::ambient-acquisition": 2, "std::fs": 3, "std::fs::File": 2, "tempfile": 2},
     "src/compat/v02_migration.rs": {"std::fs": 5, "tempfile": 1},
     "src/config/mod.rs": {"std::fs": 2},
     "src/data_contracts.rs": {"std::fs": 1, "walkdir": 2},
