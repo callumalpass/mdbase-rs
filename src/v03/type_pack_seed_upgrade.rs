@@ -1,7 +1,7 @@
 //! Seed-type upgrades: digest-pinned baselines, the ordered choice of one by
 //! the seed's recorded origin, and a conservative, data-free three-way merge.
 use super::ManifestResource;
-use super::{frontmatter_bounds, replace_yaml_node, revision};
+use super::{frontmatter_bounds, replace_yaml_node, revision, splice_yaml_node, yaml_node_text};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -127,16 +127,35 @@ fn merge(base_document: &str, current: &str, desired_document: &str) -> Result<S
         return Err("Removing a top-level type setting requires manual review.".into());
     }
     // Rewrite only changed top-level nodes. Keep the user's Markdown body and
-    // all unrelated YAML (including comments and formatting) byte-for-byte.
-    let mut document = current.to_string();
-    for (key, value) in new {
-        if old.get(key) != Some(value) {
+    // all unrelated YAML (including comments and formatting) byte-for-byte. A
+    // node that takes the desired value takes the desired document's own text,
+    // so the publisher's bytes survive; only a node merging both sides is
+    // re-emitted. Copied text can hold anchors or aliases that its neighbours
+    // relied on, so when the result does not read back as the merge, every node
+    // holding the desired value is copied.
+    let (start, end) = frontmatter_bounds(desired_document).map_err(|d| d.message.clone())?;
+    let desired_yaml = &desired_document[start..end];
+    for widen in [false, true] {
+        let mut document = current.to_string();
+        for (key, value) in new {
+            let text = (desired.get(key) == Some(value))
+                .then(|| yaml_node_text(desired_yaml, key))
+                .flatten();
+            if old.get(key) == Some(value) && !(widen && text.is_some()) {
+                continue;
+            }
             let (start, end) = frontmatter_bounds(&document).map_err(|d| d.message.clone())?;
-            document = replace_yaml_node(&document, start, end, key, value)
-                .map_err(|d| d.message.clone())?;
+            document = match text {
+                Some(text) => splice_yaml_node(&document, start, end, key, text),
+                None => replace_yaml_node(&document, start, end, key, value)
+                    .map_err(|d| d.message.clone())?,
+            };
+        }
+        if parse(&document).ok().as_ref() == Some(&merged) {
+            return Ok(document);
         }
     }
-    Ok(document)
+    Err("Seed upgrade cannot keep this type's YAML anchors and aliases consistent; review it explicitly.".into())
 }
 
 fn merge_value(
@@ -256,6 +275,38 @@ mod tests {
             merge(&doc(&base()), &merged, &doc(&desired())).unwrap(),
             merged
         );
+    }
+    const SCRATCH_V1: &str = "---\nkind: mdbase.type\nname: scratch\nversion: 1\nschema:\n  dialect: json-schema-2020-12\n  value:\n    type: object\n    required: [id, digest]\n    properties:\n      id: { type: string, minLength: 1 }\n      digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }\ncollection:\n  path:\n    folder: TaskNotes/Scratchpad\n    template: \"{{id}}\"\n  unique:\n    - field: id\n---\n# Scratch\n";
+
+    #[test]
+    fn upgraded_entries_keep_the_desired_bytes() {
+        let desired = SCRATCH_V1
+            .replace("version: 1", "version: 2")
+            .replace("[id, digest]", "[id, digest, state]")
+            .replace(
+                "      digest:",
+                "      state: { enum: [active, converted] }\n      digest:",
+            );
+        let current = SCRATCH_V1.replace("folder: TaskNotes/Scratchpad", "folder: scratchpads");
+        let merged = merge(SCRATCH_V1, &current, &desired).unwrap();
+        assert_eq!(
+            merged,
+            desired.replace("folder: TaskNotes/Scratchpad", "folder: scratchpads")
+        );
+    }
+    #[test]
+    fn copied_entries_bring_the_anchors_their_aliases_need() {
+        let base = "---\nkind: mdbase.type\nname: task\nversion: 1\nschema:\n  status: &s [open, done]\n  other: x\nimplements:\n  - values: *s\nx-owner: old\n---\n";
+        // The publisher renamed the anchor. Copying only the changed schema
+        // entry would leave the unchanged live alias pointing at nothing.
+        let desired = base
+            .replace("version: 1", "version: 2")
+            .replace("other: x", "other: y")
+            .replace("&s", "&a1")
+            .replace("*s", "*a1");
+        let current = base.replace("x-owner: old", "x-owner: custom");
+        let merged = merge(base, &current, &desired).unwrap();
+        assert_eq!(merged, desired.replace("x-owner: old", "x-owner: custom"));
     }
     #[test]
     fn conflicting_field_addition_is_not_overwritten() {

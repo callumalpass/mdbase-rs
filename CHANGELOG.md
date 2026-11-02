@@ -55,6 +55,13 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Seed-type upgrades of edited types write each upgraded top-level setting
+  with the desired document's own text. They previously re-serialized it with
+  serde_yaml, sorting keys, expanding flow lists and anchors, dropping quotes
+  and writing scalars as `version:\n  2`, so app-managed types stopped matching
+  every published baseline. A merge whose copied anchors and aliases do not
+  read back as the merge copies every untouched desired setting, and otherwise
+  reports a conflict.
 - Collection-directory capability handles now close with the last authority.
   The derived-cache registry no longer retains a stale identity handle that
   blocks Windows deletion after runtime shutdown.
