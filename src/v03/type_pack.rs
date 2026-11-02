@@ -1288,24 +1288,37 @@ fn replace_yaml_node<T: Serialize>(
     key: &str,
     value: &T,
 ) -> ContractSetupResult<String> {
-    let yaml = &document[yaml_start..yaml_end];
     let serialized = serde_yaml::to_string(value)
         .map_err(|_| contract_setup_diagnostic("The contract setup could not be serialized."))?;
     let serialized = serialized.strip_prefix("---\n").unwrap_or(&serialized);
-    let newline = if document.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
     let block = format!(
-        "{key}:{newline}{}",
+        "{key}:\n{}",
         serialized
             .trim_end_matches('\n')
             .lines()
             .map(|line| format!("  {line}"))
             .collect::<Vec<_>>()
-            .join(newline)
+            .join("\n")
     );
+    Ok(splice_yaml_node(document, yaml_start, yaml_end, key, &block))
+}
+
+/// Replace the top-level `key` node of the frontmatter at `yaml_start..yaml_end`
+/// with `block` (appending it when absent), in the document's line endings.
+fn splice_yaml_node(
+    document: &str,
+    yaml_start: usize,
+    yaml_end: usize,
+    key: &str,
+    block: &str,
+) -> String {
+    let yaml = &document[yaml_start..yaml_end];
+    let newline = if document.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let block = block.lines().collect::<Vec<_>>().join(newline);
     let (node_start, node_end) = yaml_node_range(yaml, key).unwrap_or((yaml.len(), yaml.len()));
     let mut next_yaml = String::new();
     next_yaml.push_str(&yaml[..node_start]);
@@ -1319,7 +1332,14 @@ fn replace_yaml_node<T: Serialize>(
     result.push_str(&document[..yaml_start]);
     result.push_str(&next_yaml);
     result.push_str(&document[yaml_end..]);
-    Ok(result)
+    result
+}
+
+/// The exact text of the top-level `key` node in a frontmatter block, without
+/// its final line break.
+fn yaml_node_text<'a>(yaml: &'a str, key: &str) -> Option<&'a str> {
+    let (start, end) = yaml_node_range(yaml, key)?;
+    Some(yaml[start..end].trim_end_matches(['\n', '\r']))
 }
 
 fn frontmatter_bounds(document: &str) -> ContractSetupResult<(usize, usize)> {
