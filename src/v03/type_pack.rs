@@ -1300,7 +1300,9 @@ fn replace_yaml_node<T: Serialize>(
             .collect::<Vec<_>>()
             .join("\n")
     );
-    Ok(splice_yaml_node(document, yaml_start, yaml_end, key, &block))
+    Ok(splice_yaml_node(
+        document, yaml_start, yaml_end, key, &block,
+    ))
 }
 
 /// Replace the top-level `key` node of the frontmatter at `yaml_start..yaml_end`
