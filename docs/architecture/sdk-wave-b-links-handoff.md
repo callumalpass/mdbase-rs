@@ -1,5 +1,11 @@
 # B6 handoff — wb-links
 
+> **Deprecated and not authoritative.** This describes the legacy `mdbase-rs` engine,
+> kept only to build the legacy Connect stack until it is retired. It does not define
+> current mdbase behaviour: see the mdbase specification and the runtime in
+> [mdbase-connect `runtime/`](https://github.com/mdbase-dev/mdbase-connect/tree/main/runtime) (`runtime/docs/spec-notes.md`, `runtime/crates/core`).
+> Do not cite this document as mdbase semantics.
+
 Branch: `sdk-upgrade/links`, rebased onto `origin/main` at `af73732`
 (authority PR #102). Rebased implementation commits: `2ac251b`, `33f7e48`,
 `d60f17e`, `812d4e4`; original benchmark provenance labels `aef9783`, `2a01a29`,

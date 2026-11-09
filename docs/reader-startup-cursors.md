@@ -1,5 +1,11 @@
 # Bounded filesystem cursor startup
 
+> **Deprecated and not authoritative.** This describes the legacy `mdbase-rs` engine,
+> kept only to build the legacy Connect stack until it is retired. It does not define
+> current mdbase behaviour: see the mdbase specification and the runtime in
+> [mdbase-connect `runtime/`](https://github.com/mdbase-dev/mdbase-connect/tree/main/runtime) (`runtime/docs/spec-notes.md`, `runtime/crates/core`).
+> Do not cite this document as mdbase semantics.
+
 `FilesystemRuntime::open_read` first attempts an eligible metadata query backed by a held,
 read-only SQLite WAL transaction and an `Arc<Collection>` containing collection definitions.
 It decodes and projects only the requested page, not every result. The snapshot is established

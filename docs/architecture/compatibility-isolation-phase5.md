@@ -1,5 +1,11 @@
 # Phase 5: compatibility isolation and retirement gates
 
+> **Deprecated and not authoritative.** This describes the legacy `mdbase-rs` engine,
+> kept only to build the legacy Connect stack until it is retired. It does not define
+> current mdbase behaviour: see the mdbase specification and the runtime in
+> [mdbase-connect `runtime/`](https://github.com/mdbase-dev/mdbase-connect/tree/main/runtime) (`runtime/docs/spec-notes.md`, `runtime/crates/core`).
+> Do not cite this document as mdbase semantics.
+
 ## 0.4.x ambient Collection mutations
 
 The released context-free JSON methods `Collection::{create, update, delete,

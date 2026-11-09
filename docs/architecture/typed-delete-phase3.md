@@ -1,5 +1,11 @@
 # Phase 3: typed delete/preflight slice
 
+> **Deprecated and not authoritative.** This describes the legacy `mdbase-rs` engine,
+> kept only to build the legacy Connect stack until it is retired. It does not define
+> current mdbase behaviour: see the mdbase specification and the runtime in
+> [mdbase-connect `runtime/`](https://github.com/mdbase-dev/mdbase-connect/tree/main/runtime) (`runtime/docs/spec-notes.md`, `runtime/crates/core`).
+> Do not cite this document as mdbase semantics.
+
 `TypedCollection::delete` and `TypedCollection::preflight_delete` now call the
 version-neutral mutation service directly with `DeleteRequest`. The mutation
 plan captures the canonical `CollectionPath`, exact pre-delete revision,
