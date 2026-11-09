@@ -1,5 +1,11 @@
 # Native link resolution V1
 
+> **Deprecated and not authoritative.** This describes the legacy `mdbase-rs` engine,
+> kept only to build the legacy Connect stack until it is retired. It does not define
+> current mdbase behaviour: see the mdbase specification and the runtime in
+> [mdbase-connect `runtime/`](https://github.com/mdbase-dev/mdbase-connect/tree/main/runtime) (`runtime/docs/spec-notes.md`, `runtime/crates/core`).
+> Do not cite this document as mdbase semantics.
+
 This is the mdbase-rs engine contract for CEL record traversal. The executable
 corpus is [`conformance/link-resolution-v1.json`](../conformance/link-resolution-v1.json),
 run by [`tests/link_resolution_v1.rs`](../tests/link_resolution_v1.rs). Resolution

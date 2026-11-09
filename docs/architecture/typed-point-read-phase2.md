@@ -1,5 +1,11 @@
 # Phase 2: canonical typed point reads
 
+> **Deprecated and not authoritative.** This describes the legacy `mdbase-rs` engine,
+> kept only to build the legacy Connect stack until it is retired. It does not define
+> current mdbase behaviour: see the mdbase specification and the runtime in
+> [mdbase-connect `runtime/`](https://github.com/mdbase-dev/mdbase-connect/tree/main/runtime) (`runtime/docs/spec-notes.md`, `runtime/crates/core`).
+> Do not cite this document as mdbase semantics.
+
 Phase 2 commit 1 moves v0.3 point reads behind one typed evaluator in
 `operations/read`. `TypedCollection::read` now passes `ReadRequest` directly to
 that evaluator and receives `OperationOutcome<RecordDocument>` without a JSON

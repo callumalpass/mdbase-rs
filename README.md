@@ -1,5 +1,16 @@
 # mdbase-rs
 
+> [!WARNING]
+> **Deprecated. Not authoritative for mdbase semantics.**
+>
+> `mdbase-rs` is the legacy mdbase engine. It is superseded by the runtime in
+> [mdbase-connect `runtime/`](https://github.com/mdbase-dev/mdbase-connect/tree/main/runtime), which implements the mdbase
+> specification and records its interpretations in `runtime/docs/spec-notes.md`.
+> This repository is kept only so the legacy Connect stack builds until that
+> stack is retired. It receives no new semantics, and its documentation,
+> conformance corpora and behaviour do not describe current mdbase behaviour.
+> Where they differ from the specification or the runtime, they are wrong.
+
 Typed Rust implementation of the [mdbase specification](https://mdbase.dev).
 The `0.4` releases are deliberate breaking API releases: canonical v0.3
 collection semantics sit behind typed requests, results, paths, revisions,

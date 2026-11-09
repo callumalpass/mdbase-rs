@@ -1,5 +1,11 @@
 # Typed query core — Phase 2
 
+> **Deprecated and not authoritative.** This describes the legacy `mdbase-rs` engine,
+> kept only to build the legacy Connect stack until it is retired. It does not define
+> current mdbase behaviour: see the mdbase specification and the runtime in
+> [mdbase-connect `runtime/`](https://github.com/mdbase-dev/mdbase-connect/tree/main/runtime) (`runtime/docs/spec-notes.md`, `runtime/crates/core`).
+> Do not cite this document as mdbase semantics.
+
 Phase 2 makes the parsed canonical query architecture version-neutral. The
 model, semantic preflight, executor, query context, diagnostics, and result
 serialization now live together under `src/query/canonical/`; shared CEL and

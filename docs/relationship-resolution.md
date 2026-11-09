@@ -1,5 +1,11 @@
 # Relationship resolution evidence
 
+> **Deprecated and not authoritative.** This describes the legacy `mdbase-rs` engine,
+> kept only to build the legacy Connect stack until it is retired. It does not define
+> current mdbase behaviour: see the mdbase specification and the runtime in
+> [mdbase-connect `runtime/`](https://github.com/mdbase-dev/mdbase-connect/tree/main/runtime) (`runtime/docs/spec-notes.md`, `runtime/crates/core`).
+> Do not cite this document as mdbase semantics.
+
 See [Native link resolution V1](link-resolution.md) for the CEL policy contract,
 compatibility gaps, executable fixtures, and `asFile()` option support matrix.
 

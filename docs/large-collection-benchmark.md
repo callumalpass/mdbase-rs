@@ -1,5 +1,11 @@
 # Large collection setup/startup benchmark
 
+> **Deprecated and not authoritative.** This describes the legacy `mdbase-rs` engine,
+> kept only to build the legacy Connect stack until it is retired. It does not define
+> current mdbase behaviour: see the mdbase specification and the runtime in
+> [mdbase-connect `runtime/`](https://github.com/mdbase-dev/mdbase-connect/tree/main/runtime) (`runtime/docs/spec-notes.md`, `runtime/crates/core`).
+> Do not cite this document as mdbase semantics.
+
 This is a local, synthetic **engine/runtime** benchmark for the TaskNotes large-collection investigation. It does not connect to a daemon, LAB, staging, production, or a user's collection. It complements `phase0-baseline` (general queries/mutations/concurrency) by exercising application contract setup through the durable runtime transaction path.
 
 Initial measurements, including a settlement-pending failure under a 20-second runtime budget: [2026-09-16 baseline](../benchmarks/large-collection-startup-2026-09-16.md). Current-main comparison and setup simplification: [2026-09-16 follow-up](../benchmarks/collection-setup-2026-09-16.md).
